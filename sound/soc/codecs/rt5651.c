@@ -24,6 +24,7 @@
 #include <sound/initval.h>
 #include <sound/tlv.h>
 #include <sound/jack.h>
+#include <linux/clk.h>
 
 #include "rl6231.h"
 #include "rt5651.h"
@@ -1511,6 +1512,7 @@ static int rt5651_set_dai_pll(struct snd_soc_dai *dai, int pll_id, int source,
 static int rt5651_set_bias_level(struct snd_soc_component *component,
 			enum snd_soc_bias_level level)
 {
+	struct rt5651_priv *rt5651 = snd_soc_component_get_drvdata(component);
 	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(component);
 
 	switch (level) {
@@ -1519,6 +1521,13 @@ static int rt5651_set_bias_level(struct snd_soc_component *component,
 			if (snd_soc_component_read(component, RT5651_PLL_MODE_1) & 0x9200)
 				snd_soc_component_update_bits(component, RT5651_D_MISC,
 						    0xc00, 0xc00);
+		}
+		if (!IS_ERR(rt5651->mclk)){
+			if (snd_soc_dapm_get_bias_level(dapm) == SND_SOC_BIAS_ON) {
+				clk_disable_unprepare(rt5651->mclk);
+			} else {
+				clk_prepare_enable(rt5651->mclk);
+			}
 		}
 		break;
 	case SND_SOC_BIAS_STANDBY:
@@ -2061,6 +2070,13 @@ static int rt5651_probe(struct snd_soc_component *component)
 {
 	struct rt5651_priv *rt5651 = snd_soc_component_get_drvdata(component);
 	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(component);
+
+	/* Check if MCLK provided */
+	rt5651->mclk = devm_clk_get(component->dev, "mclk");
+	if (PTR_ERR(rt5651->mclk) == -EPROBE_DEFER){
+		dev_err(component->dev, "unable to get mclk\n");
+		return -EPROBE_DEFER;
+	}
 
 	rt5651->component = component;
 
