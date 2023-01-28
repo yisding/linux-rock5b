@@ -385,6 +385,19 @@
 	status = "okay";
 };
 
+&spdif {
+	pinctrl-0 = <&spdifm0_tx>;
+	status = "okay";
+};
+
+&spdif_out {
+	status = "okay";
+};
+
+&spdif_sound {
+ 	status = "okay";
+};
+
 &tsadc {
 	status = "okay";
 };
