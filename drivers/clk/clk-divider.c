@@ -27,6 +27,17 @@
  * parent - fixed parent.  No clk_set_parent support
  */
 
+/*
+ * Same as DIV_ROUND_UP, but internally uses a division and a modulo
+ * operation instead of math tricks. This way it avoids overflowing
+ * when handling big numbers (e.g. clock rates >= 4.3 GHz on 64-bit).
+ */
+static inline unsigned long clk_divider_round_up_no_overflow(unsigned long n,
+							     unsigned long d)
+{
+	return (n / d) + !!(n % d);
+}
+
 static inline u32 clk_div_readl(struct clk_divider *divider)
 {
 	if (divider->flags & CLK_DIVIDER_BIG_ENDIAN)
@@ -227,7 +238,7 @@ static int _div_round_up(const struct clk_div_table *table,
 			 unsigned long parent_rate, unsigned long rate,
 			 unsigned long flags)
 {
-	int div = DIV_ROUND_UP_ULL((u64)parent_rate, rate);
+	int div = clk_divider_round_up_no_overflow(parent_rate, rate);
 
 	if (flags & CLK_DIVIDER_POWER_OF_TWO)
 		div = __roundup_pow_of_two(div);
@@ -244,7 +255,7 @@ static int _div_round_closest(const struct clk_div_table *table,
 	int up, down;
 	unsigned long up_rate, down_rate;
 
-	up = DIV_ROUND_UP_ULL((u64)parent_rate, rate);
+	up = clk_divider_round_up_no_overflow(parent_rate, rate);
 	down = parent_rate / rate;
 
 	if (flags & CLK_DIVIDER_POWER_OF_TWO) {
@@ -423,7 +434,7 @@ int divider_get_val(unsigned long rate, unsigned long parent_rate,
 {
 	unsigned int div, value;
 
-	div = DIV_ROUND_UP_ULL((u64)parent_rate, rate);
+	div = clk_divider_round_up_no_overflow(parent_rate, rate);
 
 	if (!_is_valid_div(table, div, flags))
 		return -EINVAL;
