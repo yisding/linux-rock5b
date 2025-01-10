@@ -297,8 +297,11 @@ static int drm_bridge_connector_detect_ctx(struct drm_connector *connector,
 	int ret;
 
 	if (detect) {
-		status = detect->funcs->detect(detect, connector);
+		ret = drm_bridge_detect_ctx(detect, connector, ctx);
+		if (ret < 0)
+			return ret;
 
+		status = ret;
 		if (hdmi) {
 			ret = drm_atomic_helper_connector_hdmi_hotplug(connector, ctx, status);
 			if (ret == -EDEADLK)
