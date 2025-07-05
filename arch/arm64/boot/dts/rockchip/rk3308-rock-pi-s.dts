@@ -48,6 +48,30 @@
 		};
 	};
 
+	analog_sound: analog-sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,format = "i2s";
+		simple-audio-card,name = "analog";
+		simple-audio-card,mclk-fs = <256>;
+		simple-audio-card,codec-hp-det;
+		simple-audio-card,widgets =
+			"Headphone", "Headphones";
+
+		simple-audio-card,dai-link@1 {
+			format = "i2s";
+
+			cpu {
+				sound-dai = <&i2s_8ch_2>;
+			};
+
+			codec {
+				sound-dai = <&codec>;
+			};
+
+		};
+
+	};
+
 	sdio_pwrseq: sdio-pwrseq {
 		compatible = "mmc-pwrseq-simple";
 		pinctrl-0 = <&wifi_enable_h>;
@@ -126,6 +150,11 @@
 		regulator-max-microvolt = <1050000>;
 		vin-supply = <&vcc5v0_sys>;
 	};
+};
+
+&codec {
+	status = "okay";
+	#sound-dai-cells = <0>;
 };
 
 &cpu0 {
@@ -242,6 +271,11 @@
 	status = "okay";
 };
 
+&i2s_8ch_2 {
+	#sound-dai-cells = <0>;
+	status = "okay";
+};
+
 &pinctrl {
 	pinctrl-names = "default";
 	pinctrl-0 = <&rtc_32k>;
@@ -333,7 +367,14 @@
 	cap-mmc-highspeed;
 	cap-sd-highspeed;
 	disable-wp;
+	card-detect-delay = <200>;
 	vmmc-supply = <&vcc_io>;
+	status = "okay";
+};
+
+&tsadc {
+	rockchip,hw-tshut-mode = <0>;		/* 0:CRU */
+	rockchip,hw-tshut-polarity = <1>;	/* 1:HIGH */
 	status = "okay";
 };
 
