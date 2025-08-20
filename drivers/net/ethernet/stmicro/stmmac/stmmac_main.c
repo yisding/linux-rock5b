@@ -3276,8 +3276,8 @@ static int stmmac_init_dma_engine(struct stmmac_priv *priv)
 
 	ret = stmmac_reset(priv);
 	if (ret) {
-		netdev_err(priv->dev, "Failed to reset the dma\n");
-		return ret;
+		netdev_warn(priv->dev, "Failed to reset the dma, device will work with reduced throughput\n");
+		ret = 0;
 	}
 
 	/* DMA Configuration */
