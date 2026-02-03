@@ -569,6 +569,11 @@ static void dw_hdmi_qp_bridge_atomic_enable(struct drm_bridge *bridge,
 	if (connector->display_info.is_hdmi) {
 		crtc_state = drm_atomic_get_new_crtc_state(state, conn_state->crtc);
 		mode = &crtc_state->mode;
+		dev_dbg(hdmi->dev, "%s mode=%ux%u@%uHz fmt=%s rate=%llu bpc=%u\n", __func__,
+			mode->hdisplay, mode->vdisplay, drm_mode_vrefresh(mode),
+			drm_hdmi_connector_get_output_format_name(conn_state->hdmi.output_format),
+			conn_state->hdmi.tmds_char_rate, conn_state->hdmi.output_bpc);
+
 		op_mode = 0;
 		hdmi->tmds_char_rate = conn_state->hdmi.tmds_char_rate;
 
