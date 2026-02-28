@@ -264,6 +264,10 @@
 	};
 };
 
+&hdmi0_sound {
+	status = "okay";
+};
+
 &hdptxphy0 {
 	status = "okay";
 };
@@ -394,6 +398,10 @@
 		pinctrl-0 = <&pcf8563_int>;
 		wakeup-source;
 	};
+};
+
+&i2s5_8ch {
+	status = "okay";
 };
 
 &mdio1 {
