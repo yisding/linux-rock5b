@@ -349,3 +349,31 @@
 	pinctrl-0 = <&uart0m0_xfer>;
 	status = "okay";
 };
+
+&u2phy {
+	status = "okay";
+};
+
+&u2phy_host {
+	phy-supply = <&usb2_host_5v>;
+	status = "okay";
+};
+
+&u2phy_otg {
+	status = "okay";
+};
+
+&usb_host0_ehci {
+	status = "okay";
+};
+
+&usb_host0_ohci {
+	status = "okay";
+};
+
+&usb_host0_xhci {
+	extcon = <&u2phy>;
+	maximum-speed = "high-speed";
+	snps,dis_u2_susphy_quirk;
+	status = "okay";
+};
