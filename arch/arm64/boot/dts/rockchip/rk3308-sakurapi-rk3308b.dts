@@ -237,10 +237,11 @@
 	non-removable;
 	no-mmc;
 	no-sd;
+	max-frequency = <8000000>;
 	status = "okay";
 
 	brcmf: wifi@1 {
-		compatible = "brcm,bcm43455-fmac", "brcm,bcm4329-fmac";
+		compatible = "brcm,bcm43455-fmac";
 		reg = <1>;
 		interrupt-parent = <&gpio0>;
 		interrupts = <RK_PA3 IRQ_TYPE_LEVEL_HIGH>;
