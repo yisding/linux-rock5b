@@ -158,6 +158,28 @@
 	status = "okay";
 };
 
+/* SPI0 for external gpio pin */
+&spi0 {
+	status = "okay";
+
+	spi_dev@0 {
+		compatible = "spidev";
+		reg = <0>;
+		spi-max-frequency = <0x2faf080>;
+	};
+};
+
+/* SPI1 for ws2812*/
+&spi1 {
+	status = "okay";
+
+	spi_dev@0 {
+		compatible = "spidev";
+		reg = <0>;
+		spi-max-frequency = <0x2faf080>;
+	};
+};
+
 &pinctrl {
 	pinctrl-names = "default";
 	pinctrl-0 = <&rtc_32k>;
