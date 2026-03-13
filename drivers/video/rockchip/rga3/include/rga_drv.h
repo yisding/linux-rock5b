@@ -204,6 +204,11 @@ struct rga_virt_addr {
 	size_t offset;
 
 	bool writable;
+
+	/* Shadow page list for cache-safe DMA */
+	struct list_head shadow_list;
+	bool shadow_head;
+	bool shadow_tail;
 	int result;
 };
 
