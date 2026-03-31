@@ -96,12 +96,12 @@ struct rockchip_hdmi_qp {
 	struct rockchip_encoder encoder;
 	struct dw_hdmi_qp *hdmi;
 	struct phy *phy;
+	struct dw_hdmi_qp_link_cfg link_cfg;
 	struct gpio_desc *frl_enable_gpio;
 	struct delayed_work hpd_work;
 	int hpd_irq;
 	int port_id;
 	const struct rockchip_hdmi_qp_ctrl_ops *ctrl_ops;
-	unsigned long long tmds_char_rate;
 };
 
 struct rockchip_hdmi_qp_ctrl_ops {
@@ -198,6 +198,7 @@ dw_hdmi_qp_rockchip_encoder_atomic_check(struct drm_encoder *encoder,
 	const struct drm_display_mode *adj_mode = &crtc_state->adjusted_mode;
 	struct rockchip_crtc_state *s = to_rockchip_crtc_state(crtc_state);
 	struct rockchip_hdmi_qp *hdmi = to_rockchip_hdmi_qp(encoder);
+	struct dw_hdmi_qp_link_cfg *lcfg = &hdmi->link_cfg;
 	union phy_configure_opts phy_cfg = {};
 	unsigned int overscan;
 	int ingest_fmt;
@@ -213,7 +214,7 @@ dw_hdmi_qp_rockchip_encoder_atomic_check(struct drm_encoder *encoder,
 	s->tv_margins.top    = adj_mode->vdisplay * overscan / 200;
 	s->tv_margins.bottom = s->tv_margins.top;
 
-	if (hdmi->tmds_char_rate == conn_state->hdmi.tmds_char_rate &&
+	if (lcfg->tmds_char_rate == conn_state->hdmi.tmds_char_rate &&
 	    s->output_bpc == conn_state->hdmi.output_bpc &&
 	    s->bus_format == ingest_fmt)
 		return 0;
@@ -249,7 +250,8 @@ dw_hdmi_qp_rockchip_encoder_atomic_check(struct drm_encoder *encoder,
 
 	ret = phy_configure(hdmi->phy, &phy_cfg);
 	if (!ret) {
-		hdmi->tmds_char_rate = conn_state->hdmi.tmds_char_rate;
+		lcfg->tmds_char_rate = conn_state->hdmi.tmds_char_rate;
+		lcfg->bpc = phy_cfg.hdmi.bpc;
 		s->output_type = DRM_MODE_CONNECTOR_HDMIA;
 		s->output_bpc = conn_state->hdmi.output_bpc;
 		s->bus_format = ingest_fmt;
@@ -335,12 +337,21 @@ static void dw_hdmi_qp_rk3588_disable_hpd(struct dw_hdmi_qp *dw_hdmi, void *data
 	dw_hdmi_qp_rk3588_mask_hpd(hdmi);
 }
 
+static const struct dw_hdmi_qp_link_cfg *
+dw_hdmi_qp_rk3588_get_link_cfg(struct dw_hdmi_qp *dw_hdmi, void *data)
+{
+	struct rockchip_hdmi_qp *hdmi = (struct rockchip_hdmi_qp *)data;
+
+	return &hdmi->link_cfg;
+}
+
 static const struct dw_hdmi_qp_phy_ops rk3588_hdmi_phy_ops = {
 	.init		= dw_hdmi_qp_rk3588_phy_init,
 	.disable	= dw_hdmi_qp_rk3588_phy_disable,
 	.read_hpd	= dw_hdmi_qp_rk3588_read_hpd,
 	.enable_hpd	= dw_hdmi_qp_rk3588_enable_hpd,
 	.disable_hpd	= dw_hdmi_qp_rk3588_disable_hpd,
+	.get_link_cfg	= dw_hdmi_qp_rk3588_get_link_cfg,
 };
 
 static enum drm_connector_status
@@ -390,6 +401,7 @@ static const struct dw_hdmi_qp_phy_ops rk3576_hdmi_phy_ops = {
 	.read_hpd	= dw_hdmi_qp_rk3576_read_hpd,
 	.enable_hpd	= dw_hdmi_qp_rk3576_enable_hpd,
 	.disable_hpd	= dw_hdmi_qp_rk3576_disable_hpd,
+	.get_link_cfg	= dw_hdmi_qp_rk3588_get_link_cfg,
 };
 
 static void dw_hdmi_qp_rk3588_hpd_work(struct work_struct *work)
