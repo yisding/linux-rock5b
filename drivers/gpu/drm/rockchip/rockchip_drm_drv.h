@@ -59,6 +59,7 @@ struct rockchip_crtc_state {
 	u32 bus_flags;
 	int color_space;
 	struct drm_connector_tv_margins tv_margins;
+	bool frl_enabled;
 };
 #define to_rockchip_crtc_state(s) \
 		container_of(s, struct rockchip_crtc_state, base)
