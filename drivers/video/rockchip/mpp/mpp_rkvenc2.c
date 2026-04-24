@@ -1647,7 +1647,7 @@ static void rkvenc2_read_slice_len(struct mpp_dev *mpp, struct rkvenc_task *task
 		mpp_write(mpp, hw->int_clr_base, new_irq_status);
 	}
 
-	last = *irq_status & INT_STA_ENC_DONE_STA;
+	last = *irq_status & (INT_STA_ENC_DONE_STA | INT_STA_ERROR);
 
 	mpp_dbg_slice("task %d wr %3d len start %s\n", task_id,
 		      sli_num, last ? "last" : "");
@@ -1788,7 +1788,8 @@ static int rkvenc_irq(struct mpp_dev *mpp)
 			wake_up(&mpp_task->wait);
 	} else {
 		if (task && task->task_split &&
-		    (irq_status & (INT_STA_SLC_DONE_STA | INT_STA_ENC_DONE_STA))) {
+		    (irq_status & (INT_STA_SLC_DONE_STA | INT_STA_ENC_DONE_STA |
+				   INT_STA_ERROR))) {
 			mpp_time_part_diff(mpp_task);
 			rkvenc2_read_slice_len(mpp, task, &irq_status);
 			wake_up(&mpp_task->wait);
@@ -2479,10 +2480,10 @@ static int rkvenc_soft_reset(struct mpp_dev *mpp)
 	ret = readl_relaxed_poll_timeout(mpp->reg_base + hw->int_sta_base,
 					 rst_status,
 					 rst_status & RKVENC_SCLR_DONE_STA,
-					 0, 5);
+					 0, 1000);
 	if (ret)
 		mpp_err("safe reset failed\n");
-	mpp_write(mpp, hw->enc_clr_base, 0x2);
+	mpp_write(mpp, hw->enc_clr_base, 0x3);
 	udelay(5);
 	mpp_write(mpp, hw->enc_clr_base, 0);
 	mpp_write(mpp, hw->int_clr_base, 0xffffffff);
