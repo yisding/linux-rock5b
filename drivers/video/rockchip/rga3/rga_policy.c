@@ -86,9 +86,18 @@ static bool rga_check_csc(const struct rga_hw_data *data, struct rga_req *rga_ba
 		break;
 	}
 
+	if ((rga_base->full_csc.flag & 0x1) &&
+	    !(data->feature & RGA_FULL_CSC)) {
+		/*
+		 * RGA2E requires FULL_CSC to execute R2Y BT.709-limit_range,
+		 * while RGA3 can directly support this CSC mode.
+		 */
+		if (data == &rga3_data &&
+		    (rga_base->yuv2rgb_mode & RGA_R2Y_MASK) == RGA_R2Y_BT709_LIMIT)
+			return true;
 
-	if ((rga_base->full_csc.flag & 0x1) && !(data->feature & RGA_FULL_CSC))
 		return false;
+	}
 
 	return true;
 }
