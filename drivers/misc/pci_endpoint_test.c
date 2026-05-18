@@ -1334,6 +1334,8 @@ static int pci_endpoint_test_probe(struct pci_dev *pdev,
 		goto err_kfree_name;
 	}
 
+	pci_save_state(pdev);
+
 	return 0;
 
 err_kfree_name:
