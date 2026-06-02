@@ -195,15 +195,23 @@ dw_hdmi_qp_rockchip_encoder_atomic_check(struct drm_encoder *encoder,
 					 struct drm_crtc_state *crtc_state,
 					 struct drm_connector_state *conn_state)
 {
+	const struct drm_display_mode *adj_mode = &crtc_state->adjusted_mode;
 	struct rockchip_crtc_state *s = to_rockchip_crtc_state(crtc_state);
 	struct rockchip_hdmi_qp *hdmi = to_rockchip_hdmi_qp(encoder);
 	union phy_configure_opts phy_cfg = {};
+	unsigned int overscan;
 	int ingest_fmt;
 	int ret;
 
 	ingest_fmt = dw_hdmi_qp_rockchip_get_vop_format(encoder, conn_state);
 	if (ingest_fmt < 0)
 		return -EINVAL;
+
+	overscan = min(conn_state->tv.overscan, 100u);
+	s->tv_margins.left   = adj_mode->hdisplay * overscan / 200;
+	s->tv_margins.right  = s->tv_margins.left;
+	s->tv_margins.top    = adj_mode->vdisplay * overscan / 200;
+	s->tv_margins.bottom = s->tv_margins.top;
 
 	if (hdmi->tmds_char_rate == conn_state->hdmi.tmds_char_rate &&
 	    s->output_bpc == conn_state->hdmi.output_bpc &&
@@ -721,6 +729,13 @@ static int dw_hdmi_qp_rockchip_bind(struct device *dev, struct device *master,
 	if (IS_ERR(connector))
 		return dev_err_probe(dev, PTR_ERR(connector),
 				     "Failed to init bridge connector\n");
+	ret = drm_mode_create_tv_properties_legacy(drm, 0, NULL);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "Failed to create TV connector properties\n");
+
+	drm_object_attach_property(&connector->base,
+				   drm->mode_config.tv_overscan_property, 0);
 
 	platform_set_drvdata(pdev, hdmi);
 
