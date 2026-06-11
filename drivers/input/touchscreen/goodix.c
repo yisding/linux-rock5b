@@ -1022,6 +1022,15 @@ retry_get_irq_gpio:
 		if (ts->gpiod_int && ts->gpiod_rst) {
 			ts->reset_controller_at_probe = true;
 			ts->load_cfg_from_disk = true;
+			/*
+			 * Some boards (e.g. Anbernic RG DS) carry two gt911 panels
+			 * that share goodix_911_cfg.bin; the async cfg-from-disk
+			 * path then leaves one panel without a working IRQ and adds
+			 * a ~60s firmware timeout. Such boards opt out via DT and
+			 * use the in-probe sync path with the chip's built-in config.
+			 */
+			if (of_property_read_bool(dev->of_node, "goodix,no-cfg-from-disk"))
+				ts->load_cfg_from_disk = false;
 			ts->irq_pin_access_method = IRQ_PIN_ACCESS_GPIO;
 		}
 	}
