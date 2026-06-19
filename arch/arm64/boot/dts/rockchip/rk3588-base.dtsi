@@ -1548,10 +1548,16 @@
 
 			vicap_toisp0: port@10 {
 				reg = <0x10>;
+				vicap_toisp0_ep: endpoint {
+					remote-endpoint = <&isp0_tovicap>;
+				};
 			};
 
 			vicap_toisp1: port@11 {
 				reg = <0x11>;
+				vicap_toisp1_ep: endpoint {
+					remote-endpoint = <&isp1_tovicap>;
+				};
 			};
 		};
 	};
@@ -3618,6 +3624,18 @@
 		power-domains = <&power RK3588_PD_VI>;
 		iommus = <&isp0_mmu>;
 		status = "disabled";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				isp0_tovicap: endpoint {
+					remote-endpoint = <&vicap_toisp0_ep>;
+				};
+			};
+		};
 	};
 
 	isp0_mmu: iommu@fdcb7f00 {
@@ -3648,6 +3666,18 @@
 		power-domains = <&power RK3588_PD_ISP1>;
 		iommus = <&isp1_mmu>;
 		status = "disabled";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				isp1_tovicap: endpoint {
+					remote-endpoint = <&vicap_toisp1_ep>;
+				};
+			};
+		};
 	};
 
 	isp1_mmu: iommu@fdcc7f00 {
