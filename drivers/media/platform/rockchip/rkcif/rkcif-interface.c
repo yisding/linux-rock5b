@@ -6,6 +6,7 @@
  * Copyright (C) 2025 Collabora, Ltd.
  */
 
+#include <media/mc-shared-graph.h>
 #include <media/v4l2-common.h>
 #include <media/v4l2-fwnode.h>
 #include <media/v4l2-mc.h>
@@ -398,6 +399,15 @@ int rkcif_interface_register(struct rkcif_device *rkcif,
 	ret = rkcif_interface_add(interface);
 	if (ret)
 		goto err_subdev_unregister;
+
+	ret = media_device_shared_join_link_source(interface->rkcif->media_dev,
+						   interface->rkcif->dev,
+						   &interface->sd.entity,
+						   RKCIF_IF_PAD_SRC,
+						   0);
+	if (ret)
+		goto err_subdev_unregister;
+
 
 	return 0;
 
