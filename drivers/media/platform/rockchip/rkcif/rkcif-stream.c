@@ -283,7 +283,7 @@ static int rkcif_stream_start_streaming(struct vb2_queue *queue,
 
 	mask = BIT_ULL(stream->id);
 	ret = v4l2_subdev_enable_streams(&stream->interface->sd,
-					 RKCIF_IF_PAD_SRC, mask);
+					 RKCIF_IF_PAD_SRC_DMA, mask);
 	if (ret < 0)
 		goto err_stop_stream;
 
@@ -309,7 +309,7 @@ static void rkcif_stream_stop_streaming(struct vb2_queue *queue)
 	int ret;
 
 	mask = BIT_ULL(stream->id);
-	v4l2_subdev_disable_streams(&stream->interface->sd, RKCIF_IF_PAD_SRC,
+	v4l2_subdev_disable_streams(&stream->interface->sd, RKCIF_IF_PAD_SRC_DMA,
 				    mask);
 
 	stream->stopping = true;
@@ -589,7 +589,7 @@ int rkcif_stream_register(struct rkcif_device *rkcif,
 	if (stream->id == RKCIF_ID0)
 		link_flags |= MEDIA_LNK_FL_ENABLED;
 
-	ret = media_create_pad_link(&interface->sd.entity, RKCIF_IF_PAD_SRC,
+	ret = media_create_pad_link(&interface->sd.entity, RKCIF_IF_PAD_SRC_DMA,
 				    &stream->vdev.entity, 0, link_flags);
 	if (ret) {
 		dev_err(rkcif->dev, "failed to link stream media pad: %d\n",
