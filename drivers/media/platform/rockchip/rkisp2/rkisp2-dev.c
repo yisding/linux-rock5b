@@ -20,6 +20,7 @@
 #include <linux/platform_device.h>
 #include <linux/pinctrl/consumer.h>
 #include <linux/pm_runtime.h>
+#include <media/mc-shared-graph.h>
 #include <media/v4l2-fwnode.h>
 #include <media/v4l2-mc.h>
 
@@ -141,6 +142,12 @@ static int rkisp2_create_links(struct rkisp2_device *rkisp2)
 	if (ret)
 		return ret;
 
+	ret = media_device_shared_join_link_sink(rkisp2->media_dev, rkisp2->dev,
+						 &rkisp2->isp.sd.entity,
+						 RKISP2_ISP_PAD_SINK_VIDEO, 0);
+	if (ret)
+		return ret;
+
 	return 0;
 }
 
@@ -229,6 +236,7 @@ static int rkisp2_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct rkisp2_device *rkisp2;
 	struct v4l2_device *v4l2_dev;
+	struct media_device *mdev;
 	unsigned int i;
 	int ret, irq;
 	u32 cif_id;
@@ -294,29 +302,28 @@ static int rkisp2_probe(struct platform_device *pdev)
 
 	pm_runtime_put(&pdev->dev);
 
-	rkisp2->media_dev.hw_revision = info->isp_ver;
-	strscpy(rkisp2->media_dev.model, RKISP2_DRIVER_NAME,
-		sizeof(rkisp2->media_dev.model));
-	rkisp2->media_dev.dev = &pdev->dev;
-	strscpy(rkisp2->media_dev.bus_info, RKISP2_BUS_INFO,
-		sizeof(rkisp2->media_dev.bus_info));
-	media_device_init(&rkisp2->media_dev);
+	mdev = media_device_shared_join(rkisp2->dev);
+	if (IS_ERR(mdev))
+		goto err_pm_runtime_disable;
+
+	rkisp2->media_dev = mdev;
+	rkisp2->media_dev->hw_revision = info->isp_ver;
+	strscpy(rkisp2->media_dev->model, RKISP2_DRIVER_NAME,
+		sizeof(rkisp2->media_dev->model));
+	strscpy(rkisp2->media_dev->bus_info, RKISP2_BUS_INFO,
+		sizeof(rkisp2->media_dev->bus_info));
 
 	v4l2_dev = &rkisp2->v4l2_dev;
-	v4l2_dev->mdev = &rkisp2->media_dev;
+	v4l2_dev->mdev = rkisp2->media_dev;
 	strscpy(v4l2_dev->name, RKISP2_DRIVER_NAME, sizeof(v4l2_dev->name));
 
 	ret = v4l2_device_register(rkisp2->dev, &rkisp2->v4l2_dev);
 	if (ret)
 		goto err_media_dev_cleanup;
 
-	ret = media_device_register(&rkisp2->media_dev);
-	if (ret)
-		goto err_unreg_v4l2_dev;
-
 	ret = rkisp2_entities_register(rkisp2);
 	if (ret)
-		goto err_unreg_media_dev;
+		goto err_unreg_v4l2_dev;
 
 	ret = v4l2_device_register_subdev_nodes(&rkisp2->v4l2_dev);
 	if (ret)
@@ -328,12 +335,10 @@ static int rkisp2_probe(struct platform_device *pdev)
 
 err_unreg_entities:
 	rkisp2_entities_unregister(rkisp2);
-err_unreg_media_dev:
-	media_device_unregister(&rkisp2->media_dev);
 err_unreg_v4l2_dev:
 	v4l2_device_unregister(&rkisp2->v4l2_dev);
 err_media_dev_cleanup:
-	media_device_cleanup(&rkisp2->media_dev);
+	media_device_shared_leave(rkisp2->media_dev, rkisp2->dev);
 err_pm_runtime_disable:
 	pm_runtime_disable(&pdev->dev);
 	return ret;
@@ -349,10 +354,9 @@ static void rkisp2_remove(struct platform_device *pdev)
 	rkisp2_entities_unregister(rkisp2);
 	rkisp2_debug_cleanup(rkisp2);
 
-	media_device_unregister(&rkisp2->media_dev);
 	v4l2_device_unregister(&rkisp2->v4l2_dev);
 
-	media_device_cleanup(&rkisp2->media_dev);
+	media_device_shared_leave(rkisp2->media_dev, rkisp2->dev);
 
 	pm_runtime_disable(&pdev->dev);
 }
