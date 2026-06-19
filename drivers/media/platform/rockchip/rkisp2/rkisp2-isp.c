@@ -24,6 +24,27 @@
 
 #define RKISP2_ISP_DEV_NAME	RKISP2_DRIVER_NAME "_isp"
 
+static u16 rkisp2_isp_get_active_sink_pad(struct rkisp2_isp *isp)
+{
+	struct media_entity *entity = &isp->sd.entity;
+	struct media_link *link;
+
+	list_for_each_entry(link, &entity->links, list) {
+		if (link->sink->entity != entity ||
+		    (link->sink->index != RKISP2_ISP_PAD_SINK_VIDEO_DMA &&
+		     link->sink->index != RKISP2_ISP_PAD_SINK_VIDEO_CIF))
+			continue;
+
+		if (link->flags & MEDIA_LNK_FL_ENABLED) {
+			dev_dbg(isp->rkisp2->dev, "%s: active link is %d\n",
+				__func__, link->sink->index);
+			return link->sink->index;
+		}
+	}
+
+	/* Default to DMA if neither link is active */
+	return RKISP2_ISP_PAD_SINK_VIDEO_DMA;
+}
 
 /* ----------------------------------------------------------------------------
  * Camera Interface registers configurations
@@ -70,9 +91,9 @@ static int rkisp2_config_isp(struct rkisp2_isp *isp,
 	const struct v4l2_rect *sink_crop;
 
 	sink_frm = v4l2_subdev_state_get_format(sd_state,
-						RKISP2_ISP_PAD_SINK_VIDEO);
+						rkisp2_isp_get_active_sink_pad(isp));
 	sink_crop = v4l2_subdev_state_get_crop(sd_state,
-					       RKISP2_ISP_PAD_SINK_VIDEO);
+					       rkisp2_isp_get_active_sink_pad(isp));
 	src_frm = v4l2_subdev_state_get_format(sd_state,
 					       RKISP2_ISP_PAD_SOURCE_VIDEO);
 
@@ -115,6 +136,12 @@ static int rkisp2_config_isp(struct rkisp2_isp *isp,
 	rkisp2_write(rkisp2, RKISP2_CIF_ISP_OUT_V_OFFS, sink_crop->top);
 	rkisp2_write(rkisp2, RKISP2_CIF_ISP_OUT_H_SIZE, sink_crop->width);
 	rkisp2_write(rkisp2, RKISP2_CIF_ISP_OUT_V_SIZE, sink_crop->height);
+
+	/*
+	 * I think we don't need to configure cif source here because it seems
+	 * like offline mode needs to explicitly configure CSI2RX in offline
+	 * mode, but the default (all zero) is inline mode
+	 */
 
 	irq_mask |= RKISP2_CIF_ISP_FRAME | RKISP2_CIF_ISP_V_START |
 		    RKISP2_CIF_ISP_PIC_SIZE_ERROR;
@@ -273,7 +300,8 @@ static int rkisp2_isp_enum_mbus_code(struct v4l2_subdev *sd,
 	unsigned int i, dir;
 	int pos = 0;
 
-	if (code->pad == RKISP2_ISP_PAD_SINK_VIDEO) {
+	if (code->pad == RKISP2_ISP_PAD_SINK_VIDEO_DMA ||
+	    code->pad == RKISP2_ISP_PAD_SINK_VIDEO_CIF) {
 		dir = RKISP2_ISP_SD_SINK;
 	} else if (code->pad == RKISP2_ISP_PAD_SOURCE_VIDEO) {
 		dir = RKISP2_ISP_SD_SRC;
@@ -322,7 +350,8 @@ static int rkisp2_isp_enum_frame_size(struct v4l2_subdev *sd,
 		return -EINVAL;
 
 	if (!(mbus_info->direction & RKISP2_ISP_SD_SINK) &&
-	    fse->pad == RKISP2_ISP_PAD_SINK_VIDEO)
+	     (fse->pad == RKISP2_ISP_PAD_SINK_VIDEO_DMA ||
+	      fse->pad == RKISP2_ISP_PAD_SINK_VIDEO_CIF))
 		return -EINVAL;
 
 	if (!(mbus_info->direction & RKISP2_ISP_SD_SRC) &&
@@ -337,15 +366,14 @@ static int rkisp2_isp_enum_frame_size(struct v4l2_subdev *sd,
 	return 0;
 }
 
-static int rkisp2_isp_init_state(struct v4l2_subdev *sd,
-				 struct v4l2_subdev_state *sd_state)
+static void rkisp2_isp_init_state_sink(struct v4l2_subdev_state *sd_state,
+				       u16 pad)
 {
-	struct v4l2_mbus_framefmt *sink_fmt, *src_fmt;
-	struct v4l2_rect *sink_crop, *src_crop;
+	struct v4l2_mbus_framefmt *sink_fmt;
+	struct v4l2_rect *sink_crop;
 
-	/* Video. */
-	sink_fmt = v4l2_subdev_state_get_format(sd_state,
-						RKISP2_ISP_PAD_SINK_VIDEO);
+	sink_fmt = v4l2_subdev_state_get_format(sd_state, pad);
+
 	sink_fmt->width = RKISP2_DEFAULT_WIDTH;
 	sink_fmt->height = RKISP2_DEFAULT_HEIGHT;
 	sink_fmt->field = V4L2_FIELD_NONE;
@@ -355,13 +383,27 @@ static int rkisp2_isp_init_state(struct v4l2_subdev *sd,
 	sink_fmt->ycbcr_enc = V4L2_YCBCR_ENC_601;
 	sink_fmt->quantization = V4L2_QUANTIZATION_FULL_RANGE;
 
-	sink_crop = v4l2_subdev_state_get_crop(sd_state,
-					       RKISP2_ISP_PAD_SINK_VIDEO);
+	sink_crop = v4l2_subdev_state_get_crop(sd_state, pad);
 	sink_crop->width = RKISP2_DEFAULT_WIDTH;
 	sink_crop->height = RKISP2_DEFAULT_HEIGHT;
 	sink_crop->left = 0;
 	sink_crop->top = 0;
+}
 
+static int rkisp2_isp_init_state(struct v4l2_subdev *sd,
+				 struct v4l2_subdev_state *sd_state)
+{
+	struct v4l2_mbus_framefmt *sink_fmt, *src_fmt;
+	struct v4l2_rect *sink_crop, *src_crop;
+
+	/* Video. */
+	rkisp2_isp_init_state_sink(sd_state, RKISP2_ISP_PAD_SINK_VIDEO_DMA);
+	rkisp2_isp_init_state_sink(sd_state, RKISP2_ISP_PAD_SINK_VIDEO_CIF);
+
+	sink_fmt = v4l2_subdev_state_get_format(sd_state,
+						RKISP2_ISP_PAD_SINK_VIDEO_DMA);
+	sink_crop = v4l2_subdev_state_get_crop(sd_state,
+					       RKISP2_ISP_PAD_SINK_VIDEO_DMA);
 	src_fmt = v4l2_subdev_state_get_format(sd_state,
 					       RKISP2_ISP_PAD_SOURCE_VIDEO);
 	*src_fmt = *sink_fmt;
@@ -390,7 +432,7 @@ static void rkisp2_isp_set_src_fmt(struct rkisp2_isp *isp,
 	bool set_csc;
 
 	sink_fmt = v4l2_subdev_state_get_format(sd_state,
-						RKISP2_ISP_PAD_SINK_VIDEO);
+						rkisp2_isp_get_active_sink_pad(isp));
 	src_fmt = v4l2_subdev_state_get_format(sd_state,
 					       RKISP2_ISP_PAD_SOURCE_VIDEO);
 	src_crop = v4l2_subdev_state_get_crop(sd_state,
@@ -490,7 +532,7 @@ static void rkisp2_isp_set_src_crop(struct rkisp2_isp *isp,
 	src_crop = v4l2_subdev_state_get_crop(sd_state,
 					      RKISP2_ISP_PAD_SOURCE_VIDEO);
 	sink_crop = v4l2_subdev_state_get_crop(sd_state,
-					       RKISP2_ISP_PAD_SINK_VIDEO);
+					       rkisp2_isp_get_active_sink_pad(isp));
 
 	src_crop->left = ALIGN(r->left, 2);
 	src_crop->width = ALIGN(r->width, 2);
@@ -508,15 +550,13 @@ static void rkisp2_isp_set_src_crop(struct rkisp2_isp *isp,
 
 static void rkisp2_isp_set_sink_crop(struct rkisp2_isp *isp,
 				     struct v4l2_subdev_state *sd_state,
-				     struct v4l2_rect *r)
+				     struct v4l2_rect *r, u16 pad)
 {
 	struct v4l2_rect *sink_crop, *src_crop;
 	const struct v4l2_mbus_framefmt *sink_fmt;
 
-	sink_crop = v4l2_subdev_state_get_crop(sd_state,
-					       RKISP2_ISP_PAD_SINK_VIDEO);
-	sink_fmt = v4l2_subdev_state_get_format(sd_state,
-						RKISP2_ISP_PAD_SINK_VIDEO);
+	sink_crop = v4l2_subdev_state_get_crop(sd_state, pad);
+	sink_fmt = v4l2_subdev_state_get_format(sd_state, pad);
 
 	sink_crop->left = ALIGN(r->left, 2);
 	sink_crop->width = ALIGN(r->width, 2);
@@ -534,15 +574,14 @@ static void rkisp2_isp_set_sink_crop(struct rkisp2_isp *isp,
 
 static void rkisp2_isp_set_sink_fmt(struct rkisp2_isp *isp,
 				    struct v4l2_subdev_state *sd_state,
-				    struct v4l2_mbus_framefmt *format)
+				    struct v4l2_mbus_framefmt *format, u16 pad)
 {
 	const struct rkisp2_mbus_info *mbus_info;
 	struct v4l2_mbus_framefmt *sink_fmt;
 	struct v4l2_rect *sink_crop;
 	bool is_yuv;
 
-	sink_fmt = v4l2_subdev_state_get_format(sd_state,
-						RKISP2_ISP_PAD_SINK_VIDEO);
+	sink_fmt = v4l2_subdev_state_get_format(sd_state, pad);
 	sink_fmt->code = format->code;
 	mbus_info = rkisp2_mbus_info_get_by_code(sink_fmt->code);
 	if (!mbus_info || !(mbus_info->direction & RKISP2_ISP_SD_SINK)) {
@@ -590,9 +629,8 @@ static void rkisp2_isp_set_sink_fmt(struct rkisp2_isp *isp,
 	*format = *sink_fmt;
 
 	/* Propagate to in crop */
-	sink_crop = v4l2_subdev_state_get_crop(sd_state,
-					       RKISP2_ISP_PAD_SINK_VIDEO);
-	rkisp2_isp_set_sink_crop(isp, sd_state, sink_crop);
+	sink_crop = v4l2_subdev_state_get_crop(sd_state, pad);
+	rkisp2_isp_set_sink_crop(isp, sd_state, sink_crop, pad);
 }
 
 static int rkisp2_isp_set_fmt(struct v4l2_subdev *sd,
@@ -601,8 +639,9 @@ static int rkisp2_isp_set_fmt(struct v4l2_subdev *sd,
 {
 	struct rkisp2_isp *isp = to_rkisp2_isp(sd);
 
-	if (fmt->pad == RKISP2_ISP_PAD_SINK_VIDEO)
-		rkisp2_isp_set_sink_fmt(isp, sd_state, &fmt->format);
+	if (fmt->pad == RKISP2_ISP_PAD_SINK_VIDEO_DMA ||
+	    fmt->pad == RKISP2_ISP_PAD_SINK_VIDEO_CIF)
+		rkisp2_isp_set_sink_fmt(isp, sd_state, &fmt->format, fmt->pad);
 	else if (fmt->pad == RKISP2_ISP_PAD_SOURCE_VIDEO)
 		rkisp2_isp_set_src_fmt(isp, sd_state, &fmt->format);
 	else
@@ -619,12 +658,14 @@ static int rkisp2_isp_get_selection(struct v4l2_subdev *sd,
 	int ret = 0;
 
 	if (sel->pad != RKISP2_ISP_PAD_SOURCE_VIDEO &&
-	    sel->pad != RKISP2_ISP_PAD_SINK_VIDEO)
+	    sel->pad != RKISP2_ISP_PAD_SINK_VIDEO_DMA &&
+	    sel->pad != RKISP2_ISP_PAD_SINK_VIDEO_CIF)
 		return -EINVAL;
 
 	switch (sel->target) {
 	case V4L2_SEL_TGT_CROP_BOUNDS:
-		if (sel->pad == RKISP2_ISP_PAD_SINK_VIDEO) {
+		if (sel->pad == RKISP2_ISP_PAD_SINK_VIDEO_DMA ||
+		    sel->pad == RKISP2_ISP_PAD_SINK_VIDEO_CIF) {
 			struct v4l2_mbus_framefmt *fmt;
 
 			fmt = v4l2_subdev_state_get_format(sd_state, sel->pad);
@@ -634,7 +675,7 @@ static int rkisp2_isp_get_selection(struct v4l2_subdev *sd,
 			sel->r.top = 0;
 		} else {
 			sel->r = *v4l2_subdev_state_get_crop(sd_state,
-							     RKISP2_ISP_PAD_SINK_VIDEO);
+							     RKISP2_ISP_PAD_SINK_VIDEO_DMA);
 		}
 		break;
 
@@ -663,8 +704,9 @@ static int rkisp2_isp_set_selection(struct v4l2_subdev *sd,
 	dev_dbg(isp->rkisp2->dev, "%s: pad: %d sel(%d,%d)/%ux%u\n", __func__,
 		sel->pad, sel->r.left, sel->r.top, sel->r.width, sel->r.height);
 
-	if (sel->pad == RKISP2_ISP_PAD_SINK_VIDEO)
-		rkisp2_isp_set_sink_crop(isp, sd_state, &sel->r);
+	if (sel->pad == RKISP2_ISP_PAD_SINK_VIDEO_DMA ||
+	    sel->pad == RKISP2_ISP_PAD_SINK_VIDEO_CIF)
+		rkisp2_isp_set_sink_crop(isp, sd_state, &sel->r, sel->pad);
 	else if (sel->pad == RKISP2_ISP_PAD_SOURCE_VIDEO)
 		rkisp2_isp_set_src_crop(isp, sd_state, &sel->r);
 	else
@@ -676,6 +718,46 @@ static int rkisp2_isp_set_selection(struct v4l2_subdev *sd,
 static int rkisp2_subdev_link_validate(struct media_link *link)
 {
 	return v4l2_subdev_link_validate(link);
+}
+
+static int rkisp2_subdev_link_setup(struct media_entity *entity,
+				    const struct media_pad *local_pad,
+				    const struct media_pad *remote_pad, u32 flags)
+{
+	struct v4l2_subdev *sd = media_entity_to_v4l2_subdev(entity);
+	struct rkisp2_isp *isp = to_rkisp2_isp(sd);
+	struct media_link *link;
+	u16 other_sink_pad_index; 
+
+	dev_dbg(isp->rkisp2->dev, "link setup %s -> %s\n", remote_pad->entity->name,
+		local_pad->entity->name);
+
+	/* We only care about links being created on a sink pad */
+	if (!(flags & MEDIA_LNK_FL_ENABLED) ||
+	    !(local_pad->flags & MEDIA_PAD_FL_SINK) ||
+	    (local_pad->index != RKISP2_ISP_PAD_SINK_VIDEO_DMA &&
+	     local_pad->index != RKISP2_ISP_PAD_SINK_VIDEO_CIF))
+		return 0;
+
+	other_sink_pad_index =
+		local_pad->index == RKISP2_ISP_PAD_SINK_VIDEO_DMA ?
+				    RKISP2_ISP_PAD_SINK_VIDEO_CIF :
+				    RKISP2_ISP_PAD_SINK_VIDEO_DMA;
+
+	list_for_each_entry(link, &entity->links, list) {
+		if (link->sink->entity != local_pad->entity ||
+		    link->sink->index != other_sink_pad_index)
+			continue;
+
+		/*
+		 * If we are trying to enable DMA sink pad but the CIF
+		 * sink pad (and vice versa) has an enabled link then return
+		 * error
+		 */
+		return link->flags & MEDIA_LNK_FL_ENABLED ? -EBUSY : 0;
+	}
+
+	return 0;
 }
 
 static const struct v4l2_subdev_pad_ops rkisp2_isp_pad_ops = {
@@ -709,7 +791,7 @@ static int rkisp2_isp_s_stream(struct v4l2_subdev *sd, int enable)
 		return 0;
 	}
 
-	sink_pad = &isp->pads[RKISP2_ISP_PAD_SINK_VIDEO];
+	sink_pad = &isp->pads[rkisp2_isp_get_active_sink_pad(isp)];
 	source_pad = media_pad_remote_pad_unique(sink_pad);
 	if (IS_ERR(source_pad)) {
 		dev_dbg(rkisp2->dev, "Failed to get source for ISP: %ld\n",
@@ -769,6 +851,7 @@ static int rkisp2_isp_subs_evt(struct v4l2_subdev *sd, struct v4l2_fh *fh,
 
 static const struct media_entity_operations rkisp2_isp_media_ops = {
 	.link_validate = rkisp2_subdev_link_validate,
+	.link_setup = rkisp2_subdev_link_setup,
 };
 
 static const struct v4l2_subdev_video_ops rkisp2_isp_video_ops = {
@@ -808,8 +891,8 @@ int rkisp2_isp_register(struct rkisp2_device *rkisp2)
 	sd->owner = THIS_MODULE;
 	strscpy(sd->name, RKISP2_ISP_DEV_NAME, sizeof(sd->name));
 
-	pads[RKISP2_ISP_PAD_SINK_VIDEO].flags = MEDIA_PAD_FL_SINK |
-						MEDIA_PAD_FL_MUST_CONNECT;
+	pads[RKISP2_ISP_PAD_SINK_VIDEO_DMA].flags = MEDIA_PAD_FL_SINK;
+	pads[RKISP2_ISP_PAD_SINK_VIDEO_CIF].flags = MEDIA_PAD_FL_SINK;
 	pads[RKISP2_ISP_PAD_SINK_PARAMS].flags = MEDIA_PAD_FL_SINK;
 	pads[RKISP2_ISP_PAD_SOURCE_VIDEO].flags = MEDIA_PAD_FL_SOURCE;
 	pads[RKISP2_ISP_PAD_SOURCE_STATS].flags = MEDIA_PAD_FL_SOURCE;
