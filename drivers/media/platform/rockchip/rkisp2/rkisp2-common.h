@@ -431,7 +431,7 @@ struct rkisp2_device {
 	struct regmap *gasket;
 	unsigned int gasket_id;
 	struct v4l2_device v4l2_dev;
-	struct media_device media_dev;
+	struct media_device *media_dev;
 	struct v4l2_async_notifier notifier;
 	struct v4l2_subdev *source;
 	struct rkisp2_isp isp;
