@@ -821,6 +821,9 @@ irqreturn_t rkcif_mipi_isr(int irq, void *ctx)
 		enum rkcif_interface_index index = RKCIF_MIPI_BASE + i;
 		struct rkcif_interface *interface = &rkcif->interfaces[index];
 
+		if (interface->inline_mode)
+			continue;
+
 		intstat = rkcif_mipi_read(interface, RKCIF_MIPI_INTSTAT);
 		rkcif_mipi_write(interface, RKCIF_MIPI_INTSTAT, intstat);
 
