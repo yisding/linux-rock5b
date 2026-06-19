@@ -58,7 +58,8 @@ enum rkcif_interface_index {
 
 enum rkcif_interface_pad_index {
 	RKCIF_IF_PAD_SINK,
-	RKCIF_IF_PAD_SRC,
+	RKCIF_IF_PAD_SRC_DMA,
+	RKCIF_IF_PAD_SRC_TOISP,
 	RKCIF_IF_PAD_MAX
 };
 
@@ -194,6 +195,8 @@ struct rkcif_interface {
 	struct v4l2_fwnode_endpoint vep;
 	struct v4l2_subdev sd;
 
+	bool inline_mode;
+
 	union {
 		struct rkcif_dvp dvp;
 	};
@@ -246,5 +249,16 @@ struct rkcif_device {
 	struct v4l2_device v4l2_dev;
 	struct v4l2_async_notifier notifier;
 };
+
+static inline void
+rkcif_write(struct rkcif_device *rkcif, unsigned int addr, u32 val)
+{
+	writel(val, rkcif->base_addr + addr);
+}
+
+static inline u32 rkcif_read(struct rkcif_device *rkcif, unsigned int addr)
+{
+	return readl(rkcif->base_addr + addr);
+}
 
 #endif

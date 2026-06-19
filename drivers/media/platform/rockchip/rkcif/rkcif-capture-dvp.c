@@ -666,7 +666,7 @@ static int rkcif_dvp_start_streaming(struct rkcif_stream *stream)
 	int ret = -EINVAL;
 
 	state = v4l2_subdev_lock_and_get_active_state(&interface->sd);
-	source_fmt = v4l2_subdev_state_get_format(state, RKCIF_IF_PAD_SRC,
+	source_fmt = v4l2_subdev_state_get_format(state, RKCIF_IF_PAD_SRC_DMA,
 						  stream->id);
 	if (!source_fmt)
 		goto out;
