@@ -20,6 +20,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/reset.h>
 
+#include <media/mc-shared-graph.h>
 #include <media/v4l2-fwnode.h>
 #include <media/v4l2-mc.h>
 
@@ -165,6 +166,7 @@ static int rkcif_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct rkcif_device *rkcif;
+	struct media_device *mdev;
 	int ret, irq;
 
 	rkcif = devm_kzalloc(dev, sizeof(*rkcif), GFP_KERNEL);
@@ -212,21 +214,21 @@ static int rkcif_probe(struct platform_device *pdev)
 
 	pm_runtime_enable(&pdev->dev);
 
-	rkcif->media_dev.dev = dev;
-	strscpy(rkcif->media_dev.model, RKCIF_DRIVER_NAME,
-		sizeof(rkcif->media_dev.model));
-	media_device_init(&rkcif->media_dev);
+	mdev = media_device_shared_join(rkcif->dev);
+	if (IS_ERR(mdev)) {
+		dev_err(dev, "failed to register media device: %d\n", ret);
+		goto err_pm_runtime_disable;
+	}
 
-	rkcif->v4l2_dev.mdev = &rkcif->media_dev;
+	rkcif->media_dev = mdev;
+	rkcif->media_dev->dev = dev;
+	strscpy(rkcif->media_dev->model, RKCIF_DRIVER_NAME,
+		sizeof(rkcif->media_dev->model));
+
+	rkcif->v4l2_dev.mdev = rkcif->media_dev;
 	ret = v4l2_device_register(dev, &rkcif->v4l2_dev);
 	if (ret)
 		goto err_media_dev_cleanup;
-
-	ret = media_device_register(&rkcif->media_dev);
-	if (ret < 0) {
-		dev_err(dev, "failed to register media device: %d\n", ret);
-		goto err_v4l2_dev_unregister;
-	}
 
 	v4l2_async_nf_init(&rkcif->notifier, &rkcif->v4l2_dev);
 	rkcif->notifier.ops = &rkcif_notifier_ops;
@@ -247,11 +249,10 @@ err_rkcif_unregister:
 	rkcif_unregister(rkcif);
 err_notifier_cleanup:
 	v4l2_async_nf_cleanup(&rkcif->notifier);
-	media_device_unregister(&rkcif->media_dev);
-err_v4l2_dev_unregister:
 	v4l2_device_unregister(&rkcif->v4l2_dev);
 err_media_dev_cleanup:
-	media_device_cleanup(&rkcif->media_dev);
+	media_device_shared_leave(rkcif->media_dev, rkcif->dev);
+err_pm_runtime_disable:
 	pm_runtime_disable(&pdev->dev);
 	return ret;
 }
@@ -263,9 +264,8 @@ static void rkcif_remove(struct platform_device *pdev)
 	v4l2_async_nf_unregister(&rkcif->notifier);
 	rkcif_unregister(rkcif);
 	v4l2_async_nf_cleanup(&rkcif->notifier);
-	media_device_unregister(&rkcif->media_dev);
 	v4l2_device_unregister(&rkcif->v4l2_dev);
-	media_device_cleanup(&rkcif->media_dev);
+	media_device_shared_leave(rkcif->media_dev, rkcif->dev);
 	pm_runtime_disable(&pdev->dev);
 }
 

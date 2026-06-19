@@ -242,7 +242,7 @@ struct rkcif_device {
 
 	struct rkcif_interface interfaces[RKCIF_IF_MAX];
 
-	struct media_device media_dev;
+	struct media_device *media_dev;
 	struct v4l2_device v4l2_dev;
 	struct v4l2_async_notifier notifier;
 };
