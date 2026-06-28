@@ -84,3 +84,140 @@
 	pinctrl-0 = <&pcie2_0_vcc3v3_en>;
 	status = "okay";
 };
+
+/*
+ * VEPU580 / rkvenc2 H.264 + H.265 hardware encoder (dual-core CCU).
+ *
+ * The vendor MPP encoder ALWAYS runs through the CCU: a core node is named
+ * "rkvenc-core...", so rkvenc_probe() dispatches it to rkvenc_core_probe(),
+ * which calls rkvenc_attach_ccu() and hard-fails ("attach ccu failed") if the
+ * CCU node is disabled -- there is no standalone path for a *core* node. So the
+ * CCU, both cores and both IOMMUs are enabled together, exactly like the
+ * rkvdec decoder below (both cores share taskqueue-node = <7>).
+ */
+&mpp_srv {
+	status = "okay";
+};
+
+&rkvenc_ccu {
+	status = "okay";
+};
+
+&rkvenc0 {
+	status = "okay";
+};
+
+&rkvenc0_mmu {
+	status = "okay";
+};
+
+&rkvenc1 {
+	status = "okay";
+};
+
+&rkvenc1_mmu {
+	status = "okay";
+};
+
+/*
+ * VDPU381 / rkvdec2 H.264 + H.265 + VP9 hardware decoder (dual-core CCU) --
+ * CONVERT-IN-PLACE packaging (zero edits to Armbian's built-in media-0001 patch).
+ *
+ * Armbian's mainline rkvdec patch already adds the decoder cores as V4L2 nodes:
+ * vdec0@fdc38000 / vdec1@fdc40000 (compatible "rockchip,rk3588-vdec") plus
+ * vdec0_mmu/vdec1_mmu and the vdec0_sram/vdec1_sram RCB pools. Instead of editing
+ * that patch, we CONVERT those nodes in place to the vendor MPP binding: retype
+ * the compatible (mpp_rkvdec2's probe dispatches by compatible, so the generic
+ * "video-codec" node name is fine), swap to the vendor reg/clock/reset layout,
+ * add the rockchip,* properties, and REUSE the existing IOMMU + SRAM nodes as-is
+ * (the vendor decoder reads rockchip,sram via of_address_to_resource, so media's
+ * pool/codec-sram nodes work untouched). Retyping the compatible also detaches
+ * the cores from the V4L2 "rockchip,rk3588-vdec" driver (mutually exclusive).
+ *
+ * The decoder always runs through the CCU, so the new rkvdec_ccu node + both
+ * converted cores + their IOMMUs are enabled together (shared taskqueue-node
+ * = <9>); mpp_srv is already enabled above by the rkvenc2 fragment.
+ */
+&rkvdec_ccu {
+	status = "okay";
+};
+
+&{/aliases} {
+	/* of_alias_get_id(np, "rkvdec") -> core_id; point at the converted nodes */
+	rkvdec0 = &vdec0;
+	rkvdec1 = &vdec1;
+};
+
+&vdec0 {
+	compatible = "rockchip,rkv-decoder-v2";
+	reg = <0x0 0xfdc38100 0x0 0x400>, <0x0 0xfdc38000 0x0 0x100>;
+	reg-names = "regs", "link";
+	interrupt-names = "irq_rkvdec0";
+	clocks = <&cru ACLK_RKVDEC0>, <&cru HCLK_RKVDEC0>,
+		 <&cru CLK_RKVDEC0_CORE>, <&cru CLK_RKVDEC0_CA>,
+		 <&cru CLK_RKVDEC0_HEVC_CA>;
+	clock-names = "aclk_vcodec", "hclk_vcodec", "clk_core",
+		      "clk_cabac", "clk_hevc_cabac";
+	rockchip,normal-rates = <800000000>, <0>, <600000000>,
+				<600000000>, <1000000000>;
+	resets = <&cru SRST_A_RKVDEC0>, <&cru SRST_H_RKVDEC0>,
+		 <&cru SRST_RKVDEC0_CORE>, <&cru SRST_RKVDEC0_CA>,
+		 <&cru SRST_RKVDEC0_HEVC_CA>;
+	reset-names = "video_a", "video_h", "video_core",
+		      "video_cabac", "video_hevc_cabac";
+	rockchip,skip-pmu-idle-request;
+	rockchip,srv = <&mpp_srv>;
+	rockchip,ccu = <&rkvdec_ccu>;
+	rockchip,core-mask = <0x00010001>;
+	rockchip,task-capacity = <16>;
+	rockchip,taskqueue-node = <9>;
+	rockchip,sram = <&vdec0_sram>;
+	rockchip,rcb-iova = <0xFFF00000 0x100000>;
+	rockchip,rcb-info = <136 24576>, <137 49152>, <141 90112>, <140 49152>,
+			    <139 180224>, <133 49152>, <134 8192>, <135 4352>,
+			    <138 13056>, <142 291584>;
+	rockchip,rcb-min-width = <512>;
+	status = "okay";
+};
+
+&vdec0_mmu {
+	rockchip,disable-mmu-reset;
+	status = "okay";
+};
+
+&vdec1 {
+	compatible = "rockchip,rkv-decoder-v2";
+	reg = <0x0 0xfdc40100 0x0 0x400>, <0x0 0xfdc40000 0x0 0x100>;
+	reg-names = "regs", "link";
+	interrupt-names = "irq_rkvdec1";
+	clocks = <&cru ACLK_RKVDEC1>, <&cru HCLK_RKVDEC1>,
+		 <&cru CLK_RKVDEC1_CORE>, <&cru CLK_RKVDEC1_CA>,
+		 <&cru CLK_RKVDEC1_HEVC_CA>;
+	clock-names = "aclk_vcodec", "hclk_vcodec", "clk_core",
+		      "clk_cabac", "clk_hevc_cabac";
+	rockchip,normal-rates = <800000000>, <0>, <600000000>,
+				<600000000>, <1000000000>;
+	resets = <&cru SRST_A_RKVDEC1>, <&cru SRST_H_RKVDEC1>,
+		 <&cru SRST_RKVDEC1_CORE>, <&cru SRST_RKVDEC1_CA>,
+		 <&cru SRST_RKVDEC1_HEVC_CA>;
+	reset-names = "video_a", "video_h", "video_core",
+		      "video_cabac", "video_hevc_cabac";
+	rockchip,skip-pmu-idle-request;
+	rockchip,srv = <&mpp_srv>;
+	rockchip,ccu = <&rkvdec_ccu>;
+	rockchip,core-mask = <0x00020002>;
+	rockchip,task-capacity = <16>;
+	rockchip,taskqueue-node = <9>;
+	rockchip,sram = <&vdec1_sram>;
+	rockchip,rcb-iova = <0xFFE00000 0x100000>;
+	rockchip,rcb-info = <136 24576>, <137 49152>, <141 90112>, <140 49152>,
+			    <139 180224>, <133 49152>, <134 8192>, <135 4352>,
+			    <138 13056>, <142 291584>;
+	rockchip,rcb-min-width = <512>;
+	status = "okay";
+};
+
+&vdec1_mmu {
+	rockchip,disable-mmu-reset;
+	status = "okay";
+};
