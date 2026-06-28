@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: GPL-2.0
+config ROCKCHIP_MPP_SERVICE
+	tristate "Rockchip MPP service framework"
+	depends on ARCH_ROCKCHIP
+	default y
+	select DMA_SHARED_BUFFER
+	help
+	  Rockchip Media Process Platform (MPP) service framework. Provides the
+	  /dev/mpp_service char device and the shared task/IOMMU/clk/pm core used
+	  by the Rockchip hardware codec device drivers.
+
+if ROCKCHIP_MPP_SERVICE
+
+config ROCKCHIP_MPP_PROC_FS
+	bool "Rockchip MPP procfs"
+	default y
+	help
+	  Expose per-device runtime state under /proc/mpp_service.
+
+config ROCKCHIP_MPP_RKVENC2
+	bool "RKVENC2 (VEPU580) H.264/H.265 encoder"
+	default y
+	help
+	  Hardware video encoder VEPU580 (rkvenc2) found on RK3588. H.264 and
+	  H.265 encode.
+
+config ROCKCHIP_MPP_RKVENC2_DEVFREQ
+	bool "RKVENC2 devfreq/OPP/thermal (tier-2)"
+	depends on ROCKCHIP_MPP_RKVENC2 && PM_DEVFREQ
+	default n
+	help
+	  Enable the devfreq/OPP/system-monitor DVFS island for rkvenc2. Off by
+	  default; the encoder runs at fixed assigned-clock-rates without it.
+
+config ROCKCHIP_MPP_RKVDEC2
+	bool "RKVDEC2 (VDPU381) H.264/H.265/VP9 decoder"
+	default y
+	help
+	  Hardware video decoder VDPU381 (rkvdec2) found on RK3588: two decoder
+	  cores plus a CCU. H.264, H.265 and VP9 decode. Builds the
+	  mpp_rkvdec2 + mpp_rkvdec2_link objects into rk_vcodec.ko.
+
+config ROCKCHIP_MPP_RKVDEC2_DEVFREQ
+	bool "RKVDEC2 devfreq/OPP/system-monitor (tier-2)"
+	depends on ROCKCHIP_MPP_RKVDEC2 && PM_DEVFREQ
+	default n
+	help
+	  Enable the devfreq/OPP/system-monitor DVFS island for rkvdec2. Off by
+	  default; the decoder runs at fixed assigned-clock-rates without it.
+	  When off, the donor's private ../drivers/devfreq/governor.h include is
+	  elided (it is absent from out-of-tree build trees).
+
+endif
