@@ -233,9 +233,11 @@ Implemented
   ``UPDATE_PALETTE_TABLE`` with the 16x16 RGBA8888 LUT image, then
   ``COLOR_PALETTE`` from a same-size BPP8/YCbCr400 raster source to an
   RGB-family raster destination.  Palette mode ``3`` and the little-endian
-  color-palette source encoding used by current ``librga`` are programmed;
-  BPP1/2/4, scaled/rotated/converted, YUV destination, FBC/tile, pattern,
-  alpha/ROP, OSD, and mixed-feature palette variants remain unsupported.
+  color-palette source encoding used by current ``librga`` are programmed; the
+  BSP userspace render mode ``6`` update request is remapped to RGA2 hardware
+  render mode ``3`` when loading the LUT.  BPP1/2/4, scaled/rotated/converted,
+  YUV destination, FBC/tile, pattern, alpha/ROP, OSD, and mixed-feature
+  palette variants remain unsupported.
 * Multi-task requests are accepted when every task matches the same supported
   backend profile; tasks run serially under the request's single
   completion/fence.  The RGA3 no-blend emitted command includes overlap field
