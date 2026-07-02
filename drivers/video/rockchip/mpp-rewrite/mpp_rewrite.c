@@ -1238,6 +1238,110 @@ rk_mpp_rkvdec2_link_node_size(const struct rk_mpp_rkvdec2_link_info *info)
 		     RK_MPP_RKVDEC_LINK_NODE_ALIGN);
 }
 
+static int
+rk_mpp_rkvdec2_link_part_check(const struct rk_mpp_rkvdec2_link_part *part,
+			       u32 table_words)
+{
+	if (part->table_word > table_words ||
+	    part->word_count > table_words - part->table_word)
+		return -EOVERFLOW;
+
+	return 0;
+}
+
+static int
+rk_mpp_rkvdec2_link_write_part_check(const struct rk_mpp_rkvdec2_link_part *part,
+				     u32 table_words, u32 reg_words)
+{
+	int ret;
+
+	ret = rk_mpp_rkvdec2_link_part_check(part, table_words);
+	if (ret)
+		return ret;
+	if (part->reg_word > reg_words ||
+	    part->word_count > reg_words - part->reg_word)
+		return -EINVAL;
+
+	return 0;
+}
+
+static int
+rk_mpp_rkvdec2_fill_link_table(const struct rk_mpp_reg_image *image,
+			       const struct rk_mpp_rkvdec2_link_info *info,
+			       u32 *table, dma_addr_t table_iova,
+			       dma_addr_t next_iova)
+{
+	u32 i;
+	int ret;
+
+	if (!table)
+		return -EINVAL;
+
+	memset(table, 0, rk_mpp_rkvdec2_link_node_size(info));
+
+	for (i = 0; i < info->write_part_count; i++) {
+		const struct rk_mpp_rkvdec2_link_part *part =
+			&info->write_parts[i];
+
+		ret = rk_mpp_rkvdec2_link_write_part_check(part,
+							   info->table_words,
+							   image->reg_words);
+		if (ret)
+			return ret;
+		memcpy(&table[part->table_word], &image->regs[part->reg_word],
+		       part->word_count * sizeof(u32));
+	}
+
+	for (i = 0; i < info->read_part_count; i++) {
+		const struct rk_mpp_rkvdec2_link_part *part =
+			&info->read_parts[i];
+
+		ret = rk_mpp_rkvdec2_link_part_check(part, info->table_words);
+		if (ret)
+			return ret;
+		memset(&table[part->table_word], 0,
+		       part->word_count * sizeof(u32));
+	}
+
+	table[info->next_word] = lower_32_bits(next_iova);
+	table[info->readback_word] = lower_32_bits(table_iova +
+		info->read_parts[0].table_word * sizeof(u32));
+	if (info->debug_word >= 0)
+		table[info->debug_word] = table[info->readback_word];
+	if (info->seg0_word >= 0)
+		table[info->seg0_word] = lower_32_bits(table_iova +
+			info->write_parts[0].table_word * sizeof(u32));
+	if (info->seg1_word >= 0)
+		table[info->seg1_word] = lower_32_bits(table_iova +
+			info->write_parts[1].table_word * sizeof(u32));
+	if (info->seg2_word >= 0)
+		table[info->seg2_word] = lower_32_bits(table_iova +
+			info->write_parts[2].table_word * sizeof(u32));
+
+	return 0;
+}
+
+static void rk_mpp_rkvdec2_stage_link_table(struct rk_mpp_job *job)
+{
+	struct rk_mpp_hw *hw = job->hw;
+	dma_addr_t next_iova = 0;
+	int ret;
+
+	if (!hw || !hw->rkvdec_link_vaddr || !hw->rkvdec_link_capacity)
+		return;
+
+	if (hw->rkvdec_link_capacity > 1)
+		next_iova = hw->rkvdec_link_iova + hw->rkvdec_link_node_size;
+
+	ret = rk_mpp_rkvdec2_fill_link_table(&job->reg_image,
+					     &rk_mpp_rkvdec2_vdpu383_link_info,
+					     hw->rkvdec_link_vaddr,
+					     hw->rkvdec_link_iova,
+					     next_iova);
+	if (ret)
+		dev_dbg(hw->dev, "failed to stage rkvdec link table: %d\n", ret);
+}
+
 static int rk_mpp_poll_irq_check_size(s32 count_max, u32 req_size)
 {
 	size_t slice_bytes;
@@ -1465,6 +1569,64 @@ static void rk_mpp_rkvdec2_link_info_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, info->sw_iommu_zap);
 }
 
+static void rk_mpp_rkvdec2_fill_link_table_kunit(struct kunit *test)
+{
+	const struct rk_mpp_rkvdec2_link_info *info =
+		&rk_mpp_rkvdec2_vdpu383_link_info;
+	u32 *regs;
+	u32 *table;
+	struct rk_mpp_reg_image image = {
+		.reg_words = 360,
+	};
+	dma_addr_t iova = 0x12345000;
+	dma_addr_t next = 0x12345400;
+	u32 i;
+
+	regs = kunit_kcalloc(test, image.reg_words, sizeof(*regs), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, regs);
+	table = kunit_kcalloc(test, info->table_words, sizeof(*table),
+			      GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, table);
+	image.regs = regs;
+
+	for (i = 0; i < image.reg_words; i++)
+		regs[i] = 0xa5000000 | i;
+	memset(table, 0xff, info->table_words * sizeof(*table));
+
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_rkvdec2_fill_link_table(&image, info, table,
+						       iova, next),
+			0);
+
+	KUNIT_EXPECT_EQ(test, table[info->next_word], lower_32_bits(next));
+	KUNIT_EXPECT_EQ(test, table[info->readback_word],
+			lower_32_bits(iova + 16 * sizeof(u32)));
+	KUNIT_EXPECT_EQ(test, table[info->debug_word], table[info->readback_word]);
+	KUNIT_EXPECT_EQ(test, table[info->seg0_word],
+			lower_32_bits(iova + 80 * sizeof(u32)));
+	KUNIT_EXPECT_EQ(test, table[info->seg1_word],
+			lower_32_bits(iova + 104 * sizeof(u32)));
+	KUNIT_EXPECT_EQ(test, table[info->seg2_word],
+			lower_32_bits(iova + 148 * sizeof(u32)));
+
+	KUNIT_EXPECT_EQ(test, table[80], regs[8]);
+	KUNIT_EXPECT_EQ(test, table[103], regs[31]);
+	KUNIT_EXPECT_EQ(test, table[104], regs[64]);
+	KUNIT_EXPECT_EQ(test, table[147], regs[107]);
+	KUNIT_EXPECT_EQ(test, table[148], regs[128]);
+	KUNIT_EXPECT_EQ(test, table[255], regs[235]);
+
+	KUNIT_EXPECT_EQ(test, table[16], 0U);
+	KUNIT_EXPECT_EQ(test, table[20], 0U);
+	KUNIT_EXPECT_EQ(test, table[59], 0U);
+
+	image.reg_words = 128;
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_rkvdec2_fill_link_table(&image, info, table,
+						       iova, next),
+			-EINVAL);
+}
+
 static void rk_mpp_poll_irq_check_size_kunit(struct kunit *test)
 {
 	u32 base = sizeof(struct rk_mpp_rkvenc_poll_slice_cfg);
@@ -1517,6 +1679,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_request_check_rkvdec_perf_span_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_timeout_threshold_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_link_info_kunit),
+	KUNIT_CASE(rk_mpp_rkvdec2_fill_link_table_kunit),
 	KUNIT_CASE(rk_mpp_poll_irq_check_size_kunit),
 	KUNIT_CASE(rk_mpp_rkvenc_slice_mode_kunit),
 	{}
@@ -3261,6 +3424,7 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 		writel_relaxed(1, hw->regs[0] + RK_MPP_RKVDEC_CLR_CACHE2_BASE);
 
 	rk_mpp_rkvdec2_prepare_ccu_regs(job);
+	rk_mpp_rkvdec2_stage_link_table(job);
 
 	ret = rk_mpp_job_write_regs(job, RK_MPP_RKVDEC_START_BASE,
 				    &start_value, &start_seen);
