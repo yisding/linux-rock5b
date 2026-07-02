@@ -5131,6 +5131,79 @@ static void rk_rga2_fill_multitask_hw_type_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 }
 
+static void rk_rga2_rectangle_task_emit_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA2_CMD_REG_COUNT] = {};
+	static const struct {
+		u16 x;
+		u16 y;
+		u16 w;
+		u16 h;
+	} rects[] = {
+		{ 100, 200, 300, 4 },
+		{ 100, 292, 300, 4 },
+		{ 100, 204, 4, 88 },
+		{ 396, 204, 4, 88 },
+	};
+	struct rga_req *tasks;
+	struct rk_rga_job job = {
+		.task_count = ARRAY_SIZE(rects),
+		.import_count = 1,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+	u32 stride_bytes;
+
+	tasks = kunit_kcalloc(test, job.task_count, sizeof(*tasks), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, tasks);
+	job.tasks = tasks;
+
+	for (u32 i = 0; i < job.task_count; i++) {
+		tasks[i] = rk_rga_fill_task(BIT(2));
+		tasks[i].dst = rk_rga_kunit_img(0x20000000,
+						 RK_RGA_FORMAT_RGBA_8888,
+						 rects[i].w, rects[i].h);
+		tasks[i].dst.vir_w = 640;
+		tasks[i].dst.vir_h = 480;
+		tasks[i].dst.x_offset = rects[i].x;
+		tasks[i].dst.y_offset = rects[i].y;
+		tasks[i].fg_color = 0xff00ff00;
+	}
+
+	stride_bytes = ALIGN((u32)tasks[0].dst.vir_w * 4, 4);
+	for (u32 i = 0; i < job.task_count; i++) {
+		enum rk_rga_hw_type type = 0;
+		u32 expected_base;
+
+		memset(cmd, 0, sizeof(cmd));
+		job.cmd_ready = false;
+
+		KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+		KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
+		KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_fill(&job), 0);
+		KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+
+		expected_base = lower_32_bits(tasks[i].dst.yrgb_addr +
+					      (u64)rects[i].y *
+					      stride_bytes +
+					      (u64)rects[i].x * 4);
+		KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_BASE0_OFFSET / 4],
+				expected_base);
+		KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_ACT_INFO_OFFSET / 4],
+				((u32)rects[i].w - 1) |
+				(((u32)rects[i].h - 1) << 16));
+		KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_FG_COLOR_OFFSET / 4],
+				tasks[i].fg_color);
+
+		if (i + 1 < job.task_count)
+			KUNIT_EXPECT_TRUE(test, rk_rga_job_advance_task(&job,
+									0));
+		else
+			KUNIT_EXPECT_FALSE(test, rk_rga_job_advance_task(&job,
+									 0));
+	}
+}
+
 static void rk_rga2_mosaic_emit_kunit(struct kunit *test)
 {
 	u32 cmd[RK_RGA2_CMD_REG_COUNT] = { };
@@ -7019,6 +7092,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga2_fill_dst_offset_emit_kunit),
 	KUNIT_CASE(rk_rga2_fill_yuv_emit_kunit),
 	KUNIT_CASE(rk_rga2_fill_multitask_hw_type_kunit),
+	KUNIT_CASE(rk_rga2_rectangle_task_emit_kunit),
 	KUNIT_CASE(rk_rga2_mosaic_emit_kunit),
 	KUNIT_CASE(rk_rga2_rop_emit_kunit),
 	KUNIT_CASE(rk_rga2_gauss_emit_kunit),
