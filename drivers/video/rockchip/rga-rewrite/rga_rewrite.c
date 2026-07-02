@@ -3846,6 +3846,84 @@ static void rk_rga2_normalized_dst(const struct rga_req *task,
 	dst->act_h = transform->dst_act_h;
 }
 
+static bool rk_rga_img_rects_disjoint(const struct rga_img_info_t *a,
+				      const struct rga_img_info_t *b)
+{
+	u32 a_right;
+	u32 a_bottom;
+	u32 b_right;
+	u32 b_bottom;
+
+	if (check_add_overflow((u32)a->x_offset, (u32)a->act_w, &a_right) ||
+	    check_add_overflow((u32)a->y_offset, (u32)a->act_h, &a_bottom) ||
+	    check_add_overflow((u32)b->x_offset, (u32)b->act_w, &b_right) ||
+	    check_add_overflow((u32)b->y_offset, (u32)b->act_h, &b_bottom))
+		return false;
+
+	return a_right <= b->x_offset || b_right <= a->x_offset ||
+	       a_bottom <= b->y_offset || b_bottom <= a->y_offset;
+}
+
+static bool rk_rga_mirror_only_rotate_mode(u16 rotate_mode)
+{
+	u16 low = rotate_mode & 0x0f;
+	u16 high = (rotate_mode >> 4) & 0x0f;
+
+	if (rotate_mode & ~0xff)
+		return false;
+
+	switch (low) {
+	case 0:
+	case 2:
+	case 3:
+	case 4:
+		break;
+	default:
+		return false;
+	}
+
+	switch (high) {
+	case 0:
+	case 2:
+	case 3:
+	case 4:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool rk_rga2_in_place_bitblt_allowed(const struct rga_req *task)
+{
+	if (task->src.yrgb_addr != task->dst.yrgb_addr)
+		return true;
+	if (!task->src.yrgb_addr)
+		return false;
+	if (task->src.uv_addr != task->dst.uv_addr ||
+	    task->src.v_addr != task->dst.v_addr)
+		return false;
+	if (task->src.format != task->dst.format)
+		return false;
+	if (task->src.rd_mode != task->dst.rd_mode)
+		return false;
+	if (task->src.rd_mode && task->src.rd_mode != RK_RGA_RASTER_MODE)
+		return false;
+	if (task->src.vir_w != task->dst.vir_w ||
+	    task->src.vir_h != task->dst.vir_h)
+		return false;
+	if (task->src.act_w != task->dst.act_w ||
+	    task->src.act_h != task->dst.act_h)
+		return false;
+	if (task->src.rotate_mode || task->dst.rotate_mode)
+		return false;
+	if (!rk_rga_mirror_only_rotate_mode(task->rotate_mode))
+		return false;
+	if (task->full_csc.flag || task->yuv2rgb_mode)
+		return false;
+
+	return rk_rga_img_rects_disjoint(&task->src, &task->dst);
+}
+
 #if IS_ENABLED(CONFIG_ROCKCHIP_RGA_REWRITE_KUNIT_TEST)
 static int rk_rga2_select_dst_addresses(const struct rga_img_info_t *dst,
 					const struct rk_rga2_format_info *fmt,
@@ -4054,6 +4132,25 @@ static struct rga_req rk_rga_ffmpeg_bitblt_task(u32 src_format,
 		.dst = rk_rga_kunit_img(0x20000000, dst_format, 1280, 720),
 		.yuv2rgb_mode = 1,
 	};
+}
+
+static struct rga_req rk_rga_in_place_border_bitblt_task(u32 core)
+{
+	struct rga_img_info_t img =
+		rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_RGBA_8888, 8, 48);
+	struct rga_req task = {
+		.render_mode = RK_RGA_RENDER_BITBLT,
+		.core = core,
+		.rotate_mode = 2,
+	};
+
+	img.vir_w = 64;
+	task.src = img;
+	task.dst = img;
+	task.src.x_offset = 16;
+	task.dst.x_offset = 0;
+
+	return task;
 }
 
 static void rk_rga_fill_hw_type_kunit(struct kunit *test)
@@ -4431,6 +4528,47 @@ static void rk_rga_ffmpeg_rga3_profiles_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 }
 
+static void rk_rga2_in_place_border_bitblt_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA2_CMD_REG_COUNT] = { };
+	enum rk_rga_hw_type type = 0;
+	struct rga_req task = rk_rga_in_place_border_bitblt_task(0);
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 2,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
+
+	task.core = BIT(2);
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+
+	task.core = BIT(0);
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
+
+	task = rk_rga_in_place_border_bitblt_task(0);
+	task.dst.x_offset = 20;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
+
+	task = rk_rga_in_place_border_bitblt_task(0);
+	task.dst.act_w = 4;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
+}
+
 static void rk_rga2_compact_10bit_profile_kunit(struct kunit *test)
 {
 	u32 cmd[RK_RGA2_CMD_REG_COUNT] = { };
@@ -4769,6 +4907,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_find_best_hw_for_job_kunit),
 	KUNIT_CASE(rk_rga_iommu_fault_match_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_rga3_profiles_kunit),
+	KUNIT_CASE(rk_rga2_in_place_border_bitblt_kunit),
 	KUNIT_CASE(rk_rga2_compact_10bit_profile_kunit),
 	KUNIT_CASE(rk_rga2_src_crop_emit_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_fbc_profiles_kunit),
@@ -4866,7 +5005,7 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 		return -EOPNOTSUPP;
 	if (task->pat.yrgb_addr || task->pat.uv_addr || task->pat.v_addr)
 		return -EOPNOTSUPP;
-	if (task->src.yrgb_addr == task->dst.yrgb_addr)
+	if (!rk_rga2_in_place_bitblt_allowed(task))
 		return -EOPNOTSUPP;
 	if (task->alpha_rop_flag || task->PD_mode ||
 	    task->feature.global_alpha_en)
