@@ -164,7 +164,8 @@ Implemented
   BSP-compatible ``(register index, size)`` descriptors per session, snapshots
   them into each job, allocates per-core coherent scratch memory using the
   device-tree ``rockchip,rcb-iova`` size, and patches matching registers after
-  fd-to-IOVA translation and offset handling.  Decoder RCB obeys the BSP
+  fd-to-IOVA translation and offset handling.  Out-of-range register indices
+  are ignored without consuming scratch space.  Decoder RCB obeys the BSP
   ``rockchip,rcb-min-width`` gate using retained ``SEND_CODEC_INFO`` width.
   This uses the public DMA API rather than BSP fixed-IOVA SRAM reservation.
 * Refcounted batch/session/hardware job ownership so a concurrent poll, reset,
