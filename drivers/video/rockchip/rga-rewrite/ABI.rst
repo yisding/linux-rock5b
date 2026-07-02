@@ -69,6 +69,8 @@ Implemented
   release-fence fd, arms ``dma_fence`` callbacks, queues dispatch work when the
   acquire fences have signaled on the high-priority system workqueue like the
   forward port, and signals the release fence with the eventual backend result.
+  Negative acquire-fence status is preserved as the submit/completion result;
+  already-signaled success fences do not force the async pending path.
 * Ready async jobs for supported hardware profiles now export the release-fence
   fd, queue the prepared job, and return without waiting for IRQ/timeout
   completion.  The queued job owns its own lifetime reference until completion
@@ -317,7 +319,9 @@ Implemented
   dispatch/emission, RGA2 RGB alpha-bitmap SRC1/alpha emission, RGA2 OSD
   SRC1/alpha/control emission, RGA2 palette update and color-palette command
   emission,
-  acquire-fence fd ownership merging, ffmpeg-facing RGA2 RFBC64x4 source
+  acquire-fence fd ownership merging, acquire-fence pending/success/error
+  status propagation, async acquire-callback error completion,
+  ffmpeg-facing RGA2 RFBC64x4 source
   profile selection and FBCIN command emission, IOMMU fault target matching,
   post-reset IOMMU refresh accounting, scheduler priority enqueue/aging,
   RGA2 ``librga`` full-CSC RGB-to-YUV dispatch/emission,
