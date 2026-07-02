@@ -3171,6 +3171,23 @@ static bool rk_rga3_fbc_format_supported(u32 format, bool write)
 	}
 }
 
+static bool rk_rga3_tile_format_supported(u32 format)
+{
+	switch (format) {
+	case RK_RGA_FORMAT_YCBCR_422_SP:
+	case RK_RGA_FORMAT_YCRCB_422_SP:
+	case RK_RGA_FORMAT_YCBCR_420_SP:
+	case RK_RGA_FORMAT_YCRCB_420_SP:
+	case RK_RGA_FORMAT_YCBCR_420_SP_10B:
+	case RK_RGA_FORMAT_YCRCB_420_SP_10B:
+	case RK_RGA_FORMAT_YCBCR_422_SP_10B:
+	case RK_RGA_FORMAT_YCRCB_422_SP_10B:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static int rk_rga2_format_info(u32 format, bool write,
 			       struct rk_rga2_format_info *info)
 {
@@ -3522,6 +3539,10 @@ static int rk_rga3_hw_rd_mode(u32 user_mode, u32 *hw_mode)
 		*hw_mode = 1;
 		return 0;
 	}
+	if (user_mode == RK_RGA_TILE_MODE) {
+		*hw_mode = 2;
+		return 0;
+	}
 
 	return -EOPNOTSUPP;
 }
@@ -3548,6 +3569,18 @@ static int rk_rga3_stride(u32 width, u8 pixel_width, u32 *stride)
 	return 0;
 }
 
+static int rk_rga3_tile_stride(u32 width, u8 pixel_width, u32 *stride)
+{
+	u32 bytes;
+
+	if (check_mul_overflow(width, (u32)pixel_width * 8, &bytes))
+		return -EOVERFLOW;
+
+	*stride = ALIGN(bytes, 16) >> 2;
+
+	return 0;
+}
+
 static int rk_rga3_read_strides(const struct rga_img_info_t *img,
 				const struct rk_rga3_format_info *fmt,
 				u32 rd_mode, u32 *stride, u32 *uv_stride)
@@ -3557,6 +3590,19 @@ static int rk_rga3_read_strides(const struct rga_img_info_t *img,
 	if (rd_mode == 1) {
 		*stride = ALIGN((u32)img->vir_w, 16) >> 2;
 		*uv_stride = *stride;
+		return 0;
+	}
+	if (rd_mode == 2) {
+		int ret;
+
+		ret = rk_rga3_tile_stride(img->vir_w, fmt->pixel_width,
+					  stride);
+		if (ret)
+			return ret;
+		if (fmt->yuv420_sp)
+			*uv_stride = ALIGN((u32)img->vir_w * 8, 16) >> 3;
+		else
+			*uv_stride = *stride;
 		return 0;
 	}
 
@@ -4908,6 +4954,62 @@ static void rk_rga_ffmpeg_fbc_profiles_kunit(struct kunit *test)
 			-EOPNOTSUPP);
 }
 
+static void rk_rga3_tile8x8_profile_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
+	enum rk_rga_hw_type type = 0;
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_420_SP,
+					  RK_RGA_FORMAT_YCBCR_420_SP);
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 2,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+	u32 dst_tile_stride = ALIGN((u32)task.dst.vir_w * 8, 16) >> 2;
+	u32 dst_tile_uv_stride = ALIGN((u32)task.dst.vir_w * 8, 16) >> 3;
+	u32 src_tile_stride = ALIGN((u32)task.src.vir_w * 8, 16) >> 2;
+	u32 src_tile_uv_stride = ALIGN((u32)task.src.vir_w * 8, 16) >> 3;
+	u32 ctrl;
+
+	task.dst.rd_mode = RK_RGA_TILE_MODE;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+
+	ctrl = cmd[RK_RGA3_WR_CTRL_OFFSET / 4];
+	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WR_MODE,
+			FIELD_PREP(RK_RGA3_WR_MODE, 2));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4],
+			dst_tile_stride);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_PL_VIR_STRIDE_OFFSET / 4],
+			dst_tile_uv_stride);
+
+	memset(cmd, 0, sizeof(cmd));
+	task.src.rd_mode = RK_RGA_TILE_MODE;
+	task.dst.rd_mode = RK_RGA_RASTER_MODE;
+	job.cmd_ready = false;
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+
+	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
+	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WIN0_RD_MODE,
+			FIELD_PREP(RK_RGA3_WIN0_RD_MODE, 2));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_VIR_STRIDE_OFFSET / 4],
+			src_tile_stride);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_UV_VIR_STRIDE_OFFSET / 4],
+			src_tile_uv_stride);
+
+	task.dst.format = RK_RGA_FORMAT_RGBA_8888;
+	task.dst.rd_mode = RK_RGA_TILE_MODE;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
+}
+
 static void rk_rga_ffmpeg_alpha_overlay_kunit(struct kunit *test)
 {
 	enum rk_rga_hw_type type = 0;
@@ -5172,6 +5274,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga2_compact_10bit_profile_kunit),
 	KUNIT_CASE(rk_rga2_src_crop_emit_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_fbc_profiles_kunit),
+	KUNIT_CASE(rk_rga3_tile8x8_profile_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_alpha_overlay_kunit),
 	KUNIT_CASE(rk_rga3_colorkey_emit_kunit),
 	KUNIT_CASE(rk_rga3_alpha_rotate_emit_kunit),
@@ -5395,7 +5498,18 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 	} else {
 		profile->bg_mode = profile->dst_mode;
 	}
+	if (profile->src_mode == 2 || profile->dst_mode == 2 ||
+	    profile->bg_mode == 2) {
+		if (profile->alpha_blend || profile->pattern_blend ||
+		    profile->color_key)
+			return -EOPNOTSUPP;
+		if (task->src.yrgb_addr == task->dst.yrgb_addr)
+			return -EOPNOTSUPP;
+	}
 	if (profile->dst_mode == 1 &&
+	    (task->dst.x_offset || task->dst.y_offset))
+		return -EOPNOTSUPP;
+	if (profile->dst_mode == 2 &&
 	    (task->dst.x_offset || task->dst.y_offset))
 		return -EOPNOTSUPP;
 	if (profile->alpha_blend && !profile->pattern_blend &&
@@ -5426,12 +5540,18 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 	if (profile->src_mode == 1 &&
 	    !rk_rga3_fbc_format_supported(task->src.format, false))
 		return -EOPNOTSUPP;
+	if (profile->src_mode == 2 &&
+	    !rk_rga3_tile_format_supported(task->src.format))
+		return -EOPNOTSUPP;
 	ret = rk_rga3_format_info(task->dst.format, true,
 				  &profile->dst_fmt);
 	if (ret)
 		return ret;
 	if (profile->dst_mode == 1 &&
 	    !rk_rga3_fbc_format_supported(task->dst.format, true))
+		return -EOPNOTSUPP;
+	if (profile->dst_mode == 2 &&
+	    !rk_rga3_tile_format_supported(task->dst.format))
 		return -EOPNOTSUPP;
 	if (profile->dst_fmt.yuv10 &&
 	    (task->dst.x_offset || task->dst.y_offset))
@@ -5662,13 +5782,24 @@ static int rk_rga3_emit_wr(struct rk_rga_job *job,
 			break;
 		}
 	} else {
-		ret = rk_rga3_stride(task->dst.vir_w, dst_fmt->pixel_width,
-				     &stride);
-		if (ret)
-			return ret;
-
-		uv_stride = dst_fmt->yuv_sp ?
-			    ALIGN((u32)task->dst.vir_w, 16) >> 2 : stride;
+		if (wr_mode == 2) {
+			ret = rk_rga3_tile_stride(task->dst.vir_w,
+						  dst_fmt->pixel_width,
+						  &stride);
+			if (ret)
+				return ret;
+			uv_stride = dst_fmt->yuv420_sp ?
+				    ALIGN((u32)task->dst.vir_w * 8, 16) >> 3 :
+				    stride;
+		} else {
+			ret = rk_rga3_stride(task->dst.vir_w,
+					     dst_fmt->pixel_width, &stride);
+			if (ret)
+				return ret;
+			uv_stride = dst_fmt->yuv_sp ?
+				    ALIGN((u32)task->dst.vir_w, 16) >> 2 :
+				    stride;
+		}
 		y_stride_bytes = stride << 2;
 		uv_stride_bytes = uv_stride << 2;
 
