@@ -122,7 +122,9 @@ Implemented
   on WIN0, WR on the destination, and the destination rectangle carried in
   ``OVLP_OFF``.  This covers the current ``librga`` ``immakeBorder()`` reflect
   top/bottom source-to-destination tasks and reflect/wrap same-destination
-  side-edge tasks.  The path requires imported dma-buf backed
+  side-edge tasks, plus the current ``librga`` DRM-fourcc
+  ``rga_copy_drm_fourcc_demo`` ``DRM_FORMAT_ABGR8888``/modifier-zero path after
+  userspace maps it to ``RK_FORMAT_RGBA_8888``.  The path requires imported dma-buf backed
   source/destination images, rejects color-key and unsupported pattern
   operations, and supports the 8-bit RGB/YUV plus semiplanar 10-bit YUV formats
   exposed by common ``librga`` and ``ffmpeg-rockchip`` blit/scale/convert users.
@@ -322,6 +324,7 @@ Implemented
   RGA2 ``librga`` gray256 RGB-to-Y400 color-conversion dispatch/emission,
   RGA2 ``librga`` Y400 UV-downsampling resize dispatch/emission,
   RGA3 normal RGB color-key dispatch/emission and inverted-mode rejection,
+  RGA3 ``librga`` DRM-fourcc ABGR8888-to-RGBA normal raster copy emission,
   RGA3 ``librga`` copy-splice multi-task destination-offset emission,
   RGA3 ``librga`` RGB translate destination-offset emission,
   RGA3 ``librga`` RGB rotate, flip/mirror, and combined rotate/mirror
