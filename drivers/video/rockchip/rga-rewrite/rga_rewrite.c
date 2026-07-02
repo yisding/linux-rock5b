@@ -268,6 +268,7 @@
 #define RK_RGA2_BILINEAR_PREC			12
 #define RK_RGA2_INTERP_DEFAULT			0
 #define RK_RGA2_INTERP_LINEAR			1
+#define RK_RGA2_INTERP_BICUBIC			2
 #define RK_RGA2_INTERP_AVERAGE			3
 
 #define RK_RGA3_SYS_CTRL	0x000
@@ -6203,6 +6204,64 @@ static void rk_rga2_compact_10bit_profile_kunit(struct kunit *test)
 			-EOPNOTSUPP);
 }
 
+static void rk_rga2_librga_interp_emit_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA2_CMD_REG_COUNT] = { };
+	enum rk_rga_hw_type type = 0;
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_RGBA_8888);
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 2,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+	u32 src_info;
+
+	task.core = BIT(2);
+	task.yuv2rgb_mode = 0;
+	task.interp.horiz = RK_RGA2_INTERP_LINEAR;
+	task.interp.verti = RK_RGA2_INTERP_LINEAR;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+
+	src_info = cmd[RK_RGA2_SRC_INFO_OFFSET / 4];
+	KUNIT_EXPECT_EQ(test, src_info & RK_RGA2_SRC_HSCL_MODE,
+			FIELD_PREP(RK_RGA2_SRC_HSCL_MODE,
+				   RK_RGA2_SCALE_DOWN));
+	KUNIT_EXPECT_EQ(test, src_info & RK_RGA2_SRC_VSCL_MODE,
+			FIELD_PREP(RK_RGA2_SRC_VSCL_MODE,
+				   RK_RGA2_SCALE_DOWN));
+	KUNIT_EXPECT_TRUE(test, src_info & RK_RGA2_SRC_HSD_MODE_SEL);
+	KUNIT_EXPECT_TRUE(test, src_info & RK_RGA2_SRC_VSD_MODE_SEL);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_X_FACTOR_OFFSET / 4],
+			0x080017ffU);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_Y_FACTOR_OFFSET / 4],
+			0x080017ffU);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_ACT_INFO_OFFSET / 4],
+			1919U | (1079U << 16));
+
+	memset(cmd, 0, sizeof(cmd));
+	job.cmd_ready = false;
+	task.interp.horiz = RK_RGA2_INTERP_BICUBIC;
+	task.interp.verti = RK_RGA2_INTERP_BICUBIC;
+
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	src_info = cmd[RK_RGA2_SRC_INFO_OFFSET / 4];
+	KUNIT_EXPECT_FALSE(test, src_info & RK_RGA2_SRC_HSD_MODE_SEL);
+	KUNIT_EXPECT_FALSE(test, src_info & RK_RGA2_SRC_VSD_MODE_SEL);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_X_FACTOR_OFFSET / 4],
+			0xaaabU);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_Y_FACTOR_OFFSET / 4],
+			0xaaabU);
+}
+
 static void rk_rga2_src_crop_emit_kunit(struct kunit *test)
 {
 	u32 cmd[RK_RGA2_CMD_REG_COUNT] = { };
@@ -6882,6 +6941,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga3_yuv422_rotate_policy_kunit),
 	KUNIT_CASE(rk_rga_in_place_border_bitblt_kunit),
 	KUNIT_CASE(rk_rga2_compact_10bit_profile_kunit),
+	KUNIT_CASE(rk_rga2_librga_interp_emit_kunit),
 	KUNIT_CASE(rk_rga2_src_crop_emit_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_fbc_profiles_kunit),
 	KUNIT_CASE(rk_rga3_tile8x8_profile_kunit),
@@ -7975,12 +8035,46 @@ static int rk_rga2_select_dst_addresses(const struct rga_img_info_t *dst,
 	return 0;
 }
 
+static void rk_rga2_scale_down_bilinear_protect(u32 src, u32 dst,
+						u32 *factor,
+						u32 *active_src)
+{
+	u32 offset = (1 << RK_RGA2_BILINEAR_PREC) >> 1;
+	u32 param = ((u64)src << RK_RGA2_BILINEAR_PREC) / dst;
+	u64 final_coor;
+	u64 final_limit = (u64)(src - 1) << RK_RGA2_BILINEAR_PREC;
+	u32 final_steps;
+
+	for (;;) {
+		final_coor = offset + (u64)param * (dst - 1);
+		if (final_coor < final_limit)
+			break;
+		param--;
+	}
+
+	final_steps = DIV_ROUND_UP_ULL(final_coor,
+				       1 << RK_RGA2_BILINEAR_PREC);
+	*factor = param | (offset << 16);
+	*active_src = final_steps + 1;
+}
+
+static u32 rk_rga2_scale_down_average_factor(u32 src, u32 dst)
+{
+	u32 param = div_u64((u64)dst << 16, src) + 1;
+
+	while (param && (u64)param * (src - 1) > (u64)dst << 16)
+		param--;
+
+	return param;
+}
+
 static int rk_rga2_scale_factor(u32 src, u32 dst, u8 interp, u32 *mode,
-				u32 *factor, bool *filter)
+				u32 *factor, bool *filter, u32 *active_src)
 {
 	u32 param;
 
 	*filter = false;
+	*active_src = src;
 	if (src == dst) {
 		*mode = RK_RGA2_SCALE_BYPASS;
 		*factor = 0;
@@ -7990,19 +8084,16 @@ static int rk_rga2_scale_factor(u32 src, u32 dst, u8 interp, u32 *mode,
 	if (src > dst) {
 		*mode = RK_RGA2_SCALE_DOWN;
 		if (interp == RK_RGA2_INTERP_LINEAR) {
-			param = (src << RK_RGA2_BILINEAR_PREC) / dst;
+			param = ((u64)src << RK_RGA2_BILINEAR_PREC) / dst;
 			if (param > 0xffff)
 				return -EOPNOTSUPP;
-			*factor = param |
-				  (((1 << RK_RGA2_BILINEAR_PREC) >> 1) << 16);
+			rk_rga2_scale_down_bilinear_protect(src, dst, factor,
+							    active_src);
 			*filter = true;
 			return 0;
 		}
 
-		param = (dst << 16) / src;
-		while (param && (u64)param * (src - 1) > (u64)dst << 16)
-			param--;
-		*factor = param;
+		*factor = rk_rga2_scale_down_average_factor(src, dst);
 		return 0;
 	}
 
@@ -8072,6 +8163,8 @@ static int rk_rga2_emit_src(struct rk_rga_job *job,
 	bool h_filter;
 	bool v_filter;
 	bool src_rkfbc = task->src.rd_mode == RK_RGA_RKFBC_MODE;
+	u32 active_w;
+	u32 active_h;
 	int ret;
 
 	if (src_rkfbc) {
@@ -8091,12 +8184,12 @@ static int rk_rga2_emit_src(struct rk_rga_job *job,
 	}
 	ret = rk_rga2_scale_factor(task->src.act_w, dst_w,
 				   task->interp.horiz, &h_mode, &x_factor,
-				   &h_filter);
+				   &h_filter, &active_w);
 	if (ret)
 		return ret;
 	ret = rk_rga2_scale_factor(task->src.act_h, dst_h,
 				   task->interp.verti, &v_mode, &y_factor,
-				   &v_filter);
+				   &v_filter, &active_h);
 	if (ret)
 		return ret;
 	if (rk_rga2_needs_force_tile(task, transform, dst_w, dst_h)) {
@@ -8106,6 +8199,8 @@ static int rk_rga2_emit_src(struct rk_rga_job *job,
 		y_factor = 0;
 		h_filter = false;
 		v_filter = false;
+		active_w = task->src.act_w;
+		active_h = task->src.act_h;
 	}
 
 	src_info = FIELD_PREP(RK_RGA2_SRC_RB_SWAP, src_fmt->rb_swap) |
@@ -8176,8 +8271,7 @@ static int rk_rga2_emit_src(struct rk_rga_job *job,
 	rk_rga_cmd_write(job, RK_RGA2_SRC_VIR_INFO_OFFSET,
 			 src_rkfbc ? stride : stride >> 2);
 	rk_rga_cmd_write(job, RK_RGA2_SRC_ACT_INFO_OFFSET,
-			 ((u32)task->src.act_w - 1) |
-			 (((u32)task->src.act_h - 1) << 16));
+			 (active_w - 1) | ((active_h - 1) << 16));
 	rk_rga_cmd_write(job, RK_RGA2_SRC_X_FACTOR_OFFSET, x_factor);
 	rk_rga_cmd_write(job, RK_RGA2_SRC_Y_FACTOR_OFFSET, y_factor);
 	rk_rga_cmd_write(job, RK_RGA2_SRC_BG_COLOR_OFFSET, 0);
