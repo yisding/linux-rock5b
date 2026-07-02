@@ -121,7 +121,8 @@ Implemented
   use the BSP-compatible overlap route with source on WIN1, destination/background
   on WIN0, WR on the destination, and the destination rectangle carried in
   ``OVLP_OFF``.  This covers the current ``librga`` ``immakeBorder()`` reflect
-  and wrap side-edge tasks.  The path requires imported dma-buf backed
+  top/bottom source-to-destination tasks and reflect/wrap same-destination
+  side-edge tasks.  The path requires imported dma-buf backed
   source/destination images, rejects color-key and unsupported pattern
   operations, and supports the 8-bit RGB/YUV plus semiplanar 10-bit YUV formats
   exposed by common ``librga`` and ``ffmpeg-rockchip`` blit/scale/convert users.
@@ -325,6 +326,7 @@ Implemented
   RGA3 ``librga`` RGB translate destination-offset emission,
   RGA3 ``librga`` RGB rotate, flip/mirror, and combined rotate/mirror
   emission, RGA3 ``librga`` centered RGB rotate destination-offset emission,
+  RGA3 ``librga`` ``immakeBorder()`` reflect top/bottom command emission,
   RGA3 ``librga`` AFBC16x16 copy profile selection and FBCD/FBCE command
   emission, RGA3 tile8x8 profile selection and stride emission, RGA3
   pattern-backed 8-bit ``librga`` alpha-YUV overlay emission,
