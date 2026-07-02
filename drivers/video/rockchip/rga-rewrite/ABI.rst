@@ -228,6 +228,14 @@ Implemented
   Porter-Duff modes, scaling, conversion, rotation, YUV/FBC, in-place,
   non-5551 pattern, OSD, gauss, ROP, and mixed-feature alpha-bitmap variants
   remain unsupported.
+* RGA2 color palette for the current ``librga`` ``impalette`` sample path.
+  The rewrite accepts the BSP two-command sequence emitted by userspace: first
+  ``UPDATE_PALETTE_TABLE`` with the 16x16 RGBA8888 LUT image, then
+  ``COLOR_PALETTE`` from a same-size BPP8/YCbCr400 raster source to an
+  RGB-family raster destination.  Palette mode ``3`` and the little-endian
+  color-palette source encoding used by current ``librga`` are programmed;
+  BPP1/2/4, scaled/rotated/converted, YUV destination, FBC/tile, pattern,
+  alpha/ROP, OSD, and mixed-feature palette variants remain unsupported.
 * Multi-task requests are accepted when every task matches the same supported
   backend profile; tasks run serially under the request's single
   completion/fence.  The RGA3 no-blend emitted command includes overlap field
@@ -244,6 +252,7 @@ Implemented
   RGA2 in-place RGB mosaic dispatch/emission, RGA2 RGB ROP dispatch/emission,
   RGA2 RGB gauss coefficient lifetime and command emission, RGA2 RGB NN
   quantize dispatch/emission, RGA2 RGB alpha-bitmap SRC1/alpha emission,
+  RGA2 palette update and color-palette command emission,
   ffmpeg-facing RGA2 RFBC64x4 source profile selection and FBCIN command
   emission, IOMMU fault target matching, scheduler priority enqueue/aging,
   RGA3 normal RGB color-key dispatch/emission and inverted-mode rejection,
@@ -257,8 +266,8 @@ Implemented
 Recognized But Unsupported
 --------------------------
 
-* RGA2 hardware command generation outside the solid color fill and raster
-  bitblit profiles above, including full-CSC outside raster bitblit.
+* RGA2 hardware command generation outside the solid color fill, raster bitblit,
+  and color-palette profiles above, including full-CSC outside raster bitblit.
 * RGA3 pattern outside the supported alpha-overlay profile, color-key outside
   the normal RGB ``imcolorkey`` profile, no-pattern or mixed-depth 8/10-bit
   YUV-destination alpha, per-channel rotation,
