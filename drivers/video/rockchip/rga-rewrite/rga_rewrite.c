@@ -2298,6 +2298,23 @@ static void rk_rga_job_put(struct rk_rga_job *job)
 		rk_rga_job_free(job);
 }
 
+static void rk_rga_job_forget_release_fence_fd(struct rk_rga_job *job, int fd)
+{
+	if (!job || fd < 0)
+		return;
+	if (job->release_fence_fd == fd)
+		job->release_fence_fd = -1;
+}
+
+static void rk_rga_job_close_release_fence_fd(struct rk_rga_job *job, int fd)
+{
+	if (fd < 0)
+		return;
+
+	close_fd(fd);
+	rk_rga_job_forget_release_fence_fd(job, fd);
+}
+
 static void rk_rga_job_acquire_work(struct work_struct *work);
 
 static void rk_rga_job_init(struct rk_rga_job *job)
@@ -5658,6 +5675,26 @@ static void rk_rga_job_free_release_fence_kunit(struct kunit *test)
 	dma_fence_put(fence);
 }
 
+static void rk_rga_release_fence_fd_state_kunit(struct kunit *test)
+{
+	struct rk_rga_job job = { };
+
+	rk_rga_job_init(&job);
+	job.release_fence_fd = 9;
+
+	rk_rga_job_forget_release_fence_fd(&job, -1);
+	KUNIT_EXPECT_EQ(test, job.release_fence_fd, 9);
+
+	rk_rga_job_forget_release_fence_fd(&job, 8);
+	KUNIT_EXPECT_EQ(test, job.release_fence_fd, 9);
+
+	rk_rga_job_forget_release_fence_fd(NULL, 9);
+	KUNIT_EXPECT_EQ(test, job.release_fence_fd, 9);
+
+	rk_rga_job_forget_release_fence_fd(&job, 9);
+	KUNIT_EXPECT_EQ(test, job.release_fence_fd, -1);
+}
+
 static void rk_rga_mixed_task_hw_type_kunit(struct kunit *test)
 {
 	enum rk_rga_hw_type type = 0;
@@ -6531,6 +6568,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_request_ioctl_ret_kunit),
 	KUNIT_CASE(rk_rga_acquire_fd_ownership_kunit),
 	KUNIT_CASE(rk_rga_job_free_release_fence_kunit),
+	KUNIT_CASE(rk_rga_release_fence_fd_state_kunit),
 	KUNIT_CASE(rk_rga_mixed_task_hw_type_kunit),
 	KUNIT_CASE(rk_rga_find_best_hw_for_job_kunit),
 	KUNIT_CASE(rk_rga_priority_enqueue_kunit),
@@ -10081,7 +10119,8 @@ static long rk_rga_ioctl_request_submit(unsigned long arg,
 				user.release_fence_fd = release_fence_fd;
 				if (copy_to_user((void __user *)arg, &user,
 						 sizeof(user))) {
-					close_fd(release_fence_fd);
+					rk_rga_job_close_release_fence_fd(job,
+									 release_fence_fd);
 					ret = -EFAULT;
 				}
 			}
@@ -10264,7 +10303,8 @@ static long rk_rga_ioctl_blit(unsigned long arg, struct rk_rga_session *session,
 			job->tasks[0].out_fence_fd = release_fence_fd;
 			if (copy_to_user((void __user *)arg, job->tasks,
 					 sizeof(*job->tasks))) {
-				close_fd(release_fence_fd);
+				rk_rga_job_close_release_fence_fd(job,
+								 release_fence_fd);
 				ret = -EFAULT;
 			}
 		}
