@@ -143,14 +143,16 @@ Implemented
 * RGA2 solid color fill for the common ``librga`` ``imfill`` destination-only
   path.  The rewrite selects an RGA2-class RK3588 core, creates job-owned
   dma-buf mappings for that core when the imported handle was originally mapped
-  elsewhere, and emits a minimal raster RGB-family fill command.  Destination
-  rectangle offsets are applied by biasing the fill destination base address,
-  covering the ``imfill`` and decomposed ``imrectangle``/``imrectangleTask``
-  paths used by current ``librga`` samples.  This is deliberately an RGA2
+  elsewhere, and emits a minimal raster fill command for RGB-family
+  destinations plus the 8-bit planar/semiplanar YUV destinations current
+  ``librga`` documents for color fill.  Destination rectangle offsets are
+  applied through the RGA2 destination address helper, including chroma-plane
+  offsets and alignment checks for YUV fill.  YUV fill requires the
+  RGB-to-YUV mode bits emitted by ``librga``.  This is deliberately an RGA2
   profile: the RK3588 forward-port RGA3 capability table does not advertise
   ``RGA_COLOR_FILL``, so requests forced to RGA3 core bits fail with
-  ``-EOPNOTSUPP``.  Pattern fill, alpha/ROP/color-key, rotation, tile/FBC, and
-  YUV fill variants remain unsupported.
+  ``-EOPNOTSUPP``.  Pattern fill, alpha/ROP/color-key, rotation, tile/FBC,
+  10-bit, and packed-YUV fill variants remain unsupported.
 * RGA2 raster bitblit for the common upstream-consumer fallback formats that
   RGA3 does not cover: planar YUV420/YUV422, YCbCr400/gray, NV24/NV42-style
   YUV444 semiplanar, compact 10-bit semiplanar source, RGB555-family, and
@@ -179,9 +181,10 @@ Implemented
   normalization helpers, including the RGA2 ``rotate_mode``/``sina``/``cosa``
   decoder, transformed destination-corner selection, color-fill core-mask
   dispatch, BSP request task-count limits and return codes, mixed RGA2/RGA3
-  multi-task rejection, RGA2 fill destination-offset emission and multi-fill
-  task acceptance, compact 10-bit RGA2 source dispatch/emission including the
-  no-scale force-tile mode, IOMMU fault target matching, and ffmpeg-facing RGA3
+  multi-task rejection, RGA2 fill RGB/YUV destination-offset emission,
+  YUV-fill chroma-alignment rejection, and multi-fill task acceptance, compact
+  10-bit RGA2 source dispatch/emission including the no-scale force-tile mode,
+  IOMMU fault target matching, and ffmpeg-facing RGA3
   raster/FBC/alpha-overlay profile selection plus destination-offset command
   emission, source-crop command emission for RGA3 and RGA2, and semiplanar
   chroma-alignment rejection.
