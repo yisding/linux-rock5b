@@ -3797,6 +3797,8 @@ static int rk_rga2_select_dst_addresses(const struct rga_img_info_t *dst,
 					__u64 *v_addr);
 static int rk_rga_job_hw_type(struct rk_rga_job *job,
 			      enum rk_rga_hw_type *type);
+static int rk_rga3_emit_simple_bitblt(struct rk_rga_job *job);
+static int rk_rga_request_check(const struct rga_user_request *user);
 
 static void rk_rga2_transform_expect(struct kunit *test, u8 rotate_mode,
 				     s32 sina, s32 cosa, u8 rot, u8 mir,
@@ -3997,6 +3999,52 @@ static void rk_rga_fill_hw_type_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), -EINVAL);
 }
 
+static void rk_rga_request_check_kunit(struct kunit *test)
+{
+	struct rga_user_request user = {
+		.task_ptr = 0x1000,
+		.task_num = 1,
+		.id = 1,
+	};
+
+	KUNIT_EXPECT_EQ(test, rk_rga_request_check(&user), 0);
+
+	user.id = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_request_check(&user), -EINVAL);
+
+	user.id = 1;
+	user.task_ptr = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_request_check(&user), -EINVAL);
+
+	user.task_ptr = 0x1000;
+	user.task_num = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_request_check(&user), -EINVAL);
+
+	user.task_num = RGA_TASK_NUM_MAX + 1;
+	KUNIT_EXPECT_EQ(test, rk_rga_request_check(&user), -EINVAL);
+
+	user.task_num = RGA_TASK_NUM_MAX;
+	KUNIT_EXPECT_EQ(test, rk_rga_request_check(&user), 0);
+}
+
+static void rk_rga_mixed_task_hw_type_kunit(struct kunit *test)
+{
+	enum rk_rga_hw_type type = 0;
+	struct rga_req tasks[2] = {
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_420_SP,
+					  RK_RGA_FORMAT_RGB_888),
+		rk_rga_fill_task(0),
+	};
+	struct rk_rga_job job = {
+		.tasks = tasks,
+		.task_count = ARRAY_SIZE(tasks),
+		.import_count = 2,
+	};
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
+}
+
 static void rk_rga_ffmpeg_rga3_profiles_kunit(struct kunit *test)
 {
 	enum rk_rga_hw_type type = 0;
@@ -4175,6 +4223,8 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga2_decode_transform_kunit),
 	KUNIT_CASE(rk_rga2_dst_corner_kunit),
 	KUNIT_CASE(rk_rga_fill_hw_type_kunit),
+	KUNIT_CASE(rk_rga_request_check_kunit),
+	KUNIT_CASE(rk_rga_mixed_task_hw_type_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_rga3_profiles_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_fbc_profiles_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_alpha_overlay_kunit),
