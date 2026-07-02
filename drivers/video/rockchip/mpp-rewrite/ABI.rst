@@ -123,8 +123,11 @@ Implemented
   decoder jobs reserve one node from a per-core bitmap, stage the BSP
   write/readback register partitions into that job-owned table node, hold a
   counted reference to the referenced CCU coordinator, and release both on
-  completion or abort.  Jobs also record BSP-shaped hard-CCU submit descriptor
-  values for the selected core: core-work mask, table address, link-mode word,
+  completion or abort.  The per-core active table list is relinked whenever a
+  node is staged or released, so the tail points at an unused node and earlier
+  active tables point at the next active table, matching the BSP add-mode queue
+  invariant.  Jobs also record BSP-shaped hard-CCU submit descriptor values for
+  the selected core: core-work mask, table address, link-mode word,
   autogate/work/cfg-done bits, and the link IRQ CCU-mode bit.  When the CCU is
   idle, the rewrite can start that job through the hard-CCU config path and
   copy BSP table readback partitions back into the normal register image with
@@ -153,7 +156,7 @@ Implemented
   boundary queries, fixed-width V1/``mpp_bat_msg`` ABI layout, V1-to-native
   request conversion, payload-copy classification, register-span overflow
   checks, BSP VDPU383 link IRQ decoding, link-table
-  layout/materialization/readback/ownership, CCU-reference lifetime,
+  layout/materialization/readback/ownership/relinking, CCU-reference lifetime,
   hard-CCU descriptor values, ``POLL_HW_IRQ`` flexible-buffer sizing, and
   RKVENC2 slice-mode detection.
 
