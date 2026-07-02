@@ -5262,6 +5262,92 @@ static void rk_rga2_mosaic_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
 }
 
+static void rk_rga2_mosaic_task_array_emit_kunit(struct kunit *test)
+{
+	static const struct {
+		u16 x;
+		u16 y;
+		u16 w;
+		u16 h;
+		u8 mode;
+	} rects[] = {
+		{ 32, 16, 96, 48, 1 },
+		{ 320, 180, 160, 90, 3 },
+	};
+	u32 cmd[RK_RGA2_CMD_REG_COUNT] = { };
+	struct rga_req *tasks;
+	struct rk_rga_job job = {
+		.task_count = ARRAY_SIZE(rects),
+		.import_count = 2,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+	u32 stride_bytes;
+
+	tasks = kunit_kcalloc(test, job.task_count, sizeof(*tasks), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, tasks);
+	job.tasks = tasks;
+
+	for (u32 i = 0; i < job.task_count; i++) {
+		struct rga_img_info_t img =
+			rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_RGBA_8888,
+					 rects[i].w, rects[i].h);
+
+		tasks[i] = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+						     RK_RGA_FORMAT_RGBA_8888);
+		img.vir_w = 640;
+		img.vir_h = 480;
+		img.x_offset = rects[i].x;
+		img.y_offset = rects[i].y;
+		tasks[i].src = img;
+		tasks[i].dst = img;
+		tasks[i].core = RK_RGA_CORE_RGA2_MASK;
+		tasks[i].yuv2rgb_mode = 0;
+		tasks[i].mosaic_info.enable = 1;
+		tasks[i].mosaic_info.mode = rects[i].mode;
+	}
+
+	stride_bytes = ALIGN((u32)tasks[0].src.vir_w * 4, 4);
+	for (u32 i = 0; i < job.task_count; i++) {
+		enum rk_rga_hw_type type = 0;
+		u32 expected_base;
+
+		memset(cmd, 0, sizeof(cmd));
+		job.cmd_ready = false;
+
+		KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+		KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
+		KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
+		KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+
+		expected_base = lower_32_bits(tasks[i].src.yrgb_addr +
+					      (u64)rects[i].y *
+					      stride_bytes +
+					      (u64)rects[i].x * 4);
+		KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_BASE0_OFFSET / 4],
+				expected_base);
+		KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_BASE0_OFFSET / 4],
+				expected_base);
+		KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_ACT_INFO_OFFSET / 4],
+				((u32)rects[i].w - 1) |
+				(((u32)rects[i].h - 1) << 16));
+		KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_ACT_INFO_OFFSET / 4],
+				((u32)rects[i].w - 1) |
+				(((u32)rects[i].h - 1) << 16));
+		KUNIT_EXPECT_TRUE(test, cmd[RK_RGA2_MODE_CTRL_OFFSET / 4] &
+				  RK_RGA2_MODE_MOSAIC_EN);
+		KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_MOSAIC_MODE_OFFSET / 4],
+				(u32)rects[i].mode);
+
+		if (i + 1 < job.task_count)
+			KUNIT_EXPECT_TRUE(test, rk_rga_job_advance_task(&job,
+									0));
+		else
+			KUNIT_EXPECT_FALSE(test, rk_rga_job_advance_task(&job,
+									 0));
+	}
+}
+
 static void rk_rga2_rop_emit_kunit(struct kunit *test)
 {
 	u32 cmd[RK_RGA2_CMD_REG_COUNT] = { };
@@ -7372,6 +7458,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga2_fill_multitask_hw_type_kunit),
 	KUNIT_CASE(rk_rga2_rectangle_task_emit_kunit),
 	KUNIT_CASE(rk_rga2_mosaic_emit_kunit),
+	KUNIT_CASE(rk_rga2_mosaic_task_array_emit_kunit),
 	KUNIT_CASE(rk_rga2_rop_emit_kunit),
 	KUNIT_CASE(rk_rga2_gauss_emit_kunit),
 	KUNIT_CASE(rk_rga2_quantize_emit_kunit),
