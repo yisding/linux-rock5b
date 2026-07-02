@@ -48,6 +48,10 @@
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 
+#ifndef kzalloc_obj
+#define kzalloc_obj(obj, flags)	kzalloc(sizeof(obj), flags)
+#endif
+
 #define RK_RGA_REWRITE_VERSION		"rk3588-rga-rewrite-0.1"
 #define RK_RGA2_CMD_REG_COUNT		32
 #define RK_RGA3_CMD_REG_COUNT		48
@@ -380,6 +384,7 @@
 #define RK_RGA_MMU_SRC1		BIT(9)
 #define RK_RGA_MMU_DST		BIT(10)
 #define RK_RGA_MMU_ELSE		BIT(11)
+#define RK_RGA_RELEASE_FENCE_ABORT_ERR	(-EFAULT)
 
 #define DRIVER_MAJOR_VERISON		1
 #define DRIVER_MINOR_VERSION		3
@@ -2124,7 +2129,8 @@ static void rk_rga_job_free(struct rk_rga_job *job)
 		return;
 
 	if (job->release_fence) {
-		rk_rga_fence_signal(job->release_fence, -ECANCELED);
+		rk_rga_fence_signal(job->release_fence,
+				    RK_RGA_RELEASE_FENCE_ABORT_ERR);
 		dma_fence_put(job->release_fence);
 	}
 	rk_rga_job_free_cmd(job);
@@ -3946,6 +3952,22 @@ static struct rga_req rk_rga_fill_task(u32 core)
 	};
 }
 
+static DEFINE_SPINLOCK(rk_rga_kunit_fence_lock);
+
+static struct dma_fence *rk_rga_kunit_alloc_fence(void)
+{
+	struct dma_fence *fence;
+
+	fence = kzalloc_obj(*fence, GFP_KERNEL);
+	if (!fence)
+		return NULL;
+
+	dma_fence_init(fence, &rk_rga_fence_ops, &rk_rga_kunit_fence_lock,
+		       dma_fence_context_alloc(1), 1);
+
+	return fence;
+}
+
 static struct rga_img_info_t rk_rga_kunit_img(u64 addr, u32 format,
 					      u16 width, u16 height)
 {
@@ -4025,6 +4047,52 @@ static void rk_rga_request_check_kunit(struct kunit *test)
 
 	user.task_num = RGA_TASK_NUM_MAX;
 	KUNIT_EXPECT_EQ(test, rk_rga_request_check(&user), 0);
+}
+
+static void rk_rga_job_free_release_fence_kunit(struct kunit *test)
+{
+	struct rk_rga_job *job;
+	struct dma_fence *fence;
+
+	job = kzalloc_obj(*job, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+	rk_rga_job_init(job);
+
+	fence = rk_rga_kunit_alloc_fence();
+	if (!fence) {
+		kfree(job);
+		KUNIT_FAIL(test, "failed to allocate dma fence");
+		return;
+	}
+
+	dma_fence_get(fence);
+	job->release_fence = fence;
+
+	rk_rga_job_free(job);
+
+	KUNIT_EXPECT_EQ(test, dma_fence_get_status(fence),
+			RK_RGA_RELEASE_FENCE_ABORT_ERR);
+	dma_fence_put(fence);
+
+	job = kzalloc_obj(*job, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+	rk_rga_job_init(job);
+
+	fence = rk_rga_kunit_alloc_fence();
+	if (!fence) {
+		kfree(job);
+		KUNIT_FAIL(test, "failed to allocate dma fence");
+		return;
+	}
+
+	rk_rga_fence_signal(fence, 0);
+	dma_fence_get(fence);
+	job->release_fence = fence;
+
+	rk_rga_job_free(job);
+
+	KUNIT_EXPECT_EQ(test, dma_fence_get_status(fence), 1);
+	dma_fence_put(fence);
 }
 
 static void rk_rga_mixed_task_hw_type_kunit(struct kunit *test)
@@ -4224,6 +4292,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga2_dst_corner_kunit),
 	KUNIT_CASE(rk_rga_fill_hw_type_kunit),
 	KUNIT_CASE(rk_rga_request_check_kunit),
+	KUNIT_CASE(rk_rga_job_free_release_fence_kunit),
 	KUNIT_CASE(rk_rga_mixed_task_hw_type_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_rga3_profiles_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_fbc_profiles_kunit),
