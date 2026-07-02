@@ -4021,7 +4021,7 @@ static void rk_rga_request_check_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_request_check(&user), -EINVAL);
 
 	user.task_num = RGA_TASK_NUM_MAX + 1;
-	KUNIT_EXPECT_EQ(test, rk_rga_request_check(&user), -EINVAL);
+	KUNIT_EXPECT_EQ(test, rk_rga_request_check(&user), -EFBIG);
 
 	user.task_num = RGA_TASK_NUM_MAX;
 	KUNIT_EXPECT_EQ(test, rk_rga_request_check(&user), 0);
@@ -6709,8 +6709,10 @@ static int rk_rga_request_check(const struct rga_user_request *user)
 		return -EINVAL;
 	if (!user->task_ptr)
 		return -EINVAL;
-	if (!user->task_num || user->task_num > RGA_TASK_NUM_MAX)
+	if (!user->task_num)
 		return -EINVAL;
+	if (user->task_num > RGA_TASK_NUM_MAX)
+		return -EFBIG;
 
 	return 0;
 }
