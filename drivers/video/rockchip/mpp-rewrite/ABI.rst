@@ -149,8 +149,11 @@ Implemented
   register image with the VDPU383 link-mode status word from the table
   interrupt-status word.  Hard-CCU register start/stop writes are serialized on
   the coordinator, and completion releases stop CCU work only after the
-  coordinator running list drains.  If the CCU is already active and the rewrite
-  has a tracked coordinator chain, additional jobs are appended with the BSP
+  coordinator running list drains.  If the job that powered peer decoder cores
+  completes while the coordinator still owns queued hard-CCU work, those peer
+  core references move to the next listed CCU job and are released only when the
+  chain drains or aborts.  If the CCU is already active and the rewrite has a
+  tracked coordinator chain, additional jobs are appended with the BSP
   ``ADD_MODE`` link-mode bit; if the hardware is busy without tracked jobs, the
   job keeps the direct link-MMIO fallback.  Completion matching for the selected
   active job checks that job's own CCU table, even if an earlier listed table
@@ -189,8 +192,9 @@ Implemented
   layout/materialization/readback/ownership/relinking, CCU-reference lifetime,
   hard-CCU running-list table-chain relinking/scanning/active matching and
   active-job out-of-order matching/drain detection, hard-CCU done-table
-  detection, unfinished-chain relinking for hard-CCU resend preparation,
-  cross-core CCU completion claiming, hard-CCU table-status readback,
+  detection, peer-core power ownership transfer, unfinished-chain relinking for
+  hard-CCU resend preparation, cross-core CCU completion claiming,
+  hard-CCU table-status readback,
   hard-CCU idle/add-mode descriptor values, hard-CCU all-core work-mask
   selection, fixed-RCB link-latch
   programming, IOMMU fault target matching, RKVENC2 DCHS tx/rx id remapping
