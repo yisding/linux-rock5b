@@ -342,6 +342,8 @@ struct rk_mpp_job {
 	bool canceled;
 	bool rkvdec_link_active;
 	bool rkvdec_ccu_desc_valid;
+	bool rkvdec_ccu_powered;
+	bool rkvdec_ccu_started;
 	bool rkvenc_dchs_active;
 	bool rkvenc_slice_mode;
 	bool rkvenc_slice_done;
@@ -1424,6 +1426,12 @@ rk_mpp_rkvdec2_read_link_table(struct rk_mpp_reg_image *image,
 	return 0;
 }
 
+static bool rk_mpp_rkvdec2_ccu_regs_ready(struct rk_mpp_hw *ccu);
+static u32 rk_mpp_rkvdec2_ccu_core_mask(struct rk_mpp_service *srv,
+					struct rk_mpp_hw *ccu);
+static int rk_mpp_hw_power_on(struct rk_mpp_hw *hw);
+static void rk_mpp_hw_power_off(struct rk_mpp_hw *hw);
+
 static void rk_mpp_rkvdec2_release_link_table(struct rk_mpp_job *job)
 {
 	struct rk_mpp_hw *hw = job->hw;
@@ -1431,6 +1439,12 @@ static void rk_mpp_rkvdec2_release_link_table(struct rk_mpp_job *job)
 	unsigned long flags;
 
 	job->rkvdec_ccu = NULL;
+
+	if (job->rkvdec_ccu_started && ccu &&
+	    rk_mpp_rkvdec2_ccu_regs_ready(ccu))
+		writel_relaxed(0, ccu->regs[0] + RK_MPP_RKVDEC_CCU_WORK_BASE);
+	if (job->rkvdec_ccu_powered && ccu)
+		rk_mpp_hw_power_off(ccu);
 
 	if (job->rkvdec_link_active && hw && hw->rkvdec_link_used) {
 		spin_lock_irqsave(&hw->lock, flags);
@@ -1451,6 +1465,8 @@ static void rk_mpp_rkvdec2_release_link_table(struct rk_mpp_job *job)
 	job->rkvdec_ccu_cfg_done = 0;
 	job->rkvdec_link_irq_mode = 0;
 	job->rkvdec_ccu_desc_valid = false;
+	job->rkvdec_ccu_powered = false;
+	job->rkvdec_ccu_started = false;
 
 	rk_mpp_hw_put(ccu);
 }
@@ -1495,10 +1511,6 @@ static int rk_mpp_rkvdec2_reserve_link_table(struct rk_mpp_job *job)
 	return 0;
 }
 
-static bool rk_mpp_rkvdec2_ccu_regs_ready(struct rk_mpp_hw *ccu);
-static u32 rk_mpp_rkvdec2_ccu_core_mask(struct rk_mpp_service *srv,
-					struct rk_mpp_hw *ccu);
-
 static int rk_mpp_rkvdec2_fill_ccu_descriptor(struct rk_mpp_job *job,
 					      u32 core_work)
 {
@@ -1528,8 +1540,10 @@ static int rk_mpp_rkvdec2_prepare_ccu_descriptor(struct rk_mpp_job *job)
 	if (!rk_mpp_rkvdec2_ccu_regs_ready(job->rkvdec_ccu))
 		return -EOPNOTSUPP;
 
-	core_work = rk_mpp_rkvdec2_ccu_core_mask(job->session->srv,
-						 job->rkvdec_ccu);
+	core_work = job->hw ? job->hw->core_mask : 0;
+	if (!core_work)
+		core_work = rk_mpp_rkvdec2_ccu_core_mask(job->session->srv,
+							 job->rkvdec_ccu);
 	if (!core_work)
 		return -ENODEV;
 
@@ -3236,6 +3250,77 @@ static void rk_mpp_hw_schedule_timeout(struct rk_mpp_hw *hw)
 			      msecs_to_jiffies(RK_MPP_WORK_TIMEOUT_MS));
 }
 
+static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
+{
+	const struct rk_mpp_rkvdec2_link_info *link_info =
+		&rk_mpp_rkvdec2_vdpu383_link_info;
+	struct rk_mpp_hw *hw = job->hw;
+	struct rk_mpp_hw *ccu = job->rkvdec_ccu;
+	void __iomem *link;
+	void __iomem *ccu_regs;
+	u32 irq_val;
+	u32 ccu_en;
+	int ret;
+
+	if (!job->rkvdec_ccu_desc_valid || !job->rkvdec_link_active)
+		return -EOPNOTSUPP;
+	if (!rk_mpp_rkvdec2_link_regs_ready(hw, link_info) ||
+	    !rk_mpp_rkvdec2_ccu_regs_ready(ccu))
+		return -EOPNOTSUPP;
+	if (!job->rkvdec_ccu_core_work)
+		return -EINVAL;
+
+	ret = rk_mpp_hw_power_on(ccu);
+	if (ret)
+		return ret;
+	job->rkvdec_ccu_powered = true;
+
+	if (!READ_ONCE(ccu->online) || !READ_ONCE(hw->online) ||
+	    READ_ONCE(job->canceled)) {
+		ret = READ_ONCE(job->canceled) ? -ECANCELED : -ENODEV;
+		goto err_power_off;
+	}
+
+	link = hw->regs[RK_MPP_RKVDEC_LINK_REGION];
+	ccu_regs = ccu->regs[0];
+	ccu_en = readl_relaxed(ccu_regs + RK_MPP_RKVDEC_CCU_WORK_BASE);
+	if (ccu_en) {
+		ret = -EBUSY;
+		goto err_power_off;
+	}
+
+	writel_relaxed(link_info->irq_mask, link + link_info->irq_base);
+	writel_relaxed(link_info->status_mask, link + link_info->status_base);
+	irq_val = readl_relaxed(link + link_info->irq_base);
+	irq_val |= job->rkvdec_link_irq_mode;
+	writel_relaxed(irq_val, link + link_info->irq_base);
+
+	writel_relaxed(job->rkvdec_ccu_core_work,
+		       ccu_regs + RK_MPP_RKVDEC_CCU_CORE_WORK_BASE);
+	writel_relaxed(job->rkvdec_ccu_ctrl,
+		       ccu_regs + RK_MPP_RKVDEC_CCU_CTRL_BASE);
+	writel_relaxed(job->rkvdec_ccu_cfg_addr,
+		       ccu_regs + RK_MPP_RKVDEC_CCU_CFG_ADDR_BASE);
+	writel_relaxed(job->rkvdec_ccu_work,
+		       ccu_regs + RK_MPP_RKVDEC_CCU_WORK_BASE);
+	writel_relaxed(job->rkvdec_ccu_link_mode,
+		       ccu_regs + RK_MPP_RKVDEC_CCU_LINK_MODE_BASE);
+
+	rk_mpp_hw_schedule_timeout(hw);
+	/* Ensure CCU descriptor writes land before CFG_DONE starts the job. */
+	wmb();
+	writel(job->rkvdec_ccu_cfg_done,
+	       ccu_regs + RK_MPP_RKVDEC_CCU_CFG_DONE_BASE);
+	job->rkvdec_ccu_started = true;
+
+	return 0;
+
+err_power_off:
+	rk_mpp_hw_power_off(ccu);
+	job->rkvdec_ccu_powered = false;
+	return ret;
+}
+
 static void rk_mpp_hw_timeout_work(struct work_struct *work)
 {
 	struct rk_mpp_hw *hw =
@@ -3817,6 +3902,7 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 	struct rk_mpp_hw *hw = job->hw;
 	u32 start_value = 0;
 	bool link_start;
+	bool ccu_start = false;
 	bool start_seen;
 	int ret;
 
@@ -3891,6 +3977,17 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 	if (!READ_ONCE(hw->online) || READ_ONCE(job->canceled)) {
 		ret = READ_ONCE(job->canceled) ? -ECANCELED : -ENODEV;
 		goto err_power_off;
+	}
+
+	if (link_start && job->rkvdec_ccu_desc_valid) {
+		ret = rk_mpp_rkvdec2_start_ccu_job(job);
+		if (ret && ret != -EOPNOTSUPP && ret != -EBUSY)
+			goto err_power_off;
+		ccu_start = !ret;
+	}
+	if (ccu_start) {
+		mutex_unlock(&hw->run_lock);
+		return 0;
 	}
 
 	rk_mpp_hw_schedule_timeout(hw);
@@ -3992,6 +4089,8 @@ static irqreturn_t rk_mpp_rkvdec2_irq(struct rk_mpp_hw *hw)
 
 static irqreturn_t rk_mpp_rkvdec2_thread(struct rk_mpp_hw *hw)
 {
+	const struct rk_mpp_rkvdec2_link_info *link_info =
+		&rk_mpp_rkvdec2_vdpu383_link_info;
 	struct rk_mpp_job *job;
 	u32 irq_status = 0;
 	int ret;
@@ -4004,11 +4103,20 @@ static irqreturn_t rk_mpp_rkvdec2_thread(struct rk_mpp_hw *hw)
 	}
 	cancel_delayed_work(&hw->timeout_work);
 
-	ret = rk_mpp_job_read_regs(job);
-	if (!ret)
-		ret = rk_mpp_job_store_reg_word(job, RK_MPP_RKVDEC_INT_STA_BASE,
-						irq_status);
-	if (!ret && RK_MPP_RKVDEC_RLC_WORD < job->reg_image.reg_words) {
+	if (job->rkvdec_ccu_started) {
+		ret = rk_mpp_rkvdec2_read_link_table(&job->reg_image,
+						     link_info,
+						     job->rkvdec_link_vaddr,
+						     irq_status);
+	} else {
+		ret = rk_mpp_job_read_regs(job);
+		if (!ret)
+			ret = rk_mpp_job_store_reg_word(job,
+							RK_MPP_RKVDEC_INT_STA_BASE,
+							irq_status);
+	}
+	if (!ret && !job->rkvdec_ccu_started &&
+	    job->reg_image.reg_words > RK_MPP_RKVDEC_RLC_WORD) {
 		u32 dec_get = readl_relaxed(hw->regs[0] + RK_MPP_RKVDEC_RLC_BASE);
 		s32 dec_length = (s32)(dec_get - job->rkvdec_stream_addr);
 
