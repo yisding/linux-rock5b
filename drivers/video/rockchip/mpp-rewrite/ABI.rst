@@ -99,6 +99,12 @@ Implemented
   64-word logical side buffer, programs the selector register, reads the three
   selector-value registers, and copies results back through the normal
   readback path without treating the selector window as real MMIO.
+* RK3588 RKVDEC2 CCU-mode task register preparation for cores that declare a
+  ``rockchip,ccu`` phandle.  The rewrite patches the BSP session/film index,
+  disables the multicore PU/COLMV offset timeout reset bit, and writes the same
+  20/50/100 ms timeout-threshold register values that the BSP selects from
+  retained decoder width/height/bitdepth codec info when those task register
+  words are present in the submitted image.
 * ``MPP_CMD_POLL_HW_IRQ`` for RK3588 RKVENC2 encoder slice result streaming.
   The rewrite advertises the forward-port ``POLL_BUTT`` command boundary,
   detects slice mode from the submitted RKVENC2 register image
@@ -134,8 +140,9 @@ Outside This Slice
 * Full BSP-equivalent RK3588 decoder/link CCU task policy and SRAM-backed
   fixed-IOVA RCB optimization.  The rewrite requires the referenced CCU
   coordinator to be bound and online, has least-loaded core selection, queued
-  dispatch, and RKVENC2 DCHS hand-shake remapping, but does not yet mirror the
-  BSP decoder/link CCU policy.
+  dispatch, RKVENC2 DCHS hand-shake remapping, and RKVDEC2 CCU-mode task
+  register preparation, but does not yet mirror the BSP decoder/link scheduling
+  and link-table policy.
 * Full BSP-equivalent timeout recovery policy and IOMMU fault recovery,
   including shared reset-domain serialization and MMU-domain refresh.
 * Fence export/import semantics.
