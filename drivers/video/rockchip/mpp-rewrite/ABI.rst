@@ -94,6 +94,11 @@ Implemented
   job is removed from the active hardware slot, the core reset line is pulsed
   when available, runtime PM/clocks are released, ``POLL_HW_FINISH`` wakes, and
   the job returns ``-ETIMEDOUT``.
+* RK3588 RKVDEC2 performance-selector readbacks for ``SET_REG_READ`` requests
+  in the BSP ``0x20000`` selector window.  The rewrite validates this as a
+  64-word logical side buffer, programs the selector register, reads the three
+  selector-value registers, and copies results back through the normal
+  readback path without treating the selector window as real MMIO.
 * ``MPP_CMD_POLL_HW_IRQ`` for RK3588 RKVENC2 encoder slice result streaming.
   The rewrite advertises the forward-port ``POLL_BUTT`` command boundary,
   detects slice mode from the submitted RKVENC2 register image
@@ -133,7 +138,6 @@ Outside This Slice
   BSP decoder/link CCU policy.
 * Full BSP-equivalent timeout recovery policy and IOMMU fault recovery,
   including shared reset-domain serialization and MMU-domain refresh.
-* Decoder performance-selector readback ranges above the core MMIO resource.
 * Fence export/import semantics.
 * 32-bit compat structure translation beyond the BSP-style shared ioctl path.
 * ``MPP_IOC_CFG_V2``; the BSP-derived 6.18 driver also rejects this in the
