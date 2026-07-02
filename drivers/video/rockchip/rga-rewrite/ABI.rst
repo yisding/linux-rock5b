@@ -38,7 +38,8 @@ Implemented
   address channels remain unsupported.
 * Acquire-fence sync-file validation and ownership for modern request and
   legacy blit paths.  Configured requests hold references to the imported
-  ``dma_fence`` objects for submit.
+  ``dma_fence`` objects for submit and close kernel-owned acquire-fence fds
+  once those references have been taken.
 * ``librga`` acquire-fence ownership semantics.  When a submitted task clears
   ``feature.user_close_fence``, the rewrite closes the imported acquire-fence fd
   after taking its own ``dma_fence`` reference, matching the forward-port
