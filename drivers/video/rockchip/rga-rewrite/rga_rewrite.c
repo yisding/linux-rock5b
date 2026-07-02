@@ -6227,6 +6227,52 @@ static void rk_rga3_librga_copy_splice_task_kunit(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, rk_rga_job_advance_task(&job, 0));
 }
 
+static void rk_rga3_librga_translate_emit_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
+	enum rk_rga_hw_type type = 0;
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_RGBA_8888);
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 2,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+	u32 stride_bytes;
+
+	task.src.act_w = 1620;
+	task.src.act_h = 780;
+	task.src.vir_w = 1920;
+	task.src.vir_h = 1080;
+	task.dst.act_w = 1620;
+	task.dst.act_h = 780;
+	task.dst.vir_w = 1920;
+	task.dst.vir_h = 1080;
+	task.dst.x_offset = 300;
+	task.dst.y_offset = 300;
+	task.yuv2rgb_mode = 0;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+
+	stride_bytes = cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4] << 2;
+	KUNIT_EXPECT_EQ(test, stride_bytes, 1920U * 4U);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_SRC_SIZE_OFFSET / 4],
+			1920U | (1080U << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_ACT_SIZE_OFFSET / 4],
+			1620U | (780U << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
+			1620U | (780U << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_Y_BASE_OFFSET / 4],
+			lower_32_bits(task.dst.yrgb_addr +
+				      300ULL * stride_bytes + 300ULL * 4ULL));
+}
+
 static void rk_rga3_yuv422_rotate_policy_kunit(struct kunit *test)
 {
 	struct rk_rga3_bitblt_profile profile;
@@ -7115,6 +7161,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_ffmpeg_rga3_profiles_kunit),
 	KUNIT_CASE(rk_rga3_librga_resize_interp_emit_kunit),
 	KUNIT_CASE(rk_rga3_librga_copy_splice_task_kunit),
+	KUNIT_CASE(rk_rga3_librga_translate_emit_kunit),
 	KUNIT_CASE(rk_rga3_yuv422_rotate_policy_kunit),
 	KUNIT_CASE(rk_rga_in_place_border_bitblt_kunit),
 	KUNIT_CASE(rk_rga2_compact_10bit_profile_kunit),
