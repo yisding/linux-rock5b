@@ -23,6 +23,7 @@
 #include <linux/fs.h>
 #include <linux/idr.h>
 #include <linux/io.h>
+#include <linux/iommu.h>
 #include <linux/interrupt.h>
 #include <linux/jiffies.h>
 #if IS_ENABLED(CONFIG_ROCKCHIP_RGA_REWRITE_KUNIT_TEST)
@@ -874,7 +875,10 @@ struct rk_rga_hw_match {
 
 struct rk_rga_hw {
 	struct list_head node;
+	struct list_head fault_node;
 	struct device *dev;
+	struct device_node *iommu_node;
+	struct iommu_domain *iommu_domain;
 	void __iomem *regs;
 	struct clk_bulk_data *clks;
 	struct reset_control *resets;
@@ -892,6 +896,7 @@ struct rk_rga_hw {
 	struct list_head job_queue;
 	struct rk_rga_job *active_job;
 	u32 queued_jobs;
+	atomic_t iommu_fault_pending;
 	bool removing;
 };
 
@@ -905,7 +910,9 @@ struct rk_rga_service {
 	struct miscdevice miscdev;
 	struct dentry *debugfs_root;
 	struct mutex hw_lock;
+	spinlock_t fault_lock; /* protects fault_hws in fault handler context */
 	struct list_head hw_list;
+	struct list_head fault_hws;
 	struct rga_hw_versions_t hw_versions;
 	u32 hw_count;
 	u64 fence_context;
@@ -926,10 +933,16 @@ struct rk_rga_service {
 	atomic_t irq_error_count;
 	atomic_t irq_spurious_count;
 	atomic_t timeout_count;
+	atomic_t iommu_fault_count;
 	atomic_t unsupported_count;
 };
 
 static struct rk_rga_service rk_rga;
+
+static void rk_rga_of_node_put(void *data)
+{
+	of_node_put(data);
+}
 
 static const char *rk_rga_fence_get_name(struct dma_fence *fence)
 {
@@ -2643,7 +2656,7 @@ static int rk_rga3_soft_reset(struct rk_rga_hw *hw)
 	return i == RK_RGA_RESET_TIMEOUT_US ? -ETIMEDOUT : 0;
 }
 
-static void rk_rga_hw_reset_after_timeout(struct rk_rga_hw *hw)
+static void rk_rga_hw_reset_for_recovery(struct rk_rga_hw *hw)
 {
 	int ret;
 
@@ -2655,7 +2668,7 @@ static void rk_rga_hw_reset_after_timeout(struct rk_rga_hw *hw)
 	if (!ret)
 		return;
 
-	dev_warn(hw->dev, "%s soft reset after timeout failed: %d\n",
+	dev_warn(hw->dev, "%s soft reset during recovery failed: %d\n",
 		 hw->match->name, ret);
 
 	if (!hw->resets)
@@ -2664,7 +2677,7 @@ static void rk_rga_hw_reset_after_timeout(struct rk_rga_hw *hw)
 	ret = reset_control_reset(hw->resets);
 	if (ret)
 		dev_warn(hw->dev,
-			 "%s reset-control fallback after timeout failed: %d\n",
+			 "%s reset-control recovery fallback failed: %d\n",
 			 hw->match->name, ret);
 }
 
@@ -6170,6 +6183,8 @@ static int rk_rga_backend_start(struct rk_rga_hw *hw, struct rk_rga_job *job)
 {
 	int ret;
 
+	atomic_set(&hw->iommu_fault_pending, 0);
+
 	ret = rk_rga_job_prepare_hw_mappings(hw, job);
 	if (ret)
 		return ret;
@@ -6296,11 +6311,14 @@ static void rk_rga_hw_timeout_work(struct work_struct *work)
 					    timeout_work);
 	struct rk_rga_job *job;
 	unsigned long flags;
+	bool iommu_fault;
+	int result;
 
 	mutex_lock(&hw->run_lock);
 	spin_lock_irqsave(&hw->job_lock, flags);
 	job = hw->active_job;
-	if (!job || job->irq_seen) {
+	iommu_fault = atomic_xchg(&hw->iommu_fault_pending, 0);
+	if (!job || (job->irq_seen && !iommu_fault)) {
 		spin_unlock_irqrestore(&hw->job_lock, flags);
 		mutex_unlock(&hw->run_lock);
 		return;
@@ -6314,12 +6332,103 @@ static void rk_rga_hw_timeout_work(struct work_struct *work)
 	hw->active_job = NULL;
 	spin_unlock_irqrestore(&hw->job_lock, flags);
 
-	atomic_inc(&rk_rga.timeout_count);
-	rk_rga_hw_reset_after_timeout(hw);
+	if (iommu_fault) {
+		result = -EIO;
+		dev_err(hw->dev, "job failed on IOMMU fault\n");
+	} else {
+		result = -EBUSY;
+		atomic_inc(&rk_rga.timeout_count);
+	}
+
+	rk_rga_hw_reset_for_recovery(hw);
 	rk_rga_hw_power_off(hw);
-	rk_rga_job_complete_queued(job, -EBUSY);
+	rk_rga_job_complete_queued(job, result);
 	mutex_unlock(&hw->run_lock);
 	rk_rga_hw_dispatch(hw);
+}
+
+static int rk_rga_iommu_fault_handler(struct iommu_domain *domain,
+				      struct device *iommu_dev,
+				      unsigned long iova, int status,
+				      void *arg)
+{
+	struct rk_rga_service *rga = arg;
+	struct rk_rga_hw *fallback = NULL;
+	struct rk_rga_hw *match = NULL;
+	struct rk_rga_hw *hw;
+	unsigned long flags;
+
+	atomic_inc(&rga->iommu_fault_count);
+
+	spin_lock_irqsave(&rga->fault_lock, flags);
+	list_for_each_entry(hw, &rga->fault_hws, fault_node) {
+		if (hw->iommu_domain != domain)
+			continue;
+
+		if (!fallback)
+			fallback = hw;
+		if (iommu_dev && hw->iommu_node == iommu_dev->of_node) {
+			match = hw;
+			break;
+		}
+	}
+	if (!match)
+		match = fallback;
+
+	if (match) {
+		atomic_set(&match->iommu_fault_pending, 1);
+		mod_delayed_work(system_wq, &match->timeout_work, 0);
+		dev_err_ratelimited(match->dev,
+				    "IOMMU fault iova %#lx status %#x\n",
+				    iova, status);
+	}
+	spin_unlock_irqrestore(&rga->fault_lock, flags);
+
+	if (!match)
+		pr_err_ratelimited("unmatched RGA IOMMU fault iova %#lx status %#x\n",
+				   iova, status);
+
+	return 0;
+}
+
+static void rk_rga_iommu_register_fault_handler(struct rk_rga_hw *hw)
+{
+	unsigned long flags;
+
+	hw->iommu_domain = iommu_get_domain_for_dev(hw->dev);
+	if (!hw->iommu_domain)
+		return;
+
+	spin_lock_irqsave(&rk_rga.fault_lock, flags);
+	list_add_tail(&hw->fault_node, &rk_rga.fault_hws);
+	spin_unlock_irqrestore(&rk_rga.fault_lock, flags);
+
+	iommu_set_fault_handler(hw->iommu_domain,
+				rk_rga_iommu_fault_handler, &rk_rga);
+}
+
+static void rk_rga_iommu_unregister_fault_handler(struct rk_rga_hw *hw)
+{
+	struct rk_rga_hw *other;
+	unsigned long flags;
+	bool clear = true;
+
+	if (!hw->iommu_domain)
+		return;
+
+	spin_lock_irqsave(&rk_rga.fault_lock, flags);
+	if (!list_empty(&hw->fault_node))
+		list_del_init(&hw->fault_node);
+	list_for_each_entry(other, &rk_rga.fault_hws, fault_node) {
+		if (other->iommu_domain == hw->iommu_domain) {
+			clear = false;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&rk_rga.fault_lock, flags);
+
+	if (clear)
+		iommu_set_fault_handler(hw->iommu_domain, NULL, NULL);
 }
 
 static void rk_rga_hw_dispatch(struct rk_rga_hw *hw)
@@ -6435,7 +6544,7 @@ static void rk_rga_hw_abort_jobs(struct rk_rga_hw *hw, int result)
 	spin_unlock_irqrestore(&hw->job_lock, flags);
 
 	if (active) {
-		rk_rga_hw_reset_after_timeout(hw);
+		rk_rga_hw_reset_for_recovery(hw);
 		rk_rga_hw_power_off(hw);
 	}
 	mutex_unlock(&hw->run_lock);
@@ -7377,8 +7486,17 @@ static int rk_rga_hw_probe(struct platform_device *pdev)
 	spin_lock_init(&hw->job_lock);
 	mutex_init(&hw->run_lock);
 	INIT_DELAYED_WORK(&hw->timeout_work, rk_rga_hw_timeout_work);
+	INIT_LIST_HEAD(&hw->fault_node);
 	INIT_LIST_HEAD(&hw->job_queue);
 	platform_set_drvdata(pdev, hw);
+
+	hw->iommu_node = of_parse_phandle(dev->of_node, "iommus", 0);
+	if (hw->iommu_node) {
+		ret = devm_add_action_or_reset(dev, rk_rga_of_node_put,
+					       hw->iommu_node);
+		if (ret)
+			return ret;
+	}
 
 	if (hw->irq >= 0) {
 		ret = devm_request_threaded_irq(dev, hw->irq,
@@ -7391,6 +7509,8 @@ static int rk_rga_hw_probe(struct platform_device *pdev)
 	}
 
 	pm_runtime_enable(dev);
+
+	rk_rga_iommu_register_fault_handler(hw);
 
 	mutex_lock(&rk_rga.hw_lock);
 	list_for_each_entry(iter, &rk_rga.hw_list, node) {
@@ -7420,6 +7540,7 @@ static void rk_rga_hw_remove(struct platform_device *pdev)
 	rk_rga_refresh_hw_versions_locked();
 	mutex_unlock(&rk_rga.hw_lock);
 
+	rk_rga_iommu_unregister_fault_handler(hw);
 	rk_rga_hw_abort_jobs(hw, -ENODEV);
 	wait_event(hw->idle, refcount_read(&hw->refs) == 1);
 	pm_runtime_disable(&pdev->dev);
@@ -7488,7 +7609,9 @@ static int __init rk_rga_init(void)
 	int ret;
 
 	mutex_init(&rk_rga.hw_lock);
+	spin_lock_init(&rk_rga.fault_lock);
 	INIT_LIST_HEAD(&rk_rga.hw_list);
+	INIT_LIST_HEAD(&rk_rga.fault_hws);
 	spin_lock_init(&rk_rga.fence_lock);
 	rk_rga.fence_context = dma_fence_context_alloc(1);
 
@@ -7545,6 +7668,9 @@ static int __init rk_rga_init(void)
 				&rk_rga.irq_spurious_count);
 	debugfs_create_atomic_t("timeout_count", 0444, rk_rga.debugfs_root,
 				&rk_rga.timeout_count);
+	debugfs_create_atomic_t("iommu_fault_count", 0444,
+				rk_rga.debugfs_root,
+				&rk_rga.iommu_fault_count);
 	debugfs_create_atomic_t("unsupported_count", 0444, rk_rga.debugfs_root,
 				&rk_rga.unsupported_count);
 
