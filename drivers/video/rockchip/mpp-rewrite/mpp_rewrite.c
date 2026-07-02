@@ -57,6 +57,8 @@
 #define RK_MPP_MAX_RCB_ELEMS		16
 #define RK_MPP_RKVENC_MAX_RCB_ELEMS	4
 #define RK_MPP_RKVENC_MAX_SLICE_FIFO	256
+#define RK_MPP_RKVENC_MAX_DCHS_CORES	4
+#define RK_MPP_RKVENC_MAX_DCHS_ID	4
 #define RK_MPP_WORK_TIMEOUT_MS		500
 #define RK_MPP_CODEC_INFO_MAX		11
 #define RK_MPP_ENC_INFO_BUTT		RK_MPP_CODEC_INFO_MAX
@@ -116,6 +118,13 @@ enum rk_mpp_job_state {
 struct rk_mpp_backend_ops;
 struct rk_mpp_job;
 
+struct rk_mpp_rkvenc_dchs_entry {
+	struct rk_mpp_job *job;
+	u64 val;
+	u8 txid_orig;
+	u8 rxid_orig;
+};
+
 struct rk_mpp_hw_match {
 	const char *name;
 	const char *alias;
@@ -162,6 +171,7 @@ struct rk_mpp_service {
 	struct proc_dir_entry *procfs_root;
 	struct mutex hw_lock;
 	struct mutex sched_lock; /* protects queued_jobs */
+	spinlock_t rkvenc_dchs_lock;
 	struct list_head hw_list;
 	struct list_head queued_jobs;
 	struct work_struct sched_work;
@@ -171,6 +181,8 @@ struct rk_mpp_service {
 	atomic_t submitted_job_count;
 	atomic_t queued_job_count;
 	atomic_t timeout_count;
+	atomic_t next_session_id;
+	struct rk_mpp_rkvenc_dchs_entry rkvenc_dchs[RK_MPP_RKVENC_MAX_DCHS_CORES];
 	u32 hw_support;
 	u32 bound_hw_count;
 };
@@ -185,6 +197,7 @@ struct rk_mpp_session {
 	u32 client_type;
 	u16 trans_table[RK_MPP_MAX_REG_TRANS_NUM];
 	u32 trans_count;
+	u32 id;
 	u32 next_job_id;
 	u32 active_job_count;
 	struct rk_mpp_rcb_desc rcb_descs[RK_MPP_MAX_RCB_ELEMS];
@@ -243,8 +256,10 @@ struct rk_mpp_job {
 	u32 flags;
 	int result;
 	u32 rkvdec_stream_addr;
+	u32 rkvenc_dchs_core_id;
 	bool poll_irq;
 	bool canceled;
+	bool rkvenc_dchs_active;
 	bool rkvenc_slice_mode;
 	bool rkvenc_slice_done;
 	bool rkvenc_slice_overflow;
@@ -317,6 +332,7 @@ MODULE_DEVICE_TABLE(of, rk_mpp_hw_of_match);
 #define RK_MPP_RKVENC_SLI_SPLIT_WORD		(RK_MPP_RKVENC_PIC_BASE_WORDS + 56)
 #define RK_MPP_RKVENC_FMT_WORD			(0x0300 / sizeof(u32))
 #define RK_MPP_RKVENC_FMT_MASK			0x1
+#define RK_MPP_RKVENC_DCHS_WORD		(0x0304 / sizeof(u32))
 #define RK_MPP_RKVENC_START_BASE		0x0010
 #define RK_MPP_RKVENC_CLR_BASE			0x0014
 #define RK_MPP_RKVENC_INT_MASK_BASE		0x0024
@@ -333,6 +349,12 @@ MODULE_DEVICE_TABLE(of, rk_mpp_hw_of_match);
 #define RK_MPP_RKVENC_SLI_SPLIT_EN		BIT(0)
 #define RK_MPP_RKVENC_SLICE_NUM_MASK		GENMASK(5, 0)
 #define RK_MPP_RKVENC_SLICE_LAST		BIT(31)
+#define RK_MPP_RKVENC_DCHS_TXID_MASK		GENMASK(1, 0)
+#define RK_MPP_RKVENC_DCHS_RXID_MASK		GENMASK(3, 2)
+#define RK_MPP_RKVENC_DCHS_TXID_SHIFT		0
+#define RK_MPP_RKVENC_DCHS_RXID_SHIFT		2
+#define RK_MPP_RKVENC_DCHS_TXE			BIT(4)
+#define RK_MPP_RKVENC_DCHS_RXE			BIT(5)
 
 struct rk_mpp_rkvenc_poll_slice_cfg {
 	s32 poll_type;
@@ -1597,6 +1619,182 @@ static bool rk_mpp_job_rkvenc_slice_mode(struct rk_mpp_job *job)
 	       (sli_split & RK_MPP_RKVENC_SLI_SPLIT_EN);
 }
 
+static u32 rk_mpp_rkvenc_dchs_txid(u32 val)
+{
+	return (val & RK_MPP_RKVENC_DCHS_TXID_MASK) >>
+	       RK_MPP_RKVENC_DCHS_TXID_SHIFT;
+}
+
+static u32 rk_mpp_rkvenc_dchs_rxid(u32 val)
+{
+	return (val & RK_MPP_RKVENC_DCHS_RXID_MASK) >>
+	       RK_MPP_RKVENC_DCHS_RXID_SHIFT;
+}
+
+static u32 rk_mpp_rkvenc_dchs_set_txid(u32 val, u32 id)
+{
+	val &= ~RK_MPP_RKVENC_DCHS_TXID_MASK;
+	val |= (id << RK_MPP_RKVENC_DCHS_TXID_SHIFT) &
+	       RK_MPP_RKVENC_DCHS_TXID_MASK;
+
+	return val;
+}
+
+static u32 rk_mpp_rkvenc_dchs_set_rxid(u32 val, u32 id)
+{
+	val &= ~RK_MPP_RKVENC_DCHS_RXID_MASK;
+	val |= (id << RK_MPP_RKVENC_DCHS_RXID_SHIFT) &
+	       RK_MPP_RKVENC_DCHS_RXID_MASK;
+
+	return val;
+}
+
+static int rk_mpp_rkvenc_dchs_find_id(u32 valid)
+{
+	u32 id;
+
+	for (id = 0; id < RK_MPP_RKVENC_MAX_DCHS_ID; id++) {
+		if (valid & BIT(id))
+			return id;
+	}
+
+	return -ENOSPC;
+}
+
+static void rk_mpp_rkvenc2_dchs_patch(struct rk_mpp_job *job)
+{
+	struct rk_mpp_reg_image *image = &job->reg_image;
+	struct rk_mpp_service *srv = job->session->srv;
+	struct rk_mpp_hw *hw = job->hw;
+	struct rk_mpp_rkvenc_dchs_entry *entry;
+	unsigned long flags;
+	u32 id_valid = GENMASK(RK_MPP_RKVENC_MAX_DCHS_ID - 1, 0);
+	u32 low;
+	u32 patched;
+	u32 core_id;
+	u32 txid_orig;
+	u32 rxid_orig;
+	int txid_map;
+	int rxid_map = -1;
+	bool rxe_map;
+	u32 i;
+
+	if (job->session->client_type != RK_MPP_DEVICE_RKVENC || !hw)
+		return;
+	if (image->reg_words <= RK_MPP_RKVENC_DCHS_WORD)
+		return;
+
+	low = image->regs[RK_MPP_RKVENC_DCHS_WORD] | RK_MPP_RKVENC_DCHS_TXE;
+	image->regs[RK_MPP_RKVENC_DCHS_WORD] = low;
+
+	if (!hw->ccu_node)
+		return;
+
+	core_id = hw->core_id;
+	if (core_id >= RK_MPP_RKVENC_MAX_DCHS_CORES) {
+		dev_err(hw->dev, "invalid RKVENC2 DCHS core id %u\n", core_id);
+		return;
+	}
+
+	txid_orig = rk_mpp_rkvenc_dchs_txid(low);
+	rxid_orig = rk_mpp_rkvenc_dchs_rxid(low);
+	rxe_map = low & RK_MPP_RKVENC_DCHS_RXE;
+
+	spin_lock_irqsave(&srv->rkvenc_dchs_lock, flags);
+
+	entry = &srv->rkvenc_dchs[core_id];
+	if (entry->job) {
+		spin_unlock_irqrestore(&srv->rkvenc_dchs_lock, flags);
+		dev_err(hw->dev, "RKVENC2 DCHS core %u is still active\n",
+			core_id);
+		return;
+	}
+
+	for (i = 0; i < RK_MPP_RKVENC_MAX_DCHS_CORES; i++) {
+		u32 busy = lower_32_bits(srv->rkvenc_dchs[i].val);
+
+		if (!srv->rkvenc_dchs[i].job)
+			continue;
+
+		id_valid &= ~BIT(rk_mpp_rkvenc_dchs_txid(busy));
+		id_valid &= ~BIT(rk_mpp_rkvenc_dchs_rxid(busy));
+	}
+
+	if (low & RK_MPP_RKVENC_DCHS_RXE) {
+		for (i = 0; i < RK_MPP_RKVENC_MAX_DCHS_CORES; i++) {
+			struct rk_mpp_rkvenc_dchs_entry *busy_entry =
+				&srv->rkvenc_dchs[i];
+			u32 busy = lower_32_bits(busy_entry->val);
+
+			if (!busy_entry->job || i == core_id)
+				continue;
+			if ((u32)(busy_entry->val >> 32) != job->session->id)
+				continue;
+			if (rxid_orig != busy_entry->txid_orig)
+				continue;
+
+			rxid_map = rk_mpp_rkvenc_dchs_txid(busy);
+			break;
+		}
+	}
+
+	txid_map = rk_mpp_rkvenc_dchs_find_id(id_valid);
+	if (txid_map < 0) {
+		spin_unlock_irqrestore(&srv->rkvenc_dchs_lock, flags);
+		dev_err(hw->dev, "job %u session %u failed to allocate DCHS tx id\n",
+			job->id, job->session->id);
+		return;
+	}
+
+	id_valid &= ~BIT(txid_map);
+
+	if (rxid_map < 0) {
+		rxid_map = rk_mpp_rkvenc_dchs_find_id(id_valid);
+		if (rxid_map < 0) {
+			spin_unlock_irqrestore(&srv->rkvenc_dchs_lock, flags);
+			dev_err(hw->dev, "job %u session %u failed to allocate DCHS rx id\n",
+				job->id, job->session->id);
+			return;
+		}
+
+		rxe_map = false;
+	}
+
+	patched = rk_mpp_rkvenc_dchs_set_txid(low, txid_map);
+	patched = rk_mpp_rkvenc_dchs_set_rxid(patched, rxid_map);
+	if (rxe_map)
+		patched |= RK_MPP_RKVENC_DCHS_RXE;
+	else
+		patched &= ~RK_MPP_RKVENC_DCHS_RXE;
+
+	entry->job = job;
+	entry->val = ((u64)job->session->id << 32) | patched;
+	entry->txid_orig = txid_orig;
+	entry->rxid_orig = rxid_orig;
+	job->rkvenc_dchs_core_id = core_id;
+	job->rkvenc_dchs_active = true;
+	image->regs[RK_MPP_RKVENC_DCHS_WORD] = patched;
+
+	spin_unlock_irqrestore(&srv->rkvenc_dchs_lock, flags);
+}
+
+static void rk_mpp_rkvenc2_dchs_release(struct rk_mpp_job *job)
+{
+	struct rk_mpp_service *srv = job->session->srv;
+	unsigned long flags;
+	u32 core_id = job->rkvenc_dchs_core_id;
+
+	spin_lock_irqsave(&srv->rkvenc_dchs_lock, flags);
+	if (job->rkvenc_dchs_active) {
+		if (core_id < RK_MPP_RKVENC_MAX_DCHS_CORES &&
+		    srv->rkvenc_dchs[core_id].job == job)
+			memset(&srv->rkvenc_dchs[core_id], 0,
+			       sizeof(srv->rkvenc_dchs[core_id]));
+		job->rkvenc_dchs_active = false;
+	}
+	spin_unlock_irqrestore(&srv->rkvenc_dchs_lock, flags);
+}
+
 static int rk_mpp_job_translate_reg_image(struct rk_mpp_job *job)
 {
 	struct rk_mpp_reg_image *image = &job->reg_image;
@@ -1825,6 +2023,7 @@ static void rk_mpp_job_complete(struct rk_mpp_job *job, int result)
 	job->result = result;
 	job->state = RK_MPP_JOB_DONE;
 	mutex_unlock(&session->lock);
+	rk_mpp_rkvenc2_dchs_release(job);
 	rk_mpp_job_drop_hw(job);
 	wake_up_all(&session->wait);
 	schedule_work(&session->srv->sched_work);
@@ -2070,6 +2269,7 @@ static void rk_mpp_hw_abort_job(struct rk_mpp_job *job)
 	cancel_delayed_work_sync(&hw->timeout_work);
 	mutex_lock(&hw->run_lock);
 	if (rk_mpp_hw_clear_active_job(hw, job, NULL)) {
+		rk_mpp_rkvenc2_dchs_release(job);
 		rk_mpp_hw_reset_active(hw);
 		rk_mpp_hw_power_off(hw);
 	}
@@ -2386,6 +2586,8 @@ static int rk_mpp_rkvenc2_submit(struct rk_mpp_job *job)
 				      sizeof(u32)))
 		writel_relaxed(0x2, hw->regs[0] + RK_MPP_RKVENC_COUNTER_CLR_BASE);
 
+	rk_mpp_rkvenc2_dchs_patch(job);
+
 	ret = rk_mpp_job_write_regs(job, RK_MPP_RKVENC_START_BASE,
 				    &start_value, &start_seen);
 	if (ret)
@@ -2407,6 +2609,7 @@ static int rk_mpp_rkvenc2_submit(struct rk_mpp_job *job)
 	return 0;
 
 err_power_off:
+	rk_mpp_rkvenc2_dchs_release(job);
 	rk_mpp_hw_power_off(hw);
 err_clear_active:
 	rk_mpp_hw_clear_active_job(hw, job, NULL);
@@ -3351,6 +3554,7 @@ static int rk_mpp_open(struct inode *inode, struct file *filp)
 		return -ENOMEM;
 
 	session->srv = &rk_mpp_srv;
+	session->id = (u32)atomic_inc_return(&rk_mpp_srv.next_session_id);
 	session->client_type = RK_MPP_DEVICE_BUTT;
 	mutex_init(&session->lock);
 	init_waitqueue_head(&session->wait);
@@ -3608,6 +3812,7 @@ static int __init rk_mpp_init(void)
 
 	mutex_init(&rk_mpp_srv.hw_lock);
 	mutex_init(&rk_mpp_srv.sched_lock);
+	spin_lock_init(&rk_mpp_srv.rkvenc_dchs_lock);
 	INIT_LIST_HEAD(&rk_mpp_srv.hw_list);
 	INIT_LIST_HEAD(&rk_mpp_srv.queued_jobs);
 	INIT_WORK(&rk_mpp_srv.sched_work, rk_mpp_scheduler_work);
