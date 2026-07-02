@@ -1534,18 +1534,22 @@ static void rk_mpp_rkvdec2_ccu_job_add(struct rk_mpp_job *job)
 	spin_unlock_irqrestore(&ccu->lock, flags);
 }
 
-static void
+static bool
 rk_mpp_rkvdec2_ccu_job_del(struct rk_mpp_job *job, struct rk_mpp_hw *ccu)
 {
 	unsigned long flags;
+	bool empty = true;
 
 	if (!ccu || !job->rkvdec_ccu_listed)
-		return;
+		return true;
 
 	spin_lock_irqsave(&ccu->lock, flags);
 	list_del_init(&job->rkvdec_ccu_node);
 	job->rkvdec_ccu_listed = false;
+	empty = list_empty(&ccu->rkvdec_ccu_jobs);
 	spin_unlock_irqrestore(&ccu->lock, flags);
+
+	return empty;
 }
 
 static struct rk_mpp_job *rk_mpp_rkvdec2_ccu_first_done_job(struct rk_mpp_hw *ccu)
@@ -1597,15 +1601,24 @@ static void rk_mpp_rkvdec2_release_link_table(struct rk_mpp_job *job)
 	struct rk_mpp_hw *hw = job->hw;
 	struct rk_mpp_hw *ccu = job->rkvdec_ccu;
 	unsigned long flags;
+	bool ccu_empty = true;
 
 	job->rkvdec_ccu = NULL;
 
-	if (job->rkvdec_ccu_started && ccu &&
-	    rk_mpp_rkvdec2_ccu_regs_ready(ccu))
-		writel_relaxed(0, ccu->regs[0] + RK_MPP_RKVDEC_CCU_WORK_BASE);
+	if (job->rkvdec_ccu_started && ccu) {
+		mutex_lock(&ccu->run_lock);
+		ccu_empty = rk_mpp_rkvdec2_ccu_job_del(job, ccu);
+		if (ccu_empty && rk_mpp_rkvdec2_ccu_regs_ready(ccu))
+			writel_relaxed(0,
+				       ccu->regs[0] +
+				       RK_MPP_RKVDEC_CCU_WORK_BASE);
+		mutex_unlock(&ccu->run_lock);
+	} else {
+		rk_mpp_rkvdec2_ccu_job_del(job, ccu);
+	}
+
 	if (job->rkvdec_ccu_powered && ccu)
 		rk_mpp_hw_power_off(ccu);
-	rk_mpp_rkvdec2_ccu_job_del(job, ccu);
 
 	if (job->rkvdec_link_active && hw && hw->rkvdec_link_used) {
 		spin_lock_irqsave(&hw->lock, flags);
@@ -2263,7 +2276,7 @@ static void rk_mpp_rkvdec2_ccu_running_list_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&job1->refs), 2);
 	refcount_dec(&job1->refs);
 
-	rk_mpp_rkvdec2_ccu_job_del(job1, ccu);
+	KUNIT_EXPECT_FALSE(test, rk_mpp_rkvdec2_ccu_job_del(job1, ccu));
 	KUNIT_EXPECT_FALSE(test, job1->rkvdec_ccu_listed);
 	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_rkvdec2_ccu_first_done_job(ccu),
 			    NULL);
@@ -2273,7 +2286,7 @@ static void rk_mpp_rkvdec2_ccu_running_list_kunit(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, done, job0);
 	refcount_dec(&job0->refs);
 
-	rk_mpp_rkvdec2_ccu_job_del(job0, ccu);
+	KUNIT_EXPECT_TRUE(test, rk_mpp_rkvdec2_ccu_job_del(job0, ccu));
 	KUNIT_EXPECT_FALSE(test, job0->rkvdec_ccu_listed);
 	KUNIT_EXPECT_TRUE(test, list_empty(&ccu->rkvdec_ccu_jobs));
 }
@@ -3556,10 +3569,11 @@ static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
 
 	link = hw->regs[RK_MPP_RKVDEC_LINK_REGION];
 	ccu_regs = ccu->regs[0];
+	mutex_lock(&ccu->run_lock);
 	ccu_en = readl_relaxed(ccu_regs + RK_MPP_RKVDEC_CCU_WORK_BASE);
 	if (ccu_en) {
 		ret = -EBUSY;
-		goto err_power_off;
+		goto err_unlock_ccu;
 	}
 
 	writel_relaxed(link_info->irq_mask, link + link_info->irq_base);
@@ -3586,9 +3600,12 @@ static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
 	writel(job->rkvdec_ccu_cfg_done,
 	       ccu_regs + RK_MPP_RKVDEC_CCU_CFG_DONE_BASE);
 	job->rkvdec_ccu_started = true;
+	mutex_unlock(&ccu->run_lock);
 
 	return 0;
 
+err_unlock_ccu:
+	mutex_unlock(&ccu->run_lock);
 err_power_off:
 	rk_mpp_hw_power_off(ccu);
 	job->rkvdec_ccu_powered = false;
