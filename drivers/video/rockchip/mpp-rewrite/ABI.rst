@@ -98,9 +98,10 @@ Implemented
   job is removed from the active hardware slot, the core reset line is pulsed
   when available, runtime PM/clocks are released, ``POLL_HW_FINISH`` wakes, and
   the job returns ``-ETIMEDOUT``.  For hard-CCU RKVDEC2 jobs, timeout recovery
-  first force-stops and resets the coordinator, then opportunistically aborts
-  other active dependent cores without waiting on possibly running timeout
-  workers.
+  first force-stops and resets the coordinator, preserves table-complete jobs
+  that raced the timeout by reading back their CCU link tables, then
+  opportunistically aborts unfinished active dependent cores without waiting on
+  possibly running timeout workers.
 * Public IOMMU fault callback registration for bound MPP cores.  A fault
   records ``iommu_fault_count`` in debugfs, logs the IOVA/status, marks the
   active job for immediate recovery through the same serialized reset path,
@@ -159,7 +160,8 @@ Implemented
   cores are left for their own IRQ or timeout path.  If a hard-CCU completion
   table reports a VDPU383 error bit, the rewrite preserves the readback status
   for userspace but force-stops and resets the coordinator, resets the reporting
-  core, and aborts other active dependent cores to contain the failed chain.
+  core, drains any other table-complete jobs it can claim, and aborts unfinished
+  active dependent cores to contain the failed chain.
 * ``MPP_CMD_POLL_HW_IRQ`` for RK3588 RKVENC2 encoder slice result streaming.
   The rewrite advertises the forward-port ``POLL_BUTT`` command boundary,
   detects slice mode from the submitted RKVENC2 register image
@@ -186,9 +188,10 @@ Implemented
   checks, BSP VDPU383 link IRQ decoding, link-table
   layout/materialization/readback/ownership/relinking, CCU-reference lifetime,
   hard-CCU running-list table-chain relinking/scanning/active matching and
-  active-job out-of-order matching/drain detection, cross-core CCU completion
-  claiming, hard-CCU table-status readback, hard-CCU idle/add-mode descriptor
-  values, hard-CCU all-core work-mask selection, fixed-RCB link-latch
+  active-job out-of-order matching/drain detection, hard-CCU done-table
+  detection, cross-core CCU completion claiming, hard-CCU table-status readback,
+  hard-CCU idle/add-mode descriptor values, hard-CCU all-core work-mask
+  selection, fixed-RCB link-latch
   programming, IOMMU fault target matching, RKVENC2 DCHS tx/rx id remapping
   and release, ``POLL_HW_IRQ`` flexible-buffer sizing, and RKVENC2 slice-mode
   detection.
@@ -202,9 +205,9 @@ Recognized But Unsupported
 Outside This Slice
 ------------------
 
-* Full BSP-equivalent timeout recovery policy beyond immediate reset/abort,
-  including hard-CCU reset/resend of still-running decoder tasks after
-  recoverable faults and MMU-domain refresh.
+* Full BSP-equivalent timeout recovery policy beyond preserving completed
+  hard-CCU tables and immediate reset/abort, including reset/resend of
+  still-running decoder tasks after recoverable faults and MMU-domain refresh.
 * MPP fence export/import semantics.  The observed RK3588 MPP UAPI in
   ``include/uapi/linux/rk-mpp.h`` exposes no fence command or fence flags, and
   the BSP-derived 6.18 driver does not provide a sync-file fence path in the
