@@ -133,9 +133,11 @@ Implemented
   the started job on the coordinator's running list, scan that list on
   completion, and copy BSP table readback partitions back into the normal
   register image with the VDPU383 link-mode status word from the table
-  interrupt-status word.  The scan is currently constrained to the selected
-  active job; if the CCU is already active, the job keeps the direct link-MMIO
-  fallback until add-mode queueing is implemented.
+  interrupt-status word.  Hard-CCU register start/stop writes are serialized
+  on the coordinator, and completion releases stop CCU work only after the
+  coordinator running list drains.  The scan is currently constrained to the
+  selected active job; if the CCU is already active, the job keeps the direct
+  link-MMIO fallback until add-mode queueing is implemented.
 * ``MPP_CMD_POLL_HW_IRQ`` for RK3588 RKVENC2 encoder slice result streaming.
   The rewrite advertises the forward-port ``POLL_BUTT`` command boundary,
   detects slice mode from the submitted RKVENC2 register image
@@ -160,9 +162,9 @@ Implemented
   request conversion, payload-copy classification, register-span overflow
   checks, BSP VDPU383 link IRQ decoding, link-table
   layout/materialization/readback/ownership/relinking, CCU-reference lifetime,
-  hard-CCU running-list scanning/active matching, hard-CCU table-status
-  readback, hard-CCU descriptor values, ``POLL_HW_IRQ`` flexible-buffer sizing,
-  and RKVENC2 slice-mode detection.
+  hard-CCU running-list scanning/active matching and drain detection, hard-CCU
+  table-status readback, hard-CCU descriptor values, ``POLL_HW_IRQ``
+  flexible-buffer sizing, and RKVENC2 slice-mode detection.
 
 Recognized But Unsupported
 --------------------------
