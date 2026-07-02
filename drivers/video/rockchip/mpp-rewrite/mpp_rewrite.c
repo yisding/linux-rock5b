@@ -61,6 +61,10 @@
 #define RK_MPP_RKVENC_MAX_DCHS_CORES	4
 #define RK_MPP_RKVENC_MAX_DCHS_ID	4
 #define RK_MPP_RKVDEC_PERF_SEL_NUM	64
+#define RK_MPP_RKVDEC_LINK_REGION	1
+#define RK_MPP_RKVDEC_LINK_NODE_ALIGN	256
+#define RK_MPP_RKVDEC_LINK_WRITE_PARTS	3
+#define RK_MPP_RKVDEC_LINK_READ_PARTS	2
 #define RK_MPP_WORK_TIMEOUT_MS		500
 #define RK_MPP_CODEC_INFO_MAX		11
 #define RK_MPP_ENC_INFO_BUTT		RK_MPP_CODEC_INFO_MAX
@@ -142,6 +146,43 @@ struct rk_mpp_rkvenc_dchs_entry {
 	u8 rxid_orig;
 };
 
+struct rk_mpp_rkvdec2_link_part {
+	u16 table_word;
+	u16 reg_word;
+	u16 word_count;
+};
+
+struct rk_mpp_rkvdec2_link_info {
+	u16 table_words;
+	u16 next_word;
+	u16 readback_word;
+	s16 debug_word;
+	s16 seg0_word;
+	s16 seg1_word;
+	s16 seg2_word;
+	s16 second_en_word;
+	u16 irq_status_word;
+	u16 cycle_word;
+	u8 write_part_count;
+	u8 read_part_count;
+	struct rk_mpp_rkvdec2_link_part write_parts[RK_MPP_RKVDEC_LINK_WRITE_PARTS];
+	struct rk_mpp_rkvdec2_link_part read_parts[RK_MPP_RKVDEC_LINK_READ_PARTS];
+	u32 next_addr_base;
+	u32 ip_reset_base;
+	u32 ip_reset_en;
+	u32 irq_base;
+	u32 irq_mask;
+	u32 status_base;
+	u32 status_mask;
+	u32 err_mask;
+	u32 ip_reset_mask;
+	u32 ip_time_base;
+	u32 en_base;
+	u32 ip_en_base;
+	u32 ip_en_val;
+	bool sw_iommu_zap;
+};
+
 struct rk_mpp_hw_match {
 	const char *name;
 	const char *alias;
@@ -171,6 +212,11 @@ struct rk_mpp_hw {
 	void *rcb_vaddr;
 	dma_addr_t rcb_iova;
 	size_t rcb_size;
+	void *rkvdec_link_vaddr;
+	dma_addr_t rkvdec_link_iova;
+	size_t rkvdec_link_size;
+	u32 rkvdec_link_node_size;
+	u32 rkvdec_link_capacity;
 	u32 rcb_min_width;
 	refcount_t refs;
 	atomic_t queued_job_count;
@@ -474,6 +520,44 @@ static const struct rk_mpp_trans_table rk_mpp_rkvdec_tables[] = {
 		.regs = rk_mpp_rkvdec_avs2d_regs,
 		.count = ARRAY_SIZE(rk_mpp_rkvdec_avs2d_regs),
 	},
+};
+
+static const struct rk_mpp_rkvdec2_link_info rk_mpp_rkvdec2_vdpu383_link_info = {
+	.table_words = 256,
+	.next_word = 0,
+	.readback_word = 1,
+	.debug_word = 2,
+	.seg0_word = 3,
+	.seg1_word = 4,
+	.seg2_word = 5,
+	.second_en_word = -1,
+	.irq_status_word = 16,
+	.cycle_word = 27,
+	.write_part_count = 3,
+	.read_part_count = 2,
+	.write_parts = {
+		{ .table_word = 80, .reg_word = 8, .word_count = 24 },
+		{ .table_word = 104, .reg_word = 64, .word_count = 44 },
+		{ .table_word = 148, .reg_word = 128, .word_count = 108 },
+	},
+	.read_parts = {
+		{ .table_word = 16, .reg_word = 15, .word_count = 1 },
+		{ .table_word = 20, .reg_word = 320, .word_count = 40 },
+	},
+	.next_addr_base = 0x20,
+	.ip_reset_base = 0x44,
+	.ip_reset_en = BIT(0),
+	.irq_base = 0x48,
+	.irq_mask = 0x30000,
+	.status_base = 0x4c,
+	.status_mask = 0x3ff0000,
+	.err_mask = 0x3fe,
+	.ip_reset_mask = 0x8000000,
+	.ip_time_base = 0x54,
+	.en_base = 0x40,
+	.ip_en_base = 0x58,
+	.ip_en_val = 0x01000000,
+	.sw_iommu_zap = true,
 };
 
 static const u16 rk_mpp_rkvenc_pic_regs[] = {
@@ -1147,6 +1231,13 @@ static u32 rk_mpp_rkvdec2_ccu_timeout_threshold(u32 width, u32 height,
 	return RK_MPP_RKVDEC_CCU_TIMEOUT_100MS;
 }
 
+static size_t
+rk_mpp_rkvdec2_link_node_size(const struct rk_mpp_rkvdec2_link_info *info)
+{
+	return ALIGN(info->table_words * sizeof(u32),
+		     RK_MPP_RKVDEC_LINK_NODE_ALIGN);
+}
+
 static int rk_mpp_poll_irq_check_size(s32 count_max, u32 req_size)
 {
 	size_t slice_bytes;
@@ -1338,6 +1429,42 @@ static void rk_mpp_rkvdec2_ccu_timeout_threshold_kunit(struct kunit *test)
 			(u32)RK_MPP_RKVDEC_CCU_TIMEOUT_20MS);
 }
 
+static void rk_mpp_rkvdec2_link_info_kunit(struct kunit *test)
+{
+	const struct rk_mpp_rkvdec2_link_info *info =
+		&rk_mpp_rkvdec2_vdpu383_link_info;
+
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_link_node_size(info),
+			(size_t)1024);
+	KUNIT_EXPECT_EQ(test, info->table_words, (u16)256);
+	KUNIT_EXPECT_EQ(test, info->next_word, (u16)0);
+	KUNIT_EXPECT_EQ(test, info->readback_word, (u16)1);
+	KUNIT_EXPECT_EQ(test, info->irq_status_word, (u16)16);
+	KUNIT_EXPECT_EQ(test, info->cycle_word, (u16)27);
+	KUNIT_EXPECT_EQ(test, info->write_part_count, (u8)3);
+	KUNIT_EXPECT_EQ(test, info->read_part_count, (u8)2);
+
+	KUNIT_EXPECT_EQ(test, info->write_parts[0].table_word, (u16)80);
+	KUNIT_EXPECT_EQ(test, info->write_parts[0].reg_word, (u16)8);
+	KUNIT_EXPECT_EQ(test, info->write_parts[0].word_count, (u16)24);
+	KUNIT_EXPECT_EQ(test, info->write_parts[2].table_word, (u16)148);
+	KUNIT_EXPECT_EQ(test, info->write_parts[2].reg_word, (u16)128);
+	KUNIT_EXPECT_EQ(test, info->write_parts[2].word_count, (u16)108);
+	KUNIT_EXPECT_EQ(test, info->read_parts[1].table_word, (u16)20);
+	KUNIT_EXPECT_EQ(test, info->read_parts[1].reg_word, (u16)320);
+	KUNIT_EXPECT_EQ(test, info->read_parts[1].word_count, (u16)40);
+
+	KUNIT_EXPECT_EQ(test, info->irq_base, 0x48U);
+	KUNIT_EXPECT_EQ(test, info->irq_mask, 0x30000U);
+	KUNIT_EXPECT_EQ(test, info->status_base, 0x4cU);
+	KUNIT_EXPECT_EQ(test, info->status_mask, 0x3ff0000U);
+	KUNIT_EXPECT_EQ(test, info->ip_time_base, 0x54U);
+	KUNIT_EXPECT_EQ(test, info->en_base, 0x40U);
+	KUNIT_EXPECT_EQ(test, info->ip_en_base, 0x58U);
+	KUNIT_EXPECT_EQ(test, info->ip_en_val, 0x01000000U);
+	KUNIT_EXPECT_TRUE(test, info->sw_iommu_zap);
+}
+
 static void rk_mpp_poll_irq_check_size_kunit(struct kunit *test)
 {
 	u32 base = sizeof(struct rk_mpp_rkvenc_poll_slice_cfg);
@@ -1389,6 +1516,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_request_check_reg_span_kunit),
 	KUNIT_CASE(rk_mpp_request_check_rkvdec_perf_span_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_timeout_threshold_kunit),
+	KUNIT_CASE(rk_mpp_rkvdec2_link_info_kunit),
 	KUNIT_CASE(rk_mpp_poll_irq_check_size_kunit),
 	KUNIT_CASE(rk_mpp_rkvenc_slice_mode_kunit),
 	{}
@@ -2336,6 +2464,22 @@ static bool rk_mpp_hw_reg_range_valid(struct rk_mpp_hw *hw, u32 region,
 		return false;
 
 	return true;
+}
+
+static bool
+rk_mpp_rkvdec2_link_regs_ready(struct rk_mpp_hw *hw,
+			       const struct rk_mpp_rkvdec2_link_info *info)
+{
+	return rk_mpp_hw_reg_range_valid(hw, RK_MPP_RKVDEC_LINK_REGION,
+					 info->en_base, sizeof(u32)) &&
+	       rk_mpp_hw_reg_range_valid(hw, RK_MPP_RKVDEC_LINK_REGION,
+					 info->irq_base, sizeof(u32)) &&
+	       rk_mpp_hw_reg_range_valid(hw, RK_MPP_RKVDEC_LINK_REGION,
+					 info->status_base, sizeof(u32)) &&
+	       rk_mpp_hw_reg_range_valid(hw, RK_MPP_RKVDEC_LINK_REGION,
+					 info->ip_time_base, sizeof(u32)) &&
+	       rk_mpp_hw_reg_range_valid(hw, RK_MPP_RKVDEC_LINK_REGION,
+					 info->ip_en_base, sizeof(u32));
 }
 
 static int rk_mpp_hw_power_on(struct rk_mpp_hw *hw)
@@ -3935,6 +4079,45 @@ static int rk_mpp_hw_alloc_rcb(struct rk_mpp_hw *hw)
 	return 0;
 }
 
+static int rk_mpp_hw_alloc_rkvdec_link(struct rk_mpp_hw *hw)
+{
+	const struct rk_mpp_rkvdec2_link_info *info =
+		&rk_mpp_rkvdec2_vdpu383_link_info;
+	struct device *dev = hw->dev;
+	u32 capacity;
+	size_t node_size;
+	size_t size;
+
+	if (hw->match->type != RK_MPP_DEVICE_RKVDEC || !hw->ccu_node)
+		return 0;
+
+	if (!rk_mpp_rkvdec2_link_regs_ready(hw, info)) {
+		dev_warn(dev, "rkvdec link MMIO unavailable; hard-CCU tables disabled\n");
+		return 0;
+	}
+
+	capacity = hw->task_capacity ?: 1;
+	node_size = rk_mpp_rkvdec2_link_node_size(info);
+	if (check_mul_overflow((size_t)capacity, node_size, &size))
+		return -EOVERFLOW;
+
+	hw->rkvdec_link_vaddr = dmam_alloc_coherent(dev, size,
+						    &hw->rkvdec_link_iova,
+						    GFP_KERNEL);
+	if (!hw->rkvdec_link_vaddr)
+		return -ENOMEM;
+
+	hw->rkvdec_link_size = size;
+	hw->rkvdec_link_node_size = node_size;
+	hw->rkvdec_link_capacity = capacity;
+
+	dev_info(dev, "rkvdec link table dma %pad nodes %u node_size %zu\n",
+		 &hw->rkvdec_link_iova, hw->rkvdec_link_capacity,
+		 node_size);
+
+	return 0;
+}
+
 static int rk_mpp_hw_read_id(struct rk_mpp_hw *hw)
 {
 	int ret;
@@ -3990,6 +4173,13 @@ static int rk_mpp_hw_probe(struct platform_device *pdev)
 			return ret;
 	}
 
+	of_property_read_u32(dev->of_node, "rockchip,taskqueue-node",
+			     &hw->taskqueue_node);
+	of_property_read_u32(dev->of_node, "rockchip,task-capacity",
+			     &hw->task_capacity);
+	of_property_read_u32(dev->of_node, "rockchip,core-mask",
+			     &hw->core_mask);
+
 	for (i = 0; i < RK_MPP_MAX_HW_REGS; i++) {
 		struct resource *res;
 
@@ -4024,6 +4214,10 @@ static int rk_mpp_hw_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	ret = rk_mpp_hw_alloc_rkvdec_link(hw);
+	if (ret)
+		return ret;
+
 	pm_runtime_set_autosuspend_delay(dev, 200);
 	pm_runtime_use_autosuspend(dev);
 	pm_runtime_enable(dev);
@@ -4044,13 +4238,6 @@ static int rk_mpp_hw_probe(struct platform_device *pdev)
 		if (ret)
 			return ret;
 	}
-
-	of_property_read_u32(dev->of_node, "rockchip,taskqueue-node",
-			     &hw->taskqueue_node);
-	of_property_read_u32(dev->of_node, "rockchip,task-capacity",
-			     &hw->task_capacity);
-	of_property_read_u32(dev->of_node, "rockchip,core-mask",
-			     &hw->core_mask);
 
 	mutex_lock(&rk_mpp_srv.hw_lock);
 	if (match->alias) {
