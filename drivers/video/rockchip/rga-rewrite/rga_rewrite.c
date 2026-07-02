@@ -8176,6 +8176,58 @@ static void rk_rga3_dst_offset_emit_kunit(struct kunit *test)
 			-EOPNOTSUPP);
 }
 
+static void rk_rga3_ffmpeg_p210_emit_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
+	enum rk_rga_hw_type type = 0;
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_422_SP_10B,
+					  RK_RGA_FORMAT_YCBCR_422_SP_10B);
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 2,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+	u32 uv_stride_bytes;
+	u32 y_stride_bytes;
+
+	task.src.compact_mode = RK_RGA_10BIT_INCOMPACT;
+	task.src.is_10b_endian = 1;
+	task.dst.act_w = 640;
+	task.dst.act_h = 360;
+	task.dst.x_offset = 32;
+	task.dst.y_offset = 7;
+	task.dst.compact_mode = RK_RGA_10BIT_INCOMPACT;
+	task.dst.is_10b_endian = 1;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_FALSE(test, cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
+			   RK_RGA3_WIN0_YUV10_COMPACT);
+	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
+			  RK_RGA3_WIN0_ENDIAN_MODE);
+	KUNIT_EXPECT_FALSE(test, cmd[RK_RGA3_WR_CTRL_OFFSET / 4] &
+			   RK_RGA3_WR_YUV10_COMPACT);
+	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WR_CTRL_OFFSET / 4] &
+			  RK_RGA3_WR_ENDIAN_MODE);
+
+	y_stride_bytes = (cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4] << 2) * 2;
+	uv_stride_bytes =
+		(cmd[RK_RGA3_WR_PL_VIR_STRIDE_OFFSET / 4] << 2) * 2;
+	KUNIT_EXPECT_EQ(test, y_stride_bytes, 2560U);
+	KUNIT_EXPECT_EQ(test, uv_stride_bytes, 2560U);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_Y_BASE_OFFSET / 4],
+			lower_32_bits(task.dst.yrgb_addr +
+				      7 * y_stride_bytes + 32 * 2));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_U_BASE_OFFSET / 4],
+			lower_32_bits(task.dst.uv_addr +
+				      7 * uv_stride_bytes + 32 * 2));
+}
+
 static void rk_rga3_src_crop_emit_kunit(struct kunit *test)
 {
 	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
@@ -8275,6 +8327,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga3_colorkey_emit_kunit),
 	KUNIT_CASE(rk_rga3_alpha_rotate_emit_kunit),
 	KUNIT_CASE(rk_rga3_dst_offset_emit_kunit),
+	KUNIT_CASE(rk_rga3_ffmpeg_p210_emit_kunit),
 	KUNIT_CASE(rk_rga3_src_crop_emit_kunit),
 	{ }
 };
