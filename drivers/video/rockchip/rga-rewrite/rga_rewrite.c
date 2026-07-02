@@ -859,7 +859,13 @@ struct rga_req {
 #define RGA_BUFFER_POOL_ABI_SIZE		16
 #define RGA_USER_REQUEST_ABI_SIZE		152
 #define RGA_REQ_ABI_SIZE			504
+#define RGA_VERSION_ABI_SIZE			28
+#define RGA_HW_VERSIONS_ABI_SIZE		144
 
+static_assert(sizeof(struct rga_version_t) == RGA_VERSION_ABI_SIZE);
+static_assert(sizeof(struct rga_hw_versions_t) ==
+	      RGA_HW_VERSIONS_ABI_SIZE);
+static_assert(offsetof(struct rga_hw_versions_t, size) == 140);
 static_assert(sizeof(struct rga_img_info_t) == RGA_IMG_INFO_ABI_SIZE);
 static_assert(offsetof(struct rga_img_info_t, compact_mode) == 48);
 static_assert(sizeof(struct rga_external_buffer) ==
@@ -875,18 +881,38 @@ static_assert(offsetof(struct rga_req, mmu_info) == 280);
 static_assert(offsetof(struct rga_req, in_fence_fd) == 348);
 static_assert(offsetof(struct rga_req, out_fence_fd) == 356);
 static_assert(offsetof(struct rga_req, handle_flag) == 360);
+static_assert(_IOC_NR(RGA_IOC_GET_DRVIER_VERSION) == 0x1);
+static_assert(_IOC_SIZE(RGA_IOC_GET_DRVIER_VERSION) ==
+	      sizeof(struct rga_version_t));
+static_assert(_IOC_NR(RGA_IOC_GET_HW_VERSION) == 0x2);
+static_assert(_IOC_SIZE(RGA_IOC_GET_HW_VERSION) ==
+	      sizeof(struct rga_hw_versions_t));
 static_assert(_IOC_NR(RGA_IOC_IMPORT_BUFFER) == 0x3);
 static_assert(_IOC_SIZE(RGA_IOC_IMPORT_BUFFER) ==
 	      sizeof(struct rga_buffer_pool));
 static_assert(_IOC_NR(RGA_IOC_RELEASE_BUFFER) == 0x4);
 static_assert(_IOC_SIZE(RGA_IOC_RELEASE_BUFFER) ==
 	      sizeof(struct rga_buffer_pool));
+static_assert(_IOC_NR(RGA_IOC_REQUEST_CREATE) == 0x5);
+static_assert(_IOC_SIZE(RGA_IOC_REQUEST_CREATE) == sizeof(__u32));
 static_assert(_IOC_NR(RGA_IOC_REQUEST_SUBMIT) == 0x6);
 static_assert(_IOC_SIZE(RGA_IOC_REQUEST_SUBMIT) ==
 	      sizeof(struct rga_user_request));
 static_assert(_IOC_NR(RGA_IOC_REQUEST_CONFIG) == 0x7);
 static_assert(_IOC_SIZE(RGA_IOC_REQUEST_CONFIG) ==
 	      sizeof(struct rga_user_request));
+static_assert(_IOC_NR(RGA_IOC_REQUEST_CANCEL) == 0x8);
+static_assert(_IOC_SIZE(RGA_IOC_REQUEST_CANCEL) == sizeof(__u32));
+static_assert(RGA_BLIT_SYNC == 0x5017);
+static_assert(RGA_BLIT_ASYNC == 0x5018);
+static_assert(RGA_FLUSH == 0x5019);
+static_assert(RGA_GET_RESULT == 0x501a);
+static_assert(RGA_GET_VERSION == 0x501b);
+static_assert(RGA_CACHE_FLUSH == 0x501c);
+static_assert(RGA2_GET_RESULT == 0x601a);
+static_assert(RGA2_GET_VERSION == 0x601b);
+static_assert(RGA_IMPORT_DMA == 0x601d);
+static_assert(RGA_RELEASE_DMA == 0x601e);
 
 struct rk_rga_import {
 	refcount_t refs;
