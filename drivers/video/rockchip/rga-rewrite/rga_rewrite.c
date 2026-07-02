@@ -854,6 +854,40 @@ struct rga_req {
 #define RGA_IOC_REQUEST_CONFIG		RGA_IOWR(0x7, struct rga_user_request)
 #define RGA_IOC_REQUEST_CANCEL		RGA_IOWR(0x8, __u32)
 
+#define RGA_IMG_INFO_ABI_SIZE			56
+#define RGA_EXTERNAL_BUFFER_ABI_SIZE		288
+#define RGA_BUFFER_POOL_ABI_SIZE		16
+#define RGA_USER_REQUEST_ABI_SIZE		152
+#define RGA_REQ_ABI_SIZE			504
+
+static_assert(sizeof(struct rga_img_info_t) == RGA_IMG_INFO_ABI_SIZE);
+static_assert(offsetof(struct rga_img_info_t, compact_mode) == 48);
+static_assert(sizeof(struct rga_external_buffer) ==
+	      RGA_EXTERNAL_BUFFER_ABI_SIZE);
+static_assert(offsetof(struct rga_external_buffer, memory_parm) == 16);
+static_assert(sizeof(struct rga_buffer_pool) == RGA_BUFFER_POOL_ABI_SIZE);
+static_assert(sizeof(struct rga_user_request) == RGA_USER_REQUEST_ABI_SIZE);
+static_assert(offsetof(struct rga_user_request, release_fence_fd) == 20);
+static_assert(offsetof(struct rga_user_request, acquire_fence_fd) == 28);
+static_assert(sizeof(struct rga_req) == RGA_REQ_ABI_SIZE);
+static_assert(offsetof(struct rga_req, src) == 8);
+static_assert(offsetof(struct rga_req, mmu_info) == 280);
+static_assert(offsetof(struct rga_req, in_fence_fd) == 348);
+static_assert(offsetof(struct rga_req, out_fence_fd) == 356);
+static_assert(offsetof(struct rga_req, handle_flag) == 360);
+static_assert(_IOC_NR(RGA_IOC_IMPORT_BUFFER) == 0x3);
+static_assert(_IOC_SIZE(RGA_IOC_IMPORT_BUFFER) ==
+	      sizeof(struct rga_buffer_pool));
+static_assert(_IOC_NR(RGA_IOC_RELEASE_BUFFER) == 0x4);
+static_assert(_IOC_SIZE(RGA_IOC_RELEASE_BUFFER) ==
+	      sizeof(struct rga_buffer_pool));
+static_assert(_IOC_NR(RGA_IOC_REQUEST_SUBMIT) == 0x6);
+static_assert(_IOC_SIZE(RGA_IOC_REQUEST_SUBMIT) ==
+	      sizeof(struct rga_user_request));
+static_assert(_IOC_NR(RGA_IOC_REQUEST_CONFIG) == 0x7);
+static_assert(_IOC_SIZE(RGA_IOC_REQUEST_CONFIG) ==
+	      sizeof(struct rga_user_request));
+
 struct rk_rga_import {
 	refcount_t refs;
 	enum rk_rga_import_type type;

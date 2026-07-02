@@ -32,6 +32,8 @@ Implemented
   copy, and configured requests hold references to their imported dma-bufs.
   After ``rga_request_check()`` accepts a modern request, config/submit
   preparation failures are normalized to the BSP ioctl wrapper's ``-EFAULT``.
+* Build-time assertions for the fixed-width RGA image, import-buffer, buffer
+  pool, user-request, and task ABI layouts plus modern ioctl numbers and sizes.
 * Legacy blit task copy and acquire-fence fd validation.
 * Legacy no-handle blit/fill submissions from ``wrapbuffer_fd()`` and
   ``wrapbuffer_virtualaddr()``.  The rewrite accepts MMU-backed direct fd and
