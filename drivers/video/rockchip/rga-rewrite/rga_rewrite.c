@@ -3805,6 +3805,7 @@ static int rk_rga_job_hw_type(struct rk_rga_job *job,
 			      enum rk_rga_hw_type *type);
 static int rk_rga3_emit_simple_bitblt(struct rk_rga_job *job);
 static int rk_rga_request_check(const struct rga_user_request *user);
+static int rk_rga_request_ioctl_ret(int ret);
 
 static void rk_rga2_transform_expect(struct kunit *test, u8 rotate_mode,
 				     s32 sina, s32 cosa, u8 rot, u8 mir,
@@ -4047,6 +4048,13 @@ static void rk_rga_request_check_kunit(struct kunit *test)
 
 	user.task_num = RGA_TASK_NUM_MAX;
 	KUNIT_EXPECT_EQ(test, rk_rga_request_check(&user), 0);
+}
+
+static void rk_rga_request_ioctl_ret_kunit(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, rk_rga_request_ioctl_ret(0), 0);
+	KUNIT_EXPECT_EQ(test, rk_rga_request_ioctl_ret(-EINVAL), -EFAULT);
+	KUNIT_EXPECT_EQ(test, rk_rga_request_ioctl_ret(-ENOMEM), -EFAULT);
 }
 
 static void rk_rga_job_free_release_fence_kunit(struct kunit *test)
@@ -4292,6 +4300,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga2_dst_corner_kunit),
 	KUNIT_CASE(rk_rga_fill_hw_type_kunit),
 	KUNIT_CASE(rk_rga_request_check_kunit),
+	KUNIT_CASE(rk_rga_request_ioctl_ret_kunit),
 	KUNIT_CASE(rk_rga_job_free_release_fence_kunit),
 	KUNIT_CASE(rk_rga_mixed_task_hw_type_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_rga3_profiles_kunit),
@@ -6786,6 +6795,11 @@ static int rk_rga_request_check(const struct rga_user_request *user)
 	return 0;
 }
 
+static int rk_rga_request_ioctl_ret(int ret)
+{
+	return ret ? -EFAULT : 0;
+}
+
 static long rk_rga_ioctl_request_submit(unsigned long arg,
 					struct rk_rga_session *session,
 					bool run)
@@ -6804,13 +6818,15 @@ static long rk_rga_ioctl_request_submit(unsigned long arg,
 
 	ret = rk_rga_request_config(session, &user, run ? &job : NULL);
 	if (ret)
-		return ret;
+		return rk_rga_request_ioctl_ret(ret);
 
 	if (run) {
 		ret = rk_rga_job_submit(job, &release_fence_fd, NULL);
-		if (!ret && user.sync_mode == RGA_BLIT_ASYNC) {
+		if (ret) {
+			ret = rk_rga_request_ioctl_ret(ret);
+		} else if (user.sync_mode == RGA_BLIT_ASYNC) {
 			if (release_fence_fd < 0) {
-				ret = -EIO;
+				ret = -EFAULT;
 			} else {
 				user.release_fence_fd = release_fence_fd;
 				if (copy_to_user((void __user *)arg, &user,
