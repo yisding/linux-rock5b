@@ -6359,6 +6359,54 @@ static void rk_rga3_librga_rotate_flip_emit_kunit(struct kunit *test)
 			lower_32_bits(task.dst.yrgb_addr));
 }
 
+static void rk_rga3_librga_center_rotate_emit_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
+	enum rk_rga_hw_type type = 0;
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_RGBA_8888);
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 2,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+	u32 stride_bytes;
+	u32 ctrl;
+
+	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
+				    1280, 720);
+	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_RGBA_8888,
+				    1280, 720);
+	task.dst.x_offset = 437;
+	task.dst.y_offset = 0;
+	task.dst.act_w = 720;
+	task.dst.act_h = 406;
+	task.rotate_mode = 1;
+	task.sina = 65536;
+	task.cosa = 0;
+	task.yuv2rgb_mode = 0;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+
+	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
+	stride_bytes = cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4] << 2;
+	KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WIN0_ROT);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_ACT_OFF_OFFSET / 4], 0U);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_ACT_SIZE_OFFSET / 4],
+			1280U | (720U << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
+			406U | (720U << 16));
+	KUNIT_EXPECT_EQ(test, stride_bytes, 1280U * 4U);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_Y_BASE_OFFSET / 4],
+			lower_32_bits(task.dst.yrgb_addr + 437ULL * 4ULL));
+}
+
 static void rk_rga3_librga_flip_emit_kunit(struct kunit *test)
 {
 	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
@@ -7291,6 +7339,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga3_librga_translate_emit_kunit),
 	KUNIT_CASE(rk_rga3_librga_rotate_emit_kunit),
 	KUNIT_CASE(rk_rga3_librga_rotate_flip_emit_kunit),
+	KUNIT_CASE(rk_rga3_librga_center_rotate_emit_kunit),
 	KUNIT_CASE(rk_rga3_librga_flip_emit_kunit),
 	KUNIT_CASE(rk_rga3_yuv422_rotate_policy_kunit),
 	KUNIT_CASE(rk_rga_in_place_border_bitblt_kunit),
