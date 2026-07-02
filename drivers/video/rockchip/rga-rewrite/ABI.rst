@@ -184,8 +184,10 @@ Implemented
   YUV444 semiplanar, compact 10-bit semiplanar source, RGB555-family, and
   ARGB/ABGR output.  This path supports imported dma-buf backed
   source/destination images, single-handle and per-plane-handle images, linear
-  raster scaling/conversion, BSP-compatible ``rga_req.rotate_mode`` plus
-  ``sina``/``cosa`` rotation and mirror encoding, including the active-rectangle
+  raster scaling/conversion, BSP-compatible interpolation selector and downscale
+  factor emission for current ``librga`` ``imresize()`` default/bicubic/linear
+  requests, BSP-compatible ``rga_req.rotate_mode`` plus ``sina``/``cosa``
+  rotation and mirror encoding, including the active-rectangle
   swap used by ``librga`` for 90/270-degree rotation, the BSP force-tile scale
   mode used by no-scale compact 10-bit and YUV444 semiplanar blits, and
   job-owned dma-buf mappings for the selected RGA2 core.  RGA2 destination
