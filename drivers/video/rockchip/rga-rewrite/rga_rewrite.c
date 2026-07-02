@@ -4688,6 +4688,10 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 				   struct rk_rga3_bitblt_profile *profile);
 static int rk_rga_request_check(const struct rga_user_request *user);
 static int rk_rga_request_ioctl_ret(int ret);
+static int rk_rga_import_buffer_size(const struct rga_external_buffer *buffer,
+				     size_t *size);
+static int rk_rga_import_one(struct rk_rga_session *session,
+			     struct rga_external_buffer *buffer);
 static struct rk_rga_hw *
 rk_rga_find_best_hw_for_job(struct list_head *hw_list, struct rk_rga_job *job,
 			    enum rk_rga_hw_type type);
@@ -5893,6 +5897,39 @@ static void rk_rga_request_remove_free_kunit(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, rk_rga_request_remove_free(&session, 7));
 
 	idr_destroy(&session.requests);
+}
+
+static void rk_rga_import_buffer_size_kunit(struct kunit *test)
+{
+	struct rga_external_buffer buffer = {
+		.type = RGA_VIRTUAL_ADDRESS,
+		.memory = 0x100000,
+		.memory_parm = {
+			.size = 4096,
+		},
+	};
+	size_t size = 0;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_import_buffer_size(&buffer, &size), 0);
+	KUNIT_EXPECT_EQ(test, size, (size_t)4096);
+
+	buffer.memory_parm = (struct rga_memory_parm) {
+		.width = 64,
+		.height = 32,
+		.format = RK_RGA_FORMAT_RGBA_8888,
+	};
+	size = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_import_buffer_size(&buffer, &size), 0);
+	KUNIT_EXPECT_EQ(test, size, (size_t)(64 * 32 * 4));
+
+	buffer.memory_parm.format = RK_RGA_FORMAT_YCBCR_420_SP;
+	size = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_import_buffer_size(&buffer, &size), 0);
+	KUNIT_EXPECT_EQ(test, size, (size_t)(64 * 32 * 3 / 2));
+
+	buffer.type = RGA_PHYSICAL_ADDRESS;
+	buffer.memory_parm.size = 4096;
+	KUNIT_EXPECT_EQ(test, rk_rga_import_one(NULL, &buffer), -EOPNOTSUPP);
 }
 
 static void rk_rga_acquire_fd_ownership_kunit(struct kunit *test)
@@ -8137,6 +8174,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_request_check_kunit),
 	KUNIT_CASE(rk_rga_request_ioctl_ret_kunit),
 	KUNIT_CASE(rk_rga_request_remove_free_kunit),
+	KUNIT_CASE(rk_rga_import_buffer_size_kunit),
 	KUNIT_CASE(rk_rga_acquire_fd_ownership_kunit),
 	KUNIT_CASE(rk_rga_acquire_fence_status_kunit),
 	KUNIT_CASE(rk_rga_acquire_callbacks_result_kunit),
