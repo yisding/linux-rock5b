@@ -99,6 +99,11 @@ Implemented
   RGA2/RGA3 status registers, reset the selected core with the BSP-style
   soft-reset helper plus reset-controller fallback when present, complete with
   ``-EBUSY``, release runtime PM/clocks, and dispatch the next queued job.
+* Public IOMMU fault callback registration for bound RGA cores.  A fault
+  records ``iommu_fault_count`` in debugfs, logs the IOVA/status, marks the
+  active job for immediate recovery through the same serialized reset path,
+  completes the job with ``-EIO``, and signals any exported async release
+  fence with that result.
 * Per-job DMA-coherent command-buffer allocation and lifetime, sized for the
   selected RGA2/RGA3 core and released through normal job teardown.
 * RGA3 command-buffer generation path for validated raster and AFBC16x16
@@ -186,4 +191,5 @@ Outside This Slice
 
 * Physical address imports.
 * Full RGA2/RGA3 command-register generation and policy selection.
-* Full BSP timeout diagnostics and private-IOMMU recovery after faults.
+* Full BSP timeout diagnostics and private-IOMMU recovery after faults beyond
+  immediate reset/abort.
