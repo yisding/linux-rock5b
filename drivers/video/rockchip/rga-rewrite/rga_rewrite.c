@@ -4113,8 +4113,62 @@ static void rk_rga_ffmpeg_alpha_overlay_kunit(struct kunit *test)
 	task.rotate_mode = 1;
 	task.sina = 65536;
 	type = 0;
-	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
-			-EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+}
+
+static void rk_rga3_alpha_rotate_emit_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_BGRA_8888);
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 3,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+
+	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
+				    720, 1280);
+	task.pat = rk_rga_kunit_img(0x30000000, RK_RGA_FORMAT_BGRA_8888,
+				    1280, 720);
+	task.bsfilter_flag = 1;
+	task.alpha_rop_flag = BIT(0) | BIT(3) | BIT(4) | BIT(9);
+	task.PD_mode = RK_RGA_ALPHA_BLEND_SRC_OVER;
+	task.feature.global_alpha_en = true;
+	task.fg_global_alpha = 0xff;
+	task.bg_global_alpha = 0xff;
+	task.rotate_mode = 1;
+	task.sina = 65536;
+
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_FALSE(test, cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
+			   RK_RGA3_WIN0_ROT);
+	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4] &
+			  RK_RGA3_WIN0_ROT);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
+			1280 | (720 << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN1_DST_SIZE_OFFSET / 4],
+			1280 | (720 << 16));
+
+	memset(cmd, 0, sizeof(cmd));
+	memset(&task.pat, 0, sizeof(task.pat));
+	task.bsfilter_flag = 0;
+	job.import_count = 2;
+	job.cmd_ready = false;
+
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_ACT_SIZE_OFFSET / 4],
+			720 | (1280 << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
+			720 | (1280 << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN1_DST_SIZE_OFFSET / 4],
+			720 | (1280 << 16));
 }
 
 static struct kunit_case rk_rga_rewrite_test_cases[] = {
@@ -4124,6 +4178,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_ffmpeg_rga3_profiles_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_fbc_profiles_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_alpha_overlay_kunit),
+	KUNIT_CASE(rk_rga3_alpha_rotate_emit_kunit),
 	{ }
 };
 
@@ -4288,8 +4343,6 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 	ret = rk_rga3_rotate_flags(task, &profile->rotate_flags);
 	if (ret)
 		return ret;
-	if (profile->alpha_blend && profile->rotate_flags)
-		return -EOPNOTSUPP;
 
 	ret = rk_rga3_hw_rd_mode(task->src.rd_mode, &profile->src_mode);
 	if (ret)
@@ -4380,7 +4433,8 @@ static int rk_rga3_emit_read_window(struct rk_rga_job *job,
 				    const struct rk_rga3_format_info *dst_fmt,
 				    u32 rd_mode, u32 rotate_flags,
 				    u32 dst_w, u32 dst_h, u32 base,
-				    bool align_src_size, u8 yuv2rgb_mode)
+				    bool align_src_size, u8 yuv2rgb_mode,
+				    bool rotate_dst_size)
 {
 	u32 hw_src_w = img->act_w;
 	u32 hw_src_h = img->act_h;
@@ -4406,8 +4460,10 @@ static int rk_rga3_emit_read_window(struct rk_rga_job *job,
 	if (rotate_flags & RK_RGA3_ROT_BIT_ROT_90) {
 		hw_src_w = img->act_h;
 		hw_src_h = img->act_w;
-		hw_dst_w = dst_h;
-		hw_dst_h = dst_w;
+		if (rotate_dst_size) {
+			hw_dst_w = dst_h;
+			hw_dst_h = dst_w;
+		}
 	}
 
 	ret = rk_rga3_scale_axis(hw_src_w, hw_dst_w, &x_factor,
@@ -4514,7 +4570,7 @@ static int rk_rga3_emit_win0(struct rk_rga_job *job,
 					rd_mode, rotate_flags,
 					task->dst.act_w, task->dst.act_h,
 					RK_RGA3_WIN0_RD_CTRL_OFFSET, true,
-					task->yuv2rgb_mode);
+					task->yuv2rgb_mode, true);
 }
 
 static int rk_rga3_emit_wr(struct rk_rga_job *job,
@@ -5450,22 +5506,36 @@ static int rk_rga3_emit_alpha_bitblt(struct rk_rga_job *job,
 				     const struct rk_rga3_bitblt_profile *profile)
 {
 	const struct rga_img_info_t *bg;
+	struct rga_img_info_t rotated_bg;
+	u32 bg_dst_w = task->dst.act_w;
+	u32 bg_dst_h = task->dst.act_h;
 	int ret;
 
 	bg = profile->pattern_blend ? &task->pat : &task->dst;
+	if (!profile->pattern_blend &&
+	    (profile->rotate_flags & RK_RGA3_ROT_BIT_ROT_90)) {
+		rotated_bg = *bg;
+		rotated_bg.act_w = task->dst.act_h;
+		rotated_bg.act_h = task->dst.act_w;
+		bg = &rotated_bg;
+		bg_dst_w = task->dst.act_h;
+		bg_dst_h = task->dst.act_w;
+	}
 
 	ret = rk_rga3_emit_read_window(job, bg, &profile->bg_fmt,
-					&profile->dst_fmt, profile->bg_mode,
-					0, task->dst.act_w, task->dst.act_h,
-					RK_RGA3_WIN0_RD_CTRL_OFFSET, true,
-					task->yuv2rgb_mode);
+				       &profile->dst_fmt, profile->bg_mode, 0,
+				       bg_dst_w, bg_dst_h,
+				       RK_RGA3_WIN0_RD_CTRL_OFFSET, true,
+				       task->yuv2rgb_mode, true);
 	if (ret)
 		return ret;
 	ret = rk_rga3_emit_read_window(job, &task->src, &profile->src_fmt,
-					&profile->dst_fmt, profile->src_mode,
-					0, task->dst.act_w, task->dst.act_h,
-					RK_RGA3_WIN1_RD_CTRL_OFFSET, false,
-					task->yuv2rgb_mode);
+				       &profile->dst_fmt, profile->src_mode,
+				       profile->rotate_flags, task->dst.act_w,
+				       task->dst.act_h,
+				       RK_RGA3_WIN1_RD_CTRL_OFFSET, false,
+				       task->yuv2rgb_mode,
+				       !profile->pattern_blend);
 	if (ret)
 		return ret;
 	ret = rk_rga3_emit_alpha_overlap(job, task, profile);
