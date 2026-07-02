@@ -1432,6 +1432,31 @@ rk_mpp_rkvdec2_read_link_table(struct rk_mpp_reg_image *image,
 	return 0;
 }
 
+static u32
+rk_mpp_rkvdec2_link_table_irq_status(const struct rk_mpp_rkvdec2_link_info *info,
+				     const u32 *table, u32 fallback)
+{
+	if (!table || info->irq_status_word >= info->table_words)
+		return fallback;
+
+	return table[info->irq_status_word] ?: fallback;
+}
+
+static int rk_mpp_rkvdec2_read_ccu_link_table(struct rk_mpp_job *job,
+					      const struct rk_mpp_rkvdec2_link_info *info,
+					      u32 fallback_irq_status)
+{
+	const u32 *table = job->rkvdec_link_vaddr;
+	u32 irq_status;
+
+	irq_status =
+		rk_mpp_rkvdec2_link_table_irq_status(info, table,
+						     fallback_irq_status);
+
+	return rk_mpp_rkvdec2_read_link_table(&job->reg_image, info, table,
+					      irq_status);
+}
+
 static bool rk_mpp_rkvdec2_ccu_regs_ready(struct rk_mpp_hw *ccu);
 static u32 rk_mpp_rkvdec2_ccu_core_mask(struct rk_mpp_service *srv,
 					struct rk_mpp_hw *ccu);
@@ -1975,6 +2000,7 @@ static void rk_mpp_rkvdec2_fill_link_table_kunit(struct kunit *test)
 	struct rk_mpp_reg_image image = {
 		.reg_words = 360,
 	};
+	struct rk_mpp_job *job;
 	dma_addr_t iova = 0x12345000;
 	dma_addr_t next = 0x12345400;
 	u32 i;
@@ -1984,7 +2010,11 @@ static void rk_mpp_rkvdec2_fill_link_table_kunit(struct kunit *test)
 	table = kunit_kcalloc(test, info->table_words, sizeof(*table),
 			      GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, table);
+	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
 	image.regs = regs;
+	job->reg_image = image;
+	job->rkvdec_link_vaddr = table;
 
 	for (i = 0; i < image.reg_words; i++)
 		regs[i] = 0xa5000000 | i;
@@ -2028,6 +2058,14 @@ static void rk_mpp_rkvdec2_fill_link_table_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, regs[RK_MPP_RKVDEC_LINK_STATUS_WORD], 0x1234U);
 	KUNIT_EXPECT_EQ(test, regs[320], 0xbb000000U);
 	KUNIT_EXPECT_EQ(test, regs[359], 0xbb000027U);
+
+	regs[RK_MPP_RKVDEC_LINK_STATUS_WORD] = 0;
+	table[info->irq_status_word] = 0x2222;
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_read_ccu_link_table(job, info,
+								 0x1234),
+			0);
+	KUNIT_EXPECT_EQ(test, regs[RK_MPP_RKVDEC_LINK_STATUS_WORD],
+			0x2222U);
 
 	image.reg_words = 320;
 	KUNIT_EXPECT_EQ(test,
@@ -4314,10 +4352,8 @@ static irqreturn_t rk_mpp_rkvdec2_thread(struct rk_mpp_hw *hw)
 	cancel_delayed_work(&hw->timeout_work);
 
 	if (job->rkvdec_ccu_started) {
-		ret = rk_mpp_rkvdec2_read_link_table(&job->reg_image,
-						     link_info,
-						     job->rkvdec_link_vaddr,
-						     irq_status);
+		ret = rk_mpp_rkvdec2_read_ccu_link_table(job, link_info,
+							 irq_status);
 	} else {
 		ret = rk_mpp_job_read_regs(job);
 		if (!ret)
