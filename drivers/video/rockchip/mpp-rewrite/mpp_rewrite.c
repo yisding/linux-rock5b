@@ -1546,6 +1546,21 @@ static void rk_mpp_rkvdec2_ccu_relink_tables_locked(struct rk_mpp_hw *ccu)
 	}
 }
 
+static bool rk_mpp_rkvdec2_ccu_has_jobs(struct rk_mpp_hw *ccu)
+{
+	unsigned long flags;
+	bool has_jobs;
+
+	if (!ccu)
+		return false;
+
+	spin_lock_irqsave(&ccu->lock, flags);
+	has_jobs = !list_empty(&ccu->rkvdec_ccu_jobs);
+	spin_unlock_irqrestore(&ccu->lock, flags);
+
+	return has_jobs;
+}
+
 static void rk_mpp_rkvdec2_ccu_job_add(struct rk_mpp_job *job)
 {
 	struct rk_mpp_hw *ccu = job->rkvdec_ccu;
@@ -1623,6 +1638,16 @@ rk_mpp_rkvdec2_ccu_done_active_job(struct rk_mpp_job *active)
 	}
 
 	return done;
+}
+
+static u32 rk_mpp_rkvdec2_ccu_link_mode(struct rk_mpp_job *job, bool add_mode)
+{
+	u32 link_mode = job->rkvdec_ccu_link_mode;
+
+	if (add_mode)
+		link_mode |= RK_MPP_RKVDEC_CCU_ADD_MODE;
+
+	return link_mode;
 }
 
 static void rk_mpp_rkvdec2_release_link_table(struct rk_mpp_job *job)
@@ -2353,6 +2378,11 @@ static void rk_mpp_rkvdec2_ccu_descriptor_kunit(struct kunit *test)
 			(u32)RK_MPP_RKVDEC_CCU_CFG_DONE);
 	KUNIT_EXPECT_EQ(test, job->rkvdec_link_irq_mode,
 			(u32)RK_MPP_RKVDEC_LINK_CCU_WORK_MODE);
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_ccu_link_mode(job, false),
+			(u32)RK_MPP_RKVDEC_LINK_ADD_CFG_NUM);
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_ccu_link_mode(job, true),
+			(u32)(RK_MPP_RKVDEC_CCU_ADD_MODE |
+			      RK_MPP_RKVDEC_LINK_ADD_CFG_NUM));
 
 	job->rkvdec_ccu_desc_valid = false;
 	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_fill_ccu_descriptor(job, 0),
@@ -3581,6 +3611,7 @@ static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
 	void __iomem *ccu_regs;
 	u32 irq_val;
 	u32 ccu_en;
+	bool add_mode;
 	int ret;
 
 	if (!job->rkvdec_ccu_desc_valid || !job->rkvdec_link_active)
@@ -3605,27 +3636,30 @@ static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
 	link = hw->regs[RK_MPP_RKVDEC_LINK_REGION];
 	ccu_regs = ccu->regs[0];
 	mutex_lock(&ccu->run_lock);
-	ccu_en = readl_relaxed(ccu_regs + RK_MPP_RKVDEC_CCU_WORK_BASE);
-	if (ccu_en) {
-		ret = -EBUSY;
-		goto err_unlock_ccu;
-	}
-
 	writel_relaxed(link_info->irq_mask, link + link_info->irq_base);
 	writel_relaxed(link_info->status_mask, link + link_info->status_base);
 	irq_val = readl_relaxed(link + link_info->irq_base);
 	irq_val |= job->rkvdec_link_irq_mode;
 	writel_relaxed(irq_val, link + link_info->irq_base);
 
-	writel_relaxed(job->rkvdec_ccu_core_work,
-		       ccu_regs + RK_MPP_RKVDEC_CCU_CORE_WORK_BASE);
-	writel_relaxed(job->rkvdec_ccu_ctrl,
-		       ccu_regs + RK_MPP_RKVDEC_CCU_CTRL_BASE);
-	writel_relaxed(job->rkvdec_ccu_cfg_addr,
-		       ccu_regs + RK_MPP_RKVDEC_CCU_CFG_ADDR_BASE);
-	writel_relaxed(job->rkvdec_ccu_work,
-		       ccu_regs + RK_MPP_RKVDEC_CCU_WORK_BASE);
-	writel_relaxed(job->rkvdec_ccu_link_mode,
+	ccu_en = readl_relaxed(ccu_regs + RK_MPP_RKVDEC_CCU_WORK_BASE);
+	add_mode = ccu_en && rk_mpp_rkvdec2_ccu_has_jobs(ccu);
+	if (ccu_en && !add_mode) {
+		ret = -EBUSY;
+		goto err_unlock_ccu;
+	}
+
+	if (!add_mode) {
+		writel_relaxed(job->rkvdec_ccu_core_work,
+			       ccu_regs + RK_MPP_RKVDEC_CCU_CORE_WORK_BASE);
+		writel_relaxed(job->rkvdec_ccu_ctrl,
+			       ccu_regs + RK_MPP_RKVDEC_CCU_CTRL_BASE);
+		writel_relaxed(job->rkvdec_ccu_cfg_addr,
+			       ccu_regs + RK_MPP_RKVDEC_CCU_CFG_ADDR_BASE);
+		writel_relaxed(job->rkvdec_ccu_work,
+			       ccu_regs + RK_MPP_RKVDEC_CCU_WORK_BASE);
+	}
+	writel_relaxed(rk_mpp_rkvdec2_ccu_link_mode(job, add_mode),
 		       ccu_regs + RK_MPP_RKVDEC_CCU_LINK_MODE_BASE);
 
 	rk_mpp_rkvdec2_ccu_job_add(job);
