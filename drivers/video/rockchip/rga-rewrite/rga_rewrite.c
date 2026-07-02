@@ -6561,6 +6561,7 @@ static void rk_rga3_alpha_rotate_emit_kunit(struct kunit *test)
 static void rk_rga3_dst_offset_emit_kunit(struct kunit *test)
 {
 	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
+	enum rk_rga_hw_type type = 0;
 	struct rga_req task =
 		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_420_SP,
 					  RK_RGA_FORMAT_YCBCR_420_SP);
@@ -6604,6 +6605,45 @@ static void rk_rga3_dst_offset_emit_kunit(struct kunit *test)
 	task.dst.y_offset = 3;
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), -EINVAL);
 	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+
+	memset(cmd, 0, sizeof(cmd));
+	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					 RK_RGA_FORMAT_YCBCR_420_SP_10B);
+	task.dst.act_w = 640;
+	task.dst.act_h = 360;
+	task.dst.x_offset = 64;
+	task.dst.y_offset = 8;
+	task.dst.compact_mode = RK_RGA_10BIT_INCOMPACT;
+	task.dst.is_10b_endian = 1;
+	job.cmd_ready = false;
+	type = 0;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_FALSE(test, cmd[RK_RGA3_WR_CTRL_OFFSET / 4] &
+			   RK_RGA3_WR_YUV10_COMPACT);
+	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WR_CTRL_OFFSET / 4] &
+			  RK_RGA3_WR_ENDIAN_MODE);
+
+	y_stride_bytes = (cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4] << 2) * 2;
+	uv_stride_bytes =
+		(cmd[RK_RGA3_WR_PL_VIR_STRIDE_OFFSET / 4] << 2) * 2;
+	KUNIT_EXPECT_EQ(test, y_stride_bytes, 2560);
+	KUNIT_EXPECT_EQ(test, uv_stride_bytes, 2560);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_Y_BASE_OFFSET / 4],
+			lower_32_bits(task.dst.yrgb_addr +
+				      8 * y_stride_bytes + 64 * 2));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_U_BASE_OFFSET / 4],
+			lower_32_bits(task.dst.uv_addr +
+				      4 * uv_stride_bytes + 64 * 2));
+
+	task.dst.compact_mode = 0;
+	job.cmd_ready = false;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
 }
 
 static void rk_rga3_src_crop_emit_kunit(struct kunit *test)
@@ -7180,7 +7220,8 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 	    !rk_rga3_tile_format_supported(task->dst.format))
 		return -EOPNOTSUPP;
 	if (profile->dst_fmt.yuv10 &&
-	    (task->dst.x_offset || task->dst.y_offset))
+	    (task->dst.x_offset || task->dst.y_offset) &&
+	    rk_rga_img_yuv10_compact(&task->dst))
 		return -EOPNOTSUPP;
 	if (profile->color_key &&
 	    (profile->src_mode || profile->dst_mode ||
@@ -7443,6 +7484,7 @@ static int rk_rga3_emit_wr(struct rk_rga_job *job,
 		if (apply_dst_offset &&
 		    (task->dst.x_offset || task->dst.y_offset)) {
 			u32 x_offset = task->dst.x_offset;
+			u32 x_offset_bytes;
 			u32 y_plane_offset;
 
 			if (dst_fmt->yuv_sp && (x_offset & 1))
@@ -7450,24 +7492,34 @@ static int rk_rga3_emit_wr(struct rk_rga_job *job,
 			if (dst_fmt->yuv420_sp && (task->dst.y_offset & 1))
 				return -EINVAL;
 
-			if (check_mul_overflow((u32)task->dst.y_offset,
-					       y_stride_bytes, &y_offset))
-				return -EOVERFLOW;
 			if (dst_fmt->yuv_sp) {
-				if (check_add_overflow(y_offset, x_offset,
-						       &y_offset))
-					return -EOVERFLOW;
+				if (dst_fmt->yuv10 &&
+				    !rk_rga_img_yuv10_compact(&task->dst)) {
+					if (check_mul_overflow(x_offset, 2U,
+							       &x_offset_bytes))
+						return -EOVERFLOW;
+					if (check_mul_overflow(y_stride_bytes, 2U,
+							       &y_stride_bytes))
+						return -EOVERFLOW;
+					if (check_mul_overflow(uv_stride_bytes, 2U,
+							       &uv_stride_bytes))
+						return -EOVERFLOW;
+				} else {
+					x_offset_bytes = x_offset;
+				}
 			} else {
-				u32 x_offset_bytes;
-
 				if (check_mul_overflow(x_offset,
 						       (u32)dst_fmt->pixel_width,
 						       &x_offset_bytes))
 					return -EOVERFLOW;
-				if (check_add_overflow(y_offset, x_offset_bytes,
-						       &y_offset))
-					return -EOVERFLOW;
 			}
+
+			if (check_mul_overflow((u32)task->dst.y_offset,
+					       y_stride_bytes, &y_offset))
+				return -EOVERFLOW;
+			if (check_add_overflow(y_offset, x_offset_bytes,
+					       &y_offset))
+				return -EOVERFLOW;
 
 			if (check_add_overflow(y_addr, (__u64)y_offset,
 					       &y_addr))
@@ -7482,7 +7534,8 @@ static int rk_rga3_emit_wr(struct rk_rga_job *job,
 						       uv_stride_bytes,
 						       &y_plane_offset))
 					return -EOVERFLOW;
-				if (check_add_overflow(y_plane_offset, x_offset,
+				if (check_add_overflow(y_plane_offset,
+						       x_offset_bytes,
 						       &y_plane_offset))
 					return -EOVERFLOW;
 				if (check_add_overflow(u_addr,
