@@ -189,7 +189,8 @@ Implemented
   layout/materialization/readback/ownership/relinking, CCU-reference lifetime,
   hard-CCU running-list table-chain relinking/scanning/active matching and
   active-job out-of-order matching/drain detection, hard-CCU done-table
-  detection, cross-core CCU completion claiming, hard-CCU table-status readback,
+  detection, unfinished-chain relinking for hard-CCU resend preparation,
+  cross-core CCU completion claiming, hard-CCU table-status readback,
   hard-CCU idle/add-mode descriptor values, hard-CCU all-core work-mask
   selection, fixed-RCB link-latch
   programming, IOMMU fault target matching, RKVENC2 DCHS tx/rx id remapping
@@ -206,8 +207,9 @@ Outside This Slice
 ------------------
 
 * Full BSP-equivalent timeout recovery policy beyond preserving completed
-  hard-CCU tables and immediate reset/abort, including reset/resend of
-  still-running decoder tasks after recoverable faults and MMU-domain refresh.
+  hard-CCU tables and preparing an unfinished resend chain before immediate
+  reset/abort, including runtime reset/resend of still-running decoder tasks
+  after recoverable faults and MMU-domain refresh.
 * MPP fence export/import semantics.  The observed RK3588 MPP UAPI in
   ``include/uapi/linux/rk-mpp.h`` exposes no fence command or fence flags, and
   the BSP-derived 6.18 driver does not provide a sync-file fence path in the
