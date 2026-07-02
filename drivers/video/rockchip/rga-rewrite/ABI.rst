@@ -54,7 +54,9 @@ Implemented
   scheduler/backend boundary.
 * Rewrite-local ``dma_fence`` context and prepared-job completion path.  Async
   jobs own a release fence internally and signal it with the same completion
-  status that the submit path returns.
+  status that the submit path returns.  If userspace drops a pending async job
+  before completion, cleanup signals the release fence with ``-EFAULT`` like
+  the BSP request teardown path.
 * Async pending-acquire handling for modern submit and legacy blit paths.  If
   an async job is blocked by an unsignaled acquire fence, the ioctl exports the
   release-fence fd, arms ``dma_fence`` callbacks, queues dispatch work when the
