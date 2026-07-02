@@ -2399,6 +2399,7 @@ static int rk_rga_prepare_tasks_locked(struct rk_rga_session *session,
 err_put_resources:
 	rk_rga_put_import_array(imports, import_count);
 	rk_rga_put_fence_array(fences, fence_count);
+	rk_rga_close_kernel_acquire_fds(acquire_fds, *acquire_fd_count);
 
 	return ret;
 }
@@ -5547,6 +5548,35 @@ static void rk_rga_request_ioctl_ret_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_request_ioctl_ret(-ENOMEM), -EFAULT);
 }
 
+static void rk_rga_acquire_fd_ownership_kunit(struct kunit *test)
+{
+	struct rk_rga_acquire_fd fds[2] = {};
+	u32 count = 0;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_record_acquire_fd(fds, &count, 5, true),
+			0);
+	KUNIT_EXPECT_EQ(test, count, 1U);
+	KUNIT_EXPECT_EQ(test, fds[0].fd, 5);
+	KUNIT_EXPECT_TRUE(test, fds[0].kernel_close);
+
+	KUNIT_EXPECT_TRUE(test, rk_rga_update_acquire_fd(fds, count, 5,
+							 false));
+	KUNIT_EXPECT_FALSE(test, fds[0].kernel_close);
+
+	KUNIT_EXPECT_TRUE(test, rk_rga_update_acquire_fd(fds, count, 5,
+							 true));
+	KUNIT_EXPECT_FALSE(test, fds[0].kernel_close);
+	KUNIT_EXPECT_FALSE(test, rk_rga_update_acquire_fd(fds, count, 7,
+							  true));
+
+	KUNIT_EXPECT_EQ(test, rk_rga_record_acquire_fd(fds, &count, 6, true),
+			0);
+	KUNIT_EXPECT_EQ(test, count, 2U);
+	KUNIT_EXPECT_EQ(test, rk_rga_record_acquire_fd(fds, &count, 7, true),
+			-EOVERFLOW);
+	KUNIT_EXPECT_EQ(test, count, 2U);
+}
+
 static void rk_rga_job_free_release_fence_kunit(struct kunit *test)
 {
 	struct rk_rga_job *job;
@@ -6414,6 +6444,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga2_update_palette_emit_kunit),
 	KUNIT_CASE(rk_rga_request_check_kunit),
 	KUNIT_CASE(rk_rga_request_ioctl_ret_kunit),
+	KUNIT_CASE(rk_rga_acquire_fd_ownership_kunit),
 	KUNIT_CASE(rk_rga_job_free_release_fence_kunit),
 	KUNIT_CASE(rk_rga_mixed_task_hw_type_kunit),
 	KUNIT_CASE(rk_rga_find_best_hw_for_job_kunit),
@@ -10108,12 +10139,12 @@ static long rk_rga_ioctl_blit(unsigned long arg, struct rk_rga_session *session,
 					  &fences, &fence_count,
 					  acquire_fds, &acquire_fd_count);
 	if (!ret) {
+		close_acquire_fds = true;
 		ret = rk_rga_job_take_prepared(task, 1, sync_mode, imports,
 					       import_count, fences, fence_count,
 					       gauss_coeffs,
 					       &job);
 		if (!ret) {
-			close_acquire_fds = true;
 			task = NULL;
 			imports = NULL;
 			fences = NULL;
