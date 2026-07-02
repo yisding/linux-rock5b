@@ -16,7 +16,10 @@ Implemented
   64-bit userspace data pointer; the driver converts it to a native internal
   ``struct mpp_request`` only after copying the V1 record from userspace.
 * ``MPP_CMD_SET_SESSION_FD`` session switching, restricted to other
-  ``/dev/mpp_service`` file descriptors.
+  ``/dev/mpp_service`` file descriptors.  Switching sessions closes the
+  current staged job and starts a distinct job for subsequent register/poll
+  messages, including when a later batch entry switches back to an earlier
+  session.
 * RK3588 BSP-style RKVENC2/RKVDEC2 platform-device binding with devm-managed
   MMIO, IRQ, clock, and reset discovery.
 * ``MPP_CMD_QUERY_HW_SUPPORT`` from bound RK3588 MPP hardware cores.
@@ -208,8 +211,8 @@ Implemented
   hard-CCU idle/add-mode descriptor values, hard-CCU all-core work-mask
   selection, fixed-RCB link-latch
   programming, IOMMU fault target matching, RKVENC2 DCHS tx/rx id remapping
-  and release, ``POLL_HW_IRQ`` flexible-buffer sizing, and RKVENC2 slice-mode
-  detection.
+  and release, ``POLL_HW_IRQ`` flexible-buffer sizing, RKVENC2 slice-mode
+  detection, and ``SET_SESSION_FD`` batch job splitting.
 
 Recognized But Unsupported
 --------------------------
