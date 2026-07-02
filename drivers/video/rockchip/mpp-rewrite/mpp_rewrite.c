@@ -1759,6 +1759,42 @@ rk_mpp_rkvdec2_ccu_job_done(const struct rk_mpp_job *job,
 	return table[info->irq_status_word];
 }
 
+static u32 __maybe_unused
+rk_mpp_rkvdec2_ccu_relink_unfinished_locked(struct rk_mpp_hw *ccu)
+{
+	const struct rk_mpp_rkvdec2_link_info *info =
+		&rk_mpp_rkvdec2_vdpu383_link_info;
+	struct rk_mpp_job *job;
+	struct rk_mpp_job *prev = NULL;
+	u32 count = 0;
+
+	list_for_each_entry(job, &ccu->rkvdec_ccu_jobs, rkvdec_ccu_node) {
+		u32 *table = job->rkvdec_link_vaddr;
+
+		if (!table || rk_mpp_rkvdec2_ccu_job_done(job, info))
+			continue;
+
+		if (prev) {
+			u32 *prev_table = prev->rkvdec_link_vaddr;
+
+			prev_table[info->next_word] =
+				lower_32_bits(job->rkvdec_link_iova);
+		}
+		prev = job;
+		count++;
+	}
+
+	if (prev) {
+		u32 *table = prev->rkvdec_link_vaddr;
+		dma_addr_t next_iova = prev->hw ?
+			rk_mpp_rkvdec2_next_unused_link_iova(prev->hw) : 0;
+
+		table[info->next_word] = lower_32_bits(next_iova);
+	}
+
+	return count;
+}
+
 static void rk_mpp_rkvdec2_ccu_job_add(struct rk_mpp_job *job)
 {
 	struct rk_mpp_hw *ccu = job->rkvdec_ccu;
@@ -2589,6 +2625,71 @@ static void rk_mpp_rkvdec2_ccu_job_done_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, rk_mpp_rkvdec2_ccu_job_done(&job, info));
 }
 
+static void rk_mpp_rkvdec2_ccu_relink_unfinished_kunit(struct kunit *test)
+{
+	const struct rk_mpp_rkvdec2_link_info *info =
+		&rk_mpp_rkvdec2_vdpu383_link_info;
+	struct rk_mpp_hw *ccu;
+	struct rk_mpp_job *job0;
+	struct rk_mpp_job *job1;
+	struct rk_mpp_job *job2;
+	u32 *table0;
+	u32 *table1;
+	u32 *table2;
+	unsigned long flags;
+
+	ccu = kunit_kzalloc(test, sizeof(*ccu), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ccu);
+	job0 = kunit_kzalloc(test, sizeof(*job0), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job0);
+	job1 = kunit_kzalloc(test, sizeof(*job1), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job1);
+	job2 = kunit_kzalloc(test, sizeof(*job2), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job2);
+	table0 = kunit_kcalloc(test, info->table_words, sizeof(*table0),
+			       GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, table0);
+	table1 = kunit_kcalloc(test, info->table_words, sizeof(*table1),
+			       GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, table1);
+	table2 = kunit_kcalloc(test, info->table_words, sizeof(*table2),
+			       GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, table2);
+
+	spin_lock_init(&ccu->lock);
+	INIT_LIST_HEAD(&ccu->rkvdec_ccu_jobs);
+	INIT_LIST_HEAD(&job0->rkvdec_ccu_node);
+	INIT_LIST_HEAD(&job1->rkvdec_ccu_node);
+	INIT_LIST_HEAD(&job2->rkvdec_ccu_node);
+	job0->rkvdec_link_vaddr = table0;
+	job0->rkvdec_link_iova = 0x1000;
+	job1->rkvdec_link_vaddr = table1;
+	job1->rkvdec_link_iova = 0x2000;
+	job2->rkvdec_link_vaddr = table2;
+	job2->rkvdec_link_iova = 0x3000;
+
+	list_add_tail(&job0->rkvdec_ccu_node, &ccu->rkvdec_ccu_jobs);
+	list_add_tail(&job1->rkvdec_ccu_node, &ccu->rkvdec_ccu_jobs);
+	list_add_tail(&job2->rkvdec_ccu_node, &ccu->rkvdec_ccu_jobs);
+	job0->rkvdec_ccu_listed = true;
+	job1->rkvdec_ccu_listed = true;
+	job2->rkvdec_ccu_listed = true;
+	table0[info->next_word] = 0x2000;
+	table1[info->next_word] = 0x3000;
+	table2[info->next_word] = 0x4000;
+	table1[info->irq_status_word] = 0x80;
+
+	spin_lock_irqsave(&ccu->lock, flags);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_rkvdec2_ccu_relink_unfinished_locked(ccu),
+			2U);
+	spin_unlock_irqrestore(&ccu->lock, flags);
+
+	KUNIT_EXPECT_EQ(test, table0[info->next_word], 0x3000U);
+	KUNIT_EXPECT_EQ(test, table1[info->next_word], 0x3000U);
+	KUNIT_EXPECT_EQ(test, table2[info->next_word], 0U);
+}
+
 static void rk_mpp_rkvdec2_ccu_descriptor_kunit(struct kunit *test)
 {
 	struct rk_mpp_hw ccu = {};
@@ -3074,6 +3175,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_rkvdec2_link_table_ccu_ref_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_running_list_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_job_done_kunit),
+	KUNIT_CASE(rk_mpp_rkvdec2_ccu_relink_unfinished_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_descriptor_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_descriptor_core_mask_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_fixed_rcb_link_kunit),
