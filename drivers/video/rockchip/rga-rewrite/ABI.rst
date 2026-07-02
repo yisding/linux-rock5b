@@ -12,6 +12,8 @@ Implemented
   Hardware version queries report the RK3588-compatible RGA2E
   ``3.2.63318`` and RGA3 ``3.0.76831`` tuples used by current ``librga``
   capability probing.
+* Native and compat ioctl entry points share the same fixed-width RGA parser,
+  matching the BSP RGA3 compat entry behavior for current ``librga``.
 * RGA2/RGA3 platform-driver binding for RK3588 BSP and mainline compatibles,
   with devm-managed MMIO, IRQ, clock, and reset discovery.
 * ``RGA_IOC_IMPORT_BUFFER`` and ``RGA_IOC_RELEASE_BUFFER`` for dma-buf fd and
@@ -32,8 +34,9 @@ Implemented
   copy, and configured requests hold references to their imported dma-bufs.
   After ``rga_request_check()`` accepts a modern request, config/submit
   preparation failures are normalized to the BSP ioctl wrapper's ``-EFAULT``.
-* Build-time assertions for the fixed-width RGA image, import-buffer, buffer
-  pool, user-request, and task ABI layouts plus modern ioctl numbers and sizes.
+* Build-time assertions for the fixed-width RGA version-query, image,
+  import-buffer, buffer pool, user-request, and task ABI layouts plus legacy
+  command constants and modern ioctl numbers and sizes.
 * Legacy blit task copy and acquire-fence fd validation.
 * Legacy no-handle blit/fill submissions from ``wrapbuffer_fd()`` and
   ``wrapbuffer_virtualaddr()``.  The rewrite accepts MMU-backed direct fd and
