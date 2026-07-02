@@ -170,7 +170,8 @@ Implemented
   dispatch, BSP request task-count limits and return codes, mixed RGA2/RGA3
   multi-task rejection, compact 10-bit RGA2 source dispatch/emission including
   the no-scale force-tile mode, IOMMU fault target matching, and ffmpeg-facing
-  RGA3 raster/FBC/alpha-overlay profile selection.
+  RGA3 raster/FBC/alpha-overlay profile selection plus destination-offset
+  command emission and semiplanar chroma-alignment rejection.
 
 Recognized But Unsupported
 --------------------------
