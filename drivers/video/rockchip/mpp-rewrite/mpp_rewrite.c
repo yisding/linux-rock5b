@@ -1892,6 +1892,9 @@ static int rk_mpp_poll_irq_check_size(s32 count_max, u32 req_size)
 }
 
 #if IS_ENABLED(CONFIG_ROCKCHIP_MPP_REWRITE_KUNIT_TEST)
+static void rk_mpp_rkvenc2_dchs_patch(struct rk_mpp_job *job);
+static void rk_mpp_rkvenc2_dchs_release(struct rk_mpp_job *job);
+
 static void rk_mpp_check_cmd_v1_kunit(struct kunit *test)
 {
 	KUNIT_EXPECT_EQ(test, rk_mpp_check_cmd_v1(MPP_CMD_QUERY_HW_SUPPORT), 0);
@@ -2594,6 +2597,142 @@ static void rk_mpp_rkvenc_slice_mode_kunit(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, rk_mpp_job_rkvenc_slice_mode(&job));
 }
 
+static void rk_mpp_rkvenc2_dchs_remap_kunit(struct kunit *test)
+{
+	struct rk_mpp_service *srv;
+	struct rk_mpp_session *session0;
+	struct rk_mpp_session *session1;
+	struct device_node *ccu_node;
+	struct rk_mpp_hw *hw0;
+	struct rk_mpp_hw *hw1;
+	struct rk_mpp_hw *hw2;
+	struct rk_mpp_job *producer;
+	struct rk_mpp_job *consumer;
+	struct rk_mpp_job *unrelated;
+	u32 reg_words = RK_MPP_RKVENC_DCHS_WORD + 1;
+	u32 producer_low;
+	u32 consumer_low;
+	u32 unrelated_low;
+	u32 producer_patched;
+	u32 consumer_patched;
+	u32 unrelated_patched;
+
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
+	session0 = kunit_kzalloc(test, sizeof(*session0), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, session0);
+	session1 = kunit_kzalloc(test, sizeof(*session1), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, session1);
+	ccu_node = kunit_kzalloc(test, sizeof(*ccu_node), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ccu_node);
+	hw0 = kunit_kzalloc(test, sizeof(*hw0), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw0);
+	hw1 = kunit_kzalloc(test, sizeof(*hw1), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw1);
+	hw2 = kunit_kzalloc(test, sizeof(*hw2), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw2);
+	producer = kunit_kzalloc(test, sizeof(*producer), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, producer);
+	consumer = kunit_kzalloc(test, sizeof(*consumer), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, consumer);
+	unrelated = kunit_kzalloc(test, sizeof(*unrelated), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, unrelated);
+
+	spin_lock_init(&srv->rkvenc_dchs_lock);
+	session0->srv = srv;
+	session0->client_type = RK_MPP_DEVICE_RKVENC;
+	session0->id = 11;
+	session1->srv = srv;
+	session1->client_type = RK_MPP_DEVICE_RKVENC;
+	session1->id = 12;
+
+	hw0->ccu_node = ccu_node;
+	hw0->core_id = 0;
+	hw1->ccu_node = ccu_node;
+	hw1->core_id = 1;
+	hw2->ccu_node = ccu_node;
+	hw2->core_id = 2;
+
+	producer->session = session0;
+	producer->hw = hw0;
+	producer->id = 100;
+	producer->reg_image.reg_words = reg_words;
+	producer->reg_image.regs =
+		kunit_kcalloc(test, reg_words, sizeof(u32), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, producer->reg_image.regs);
+
+	consumer->session = session0;
+	consumer->hw = hw1;
+	consumer->id = 101;
+	consumer->reg_image.reg_words = reg_words;
+	consumer->reg_image.regs =
+		kunit_kcalloc(test, reg_words, sizeof(u32), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, consumer->reg_image.regs);
+
+	unrelated->session = session1;
+	unrelated->hw = hw2;
+	unrelated->id = 102;
+	unrelated->reg_image.reg_words = reg_words;
+	unrelated->reg_image.regs =
+		kunit_kcalloc(test, reg_words, sizeof(u32), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, unrelated->reg_image.regs);
+
+	producer_low = 2 << RK_MPP_RKVENC_DCHS_TXID_SHIFT;
+	producer->reg_image.regs[RK_MPP_RKVENC_DCHS_WORD] = producer_low;
+	rk_mpp_rkvenc2_dchs_patch(producer);
+	producer_patched = producer->reg_image.regs[RK_MPP_RKVENC_DCHS_WORD];
+	KUNIT_EXPECT_TRUE(test, producer->rkvenc_dchs_active);
+	KUNIT_EXPECT_PTR_EQ(test, srv->rkvenc_dchs[0].job, producer);
+	KUNIT_EXPECT_EQ(test, srv->rkvenc_dchs[0].txid_orig, 2U);
+	KUNIT_EXPECT_EQ(test, producer_patched & RK_MPP_RKVENC_DCHS_TXE,
+			(u32)RK_MPP_RKVENC_DCHS_TXE);
+	KUNIT_EXPECT_EQ(test, producer_patched & RK_MPP_RKVENC_DCHS_RXE, 0U);
+	KUNIT_EXPECT_EQ(test, producer_patched & RK_MPP_RKVENC_DCHS_TXID_MASK,
+			0U);
+	KUNIT_EXPECT_EQ(test, producer_patched & RK_MPP_RKVENC_DCHS_RXID_MASK,
+			1U << RK_MPP_RKVENC_DCHS_RXID_SHIFT);
+
+	unrelated_low = (2 << RK_MPP_RKVENC_DCHS_RXID_SHIFT) |
+			RK_MPP_RKVENC_DCHS_RXE;
+	unrelated->reg_image.regs[RK_MPP_RKVENC_DCHS_WORD] = unrelated_low;
+	rk_mpp_rkvenc2_dchs_patch(unrelated);
+	unrelated_patched = unrelated->reg_image.regs[RK_MPP_RKVENC_DCHS_WORD];
+	KUNIT_EXPECT_TRUE(test, unrelated->rkvenc_dchs_active);
+	KUNIT_EXPECT_PTR_EQ(test, srv->rkvenc_dchs[2].job, unrelated);
+	KUNIT_EXPECT_EQ(test, unrelated_patched & RK_MPP_RKVENC_DCHS_RXE,
+			0U);
+	KUNIT_EXPECT_EQ(test, unrelated_patched & RK_MPP_RKVENC_DCHS_TXID_MASK,
+			2U << RK_MPP_RKVENC_DCHS_TXID_SHIFT);
+	KUNIT_EXPECT_EQ(test, unrelated_patched & RK_MPP_RKVENC_DCHS_RXID_MASK,
+			3U << RK_MPP_RKVENC_DCHS_RXID_SHIFT);
+	rk_mpp_rkvenc2_dchs_release(unrelated);
+	KUNIT_EXPECT_FALSE(test, unrelated->rkvenc_dchs_active);
+	KUNIT_EXPECT_PTR_EQ(test, srv->rkvenc_dchs[2].job, NULL);
+
+	consumer_low = (3 << RK_MPP_RKVENC_DCHS_TXID_SHIFT) |
+		       (2 << RK_MPP_RKVENC_DCHS_RXID_SHIFT) |
+		       RK_MPP_RKVENC_DCHS_RXE;
+	consumer->reg_image.regs[RK_MPP_RKVENC_DCHS_WORD] = consumer_low;
+	rk_mpp_rkvenc2_dchs_patch(consumer);
+	consumer_patched = consumer->reg_image.regs[RK_MPP_RKVENC_DCHS_WORD];
+	KUNIT_EXPECT_TRUE(test, consumer->rkvenc_dchs_active);
+	KUNIT_EXPECT_PTR_EQ(test, srv->rkvenc_dchs[1].job, consumer);
+	KUNIT_EXPECT_EQ(test, consumer_patched & RK_MPP_RKVENC_DCHS_RXE,
+			(u32)RK_MPP_RKVENC_DCHS_RXE);
+	KUNIT_EXPECT_EQ(test, consumer_patched & RK_MPP_RKVENC_DCHS_TXID_MASK,
+			2U << RK_MPP_RKVENC_DCHS_TXID_SHIFT);
+	KUNIT_EXPECT_EQ(test, consumer_patched & RK_MPP_RKVENC_DCHS_RXID_MASK,
+			0U << RK_MPP_RKVENC_DCHS_RXID_SHIFT);
+
+	rk_mpp_rkvenc2_dchs_release(consumer);
+	KUNIT_EXPECT_FALSE(test, consumer->rkvenc_dchs_active);
+	KUNIT_EXPECT_PTR_EQ(test, srv->rkvenc_dchs[1].job, NULL);
+
+	rk_mpp_rkvenc2_dchs_release(producer);
+	KUNIT_EXPECT_FALSE(test, producer->rkvenc_dchs_active);
+	KUNIT_EXPECT_PTR_EQ(test, srv->rkvenc_dchs[0].job, NULL);
+}
+
 static void rk_mpp_rcb_invalid_index_kunit(struct kunit *test)
 {
 	struct rk_mpp_session session = {
@@ -2650,6 +2789,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_iommu_fault_match_kunit),
 	KUNIT_CASE(rk_mpp_poll_irq_check_size_kunit),
 	KUNIT_CASE(rk_mpp_rkvenc_slice_mode_kunit),
+	KUNIT_CASE(rk_mpp_rkvenc2_dchs_remap_kunit),
 	KUNIT_CASE(rk_mpp_rcb_invalid_index_kunit),
 	{}
 };
