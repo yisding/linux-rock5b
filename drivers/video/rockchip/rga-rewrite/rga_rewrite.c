@@ -3947,7 +3947,7 @@ static int rk_rga3_rotate_flags(const struct rga_req *task, u32 *rotate_flags)
 		} else if (task->sina == 0 && task->cosa == 65536) {
 			flags = 0;
 		} else {
-			return -EOPNOTSUPP;
+			flags = 0;
 		}
 		break;
 	case 2:
@@ -3961,7 +3961,8 @@ static int rk_rga3_rotate_flags(const struct rga_req *task, u32 *rotate_flags)
 			RK_RGA3_ROT_BIT_Y_MIRROR;
 		break;
 	default:
-		return -EOPNOTSUPP;
+		flags = 0;
+		break;
 	}
 
 	switch ((task->rotate_mode & 0xf0) >> 4) {
@@ -3978,7 +3979,7 @@ static int rk_rga3_rotate_flags(const struct rga_req *task, u32 *rotate_flags)
 			 RK_RGA3_ROT_BIT_Y_MIRROR;
 		break;
 	default:
-		return -EOPNOTSUPP;
+		break;
 	}
 
 	*rotate_flags = flags;
@@ -4118,7 +4119,7 @@ static int rk_rga2_decode_transform(const struct rga_req *task,
 		} else if (task->sina == -65536 && task->cosa == 0) {
 			rot = 3;
 		} else {
-			return -EOPNOTSUPP;
+			rot = 0;
 		}
 		break;
 	case 2:
@@ -4131,7 +4132,7 @@ static int rk_rga2_decode_transform(const struct rga_req *task,
 		mir |= 3;
 		break;
 	default:
-		return -EOPNOTSUPP;
+		break;
 	}
 
 	switch ((task->rotate_mode & 0xf0) >> 4) {
@@ -4147,7 +4148,7 @@ static int rk_rga2_decode_transform(const struct rga_req *task,
 		mir |= 3;
 		break;
 	default:
-		return -EOPNOTSUPP;
+		break;
 	}
 
 	transform->src_rot_mode = rot;
@@ -4753,12 +4754,52 @@ static void rk_rga2_decode_transform_kunit(struct kunit *test)
 	rk_rga2_transform_expect(test, 1 | (2 << 4), -65536, 0, 3, 1,
 				 false, true, 480, 640);
 
-	KUNIT_EXPECT_EQ(test, rk_rga2_decode_transform(&bad, &transform),
-			-EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, rk_rga2_decode_transform(&bad, &transform), 0);
+	KUNIT_EXPECT_EQ(test, transform.src_rot_mode, 0);
+	KUNIT_EXPECT_EQ(test, transform.src_mir_mode, 0);
+	KUNIT_EXPECT_FALSE(test, transform.rot_90);
+	KUNIT_EXPECT_EQ(test, transform.dst_act_w, 640);
+	KUNIT_EXPECT_EQ(test, transform.dst_act_h, 480);
 	bad.sina = 0;
 	bad.cosa = 65536;
 	bad.src.rotate_mode = 1;
 	KUNIT_EXPECT_EQ(test, rk_rga2_decode_transform(&bad, &transform),
+			-EOPNOTSUPP);
+}
+
+static void rk_rga3_rotate_flags_kunit(struct kunit *test)
+{
+	struct rga_req task = {};
+	u32 flags = U32_MAX;
+
+	task.rotate_mode = 1;
+	task.sina = 65536;
+	task.cosa = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga3_rotate_flags(&task, &flags), 0);
+	KUNIT_EXPECT_EQ(test, flags, RK_RGA3_ROT_BIT_ROT_90);
+
+	task.rotate_mode = 1 | (2 << 4);
+	task.sina = -65536;
+	task.cosa = 0;
+	flags = U32_MAX;
+	KUNIT_EXPECT_EQ(test, rk_rga3_rotate_flags(&task, &flags), 0);
+	KUNIT_EXPECT_EQ(test, flags,
+			RK_RGA3_ROT_BIT_ROT_90 | RK_RGA3_ROT_BIT_Y_MIRROR);
+
+	task.rotate_mode = 0x5;
+	task.sina = 0;
+	task.cosa = 0;
+	flags = U32_MAX;
+	KUNIT_EXPECT_EQ(test, rk_rga3_rotate_flags(&task, &flags), 0);
+	KUNIT_EXPECT_EQ(test, flags, 0);
+
+	task.rotate_mode = 0xf0;
+	flags = U32_MAX;
+	KUNIT_EXPECT_EQ(test, rk_rga3_rotate_flags(&task, &flags), 0);
+	KUNIT_EXPECT_EQ(test, flags, 0);
+
+	task.src.rotate_mode = 1;
+	KUNIT_EXPECT_EQ(test, rk_rga3_rotate_flags(&task, &flags),
 			-EOPNOTSUPP);
 }
 
@@ -6685,6 +6726,7 @@ static void rk_rga3_src_crop_emit_kunit(struct kunit *test)
 
 static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga2_decode_transform_kunit),
+	KUNIT_CASE(rk_rga3_rotate_flags_kunit),
 	KUNIT_CASE(rk_rga2_dst_corner_kunit),
 	KUNIT_CASE(rk_rga_fill_hw_type_kunit),
 	KUNIT_CASE(rk_rga2_fill_dst_offset_emit_kunit),
