@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0
+
+source "drivers/video/rockchip/mpp-rewrite/Kconfig"
+source "drivers/video/rockchip/rga-rewrite/Kconfig"
