@@ -86,6 +86,19 @@ struct rk_mpp_msg_v1 {
 	__u64 data_ptr;
 };
 
+#define RK_MPP_MSG_V1_ABI_SIZE			24
+#define RK_MPP_MSG_V1_DATA_PTR_ABI_OFFSET	16
+#define RK_MPP_BAT_MSG_ABI_SIZE		16
+#define RK_MPP_BAT_MSG_RET_ABI_OFFSET		12
+
+static_assert(sizeof(struct rk_mpp_msg_v1) == RK_MPP_MSG_V1_ABI_SIZE);
+static_assert(offsetof(struct rk_mpp_msg_v1, data_ptr) ==
+	      RK_MPP_MSG_V1_DATA_PTR_ABI_OFFSET);
+static_assert(sizeof(struct mpp_bat_msg) == RK_MPP_BAT_MSG_ABI_SIZE);
+static_assert(offsetof(struct mpp_bat_msg, ret) ==
+	      RK_MPP_BAT_MSG_RET_ABI_OFFSET);
+static_assert(_IOC_SIZE(MPP_IOC_CFG_V1) == sizeof(unsigned int));
+
 struct rk_mpp_import {
 	struct list_head link;
 	int fd;
@@ -704,6 +717,16 @@ static __u32 rk_mpp_get_cmd_butt(__u32 cmd)
 	}
 }
 
+static void rk_mpp_msg_v1_to_request(const struct rk_mpp_msg_v1 *msg,
+				     struct mpp_request *req)
+{
+	req->cmd = msg->cmd;
+	req->flags = msg->flags;
+	req->size = msg->size;
+	req->offset = msg->offset;
+	req->data = (void __user *)(uintptr_t)msg->data_ptr;
+}
+
 static int rk_mpp_support_cmd_show(struct seq_file *s, void *unused)
 {
 	seq_puts(s, "QUERY_HW_SUPPORT\n");
@@ -1178,6 +1201,43 @@ static void rk_mpp_get_cmd_butt_kunit(struct kunit *test)
 			(__u32)0);
 }
 
+static void rk_mpp_abi_layout_kunit(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, sizeof(struct rk_mpp_msg_v1),
+			(size_t)RK_MPP_MSG_V1_ABI_SIZE);
+	KUNIT_EXPECT_EQ(test, offsetof(struct rk_mpp_msg_v1, data_ptr),
+			(size_t)RK_MPP_MSG_V1_DATA_PTR_ABI_OFFSET);
+	KUNIT_EXPECT_EQ(test, sizeof(struct mpp_bat_msg),
+			(size_t)RK_MPP_BAT_MSG_ABI_SIZE);
+	KUNIT_EXPECT_EQ(test, offsetof(struct mpp_bat_msg, ret),
+			(size_t)RK_MPP_BAT_MSG_RET_ABI_OFFSET);
+	KUNIT_EXPECT_EQ(test, _IOC_SIZE(MPP_IOC_CFG_V1),
+			sizeof(unsigned int));
+	KUNIT_EXPECT_EQ(test, _IOC_TYPE(MPP_IOC_CFG_V1),
+			(unsigned int)MPP_IOC_MAGIC);
+	KUNIT_EXPECT_EQ(test, _IOC_NR(MPP_IOC_CFG_V1), 1U);
+}
+
+static void rk_mpp_msg_v1_to_request_kunit(struct kunit *test)
+{
+	struct rk_mpp_msg_v1 msg = {
+		.cmd = MPP_CMD_SET_REG_WRITE,
+		.flags = MPP_FLAGS_MULTI_MSG | MPP_FLAGS_LAST_MSG,
+		.size = 128,
+		.offset = 64,
+		.data_ptr = 0x12345000,
+	};
+	struct mpp_request req = {};
+
+	rk_mpp_msg_v1_to_request(&msg, &req);
+
+	KUNIT_EXPECT_EQ(test, req.cmd, msg.cmd);
+	KUNIT_EXPECT_EQ(test, req.flags, msg.flags);
+	KUNIT_EXPECT_EQ(test, req.size, msg.size);
+	KUNIT_EXPECT_EQ(test, req.offset, msg.offset);
+	KUNIT_EXPECT_EQ(test, (uintptr_t)req.data, (uintptr_t)msg.data_ptr);
+}
+
 static void rk_mpp_cmd_copies_payload_kunit(struct kunit *test)
 {
 	KUNIT_EXPECT_TRUE(test,
@@ -1323,6 +1383,8 @@ static void rk_mpp_rkvenc_slice_mode_kunit(struct kunit *test)
 static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_check_cmd_v1_kunit),
 	KUNIT_CASE(rk_mpp_get_cmd_butt_kunit),
+	KUNIT_CASE(rk_mpp_abi_layout_kunit),
+	KUNIT_CASE(rk_mpp_msg_v1_to_request_kunit),
 	KUNIT_CASE(rk_mpp_cmd_copies_payload_kunit),
 	KUNIT_CASE(rk_mpp_request_check_reg_span_kunit),
 	KUNIT_CASE(rk_mpp_request_check_rkvdec_perf_span_kunit),
@@ -3749,11 +3811,7 @@ static int rk_mpp_collect_msgs(struct rk_mpp_session *session,
 		}
 		batch.req_cnt++;
 
-		req.cmd = msg.cmd;
-		req.flags = msg.flags;
-		req.size = msg.size;
-		req.offset = msg.offset;
-		req.data = (void __user *)(uintptr_t)msg.data_ptr;
+		rk_mpp_msg_v1_to_request(&msg, &req);
 
 		ret = rk_mpp_process_request(session, &req, &batch);
 		if (ret || last)

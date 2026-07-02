@@ -11,6 +11,10 @@ Implemented
   register jobs in one batch are all submitted before poll requests are
   processed in message order, matching the forward-port trigger-then-wait
   ordering.
+* Native and compat ioctls share the same BSP-style ``MPP_IOC_CFG_V1`` parser.
+  The externally parsed message is the fixed-width 24-byte V1 record with a
+  64-bit userspace data pointer; the driver converts it to a native internal
+  ``struct mpp_request`` only after copying the V1 record from userspace.
 * ``MPP_CMD_SET_SESSION_FD`` session switching, restricted to other
   ``/dev/mpp_service`` file descriptors.
 * RK3588 BSP-style RKVENC2/RKVDEC2 platform-device binding with devm-managed
@@ -125,8 +129,10 @@ Implemented
   close, or IRQ thread does not free a job while another owner is still using it.
 * Optional ``ROCKCHIP_MPP_REWRITE_KUNIT_TEST`` coverage for rewrite-local ABI
   parser helpers, including command range classification, command group
-  boundary queries, payload-copy classification, register-span overflow checks,
-  ``POLL_HW_IRQ`` flexible-buffer sizing, and RKVENC2 slice-mode detection.
+  boundary queries, fixed-width V1/``mpp_bat_msg`` ABI layout, V1-to-native
+  request conversion, payload-copy classification, register-span overflow
+  checks, ``POLL_HW_IRQ`` flexible-buffer sizing, and RKVENC2 slice-mode
+  detection.
 
 Recognized But Unsupported
 --------------------------
@@ -146,6 +152,5 @@ Outside This Slice
 * Full BSP-equivalent timeout recovery policy and IOMMU fault recovery,
   including shared reset-domain serialization and MMU-domain refresh.
 * Fence export/import semantics.
-* 32-bit compat structure translation beyond the BSP-style shared ioctl path.
 * ``MPP_IOC_CFG_V2``; the BSP-derived 6.18 driver also rejects this in the
   observed path.
