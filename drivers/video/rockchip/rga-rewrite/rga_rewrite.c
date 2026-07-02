@@ -7143,6 +7143,87 @@ static void rk_rga3_librga_global_alpha_emit_kunit(struct kunit *test)
 			expected_bottom_alpha);
 }
 
+static void rk_rga3_librga_rgb_composite_emit_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
+	enum rk_rga_hw_type type = 0;
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_RGBA_8888);
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 3,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+	u32 expected_top_ctrl;
+	u32 expected_bottom_ctrl;
+	u32 expected_top_alpha;
+	u32 expected_bottom_alpha;
+
+	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
+				    1280, 720);
+	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_RGBA_8888,
+				    1280, 720);
+	task.pat = rk_rga_kunit_img(0x30000000, RK_RGA_FORMAT_RGBA_8888,
+				    1280, 720);
+	task.bsfilter_flag = 1;
+	task.alpha_rop_flag = BIT(0) | BIT(3) | BIT(4) | BIT(9);
+	task.PD_mode = RK_RGA_ALPHA_BLEND_SRC_OVER;
+	task.feature.global_alpha_en = true;
+	task.fg_global_alpha = 0xff;
+	task.bg_global_alpha = 0xff;
+	task.yuv2rgb_mode = 0;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_Y_BASE_OFFSET / 4],
+			lower_32_bits(task.pat.yrgb_addr));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN1_Y_BASE_OFFSET / 4],
+			lower_32_bits(task.src.yrgb_addr));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_Y_BASE_OFFSET / 4],
+			lower_32_bits(task.dst.yrgb_addr));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_CTRL_OFFSET / 4],
+			RK_RGA3_OVLP_TOP_ALPHA_EN);
+
+	expected_top_ctrl =
+		FIELD_PREP(RK_RGA3_ALPHA_COLOR_MODE,
+			   RK_RGA3_ALPHA_NO_PRE_MULTIPLIED) |
+		FIELD_PREP(RK_RGA3_ALPHA_BLEND_MODE,
+			   RK_RGA3_ALPHA_PER_PIXEL) |
+		FIELD_PREP(RK_RGA3_ALPHA_FACTOR, RK_RGA3_ALPHA_ONE) |
+		FIELD_PREP(RK_RGA3_ALPHA_GLOBAL, 0xff);
+	expected_bottom_ctrl =
+		FIELD_PREP(RK_RGA3_ALPHA_COLOR_MODE,
+			   RK_RGA3_ALPHA_NO_PRE_MULTIPLIED) |
+		FIELD_PREP(RK_RGA3_ALPHA_BLEND_MODE,
+			   RK_RGA3_ALPHA_PER_PIXEL) |
+		FIELD_PREP(RK_RGA3_ALPHA_FACTOR,
+			   RK_RGA3_ALPHA_OPPOSITE_INVERSE) |
+		FIELD_PREP(RK_RGA3_ALPHA_GLOBAL, 0xff);
+	expected_top_alpha =
+		FIELD_PREP(RK_RGA3_ALPHA_BLEND_MODE,
+			   RK_RGA3_ALPHA_PER_PIXEL) |
+		FIELD_PREP(RK_RGA3_ALPHA_FACTOR, RK_RGA3_ALPHA_ONE);
+	expected_bottom_alpha =
+		FIELD_PREP(RK_RGA3_ALPHA_BLEND_MODE,
+			   RK_RGA3_ALPHA_PER_PIXEL) |
+		FIELD_PREP(RK_RGA3_ALPHA_FACTOR,
+			   RK_RGA3_ALPHA_OPPOSITE_INVERSE);
+
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_TOP_CTRL_OFFSET / 4],
+			expected_top_ctrl);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_BOT_CTRL_OFFSET / 4],
+			expected_bottom_ctrl);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_TOP_ALPHA_OFFSET / 4],
+			expected_top_alpha);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_BOT_ALPHA_OFFSET / 4],
+			expected_bottom_alpha);
+}
+
 static void rk_rga3_alpha_yuv10_overlay_emit_kunit(struct kunit *test)
 {
 	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
@@ -7496,6 +7577,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_ffmpeg_alpha_overlay_kunit),
 	KUNIT_CASE(rk_rga3_librga_alpha_yuv_emit_kunit),
 	KUNIT_CASE(rk_rga3_librga_global_alpha_emit_kunit),
+	KUNIT_CASE(rk_rga3_librga_rgb_composite_emit_kunit),
 	KUNIT_CASE(rk_rga3_alpha_yuv10_overlay_emit_kunit),
 	KUNIT_CASE(rk_rga3_colorkey_emit_kunit),
 	KUNIT_CASE(rk_rga3_alpha_rotate_emit_kunit),
