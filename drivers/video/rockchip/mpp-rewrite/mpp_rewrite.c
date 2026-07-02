@@ -67,6 +67,8 @@
 #define RK_MPP_RKVDEC_LINK_WRITE_PARTS	3
 #define RK_MPP_RKVDEC_LINK_READ_PARTS	2
 #define RK_MPP_RKVDEC_LINK_ADD_CFG_NUM	1
+#define RK_MPP_RKVDEC_LINK_IRQ_RAW	BIT(9)
+#define RK_MPP_RKVDEC_LINK_IP_TIMEOUT	0x007fffff
 #define RK_MPP_RKVDEC_LINK_CCU_WORK_MODE	BIT(17)
 #define RK_MPP_WORK_TIMEOUT_MS		500
 #define RK_MPP_CODEC_INFO_MAX		11
@@ -470,6 +472,8 @@ struct rk_mpp_rkvenc_poll_slice_cfg {
 #define RK_MPP_RKVDEC_CCU_TIMEOUT_20MS		0x00efffff
 #define RK_MPP_RKVDEC_CCU_TIMEOUT_50MS		0x02cfffff
 #define RK_MPP_RKVDEC_CCU_TIMEOUT_100MS		0x04ffffff
+#define RK_MPP_RKVDEC_MAX_READS_BASE		0x0518
+#define RK_MPP_RKVDEC_MAX_READS			0x1c
 #define RK_MPP_RKVDEC_CACHE0_SIZE_BASE		0x051c
 #define RK_MPP_RKVDEC_CACHE1_SIZE_BASE		0x055c
 #define RK_MPP_RKVDEC_CACHE2_SIZE_BASE		0x059c
@@ -1289,6 +1293,22 @@ rk_mpp_rkvdec2_link_node_size(const struct rk_mpp_rkvdec2_link_info *info)
 		     RK_MPP_RKVDEC_LINK_NODE_ALIGN);
 }
 
+static bool
+rk_mpp_rkvdec2_link_irq_decode(const struct rk_mpp_rkvdec2_link_info *info,
+			       u32 irq_val, u32 status_val, u32 *irq_status)
+{
+	u32 irq_bits = info->irq_mask >> 16;
+	u32 status_bits = info->status_mask >> 16;
+
+	if (!(irq_val & (irq_bits | RK_MPP_RKVDEC_LINK_IRQ_RAW)))
+		return false;
+
+	*irq_status = status_val;
+
+	return !!(status_val & status_bits) ||
+	       !!(irq_val & RK_MPP_RKVDEC_LINK_IRQ_RAW);
+}
+
 static int
 rk_mpp_rkvdec2_link_part_check(const struct rk_mpp_rkvdec2_link_part *part,
 			       u32 table_words)
@@ -1778,6 +1798,33 @@ static void rk_mpp_rkvdec2_link_info_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, info->sw_iommu_zap);
 }
 
+static void rk_mpp_rkvdec2_link_irq_decode_kunit(struct kunit *test)
+{
+	const struct rk_mpp_rkvdec2_link_info *info =
+		&rk_mpp_rkvdec2_vdpu383_link_info;
+	u32 status = 0xdeadbeef;
+
+	KUNIT_EXPECT_FALSE(test, rk_mpp_rkvdec2_link_irq_decode(info, 0,
+								0x3ff,
+								&status));
+	KUNIT_EXPECT_EQ(test, status, 0xdeadbeefU);
+
+	KUNIT_EXPECT_TRUE(test, rk_mpp_rkvdec2_link_irq_decode(info, 0x3,
+							       0x155,
+							       &status));
+	KUNIT_EXPECT_EQ(test, status, 0x155U);
+
+	KUNIT_EXPECT_FALSE(test, rk_mpp_rkvdec2_link_irq_decode(info, 0x3, 0,
+								&status));
+	KUNIT_EXPECT_EQ(test, status, 0U);
+
+	KUNIT_EXPECT_TRUE(test,
+			  rk_mpp_rkvdec2_link_irq_decode(info,
+							 RK_MPP_RKVDEC_LINK_IRQ_RAW,
+							 0, &status));
+	KUNIT_EXPECT_EQ(test, status, 0U);
+}
+
 static void rk_mpp_rkvdec2_fill_link_table_kunit(struct kunit *test)
 {
 	const struct rk_mpp_rkvdec2_link_info *info =
@@ -2033,6 +2080,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_request_check_rkvdec_perf_span_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_timeout_threshold_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_link_info_kunit),
+	KUNIT_CASE(rk_mpp_rkvdec2_link_irq_decode_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_fill_link_table_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_link_table_ownership_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_link_table_ccu_ref_kunit),
@@ -3764,8 +3812,11 @@ static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 
 static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 {
+	const struct rk_mpp_rkvdec2_link_info *link_info =
+		&rk_mpp_rkvdec2_vdpu383_link_info;
 	struct rk_mpp_hw *hw = job->hw;
 	u32 start_value = 0;
+	bool link_start;
 	bool start_seen;
 	int ret;
 
@@ -3798,6 +3849,12 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 		goto err_power_off;
 	}
 
+	link_start = rk_mpp_rkvdec2_link_regs_ready(hw, link_info);
+
+	if (rk_mpp_hw_reg_range_valid(hw, 0, RK_MPP_RKVDEC_MAX_READS_BASE,
+				      sizeof(u32)))
+		writel_relaxed(RK_MPP_RKVDEC_MAX_READS,
+			       hw->regs[0] + RK_MPP_RKVDEC_MAX_READS_BASE);
 	if (rk_mpp_hw_reg_range_valid(hw, 0, RK_MPP_RKVDEC_CACHE0_SIZE_BASE,
 				      sizeof(u32)))
 		writel_relaxed(RK_MPP_RKVDEC_CACHE_CFG,
@@ -3837,9 +3894,28 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 	}
 
 	rk_mpp_hw_schedule_timeout(hw);
+	if (link_start) {
+		writel_relaxed(link_info->irq_mask,
+			       hw->regs[RK_MPP_RKVDEC_LINK_REGION] +
+			       link_info->irq_base);
+		writel_relaxed(link_info->status_mask,
+			       hw->regs[RK_MPP_RKVDEC_LINK_REGION] +
+			       link_info->status_base);
+		writel_relaxed(RK_MPP_RKVDEC_LINK_IP_TIMEOUT,
+			       hw->regs[RK_MPP_RKVDEC_LINK_REGION] +
+			       link_info->ip_time_base);
+		writel_relaxed(link_info->ip_en_val,
+			       hw->regs[RK_MPP_RKVDEC_LINK_REGION] +
+			       link_info->ip_en_base);
+	}
 	wmb();
-	writel(start_value | RK_MPP_RKVDEC_START_EN,
-	       hw->regs[0] + RK_MPP_RKVDEC_START_BASE);
+	if (link_start)
+		writel(RK_MPP_RKVDEC_START_EN,
+		       hw->regs[RK_MPP_RKVDEC_LINK_REGION] +
+		       link_info->en_base);
+	else
+		writel(start_value | RK_MPP_RKVDEC_START_EN,
+		       hw->regs[0] + RK_MPP_RKVDEC_START_BASE);
 	mutex_unlock(&hw->run_lock);
 
 	return 0;
@@ -3875,8 +3951,28 @@ static int rk_mpp_rkvdec2_validate(struct rk_mpp_job *job)
 
 static irqreturn_t rk_mpp_rkvdec2_irq(struct rk_mpp_hw *hw)
 {
+	const struct rk_mpp_rkvdec2_link_info *link_info =
+		&rk_mpp_rkvdec2_vdpu383_link_info;
 	unsigned long flags;
 	u32 status;
+
+	if (rk_mpp_rkvdec2_link_regs_ready(hw, link_info)) {
+		void __iomem *link = hw->regs[RK_MPP_RKVDEC_LINK_REGION];
+		u32 irq_val = readl_relaxed(link + link_info->irq_base);
+		u32 link_status = readl_relaxed(link + link_info->status_base);
+
+		if (rk_mpp_rkvdec2_link_irq_decode(link_info, irq_val,
+						   link_status, &status)) {
+			writel(link_info->irq_mask, link + link_info->irq_base);
+			writel(link_info->status_mask,
+			       link + link_info->status_base);
+			spin_lock_irqsave(&hw->lock, flags);
+			hw->irq_status |= status;
+			spin_unlock_irqrestore(&hw->lock, flags);
+
+			return IRQ_WAKE_THREAD;
+		}
+	}
 
 	if (!rk_mpp_hw_reg_range_valid(hw, 0, RK_MPP_RKVDEC_INT_STA_BASE,
 				       sizeof(u32)))
