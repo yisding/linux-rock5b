@@ -140,10 +140,11 @@ Implemented
   rewrite programs only the RGA3 scale direction and factor fields.
   AFBC is accepted through ``RGA_FBC_MODE`` for the RGA3 FBCD/FBCE format
   subset, including current ``librga`` ``rga_copy_fbc_demo`` AFBC16x16
-  raster-to-FBC and FBC-to-raster YUV420SP copies, plus ffmpeg/RKMPP AFBC
-  source crop-top offsets carried as active-window y-offsets; tile8x8 is
-  accepted through ``RGA_TILE_MODE`` for the BSP RGA3 semiplanar YUV
-  tile-format subset in simple raster-to-tile and tile-to-raster bitblits.
+  raster-to-FBC and FBC-to-raster YUV420SP copies, current ffmpeg AFBC
+  RGB-family output, plus ffmpeg/RKMPP AFBC source crop-top offsets carried as
+  active-window y-offsets; tile8x8 is accepted through ``RGA_TILE_MODE`` for
+  the BSP RGA3 semiplanar YUV tile-format subset in simple raster-to-tile and
+  tile-to-raster bitblits.
   RFBC, AFBC32x8, packed-YUV FBC, compressed in-place alpha write-back,
   overlapping in-place blits, tile alpha/pattern/color-key, and in-place
   scaling/conversion/rotation remain unsupported.  Main request
@@ -344,8 +345,8 @@ Implemented
   emission, RGA3 ``librga`` centered RGB rotate destination-offset emission,
   RGA3 ``librga`` ``immakeBorder()`` reflect top/bottom command emission,
   RGA3 ``librga`` AFBC16x16 copy profile selection and FBCD/FBCE command
-  emission including source active-offset handling, RGA3 tile8x8 profile
-  selection and stride emission, RGA3
+  emission including RGB-family writeback and source active-offset handling,
+  RGA3 tile8x8 profile selection and stride emission, RGA3
   pattern-backed 8-bit ``librga`` alpha-YUV overlay emission,
   ``librga`` global-alpha register emission, RGA3 ``librga`` three-channel
   RGB alpha-composite routing/emission, current ``librga`` Porter-Duff blend-mode factor mapping
