@@ -6657,6 +6657,63 @@ static void rk_rga2_librga_interp_emit_kunit(struct kunit *test)
 			0xaaabU);
 }
 
+static void rk_rga2_librga_full_csc_emit_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA2_CMD_REG_COUNT] = { };
+	enum rk_rga_hw_type type = 0;
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_YCBCR_420_SP);
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 2,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+	u32 dst_info;
+
+	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
+				    1280, 720);
+	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_YCBCR_420_SP,
+				    1280, 720);
+	task.yuv2rgb_mode = 3 << 2;
+	task.full_csc.flag = RK_RGA_FULL_CSC_ENABLE;
+	task.full_csc.coe_y.r_v = 187;
+	task.full_csc.coe_y.g_y = 628;
+	task.full_csc.coe_y.b_u = 63;
+	task.full_csc.coe_y.off = 16368;
+	task.full_csc.coe_u.r_v = -102;
+	task.full_csc.coe_u.g_y = -346;
+	task.full_csc.coe_u.b_u = 449;
+	task.full_csc.coe_u.off = 130944;
+	task.full_csc.coe_v.r_v = 449;
+	task.full_csc.coe_v.g_y = -407;
+	task.full_csc.coe_v.b_u = -40;
+	task.full_csc.coe_v.off = 130944;
+	task.feature.full_csc_clip_en = true;
+	task.full_csc_clip.y.max = 0xeb;
+	task.full_csc_clip.y.min = 0x10;
+	task.full_csc_clip.uv.max = 0xf0;
+	task.full_csc_clip.uv.min = 0x10;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+
+	dst_info = cmd[RK_RGA2_DST_INFO_OFFSET / 4];
+	KUNIT_EXPECT_TRUE(test, dst_info & RK_RGA2_DST_FULL_CSC_EN);
+	KUNIT_EXPECT_EQ(test, dst_info & RK_RGA2_DST_CSC_MODE,
+			FIELD_PREP(RK_RGA2_DST_CSC_MODE, 3));
+	KUNIT_EXPECT_EQ(test, dst_info & RK_RGA2_DST_FORMAT,
+			FIELD_PREP(RK_RGA2_DST_FORMAT, 0xa));
+
+	task.core = RK_RGA_CORE_RGA3_MASK;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), -EOPNOTSUPP);
+}
+
 static void rk_rga2_src_crop_emit_kunit(struct kunit *test)
 {
 	u32 cmd[RK_RGA2_CMD_REG_COUNT] = { };
@@ -7345,6 +7402,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_in_place_border_bitblt_kunit),
 	KUNIT_CASE(rk_rga2_compact_10bit_profile_kunit),
 	KUNIT_CASE(rk_rga2_librga_interp_emit_kunit),
+	KUNIT_CASE(rk_rga2_librga_full_csc_emit_kunit),
 	KUNIT_CASE(rk_rga2_src_crop_emit_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_fbc_profiles_kunit),
 	KUNIT_CASE(rk_rga3_tile8x8_profile_kunit),
