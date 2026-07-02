@@ -6838,12 +6838,12 @@ static int rk_rga_request_config(struct rk_rga_session *session,
 	fences = NULL;
 	import_count = 0;
 	fence_count = 0;
+	close_acquire_fds = true;
 
 	if (job_out) {
 		ret = rk_rga_job_clone_request_locked(request, job_out);
 		if (ret)
 			goto out_unlock;
-		close_acquire_fds = true;
 	}
 
 out_unlock:
