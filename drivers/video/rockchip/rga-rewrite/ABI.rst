@@ -159,7 +159,9 @@ Implemented
   Destination rectangle offsets are supported by biasing WR plane base
   addresses for 8-bit formats and raster compact/unpacked semiplanar 10-bit YUV
   destinations; this covers current ``librga`` ``imtranslate()`` RGB requests
-  and centered RGB rotate requests with explicit destination rectangles.
+  and centered RGB rotate requests with explicit destination rectangles, plus
+  the ffmpeg ``overlay_rkrga`` pre-processing pass that copies a smaller RGB
+  overlay into an offset full-frame pattern image before alpha blending.
   Semiplanar YUV offsets must be chroma-aligned.
 * RGA3 Porter-Duff alpha blend for the common A+B composition paths emitted by
   ``librga`` and ``ffmpeg-rockchip``.  Source/foreground is programmed through
@@ -341,7 +343,7 @@ Implemented
   RGA3 normal RGB color-key dispatch/emission and inverted-mode rejection,
   RGA3 ``librga`` DRM-fourcc ABGR8888-to-RGBA normal raster copy emission,
   RGA3 ``librga`` copy-splice multi-task destination-offset emission,
-  RGA3 ``librga`` RGB translate destination-offset emission,
+  RGA3 ``librga`` RGB translate and ffmpeg overlay-preprocess destination-offset emission,
   RGA3 ``librga`` RGB rotate, flip/mirror, and combined rotate/mirror
   emission, RGA3 ``librga`` centered RGB rotate destination-offset emission,
   RGA3 ``librga`` ``immakeBorder()`` reflect top/bottom command emission,
