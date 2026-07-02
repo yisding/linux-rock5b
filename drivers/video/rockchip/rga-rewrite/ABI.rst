@@ -98,7 +98,10 @@ Implemented
   ``0x4``/``0x8`` select RGA2 cores.  Unsupported profiles requested on a
   forced core still fail with the normal validation error.  Imported images are
   rebound to the selected core's DMA device at dispatch time, so direct
-  ``wrapbuffer_fd()`` submissions can target a non-default RGA core.
+  ``wrapbuffer_fd()`` submissions can target a non-default RGA core.  Minimal
+  debugfs counters report scheduled, dispatched, and hardware-started work per
+  public core-mask bit so RK3588 board validation can confirm load balancing
+  and forced-core routing without carrying the BSP debugger ABI.
 * Runtime PM and clock-bulk sequencing around the backend dispatch boundary.
   Each dispatched job resumes the selected RGA core, enables discovered clocks,
   enters the backend, then disables clocks and drops runtime PM.
@@ -337,6 +340,7 @@ Implemented
   ffmpeg-facing RGA2 RFBC64x4 8/10-bit 4:2:0/4:2:2 source
   profile selection and FBCIN command emission, IOMMU fault target matching,
   post-reset IOMMU refresh accounting, scheduler priority enqueue/aging,
+  scheduler core-counter mapping,
   RGA2 ``librga`` full-CSC RGB-to-YUV dispatch/emission,
   RGA2 ``librga`` gray256 RGB-to-Y400 color-conversion dispatch/emission,
   RGA2 ``librga`` Y400 UV-downsampling resize dispatch/emission,
