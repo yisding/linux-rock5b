@@ -22,6 +22,7 @@
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/interrupt.h>
+#include <linux/iommu.h>
 #include <linux/io.h>
 #include <linux/jiffies.h>
 #include <linux/kfifo.h>
@@ -198,8 +199,11 @@ struct rk_mpp_hw_match {
 
 struct rk_mpp_hw {
 	struct list_head link;
+	struct list_head fault_link;
 	struct device *dev;
 	const struct rk_mpp_hw_match *match;
+	struct device_node *iommu_node;
+	struct iommu_domain *iommu_domain;
 	void __iomem *regs[RK_MPP_MAX_HW_REGS];
 	resource_size_t reg_size[RK_MPP_MAX_HW_REGS];
 	struct clk_bulk_data *clks;
@@ -228,6 +232,7 @@ struct rk_mpp_hw {
 	u32 rcb_min_width;
 	refcount_t refs;
 	atomic_t queued_job_count;
+	atomic_t iommu_fault_pending;
 	struct completion released;
 	int num_regs;
 	int num_clks;
@@ -242,8 +247,10 @@ struct rk_mpp_service {
 	struct proc_dir_entry *procfs_root;
 	struct mutex hw_lock;
 	struct mutex sched_lock; /* protects queued_jobs */
+	spinlock_t fault_lock; /* protects fault_hws in fault handler context */
 	spinlock_t rkvenc_dchs_lock;
 	struct list_head hw_list;
+	struct list_head fault_hws;
 	struct list_head queued_jobs;
 	struct work_struct sched_work;
 	atomic_t ioctl_count;
@@ -252,6 +259,7 @@ struct rk_mpp_service {
 	atomic_t submitted_job_count;
 	atomic_t queued_job_count;
 	atomic_t timeout_count;
+	atomic_t iommu_fault_count;
 	atomic_t next_session_id;
 	struct rk_mpp_rkvenc_dchs_entry rkvenc_dchs[RK_MPP_RKVENC_MAX_DCHS_CORES];
 	u32 hw_support;
@@ -3632,6 +3640,7 @@ static int rk_mpp_hw_begin_active_job(struct rk_mpp_hw *hw,
 		rk_mpp_job_get(job);
 		hw->active_job = job;
 		hw->irq_status = 0;
+		atomic_set(&hw->iommu_fault_pending, 0);
 	}
 	spin_unlock_irqrestore(&hw->lock, flags);
 
@@ -3871,32 +3880,43 @@ static void rk_mpp_hw_timeout_work(struct work_struct *work)
 			     timeout_work);
 	struct rk_mpp_job *job;
 	struct rk_mpp_hw *ccu = NULL;
-	bool hard_ccu_timeout;
+	bool hard_ccu_recovery;
+	bool iommu_fault;
+	int result;
 
 	mutex_lock(&hw->run_lock);
 	job = rk_mpp_hw_take_active_job(hw, NULL);
 	if (!job) {
+		atomic_set(&hw->iommu_fault_pending, 0);
 		mutex_unlock(&hw->run_lock);
 		return;
 	}
-	hard_ccu_timeout = job->rkvdec_ccu_started && job->rkvdec_ccu;
-	if (hard_ccu_timeout) {
+	iommu_fault = atomic_xchg(&hw->iommu_fault_pending, 0);
+	hard_ccu_recovery = job->rkvdec_ccu_started && job->rkvdec_ccu;
+	if (hard_ccu_recovery) {
 		ccu = job->rkvdec_ccu;
 		rk_mpp_hw_get(ccu);
 		rk_mpp_rkvdec2_force_stop_ccu(ccu);
 	}
 
-	atomic_inc(&job->session->srv->timeout_count);
-	dev_err(hw->dev, "session client %u job %u timed out\n",
-		job->session->client_type, job->id);
+	if (iommu_fault) {
+		result = -EIO;
+		dev_err(hw->dev, "session client %u job %u failed on IOMMU fault\n",
+			job->session->client_type, job->id);
+	} else {
+		result = -ETIMEDOUT;
+		atomic_inc(&job->session->srv->timeout_count);
+		dev_err(hw->dev, "session client %u job %u timed out\n",
+			job->session->client_type, job->id);
+	}
 
 	rk_mpp_hw_reset_active(hw);
 	rk_mpp_hw_power_off(hw);
-	rk_mpp_job_complete(job, -ETIMEDOUT);
+	rk_mpp_job_complete(job, result);
 	mutex_unlock(&hw->run_lock);
 	rk_mpp_job_put(job);
-	if (hard_ccu_timeout)
-		rk_mpp_hw_abort_ccu_active_dependents(ccu, hw, -ETIMEDOUT);
+	if (hard_ccu_recovery)
+		rk_mpp_hw_abort_ccu_active_dependents(ccu, hw, result);
 	rk_mpp_hw_put(ccu);
 }
 
@@ -4040,6 +4060,92 @@ rk_mpp_hw_abort_ccu_active_dependents(struct rk_mpp_hw *ccu,
 	}
 
 	kfree(deps);
+}
+
+static int rk_mpp_iommu_fault_handler(struct iommu_domain *domain,
+				      struct device *iommu_dev,
+				      unsigned long iova, int status,
+				      void *arg)
+{
+	struct rk_mpp_service *srv = arg;
+	struct rk_mpp_hw *fallback = NULL;
+	struct rk_mpp_hw *match = NULL;
+	struct rk_mpp_hw *hw;
+	unsigned long flags;
+
+	atomic_inc(&srv->iommu_fault_count);
+
+	spin_lock_irqsave(&srv->fault_lock, flags);
+	list_for_each_entry(hw, &srv->fault_hws, fault_link) {
+		if (hw->iommu_domain != domain)
+			continue;
+
+		if (!fallback)
+			fallback = hw;
+		if (iommu_dev && hw->iommu_node == iommu_dev->of_node) {
+			match = hw;
+			break;
+		}
+	}
+	if (!match)
+		match = fallback;
+
+	if (match) {
+		atomic_set(&match->iommu_fault_pending, 1);
+		mod_delayed_work(system_wq, &match->timeout_work, 0);
+		dev_err_ratelimited(match->dev,
+				    "IOMMU fault iova %#lx status %#x\n",
+				    iova, status);
+	}
+	spin_unlock_irqrestore(&srv->fault_lock, flags);
+
+	if (!match)
+		pr_err_ratelimited("unmatched IOMMU fault iova %#lx status %#x\n",
+				   iova, status);
+
+	return 0;
+}
+
+static void rk_mpp_iommu_register_fault_handler(struct rk_mpp_hw *hw)
+{
+	struct rk_mpp_service *srv = &rk_mpp_srv;
+	unsigned long flags;
+
+	hw->iommu_domain = iommu_get_domain_for_dev(hw->dev);
+	if (!hw->iommu_domain)
+		return;
+
+	spin_lock_irqsave(&srv->fault_lock, flags);
+	list_add_tail(&hw->fault_link, &srv->fault_hws);
+	spin_unlock_irqrestore(&srv->fault_lock, flags);
+
+	iommu_set_fault_handler(hw->iommu_domain,
+				rk_mpp_iommu_fault_handler, srv);
+}
+
+static void rk_mpp_iommu_unregister_fault_handler(struct rk_mpp_hw *hw)
+{
+	struct rk_mpp_service *srv = &rk_mpp_srv;
+	struct rk_mpp_hw *other;
+	unsigned long flags;
+	bool clear = true;
+
+	if (!hw->iommu_domain)
+		return;
+
+	spin_lock_irqsave(&srv->fault_lock, flags);
+	if (!list_empty(&hw->fault_link))
+		list_del_init(&hw->fault_link);
+	list_for_each_entry(other, &srv->fault_hws, fault_link) {
+		if (other->iommu_domain == hw->iommu_domain) {
+			clear = false;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&srv->fault_lock, flags);
+
+	if (clear)
+		iommu_set_fault_handler(hw->iommu_domain, NULL, NULL);
 }
 
 static int rk_mpp_job_store_reg_word(struct rk_mpp_job *job, u32 offset,
@@ -5560,6 +5666,7 @@ static int rk_mpp_hw_probe(struct platform_device *pdev)
 	init_completion(&hw->released);
 	mutex_init(&hw->run_lock);
 	spin_lock_init(&hw->lock);
+	INIT_LIST_HEAD(&hw->fault_link);
 	INIT_LIST_HEAD(&hw->rkvdec_ccu_jobs);
 	INIT_LIST_HEAD(&hw->rkvdec_link_jobs);
 	INIT_DELAYED_WORK(&hw->timeout_work, rk_mpp_hw_timeout_work);
@@ -5581,6 +5688,13 @@ static int rk_mpp_hw_probe(struct platform_device *pdev)
 			     &hw->task_capacity);
 	of_property_read_u32(dev->of_node, "rockchip,core-mask",
 			     &hw->core_mask);
+	hw->iommu_node = of_parse_phandle(dev->of_node, "iommus", 0);
+	if (hw->iommu_node) {
+		ret = devm_add_action_or_reset(dev, rk_mpp_of_node_put,
+					       hw->iommu_node);
+		if (ret)
+			return ret;
+	}
 
 	for (i = 0; i < RK_MPP_MAX_HW_REGS; i++) {
 		struct resource *res;
@@ -5641,6 +5755,8 @@ static int rk_mpp_hw_probe(struct platform_device *pdev)
 			return ret;
 	}
 
+	rk_mpp_iommu_register_fault_handler(hw);
+
 	mutex_lock(&rk_mpp_srv.hw_lock);
 	if (match->alias) {
 		alias_id = of_alias_get_id(dev->of_node, match->alias);
@@ -5674,6 +5790,7 @@ static void rk_mpp_hw_remove(struct platform_device *pdev)
 	rk_mpp_refresh_hw_support_locked(&rk_mpp_srv);
 	mutex_unlock(&rk_mpp_srv.hw_lock);
 
+	rk_mpp_iommu_unregister_fault_handler(hw);
 	if (!hw->match->contributes_support)
 		rk_mpp_hw_abort_ccu_dependents(hw);
 	rk_mpp_hw_abort_queued(hw, -ENODEV);
@@ -5697,8 +5814,10 @@ static int __init rk_mpp_init(void)
 
 	mutex_init(&rk_mpp_srv.hw_lock);
 	mutex_init(&rk_mpp_srv.sched_lock);
+	spin_lock_init(&rk_mpp_srv.fault_lock);
 	spin_lock_init(&rk_mpp_srv.rkvenc_dchs_lock);
 	INIT_LIST_HEAD(&rk_mpp_srv.hw_list);
+	INIT_LIST_HEAD(&rk_mpp_srv.fault_hws);
 	INIT_LIST_HEAD(&rk_mpp_srv.queued_jobs);
 	INIT_WORK(&rk_mpp_srv.sched_work, rk_mpp_scheduler_work);
 
@@ -5737,6 +5856,9 @@ static int __init rk_mpp_init(void)
 				&rk_mpp_srv.queued_job_count);
 	debugfs_create_atomic_t("timeout_count", 0444, rk_mpp_srv.debugfs_root,
 				&rk_mpp_srv.timeout_count);
+	debugfs_create_atomic_t("iommu_fault_count", 0444,
+				rk_mpp_srv.debugfs_root,
+				&rk_mpp_srv.iommu_fault_count);
 
 	pr_info("registered /dev/mpp_service (%s), hw_support=0x%08x\n",
 		RK_MPP_REWRITE_VERSION, rk_mpp_srv.hw_support);
