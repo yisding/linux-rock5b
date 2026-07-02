@@ -180,7 +180,9 @@ Implemented
   RGB-to-YUV mode bits emitted by ``librga``.  This is deliberately an RGA2
   profile: the RK3588 forward-port RGA3 capability table does not advertise
   ``RGA_COLOR_FILL``, so requests forced to RGA3 core bits fail with
-  ``-EOPNOTSUPP``.  Pattern fill, alpha/ROP/color-key, rotation, tile/FBC,
+  ``-EOPNOTSUPP``.  ``imfillTaskArray()`` and ``imrectangleTask()``/array
+  jobs are covered as serial multi-task RGA2 fill batches under one request
+  completion/fence.  Pattern fill, alpha/ROP/color-key, rotation, tile/FBC,
   10-bit, and packed-YUV fill variants remain unsupported.
 * RGA2 raster bitblit for the common upstream-consumer fallback formats that
   RGA3 does not cover: planar YUV420/YUV422, YCbCr400/gray, NV24/NV42-style
@@ -284,13 +286,14 @@ Implemented
   dispatch, BSP request task-count limits and return codes, mixed RGA2/RGA3
   multi-task classification, request-id removal on terminal submit, RGA2 fill
   RGB/YUV destination-offset emission,
-  YUV-fill chroma-alignment rejection, and multi-fill task acceptance, compact
-  10-bit RGA2 source dispatch/emission including the no-scale force-tile mode,
-  RGA2 in-place RGB mosaic dispatch/emission, RGA2 RGB ROP dispatch/emission,
-  RGA2 RGB gauss coefficient lifetime and command emission, RGA2 RGB NN
-  quantize dispatch/emission, RGA2 RGB alpha-bitmap SRC1/alpha emission,
-  RGA2 OSD SRC1/alpha/control emission, RGA2 palette update and color-palette
-  command emission,
+  YUV-fill chroma-alignment rejection, multi-fill task acceptance, and
+  ``librga`` rectangle-task serial fill command emission, compact 10-bit RGA2
+  source dispatch/emission including the no-scale force-tile mode, RGA2
+  in-place RGB mosaic dispatch/emission, RGA2 RGB ROP dispatch/emission, RGA2
+  RGB gauss coefficient lifetime and command emission, RGA2 RGB NN quantize
+  dispatch/emission, RGA2 RGB alpha-bitmap SRC1/alpha emission, RGA2 OSD
+  SRC1/alpha/control emission, RGA2 palette update and color-palette command
+  emission,
   acquire-fence fd ownership merging, ffmpeg-facing RGA2 RFBC64x4 source
   profile selection and FBCIN command emission, IOMMU fault target matching,
   post-reset IOMMU refresh accounting, scheduler priority enqueue/aging,
