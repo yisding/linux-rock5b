@@ -155,8 +155,9 @@ Implemented
 * Optional ``ROCKCHIP_RGA_REWRITE_KUNIT_TEST`` coverage for rewrite-local ABI
   normalization helpers, including the RGA2 ``rotate_mode``/``sina``/``cosa``
   decoder, transformed destination-corner selection, color-fill core-mask
-  dispatch, request task-count limits, mixed RGA2/RGA3 multi-task rejection,
-  and ffmpeg-facing RGA3 raster/FBC/alpha-overlay profile selection.
+  dispatch, BSP request task-count limits and return codes, mixed RGA2/RGA3
+  multi-task rejection, and ffmpeg-facing RGA3 raster/FBC/alpha-overlay profile
+  selection.
 
 Recognized But Unsupported
 --------------------------
