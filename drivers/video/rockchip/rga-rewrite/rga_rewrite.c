@@ -6290,6 +6290,56 @@ static void rk_rga3_librga_resize_interp_emit_kunit(struct kunit *test)
 			0xaa97aaa0U);
 }
 
+static void rk_rga3_librga_drm_abgr_copy_emit_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
+	enum rk_rga_hw_type type = 0;
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_RGBA_8888);
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 2,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+	u32 ctrl;
+
+	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
+				    1280, 720);
+	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_RGBA_8888,
+				    1280, 720);
+	task.yuv2rgb_mode = 0;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+
+	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
+	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WIN0_PIC_FORMAT,
+			FIELD_PREP(RK_RGA3_WIN0_PIC_FORMAT, 0x8));
+	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WIN0_RD_FORMAT,
+			FIELD_PREP(RK_RGA3_WIN0_RD_FORMAT, 2));
+	KUNIT_EXPECT_FALSE(test, ctrl & RK_RGA3_WIN0_PIX_SWAP);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_Y_BASE_OFFSET / 4],
+			lower_32_bits(task.src.yrgb_addr));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_VIR_STRIDE_OFFSET / 4],
+			1280U);
+
+	ctrl = cmd[RK_RGA3_WR_CTRL_OFFSET / 4];
+	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WR_PIC_FORMAT,
+			FIELD_PREP(RK_RGA3_WR_PIC_FORMAT, 0x6));
+	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WR_FORMAT,
+			FIELD_PREP(RK_RGA3_WR_FORMAT, 2));
+	KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WR_PIX_SWAP);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_Y_BASE_OFFSET / 4],
+			lower_32_bits(task.dst.yrgb_addr));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4],
+			1280U);
+}
+
 static void rk_rga3_librga_copy_splice_task_kunit(struct kunit *test)
 {
 	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
@@ -7977,6 +8027,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_iommu_refresh_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_rga3_profiles_kunit),
 	KUNIT_CASE(rk_rga3_librga_resize_interp_emit_kunit),
+	KUNIT_CASE(rk_rga3_librga_drm_abgr_copy_emit_kunit),
 	KUNIT_CASE(rk_rga3_librga_copy_splice_task_kunit),
 	KUNIT_CASE(rk_rga3_librga_translate_emit_kunit),
 	KUNIT_CASE(rk_rga3_librga_rotate_emit_kunit),
