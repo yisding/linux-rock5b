@@ -25,6 +25,7 @@
 #include <linux/jiffies.h>
 #include <linux/kfifo.h>
 #include <linux/list.h>
+#include <linux/math.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -64,6 +65,8 @@
 #define RK_MPP_CODEC_INFO_MAX		11
 #define RK_MPP_ENC_INFO_BUTT		RK_MPP_CODEC_INFO_MAX
 #define RK_MPP_DEC_INFO_WIDTH		1
+#define RK_MPP_DEC_INFO_HEIGHT		2
+#define RK_MPP_DEC_INFO_BITDEPTH	4
 #define RK_MPP_DEC_INFO_BUTT		6
 #define RK_MPP_CODEC_INFO_FLAG_NULL	0
 #define RK_MPP_CODEC_INFO_FLAG_BUTT	3
@@ -328,6 +331,12 @@ static const struct of_device_id rk_mpp_hw_of_match[] = {
 MODULE_DEVICE_TABLE(of, rk_mpp_hw_of_match);
 
 #define RK_MPP_RKVDEC_REG_FMT			9
+#define RK_MPP_RKVDEC_EN_MODE_WORD		13
+#define RK_MPP_RKVDEC_CORE_CTRL_WORD		28
+#define RK_MPP_RKVDEC_TIMEOUT_THRESHOLD_WORD	32
+#define RK_MPP_RKVDEC_FILM_IDX_MASK		GENMASK(25, 16)
+#define RK_MPP_RKVDEC_FILM_IDX_SHIFT		16
+#define RK_MPP_RKVDEC_CCU_TIMEOUT_DISABLE	BIT(1)
 #define RK_MPP_RKVENC_PIC_BASE_WORDS		(0x0280 / sizeof(u32))
 #define RK_MPP_RKVENC_OSD_BASE_WORDS		(0x3000 / sizeof(u32))
 #define RK_MPP_RKVENC_ENC_PIC_WORD		(RK_MPP_RKVENC_PIC_BASE_WORDS + 32)
@@ -379,6 +388,11 @@ struct rk_mpp_rkvenc_poll_slice_cfg {
 #define RK_MPP_RKVDEC_SEL_VAL1_BASE		0x042c
 #define RK_MPP_RKVDEC_SEL_VAL2_BASE		0x0430
 #define RK_MPP_RKVDEC_SET_PERF_SEL(a, b, c)	((a) | ((b) << 8) | ((c) << 16))
+#define RK_MPP_RKVDEC_1080P_PIXELS		(1920 * 1080)
+#define RK_MPP_RKVDEC_4K_PIXELS		(4096 * 2304)
+#define RK_MPP_RKVDEC_CCU_TIMEOUT_20MS		0x00efffff
+#define RK_MPP_RKVDEC_CCU_TIMEOUT_50MS		0x02cfffff
+#define RK_MPP_RKVDEC_CCU_TIMEOUT_100MS		0x04ffffff
 #define RK_MPP_RKVDEC_CACHE0_SIZE_BASE		0x051c
 #define RK_MPP_RKVDEC_CACHE1_SIZE_BASE		0x055c
 #define RK_MPP_RKVDEC_CACHE2_SIZE_BASE		0x059c
@@ -1092,6 +1106,24 @@ static int rk_mpp_request_check_rkvdec_perf_span(const struct mpp_request *req)
 	return 0;
 }
 
+static u32 rk_mpp_rkvdec2_ccu_timeout_threshold(u32 width, u32 height,
+						u32 bitdepth)
+{
+	u64 adjusted_width = width;
+	u64 pixels;
+
+	if (bitdepth > 8)
+		adjusted_width = DIV_ROUND_UP_ULL((u64)width * bitdepth, 8);
+
+	pixels = adjusted_width * height;
+	if (pixels < RK_MPP_RKVDEC_1080P_PIXELS)
+		return RK_MPP_RKVDEC_CCU_TIMEOUT_20MS;
+	if (pixels < RK_MPP_RKVDEC_4K_PIXELS)
+		return RK_MPP_RKVDEC_CCU_TIMEOUT_50MS;
+
+	return RK_MPP_RKVDEC_CCU_TIMEOUT_100MS;
+}
+
 static int rk_mpp_poll_irq_check_size(s32 count_max, u32 req_size)
 {
 	size_t slice_bytes;
@@ -1230,6 +1262,22 @@ static void rk_mpp_request_check_rkvdec_perf_span_kunit(struct kunit *test)
 			-EINVAL);
 }
 
+static void rk_mpp_rkvdec2_ccu_timeout_threshold_kunit(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_ccu_timeout_threshold(0, 0, 0),
+			(u32)RK_MPP_RKVDEC_CCU_TIMEOUT_20MS);
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_ccu_timeout_threshold(1919, 1080, 8),
+			(u32)RK_MPP_RKVDEC_CCU_TIMEOUT_20MS);
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_ccu_timeout_threshold(1920, 1080, 8),
+			(u32)RK_MPP_RKVDEC_CCU_TIMEOUT_50MS);
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_ccu_timeout_threshold(4095, 2304, 8),
+			(u32)RK_MPP_RKVDEC_CCU_TIMEOUT_50MS);
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_ccu_timeout_threshold(4096, 2304, 8),
+			(u32)RK_MPP_RKVDEC_CCU_TIMEOUT_100MS);
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_ccu_timeout_threshold(1280, 720, 10),
+			(u32)RK_MPP_RKVDEC_CCU_TIMEOUT_20MS);
+}
+
 static void rk_mpp_poll_irq_check_size_kunit(struct kunit *test)
 {
 	u32 base = sizeof(struct rk_mpp_rkvenc_poll_slice_cfg);
@@ -1278,6 +1326,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_cmd_copies_payload_kunit),
 	KUNIT_CASE(rk_mpp_request_check_reg_span_kunit),
 	KUNIT_CASE(rk_mpp_request_check_rkvdec_perf_span_kunit),
+	KUNIT_CASE(rk_mpp_rkvdec2_ccu_timeout_threshold_kunit),
 	KUNIT_CASE(rk_mpp_poll_irq_check_size_kunit),
 	KUNIT_CASE(rk_mpp_rkvenc_slice_mode_kunit),
 	{}
@@ -2674,6 +2723,48 @@ static int rk_mpp_job_read_regs(struct rk_mpp_job *job)
 	return 0;
 }
 
+static void rk_mpp_rkvdec2_prepare_ccu_regs(struct rk_mpp_job *job)
+{
+	struct rk_mpp_reg_image *image = &job->reg_image;
+	struct rk_mpp_session *session = job->session;
+	u32 width;
+	u32 height;
+	u32 bitdepth;
+	u32 timeout;
+	u32 session_id;
+
+	if (session->client_type != RK_MPP_DEVICE_RKVDEC || !job->hw ||
+	    !job->hw->ccu_node)
+		return;
+
+	session_id = session->id & (RK_MPP_RKVDEC_FILM_IDX_MASK >>
+				    RK_MPP_RKVDEC_FILM_IDX_SHIFT);
+	if (image->reg_words > RK_MPP_RKVDEC_CORE_CTRL_WORD) {
+		u32 val = image->regs[RK_MPP_RKVDEC_CORE_CTRL_WORD];
+
+		val &= ~RK_MPP_RKVDEC_FILM_IDX_MASK;
+		val |= (session_id << RK_MPP_RKVDEC_FILM_IDX_SHIFT) &
+		       RK_MPP_RKVDEC_FILM_IDX_MASK;
+		image->regs[RK_MPP_RKVDEC_CORE_CTRL_WORD] = val;
+	}
+
+	if (image->reg_words > RK_MPP_RKVDEC_EN_MODE_WORD)
+		image->regs[RK_MPP_RKVDEC_EN_MODE_WORD] |=
+			RK_MPP_RKVDEC_CCU_TIMEOUT_DISABLE;
+
+	if (image->reg_words <= RK_MPP_RKVDEC_TIMEOUT_THRESHOLD_WORD)
+		return;
+
+	mutex_lock(&session->lock);
+	width = lower_32_bits(session->codec_info[RK_MPP_DEC_INFO_WIDTH].val);
+	height = lower_32_bits(session->codec_info[RK_MPP_DEC_INFO_HEIGHT].val);
+	bitdepth = lower_32_bits(session->codec_info[RK_MPP_DEC_INFO_BITDEPTH].val);
+	mutex_unlock(&session->lock);
+
+	timeout = rk_mpp_rkvdec2_ccu_timeout_threshold(width, height, bitdepth);
+	image->regs[RK_MPP_RKVDEC_TIMEOUT_THRESHOLD_WORD] = timeout;
+}
+
 static int rk_mpp_rkvenc2_validate(struct rk_mpp_job *job)
 {
 	struct rk_mpp_hw *hw = job->hw;
@@ -2962,6 +3053,8 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 	if (rk_mpp_hw_reg_range_valid(hw, 0, RK_MPP_RKVDEC_CLR_CACHE2_BASE,
 				      sizeof(u32)))
 		writel_relaxed(1, hw->regs[0] + RK_MPP_RKVDEC_CLR_CACHE2_BASE);
+
+	rk_mpp_rkvdec2_prepare_ccu_regs(job);
 
 	ret = rk_mpp_job_write_regs(job, RK_MPP_RKVDEC_START_BASE,
 				    &start_value, &start_seen);
