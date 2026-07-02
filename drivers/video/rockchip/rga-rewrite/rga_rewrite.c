@@ -7387,6 +7387,36 @@ static void rk_rga_ffmpeg_fbc_profiles_kunit(struct kunit *test)
 			((u32)task.src.act_w - 1) |
 			(((u32)task.src.act_h - 1) << 16));
 
+	memset(cmd, 0, sizeof(cmd));
+	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_422_SP_10B,
+					 RK_RGA_FORMAT_RGBA_8888);
+	task.src.rd_mode = RK_RGA_RKFBC_MODE;
+	task.dst.rd_mode = RK_RGA_RASTER_MODE;
+	task.src.x_offset = 128;
+	task.src.y_offset = 8;
+	job.cmd_ready = false;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+
+	src_info = cmd[RK_RGA2_SRC_INFO_OFFSET / 4];
+	KUNIT_EXPECT_TRUE(test, src_info & RK_RGA2_SRC_YUV10_EN);
+	KUNIT_EXPECT_TRUE(test, src_info & RK_RGA2_SRC_YUV10_ROUND_EN);
+	KUNIT_EXPECT_EQ(test, src_info & RK_RGA2_SRC_FBCIN_MODE,
+			FIELD_PREP(RK_RGA2_SRC_FBCIN_MODE, 0));
+	KUNIT_EXPECT_EQ(test, src_info & RK_RGA2_SRC_FBCIN_FORMAT,
+			FIELD_PREP(RK_RGA2_SRC_FBCIN_FORMAT, 1));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_BASE0_OFFSET / 4],
+			lower_32_bits(task.src.yrgb_addr));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_BASE1_OFFSET / 4],
+			lower_32_bits(task.src.yrgb_addr));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_BASE2_OFFSET / 4],
+			128U | (8U << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_VIR_INFO_OFFSET / 4],
+			(ALIGN((u32)task.src.vir_w, 64) / 64) * 4);
+
 	task.core = BIT(0);
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
