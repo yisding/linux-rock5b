@@ -137,6 +137,8 @@
 #define RK_RGA2_DST_ACT_INFO_OFFSET		0x04c
 #define RK_RGA2_ALPHA_CTRL0_OFFSET		0x050
 #define RK_RGA2_ALPHA_CTRL1_OFFSET		0x054
+#define RK_RGA2_ROP_CTRL0_OFFSET		0x060
+#define RK_RGA2_ROP_CTRL1_OFFSET		0x064
 #define RK_RGA2_CF_GR_G_OFFSET			0x060
 #define RK_RGA2_CF_GR_R_OFFSET			0x064
 #define RK_RGA2_DST_CSC_00_OFFSET		0x060
@@ -187,6 +189,18 @@
 #define RK_RGA2_DST_FULL_CSC_EN		BIT(19)
 #define RK_RGA2_DST_YUV400_EN			BIT(24)
 #define RK_RGA2_DST_Y4_EN			BIT(25)
+
+#define RK_RGA2_ALPHA_ROP_0			BIT(0)
+#define RK_RGA2_ALPHA_ROP_SEL			BIT(1)
+#define RK_RGA2_ALPHA_ROP_MODE			GENMASK(3, 2)
+#define RK_RGA2_ALPHA_ROP_ENDIAN		BIT(20)
+
+#define RK_RGA_ROP_AND				0x88
+#define RK_RGA_ROP_OR				0xee
+#define RK_RGA_ROP_NOT_DST			0x55
+#define RK_RGA_ROP_NOT_SRC			0x33
+#define RK_RGA_ROP_XOR				0xf6
+#define RK_RGA_ROP_NOT_XOR			0xf9
 
 #define RK_RGA2_SCALE_BYPASS			0
 #define RK_RGA2_SCALE_DOWN			1
@@ -4055,6 +4069,95 @@ static bool rk_rga2_in_place_mosaic_allowed(const struct rga_req *task)
 	return true;
 }
 
+static bool rk_rga2_task_uses_rop(const struct rga_req *task)
+{
+	return task->rop_code || task->alpha_rop_flag ||
+	       task->alpha_rop_mode;
+}
+
+static bool rk_rga2_rop_bitblt_allowed(const struct rga_req *task)
+{
+	if (task->src.yrgb_addr != task->dst.yrgb_addr)
+		return true;
+	if (!task->src.yrgb_addr)
+		return false;
+	if (task->src.uv_addr != task->dst.uv_addr ||
+	    task->src.v_addr != task->dst.v_addr)
+		return false;
+	if (task->src.format != task->dst.format)
+		return false;
+	if (task->src.rd_mode != task->dst.rd_mode)
+		return false;
+	if (task->src.rd_mode && task->src.rd_mode != RK_RGA_RASTER_MODE)
+		return false;
+	if (task->src.vir_w != task->dst.vir_w ||
+	    task->src.vir_h != task->dst.vir_h)
+		return false;
+	if (task->src.act_w != task->dst.act_w ||
+	    task->src.act_h != task->dst.act_h)
+		return false;
+
+	return rk_rga_img_rects_disjoint(&task->src, &task->dst);
+}
+
+static int rk_rga2_rop_ctrl(u16 rop_code, u32 *rop_ctrl)
+{
+	switch (rop_code) {
+	case RK_RGA_ROP_AND:
+		*rop_ctrl = 0x00000070;
+		return 0;
+	case RK_RGA_ROP_OR:
+		*rop_ctrl = 0x00000050;
+		return 0;
+	case RK_RGA_ROP_NOT_DST:
+		*rop_ctrl = 0x00800004;
+		return 0;
+	case RK_RGA_ROP_NOT_SRC:
+		*rop_ctrl = 0x00800006;
+		return 0;
+	case RK_RGA_ROP_XOR:
+		*rop_ctrl = 0x008004b0;
+		return 0;
+	case RK_RGA_ROP_NOT_XOR:
+		*rop_ctrl = 0x00004830;
+		return 0;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static int rk_rga2_validate_rop(const struct rga_req *task)
+{
+	u32 rop_ctrl;
+
+	if (!rk_rga2_task_uses_rop(task))
+		return 0;
+	if (task->alpha_rop_flag != (BIT(0) | BIT(1)))
+		return -EOPNOTSUPP;
+	if (task->alpha_rop_mode != 0x1)
+		return -EOPNOTSUPP;
+	if (task->PD_mode || task->feature.global_alpha_en)
+		return -EOPNOTSUPP;
+	if (task->src.format != task->dst.format)
+		return -EOPNOTSUPP;
+	if ((task->src.rd_mode && task->src.rd_mode != RK_RGA_RASTER_MODE) ||
+	    (task->dst.rd_mode && task->dst.rd_mode != RK_RGA_RASTER_MODE))
+		return -EOPNOTSUPP;
+	if (task->src.act_w != task->dst.act_w ||
+	    task->src.act_h != task->dst.act_h)
+		return -EOPNOTSUPP;
+	if (task->src.rotate_mode || task->dst.rotate_mode ||
+	    task->rotate_mode || task->sina || task->cosa)
+		return -EOPNOTSUPP;
+	if (task->yuv2rgb_mode || task->full_csc.flag)
+		return -EOPNOTSUPP;
+	if (task->mosaic_info.enable || task->osd_info.enable ||
+	    task->pre_intr_info.enable || task->gauss_config.size)
+		return -EOPNOTSUPP;
+
+	return rk_rga2_rop_ctrl(task->rop_code, &rop_ctrl);
+}
+
 #if IS_ENABLED(CONFIG_ROCKCHIP_RGA_REWRITE_KUNIT_TEST)
 static int rk_rga2_select_dst_addresses(const struct rga_img_info_t *dst,
 					const struct rk_rga2_format_info *fmt,
@@ -4510,6 +4613,58 @@ static void rk_rga2_mosaic_emit_kunit(struct kunit *test)
 
 	task.mosaic_info.mode = 2;
 	task.dst.x_offset = 4;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+}
+
+static void rk_rga2_rop_emit_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA2_CMD_REG_COUNT] = { };
+	enum rk_rga_hw_type type = 0;
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_RGBA_8888);
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 2,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+
+	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
+				    1280, 720);
+	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_RGBA_8888,
+				    1280, 720);
+	task.yuv2rgb_mode = 0;
+	task.alpha_rop_flag = BIT(0) | BIT(1);
+	task.alpha_rop_mode = 0x1;
+	task.rop_code = RK_RGA_ROP_AND;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_ALPHA_CTRL0_OFFSET / 4],
+			RK_RGA2_ALPHA_ROP_0 | RK_RGA2_ALPHA_ROP_SEL |
+			FIELD_PREP(RK_RGA2_ALPHA_ROP_MODE, 1));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_ALPHA_CTRL1_OFFSET / 4], 0U);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_ROP_CTRL0_OFFSET / 4],
+			0x00000070U);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_ROP_CTRL1_OFFSET / 4], 0U);
+
+	memset(cmd, 0, sizeof(cmd));
+	job.cmd_ready = false;
+	task.rop_code = 0x12;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+
+	task.rop_code = RK_RGA_ROP_AND;
+	task.dst.act_w = 640;
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
 			-EOPNOTSUPP);
@@ -5409,6 +5564,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga2_fill_yuv_emit_kunit),
 	KUNIT_CASE(rk_rga2_fill_multitask_hw_type_kunit),
 	KUNIT_CASE(rk_rga2_mosaic_emit_kunit),
+	KUNIT_CASE(rk_rga2_rop_emit_kunit),
 	KUNIT_CASE(rk_rga_request_check_kunit),
 	KUNIT_CASE(rk_rga_request_ioctl_ret_kunit),
 	KUNIT_CASE(rk_rga_job_free_release_fence_kunit),
@@ -5533,6 +5689,7 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 				   struct rk_rga2_bitblt_profile *profile)
 {
 	struct rga_img_info_t dst;
+	bool uses_rop = rk_rga2_task_uses_rop(task);
 	int ret;
 
 	if (task->render_mode != RK_RGA_RENDER_BITBLT)
@@ -5545,12 +5702,21 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 	if (task->mosaic_info.enable) {
 		if (!rk_rga2_in_place_mosaic_allowed(task))
 			return -EOPNOTSUPP;
+	} else if (uses_rop) {
+		if (!rk_rga2_rop_bitblt_allowed(task))
+			return -EOPNOTSUPP;
 	} else if (!rk_rga_in_place_bitblt_allowed(task)) {
 		return -EOPNOTSUPP;
 	}
-	if (task->alpha_rop_flag || task->PD_mode ||
-	    task->feature.global_alpha_en)
-		return -EOPNOTSUPP;
+	if (uses_rop) {
+		ret = rk_rga2_validate_rop(task);
+		if (ret)
+			return ret;
+	} else {
+		if (task->alpha_rop_flag || task->PD_mode ||
+		    task->feature.global_alpha_en)
+			return -EOPNOTSUPP;
+	}
 	ret = rk_rga2_decode_transform(task, &profile->transform);
 	if (ret)
 		return ret;
@@ -5597,6 +5763,11 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 	if (ret)
 		return ret;
 	if (task->mosaic_info.enable &&
+	    (profile->src_fmt.yuv || profile->src_fmt.yuv400 ||
+	     profile->src_fmt.yuv10 || profile->dst_fmt.yuv ||
+	     profile->dst_fmt.yuv400 || profile->dst_fmt.yuv10))
+		return -EOPNOTSUPP;
+	if (uses_rop &&
 	    (profile->src_fmt.yuv || profile->src_fmt.yuv400 ||
 	     profile->src_fmt.yuv10 || profile->dst_fmt.yuv ||
 	     profile->dst_fmt.yuv400 || profile->dst_fmt.yuv10))
@@ -6566,6 +6737,7 @@ static int rk_rga2_emit_simple_bitblt(struct rk_rga_job *job)
 {
 	struct rga_req *task = &job->tasks[job->current_task];
 	struct rk_rga2_bitblt_profile profile;
+	u32 rop_ctrl;
 	int ret;
 
 	ret = rk_rga2_validate_bitblt(task, &profile);
@@ -6588,8 +6760,26 @@ static int rk_rga2_emit_simple_bitblt(struct rk_rga_job *job)
 	if (ret)
 		return ret;
 
-	rk_rga_cmd_write(job, RK_RGA2_ALPHA_CTRL0_OFFSET, 0);
-	rk_rga_cmd_write(job, RK_RGA2_ALPHA_CTRL1_OFFSET, 0);
+	if (rk_rga2_task_uses_rop(task)) {
+		ret = rk_rga2_rop_ctrl(task->rop_code, &rop_ctrl);
+		if (ret)
+			return ret;
+		rk_rga_cmd_write(job, RK_RGA2_ALPHA_CTRL0_OFFSET,
+				 FIELD_PREP(RK_RGA2_ALPHA_ROP_0,
+					    task->alpha_rop_flag) |
+				 FIELD_PREP(RK_RGA2_ALPHA_ROP_SEL,
+					    task->alpha_rop_flag >> 1) |
+				 FIELD_PREP(RK_RGA2_ALPHA_ROP_MODE,
+					    task->alpha_rop_mode) |
+				 FIELD_PREP(RK_RGA2_ALPHA_ROP_ENDIAN,
+					    (task->endian_mode >> 1) & 0x1));
+		rk_rga_cmd_write(job, RK_RGA2_ALPHA_CTRL1_OFFSET, 0);
+		rk_rga_cmd_write(job, RK_RGA2_ROP_CTRL0_OFFSET, rop_ctrl);
+		rk_rga_cmd_write(job, RK_RGA2_ROP_CTRL1_OFFSET, 0);
+	} else {
+		rk_rga_cmd_write(job, RK_RGA2_ALPHA_CTRL0_OFFSET, 0);
+		rk_rga_cmd_write(job, RK_RGA2_ALPHA_CTRL1_OFFSET, 0);
+	}
 	if (task->mosaic_info.enable)
 		rk_rga_cmd_write(job, RK_RGA2_MOSAIC_MODE_OFFSET,
 				 task->mosaic_info.mode & 0x7);
