@@ -1596,7 +1596,8 @@ rk_mpp_rkvdec2_ccu_job_del(struct rk_mpp_job *job, struct rk_mpp_hw *ccu)
 	return empty;
 }
 
-static struct rk_mpp_job *rk_mpp_rkvdec2_ccu_first_done_job(struct rk_mpp_hw *ccu)
+static __maybe_unused struct rk_mpp_job *
+rk_mpp_rkvdec2_ccu_first_done_job(struct rk_mpp_hw *ccu)
 {
 	const struct rk_mpp_rkvdec2_link_info *info =
 		&rk_mpp_rkvdec2_vdpu383_link_info;
@@ -1624,18 +1625,28 @@ static struct rk_mpp_job *rk_mpp_rkvdec2_ccu_first_done_job(struct rk_mpp_hw *cc
 static struct rk_mpp_job *
 rk_mpp_rkvdec2_ccu_done_active_job(struct rk_mpp_job *active)
 {
-	struct rk_mpp_job *done;
+	const struct rk_mpp_rkvdec2_link_info *info =
+		&rk_mpp_rkvdec2_vdpu383_link_info;
+	struct rk_mpp_hw *ccu;
+	struct rk_mpp_job *done = NULL;
+	unsigned long flags;
+	u32 *table;
 
 	if (!active || !active->rkvdec_ccu_started)
 		return NULL;
 
-	done = rk_mpp_rkvdec2_ccu_first_done_job(active->rkvdec_ccu);
-	if (!done)
+	ccu = active->rkvdec_ccu;
+	if (!ccu)
 		return NULL;
-	if (done != active) {
-		rk_mpp_job_put(done);
-		return NULL;
+
+	spin_lock_irqsave(&ccu->lock, flags);
+	table = active->rkvdec_link_vaddr;
+	if (active->rkvdec_ccu_listed && table &&
+	    table[info->irq_status_word]) {
+		rk_mpp_job_get(active);
+		done = active;
 	}
+	spin_unlock_irqrestore(&ccu->lock, flags);
 
 	return done;
 }
@@ -2335,13 +2346,19 @@ static void rk_mpp_rkvdec2_ccu_running_list_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&job1->refs), 2);
 	refcount_dec(&job1->refs);
 
+	table0[info->irq_status_word] = 0x5678;
+	done = rk_mpp_rkvdec2_ccu_first_done_job(ccu);
+	KUNIT_EXPECT_PTR_EQ(test, done, job0);
+	KUNIT_EXPECT_EQ(test, refcount_read(&job0->refs), 2);
+	refcount_dec(&job0->refs);
+	done = rk_mpp_rkvdec2_ccu_done_active_job(job1);
+	KUNIT_EXPECT_PTR_EQ(test, done, job1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&job1->refs), 2);
+	refcount_dec(&job1->refs);
+
 	KUNIT_EXPECT_FALSE(test, rk_mpp_rkvdec2_ccu_job_del(job1, ccu));
 	KUNIT_EXPECT_FALSE(test, job1->rkvdec_ccu_listed);
 	KUNIT_EXPECT_EQ(test, table0[info->next_word], 0U);
-	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_rkvdec2_ccu_first_done_job(ccu),
-			    NULL);
-
-	table0[info->irq_status_word] = 0x5678;
 	done = rk_mpp_rkvdec2_ccu_first_done_job(ccu);
 	KUNIT_EXPECT_PTR_EQ(test, done, job0);
 	refcount_dec(&job0->refs);
