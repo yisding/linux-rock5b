@@ -135,9 +135,10 @@ Implemented
   overlapping in-place blits, tile alpha/pattern/color-key, and in-place
   scaling/conversion/rotation remain unsupported.  Main request
   rotation/mirror flags are translated to RGA3 WIN0 rotate/mirror controls,
-  including current ``librga`` ``imflip()`` RGB mirror blits; unknown main
-  rotate selector values fall back to no-op rotation like the BSP RGA2/RGA3
-  register builders while preserving rejection of per-channel rotate fields.
+  including current ``librga`` ``imrotate()`` and ``imflip()`` RGB blits;
+  unknown main rotate selector values fall back to no-op rotation like the BSP
+  RGA2/RGA3 register builders while preserving rejection of per-channel rotate
+  fields.
   BSP's RGA3 policy restriction for source YUV422 90/270-degree rotation is
   preserved so those jobs fall back to an eligible RGA2 core unless the request
   forced an RGA3-only core mask.  Per-channel rotate flags remain unsupported.
@@ -301,7 +302,7 @@ Implemented
   RGA3 normal RGB color-key dispatch/emission and inverted-mode rejection,
   RGA3 ``librga`` copy-splice multi-task destination-offset emission,
   RGA3 ``librga`` RGB translate destination-offset emission,
-  RGA3 ``librga`` RGB flip/mirror emission,
+  RGA3 ``librga`` RGB rotate and flip/mirror emission,
   RGA3 tile8x8 profile selection and stride emission, RGA3 pattern-backed
   8-bit ``librga`` alpha-YUV overlay emission, ``librga`` global-alpha
   register emission, 10-bit YUV alpha-overlay emission, and
