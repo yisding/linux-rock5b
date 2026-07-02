@@ -103,13 +103,14 @@ Implemented
   DMA address, start command execution, and arm a per-core timeout worker.
 * Per-core timeout completion for accepted hardware jobs.  Timed-out jobs read
   RGA2/RGA3 status registers, reset the selected core with the BSP-style
-  soft-reset helper plus reset-controller fallback when present, complete with
-  ``-EBUSY``, release runtime PM/clocks, and dispatch the next queued job.
+  soft-reset helper plus reset-controller fallback when present, ask the public
+  IOMMU layer to flush the core's attached domain, complete with ``-EBUSY``,
+  release runtime PM/clocks, and dispatch the next queued job.
 * Public IOMMU fault callback registration for bound RGA cores.  A fault
   records ``iommu_fault_count`` in debugfs, logs the IOVA/status, marks the
   active job for immediate recovery through the same serialized reset path,
-  completes the job with ``-EIO``, and signals any exported async release
-  fence with that result.
+  refreshes the attached IOMMU domain after reset, completes the job with
+  ``-EIO``, and signals any exported async release fence with that result.
 * Per-job DMA-coherent command-buffer allocation and lifetime, sized for the
   selected RGA2/RGA3 core and released through normal job teardown.
 * RGA3 command-buffer generation path for validated raster and AFBC16x16
@@ -272,7 +273,7 @@ Implemented
   command emission,
   acquire-fence fd ownership merging, ffmpeg-facing RGA2 RFBC64x4 source
   profile selection and FBCIN command emission, IOMMU fault target matching,
-  scheduler priority enqueue/aging,
+  post-reset IOMMU refresh accounting, scheduler priority enqueue/aging,
   RGA3 normal RGB color-key dispatch/emission and inverted-mode rejection,
   RGA3 tile8x8 profile selection and stride emission, RGA3 pattern-backed
   10-bit YUV alpha-overlay emission, and
@@ -302,5 +303,5 @@ Outside This Slice
 
 * Physical address imports.
 * Full RGA2/RGA3 command-register generation and policy selection.
-* Full BSP timeout diagnostics and private-IOMMU recovery after faults beyond
-  immediate reset/abort.
+* Full BSP timeout diagnostics and private-IOMMU recovery policy beyond the
+  public post-reset domain refresh.
