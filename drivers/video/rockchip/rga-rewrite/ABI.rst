@@ -229,7 +229,8 @@ Implemented
   raster mirror copies emitted by current ``librga`` for ``immakeBorder()``
   reflect/wrap left and right edge tasks.  RFBC64x4 source images emitted by
   ``ffmpeg-rockchip`` for Rockchip RFBC DRM frames are accepted for the BSP RGA2P
-  YUV source-format subset and programmed through the RGA2 FBCIN register
+  YUV source-format subset, including the current 8-bit YUV420 and compact
+  10-bit YUV422 source profiles, and programmed through the RGA2 FBCIN register
   aliases while keeping the destination raster.  Pattern/alpha blend outside
   the alpha-bitmap subset below, color-key, ROP outside the ``imrop`` subset
   below, tile, AFBC32x8, RFBC destination, overlapping
@@ -327,7 +328,7 @@ Implemented
   emission,
   acquire-fence fd ownership merging, acquire-fence pending/success/error
   status propagation, async acquire-callback error completion,
-  ffmpeg-facing RGA2 RFBC64x4 source
+  ffmpeg-facing RGA2 RFBC64x4 8/10-bit source
   profile selection and FBCIN command emission, IOMMU fault target matching,
   post-reset IOMMU refresh accounting, scheduler priority enqueue/aging,
   RGA2 ``librga`` full-CSC RGB-to-YUV dispatch/emission,
