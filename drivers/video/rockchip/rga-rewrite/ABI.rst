@@ -259,17 +259,19 @@ Implemented
   render mode ``3`` when loading the LUT.  BPP1/2/4, scaled/rotated/converted,
   YUV destination, FBC/tile, pattern, alpha/ROP, OSD, and mixed-feature
   palette variants remain unsupported.
-* Multi-task requests are accepted when every task matches the same supported
-  backend profile; tasks run serially under the request's single
-  completion/fence.  The RGA3 no-blend emitted command includes overlap field
-  and alpha/default-global-alpha controls.
+* Multi-task requests are accepted when every task matches a supported backend
+  profile; tasks run serially under the request's single completion/fence.
+  Mixed RGA2/RGA3 batches validate the complete request up front, then select
+  an eligible backend for each task as it reaches the head of the serial batch.
+  The RGA3 no-blend emitted command includes overlap field and
+  alpha/default-global-alpha controls.
 * Legacy ``RGA_CACHE_FLUSH``, ``RGA_FLUSH``, ``RGA_GET_RESULT``, and
   ``RGA2_GET_RESULT`` as BSP-compatible no-ops.
 * Optional ``ROCKCHIP_RGA_REWRITE_KUNIT_TEST`` coverage for rewrite-local ABI
   normalization helpers, including the RGA2 ``rotate_mode``/``sina``/``cosa``
   decoder, transformed destination-corner selection, color-fill core-mask
   dispatch, BSP request task-count limits and return codes, mixed RGA2/RGA3
-  multi-task rejection, request-id removal on terminal submit, RGA2 fill
+  multi-task classification, request-id removal on terminal submit, RGA2 fill
   RGB/YUV destination-offset emission,
   YUV-fill chroma-alignment rejection, and multi-fill task acceptance, compact
   10-bit RGA2 source dispatch/emission including the no-scale force-tile mode,
@@ -299,8 +301,6 @@ Recognized But Unsupported
   8/10-bit YUV-destination alpha, per-channel rotation,
   RFBC/AFBC32x8, tile outside simple bitblits, 10-bit or AFBC destination offsets,
   virtual/physical-address, and non-bitblit operation modes.
-* Mixed RGA2/RGA3 multi-task requests.
-
 Unsupported submit profiles return ``-EOPNOTSUPP`` after copying, validating,
 preparing, queuing, dispatching, resolving imported buffers, allocating an owned
 command buffer, and power-sequencing an owned job to the backend boundary.
