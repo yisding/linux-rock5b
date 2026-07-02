@@ -155,7 +155,7 @@ Implemented
   preserved so those jobs fall back to an eligible RGA2 core unless the request
   forced an RGA3-only core mask.  Per-channel rotate flags remain unsupported.
   Destination rectangle offsets are supported by biasing WR plane base
-  addresses for 8-bit formats and raster unpacked semiplanar 10-bit YUV
+  addresses for 8-bit formats and raster compact/unpacked semiplanar 10-bit YUV
   destinations; this covers current ``librga`` ``imtranslate()`` RGB requests
   and centered RGB rotate requests with explicit destination rectangles.
   Semiplanar YUV offsets must be chroma-aligned.
@@ -360,9 +360,8 @@ Recognized But Unsupported
 * RGA3 pattern outside the supported alpha-overlay profile, color-key outside
   the normal RGB ``imcolorkey`` profile, converted no-pattern or mixed-depth
   8/10-bit YUV-destination alpha, per-channel rotation,
-  RFBC/AFBC32x8, tile outside simple bitblits, compact 10-bit or AFBC
-  destination offsets, physical-address channels, and non-bitblit operation
-  modes.
+  RFBC/AFBC32x8, tile outside simple bitblits, AFBC destination offsets,
+  physical-address channels, and non-bitblit operation modes.
 Unsupported submit profiles return ``-EOPNOTSUPP`` after copying, validating,
 preparing, queuing, dispatching, resolving imported buffers, allocating an owned
 command buffer, and power-sequencing an owned job to the backend boundary.
