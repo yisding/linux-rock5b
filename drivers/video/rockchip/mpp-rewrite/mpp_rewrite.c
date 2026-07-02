@@ -3409,7 +3409,7 @@ static void rk_mpp_rkvenc2_dchs_remap_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, producer_patched & RK_MPP_RKVENC_DCHS_TXID_MASK,
 			0U);
 	KUNIT_EXPECT_EQ(test, producer_patched & RK_MPP_RKVENC_DCHS_RXID_MASK,
-			1U << RK_MPP_RKVENC_DCHS_RXID_SHIFT);
+			0U);
 
 	unrelated_low = (2 << RK_MPP_RKVENC_DCHS_RXID_SHIFT) |
 			RK_MPP_RKVENC_DCHS_RXE;
@@ -3421,9 +3421,9 @@ static void rk_mpp_rkvenc2_dchs_remap_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, unrelated_patched & RK_MPP_RKVENC_DCHS_RXE,
 			0U);
 	KUNIT_EXPECT_EQ(test, unrelated_patched & RK_MPP_RKVENC_DCHS_TXID_MASK,
-			2U << RK_MPP_RKVENC_DCHS_TXID_SHIFT);
+			1U << RK_MPP_RKVENC_DCHS_TXID_SHIFT);
 	KUNIT_EXPECT_EQ(test, unrelated_patched & RK_MPP_RKVENC_DCHS_RXID_MASK,
-			3U << RK_MPP_RKVENC_DCHS_RXID_SHIFT);
+			0U);
 	rk_mpp_rkvenc2_dchs_release(unrelated);
 	KUNIT_EXPECT_FALSE(test, unrelated->rkvenc_dchs_active);
 	KUNIT_EXPECT_PTR_EQ(test, srv->rkvenc_dchs[2].job, NULL);
@@ -3450,6 +3450,68 @@ static void rk_mpp_rkvenc2_dchs_remap_kunit(struct kunit *test)
 	rk_mpp_rkvenc2_dchs_release(producer);
 	KUNIT_EXPECT_FALSE(test, producer->rkvenc_dchs_active);
 	KUNIT_EXPECT_PTR_EQ(test, srv->rkvenc_dchs[0].job, NULL);
+}
+
+static void rk_mpp_rkvenc2_dchs_independent_cores_kunit(struct kunit *test)
+{
+	struct rk_mpp_service *srv;
+	struct rk_mpp_session *session;
+	struct device_node *ccu_node;
+	struct rk_mpp_hw *hws[RK_MPP_RKVENC_MAX_DCHS_CORES];
+	struct rk_mpp_job *jobs[RK_MPP_RKVENC_MAX_DCHS_CORES];
+	u32 reg_words = RK_MPP_RKVENC_DCHS_WORD + 1;
+	u32 i;
+
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
+	session = kunit_kzalloc(test, sizeof(*session), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, session);
+	ccu_node = kunit_kzalloc(test, sizeof(*ccu_node), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ccu_node);
+
+	spin_lock_init(&srv->rkvenc_dchs_lock);
+	session->srv = srv;
+	session->client_type = RK_MPP_DEVICE_RKVENC;
+	session->id = 20;
+
+	for (i = 0; i < ARRAY_SIZE(jobs); i++) {
+		u32 patched;
+
+		hws[i] = kunit_kzalloc(test, sizeof(*hws[i]), GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, hws[i]);
+		jobs[i] = kunit_kzalloc(test, sizeof(*jobs[i]), GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, jobs[i]);
+
+		hws[i]->ccu_node = ccu_node;
+		hws[i]->core_id = i;
+		jobs[i]->session = session;
+		jobs[i]->hw = hws[i];
+		jobs[i]->id = 200 + i;
+		jobs[i]->reg_image.reg_words = reg_words;
+		jobs[i]->reg_image.regs =
+			kunit_kcalloc(test, reg_words, sizeof(u32),
+				      GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, jobs[i]->reg_image.regs);
+
+		jobs[i]->reg_image.regs[RK_MPP_RKVENC_DCHS_WORD] =
+			i << RK_MPP_RKVENC_DCHS_TXID_SHIFT;
+		rk_mpp_rkvenc2_dchs_patch(jobs[i]);
+		patched = jobs[i]->reg_image.regs[RK_MPP_RKVENC_DCHS_WORD];
+
+		KUNIT_EXPECT_TRUE(test, jobs[i]->rkvenc_dchs_active);
+		KUNIT_EXPECT_PTR_EQ(test, srv->rkvenc_dchs[i].job, jobs[i]);
+		KUNIT_EXPECT_EQ(test,
+				patched & RK_MPP_RKVENC_DCHS_TXID_MASK,
+				i << RK_MPP_RKVENC_DCHS_TXID_SHIFT);
+		KUNIT_EXPECT_EQ(test,
+				patched & RK_MPP_RKVENC_DCHS_RXE, 0U);
+	}
+
+	for (i = 0; i < ARRAY_SIZE(jobs); i++) {
+		rk_mpp_rkvenc2_dchs_release(jobs[i]);
+		KUNIT_EXPECT_FALSE(test, jobs[i]->rkvenc_dchs_active);
+		KUNIT_EXPECT_PTR_EQ(test, srv->rkvenc_dchs[i].job, NULL);
+	}
 }
 
 static void rk_mpp_rcb_invalid_index_kunit(struct kunit *test)
@@ -3570,6 +3632,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_poll_irq_check_size_kunit),
 	KUNIT_CASE(rk_mpp_rkvenc_slice_mode_kunit),
 	KUNIT_CASE(rk_mpp_rkvenc2_dchs_remap_kunit),
+	KUNIT_CASE(rk_mpp_rkvenc2_dchs_independent_cores_kunit),
 	KUNIT_CASE(rk_mpp_rcb_invalid_index_kunit),
 	KUNIT_CASE(rk_mpp_batch_session_switch_split_kunit),
 	{}
@@ -4091,7 +4154,8 @@ static void rk_mpp_rkvenc2_dchs_patch(struct rk_mpp_job *job)
 			continue;
 
 		id_valid &= ~BIT(rk_mpp_rkvenc_dchs_txid(busy));
-		id_valid &= ~BIT(rk_mpp_rkvenc_dchs_rxid(busy));
+		if (busy & RK_MPP_RKVENC_DCHS_RXE)
+			id_valid &= ~BIT(rk_mpp_rkvenc_dchs_rxid(busy));
 	}
 
 	if (low & RK_MPP_RKVENC_DCHS_RXE) {
@@ -4122,20 +4186,12 @@ static void rk_mpp_rkvenc2_dchs_patch(struct rk_mpp_job *job)
 
 	id_valid &= ~BIT(txid_map);
 
-	if (rxid_map < 0) {
-		rxid_map = rk_mpp_rkvenc_dchs_find_id(id_valid);
-		if (rxid_map < 0) {
-			spin_unlock_irqrestore(&srv->rkvenc_dchs_lock, flags);
-			dev_err(hw->dev, "job %u session %u failed to allocate DCHS rx id\n",
-				job->id, job->session->id);
-			return;
-		}
-
+	if (rxid_map < 0)
 		rxe_map = false;
-	}
 
 	patched = rk_mpp_rkvenc_dchs_set_txid(low, txid_map);
-	patched = rk_mpp_rkvenc_dchs_set_rxid(patched, rxid_map);
+	patched = rk_mpp_rkvenc_dchs_set_rxid(patched,
+					       rxid_map >= 0 ? rxid_map : 0);
 	if (rxe_map)
 		patched |= RK_MPP_RKVENC_DCHS_RXE;
 	else
