@@ -89,8 +89,9 @@ Implemented
   backend start failures through the normal completion path.
 * RK3588 RKVENC2 DCHS dual-core hand-shake setup for queued multicore encoder
   jobs.  The rewrite mirrors the BSP-visible policy of always enabling TX,
-  allocating per-active-core tx/rx ids, linking RX to a same-session producer
-  when the original ids match, disabling RX when no producer is active, and
+  allocating per-active-core TX ids, linking RX to a same-session producer
+  when the original ids match, allocating an RX id only while RX remains
+  enabled, disabling RX when no producer is active, and
   clearing the DCHS slot on normal completion, submit failure, timeout, reset,
   close, or device removal.
 * Per-core start/abort/timeout/completion serialization.  ``RESET_SESSION``,
@@ -211,8 +212,9 @@ Implemented
   hard-CCU idle/add-mode descriptor values, hard-CCU all-core work-mask
   selection, fixed-RCB link-latch
   programming, IOMMU fault target matching, RKVENC2 DCHS tx/rx id remapping
-  and release, ``POLL_HW_IRQ`` flexible-buffer sizing, RKVENC2 slice-mode
-  detection, and ``SET_SESSION_FD`` batch job splitting.
+  and release, independent-core DCHS id capacity, ``POLL_HW_IRQ``
+  flexible-buffer sizing, RKVENC2 slice-mode detection, and
+  ``SET_SESSION_FD`` batch job splitting.
 
 Recognized But Unsupported
 --------------------------
