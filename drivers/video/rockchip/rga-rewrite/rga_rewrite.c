@@ -6114,6 +6114,23 @@ static void rk_rga_mixed_task_hw_type_kunit(struct kunit *test)
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
+
+	tasks[0].core = BIT(1);
+	tasks[1].core = BIT(3);
+	job.current_task = 0;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+
+	job.current_task = 1;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
+
+	tasks[1].core = BIT(0);
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
 }
 
 static void rk_rga_find_best_hw_for_job_kunit(struct kunit *test)
