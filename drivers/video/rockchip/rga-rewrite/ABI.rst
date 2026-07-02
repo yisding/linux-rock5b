@@ -175,7 +175,8 @@ Implemented
   task acceptance, compact 10-bit RGA2 source dispatch/emission including the
   no-scale force-tile mode, IOMMU fault target matching, and ffmpeg-facing RGA3
   raster/FBC/alpha-overlay profile selection plus destination-offset command
-  emission and semiplanar chroma-alignment rejection.
+  emission, source-crop command emission for RGA3 and RGA2, and semiplanar
+  chroma-alignment rejection.
 
 Recognized But Unsupported
 --------------------------
