@@ -1759,7 +1759,7 @@ rk_mpp_rkvdec2_ccu_job_done(const struct rk_mpp_job *job,
 	return table[info->irq_status_word];
 }
 
-static u32 __maybe_unused
+static u32
 rk_mpp_rkvdec2_ccu_relink_unfinished_locked(struct rk_mpp_hw *ccu)
 {
 	const struct rk_mpp_rkvdec2_link_info *info =
@@ -1791,6 +1791,21 @@ rk_mpp_rkvdec2_ccu_relink_unfinished_locked(struct rk_mpp_hw *ccu)
 
 		table[info->next_word] = lower_32_bits(next_iova);
 	}
+
+	return count;
+}
+
+static u32 rk_mpp_rkvdec2_ccu_prepare_resend_chain(struct rk_mpp_hw *ccu)
+{
+	unsigned long flags;
+	u32 count;
+
+	if (!ccu)
+		return 0;
+
+	spin_lock_irqsave(&ccu->lock, flags);
+	count = rk_mpp_rkvdec2_ccu_relink_unfinished_locked(ccu);
+	spin_unlock_irqrestore(&ccu->lock, flags);
 
 	return count;
 }
@@ -4565,6 +4580,7 @@ static void rk_mpp_hw_timeout_work(struct work_struct *work)
 	rk_mpp_job_put(job);
 	if (hard_ccu_recovery) {
 		rk_mpp_rkvdec2_drain_ccu_done_jobs(ccu);
+		rk_mpp_rkvdec2_ccu_prepare_resend_chain(ccu);
 		rk_mpp_hw_abort_ccu_active_dependents(ccu, hw, recovery_result);
 	}
 	rk_mpp_hw_put(ccu);
@@ -5524,6 +5540,7 @@ static irqreturn_t rk_mpp_rkvdec2_thread(struct rk_mpp_hw *hw)
 	rk_mpp_job_put(job);
 	if (ccu_error) {
 		rk_mpp_rkvdec2_drain_ccu_done_jobs(ccu);
+		rk_mpp_rkvdec2_ccu_prepare_resend_chain(ccu);
 		rk_mpp_hw_abort_ccu_active_dependents(ccu, hw, -EIO);
 	} else {
 		rk_mpp_rkvdec2_drain_ccu_done_jobs(ccu);
