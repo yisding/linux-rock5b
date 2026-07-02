@@ -3863,6 +3863,10 @@ static int rk_rga_request_ioctl_ret(int ret);
 static struct rk_rga_hw *
 rk_rga_find_best_hw_for_job(struct list_head *hw_list, struct rk_rga_job *job,
 			    enum rk_rga_hw_type type);
+static struct rk_rga_hw *
+rk_rga_iommu_find_fault_hw(struct list_head *fault_hws,
+			   struct iommu_domain *domain,
+			   struct device *iommu_dev);
 
 static void rk_rga2_transform_expect(struct kunit *test, u8 rotate_mode,
 				     s32 sina, s32 cosa, u8 rot, u8 mir,
@@ -4237,6 +4241,80 @@ static void rk_rga_find_best_hw_for_job_kunit(struct kunit *test)
 			    NULL);
 }
 
+static void rk_rga_iommu_fault_match_kunit(struct kunit *test)
+{
+	struct rk_rga_iommu_fault_match_fixture {
+		struct iommu_domain domain0;
+		struct iommu_domain domain1;
+		struct iommu_domain domain2;
+		struct device_node node0;
+		struct device_node node1;
+		struct device_node node2;
+		struct device iommu_dev;
+		struct rk_rga_hw hw0;
+		struct rk_rga_hw hw1;
+		struct rk_rga_hw hw2;
+	} *fixture;
+	struct device *iommu_dev;
+	struct rk_rga_hw *hw0;
+	struct rk_rga_hw *hw1;
+	struct rk_rga_hw *hw2;
+	LIST_HEAD(fault_hws);
+
+	fixture = kunit_kzalloc(test, sizeof(*fixture), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, fixture);
+
+	iommu_dev = &fixture->iommu_dev;
+	iommu_dev->of_node = &fixture->node1;
+
+	hw0 = &fixture->hw0;
+	hw0->iommu_domain = &fixture->domain0;
+	hw0->iommu_node = &fixture->node0;
+	hw1 = &fixture->hw1;
+	hw1->iommu_domain = &fixture->domain0;
+	hw1->iommu_node = &fixture->node1;
+	hw2 = &fixture->hw2;
+	hw2->iommu_domain = &fixture->domain1;
+	hw2->iommu_node = &fixture->node1;
+
+	INIT_LIST_HEAD(&hw0->fault_node);
+	INIT_LIST_HEAD(&hw1->fault_node);
+	INIT_LIST_HEAD(&hw2->fault_node);
+	list_add_tail(&hw0->fault_node, &fault_hws);
+	list_add_tail(&hw1->fault_node, &fault_hws);
+	list_add_tail(&hw2->fault_node, &fault_hws);
+
+	KUNIT_EXPECT_PTR_EQ(test,
+			    rk_rga_iommu_find_fault_hw(&fault_hws,
+						       &fixture->domain0,
+						       iommu_dev),
+			    hw1);
+
+	iommu_dev->of_node = &fixture->node2;
+	KUNIT_EXPECT_PTR_EQ(test,
+			    rk_rga_iommu_find_fault_hw(&fault_hws,
+						       &fixture->domain0,
+						       iommu_dev),
+			    hw0);
+
+	iommu_dev->of_node = &fixture->node1;
+	KUNIT_EXPECT_PTR_EQ(test,
+			    rk_rga_iommu_find_fault_hw(&fault_hws,
+						       &fixture->domain1,
+						       iommu_dev),
+			    hw2);
+	KUNIT_EXPECT_PTR_EQ(test,
+			    rk_rga_iommu_find_fault_hw(&fault_hws,
+						       &fixture->domain0,
+						       NULL),
+			    hw0);
+	KUNIT_EXPECT_PTR_EQ(test,
+			    rk_rga_iommu_find_fault_hw(&fault_hws,
+						       &fixture->domain2,
+						       iommu_dev),
+			    NULL);
+}
+
 static void rk_rga_ffmpeg_rga3_profiles_kunit(struct kunit *test)
 {
 	enum rk_rga_hw_type type = 0;
@@ -4476,6 +4554,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_job_free_release_fence_kunit),
 	KUNIT_CASE(rk_rga_mixed_task_hw_type_kunit),
 	KUNIT_CASE(rk_rga_find_best_hw_for_job_kunit),
+	KUNIT_CASE(rk_rga_iommu_fault_match_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_rga3_profiles_kunit),
 	KUNIT_CASE(rk_rga2_compact_10bit_profile_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_fbc_profiles_kunit),
@@ -6347,21 +6426,16 @@ static void rk_rga_hw_timeout_work(struct work_struct *work)
 	rk_rga_hw_dispatch(hw);
 }
 
-static int rk_rga_iommu_fault_handler(struct iommu_domain *domain,
-				      struct device *iommu_dev,
-				      unsigned long iova, int status,
-				      void *arg)
+static struct rk_rga_hw *
+rk_rga_iommu_find_fault_hw(struct list_head *fault_hws,
+			   struct iommu_domain *domain,
+			   struct device *iommu_dev)
 {
-	struct rk_rga_service *rga = arg;
 	struct rk_rga_hw *fallback = NULL;
 	struct rk_rga_hw *match = NULL;
 	struct rk_rga_hw *hw;
-	unsigned long flags;
 
-	atomic_inc(&rga->iommu_fault_count);
-
-	spin_lock_irqsave(&rga->fault_lock, flags);
-	list_for_each_entry(hw, &rga->fault_hws, fault_node) {
+	list_for_each_entry(hw, fault_hws, fault_node) {
 		if (hw->iommu_domain != domain)
 			continue;
 
@@ -6372,9 +6446,24 @@ static int rk_rga_iommu_fault_handler(struct iommu_domain *domain,
 			break;
 		}
 	}
-	if (!match)
-		match = fallback;
 
+	return match ?: fallback;
+}
+
+static int rk_rga_iommu_fault_handler(struct iommu_domain *domain,
+				      struct device *iommu_dev,
+				      unsigned long iova, int status,
+				      void *arg)
+{
+	struct rk_rga_service *rga = arg;
+	struct rk_rga_hw *match = NULL;
+	unsigned long flags;
+
+	atomic_inc(&rga->iommu_fault_count);
+
+	spin_lock_irqsave(&rga->fault_lock, flags);
+	match = rk_rga_iommu_find_fault_hw(&rga->fault_hws, domain,
+					   iommu_dev);
 	if (match) {
 		atomic_set(&match->iommu_fault_pending, 1);
 		mod_delayed_work(system_wq, &match->timeout_work, 0);
