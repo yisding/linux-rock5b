@@ -3164,6 +3164,23 @@ static bool rk_rga_format_is_yuv10(u32 format)
 	}
 }
 
+static bool rk_rga_format_is_rga3_yuv422_rotate_blocked(u32 format)
+{
+	switch (format) {
+	case RK_RGA_FORMAT_YCBCR_422_SP:
+	case RK_RGA_FORMAT_YCRCB_422_SP:
+	case RK_RGA_FORMAT_YCBCR_422_SP_10B:
+	case RK_RGA_FORMAT_YCRCB_422_SP_10B:
+	case RK_RGA_FORMAT_YVYU_422:
+	case RK_RGA_FORMAT_VYUY_422:
+	case RK_RGA_FORMAT_YUYV_422:
+	case RK_RGA_FORMAT_UYVY_422:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static bool rk_rga_format_is_alpha(u32 format)
 {
 	switch (format) {
@@ -4615,6 +4632,8 @@ static u32 rk_rga2_alpha_bitmap_ctrl1(void);
 static u32 rk_rga2_osd_alpha_ctrl1(void);
 static u32 rk_rga2_pack_nn_quantize(__s16 r, __s16 g, __s16 b);
 static int rk_rga3_emit_simple_bitblt(struct rk_rga_job *job);
+static int rk_rga3_validate_bitblt(const struct rga_req *task,
+				   struct rk_rga3_bitblt_profile *profile);
 static int rk_rga_request_check(const struct rga_user_request *user);
 static int rk_rga_request_ioctl_ret(int ret);
 static struct rk_rga_hw *
@@ -5881,6 +5900,37 @@ static void rk_rga_ffmpeg_rga3_profiles_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 }
 
+static void rk_rga3_yuv422_rotate_policy_kunit(struct kunit *test)
+{
+	struct rk_rga3_bitblt_profile profile;
+	enum rk_rga_hw_type type = 0;
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YUYV_422,
+					  RK_RGA_FORMAT_BGRA_8888);
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 2,
+	};
+
+	task.rotate_mode = 1;
+	task.sina = 65536;
+	task.cosa = 0;
+	task.dst.act_w = 1080;
+	task.dst.act_h = 1920;
+	task.dst.vir_w = 1920;
+	task.dst.vir_h = 1920;
+
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
+
+	task.core = RK_RGA_CORE_RGA3_MASK;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
+}
+
 static void rk_rga_in_place_border_bitblt_kunit(struct kunit *test)
 {
 	u32 rga3_cmd[RK_RGA3_CMD_REG_COUNT] = { };
@@ -6487,6 +6537,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_iommu_fault_match_kunit),
 	KUNIT_CASE(rk_rga_iommu_refresh_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_rga3_profiles_kunit),
+	KUNIT_CASE(rk_rga3_yuv422_rotate_policy_kunit),
 	KUNIT_CASE(rk_rga_in_place_border_bitblt_kunit),
 	KUNIT_CASE(rk_rga2_compact_10bit_profile_kunit),
 	KUNIT_CASE(rk_rga2_src_crop_emit_kunit),
@@ -6923,6 +6974,9 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 	ret = rk_rga3_rotate_flags(task, &profile->rotate_flags);
 	if (ret)
 		return ret;
+	if ((profile->rotate_flags & RK_RGA3_ROT_BIT_ROT_90) &&
+	    rk_rga_format_is_rga3_yuv422_rotate_blocked(task->src.format))
+		return -EOPNOTSUPP;
 
 	ret = rk_rga3_hw_rd_mode(task->src.rd_mode, &profile->src_mode);
 	if (ret)
