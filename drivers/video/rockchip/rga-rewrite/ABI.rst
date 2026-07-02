@@ -121,9 +121,11 @@ Implemented
   operations, and supports the 8-bit RGB/YUV plus semiplanar 10-bit YUV formats
   exposed by common ``librga`` and ``ffmpeg-rockchip`` blit/scale/convert users.
   AFBC is accepted through ``RGA_FBC_MODE`` for the RGA3 FBCD/FBCE format subset;
-  RFBC, AFBC32x8, tile modes, packed-YUV FBC, compressed in-place alpha
-  write-back, overlapping in-place blits, and in-place scaling/conversion/rotation
-  remain unsupported.  Main request
+  tile8x8 is accepted through ``RGA_TILE_MODE`` for the BSP RGA3 semiplanar YUV
+  tile-format subset in simple raster-to-tile and tile-to-raster bitblits.
+  RFBC, AFBC32x8, packed-YUV FBC, compressed in-place alpha write-back,
+  overlapping in-place blits, tile alpha/pattern/color-key, and in-place
+  scaling/conversion/rotation remain unsupported.  Main request
   rotation/mirror flags are translated to RGA3 WIN0 rotate/mirror controls;
   per-channel rotate flags remain unsupported.  Destination rectangle offsets
   are supported by biasing WR plane base addresses for 8-bit formats;
@@ -201,7 +203,8 @@ Implemented
   10-bit RGA2 source dispatch/emission including the no-scale force-tile mode,
   ffmpeg-facing RGA2 RFBC64x4 source profile selection and FBCIN command
   emission, IOMMU fault target matching, scheduler priority enqueue/aging,
-  RGA3 normal RGB color-key dispatch/emission and inverted-mode rejection, and
+  RGA3 normal RGB color-key dispatch/emission and inverted-mode rejection,
+  RGA3 tile8x8 profile selection and stride emission, and
   ffmpeg-facing RGA3 raster/FBC/alpha-overlay profile selection plus
   destination-offset command
   emission, source-crop command emission for RGA3 and RGA2, and semiplanar
@@ -215,7 +218,7 @@ Recognized But Unsupported
 * RGA3 pattern outside the supported alpha-overlay profile, color-key outside
   the normal RGB ``imcolorkey`` profile, no-pattern or 10-bit YUV-destination
   alpha, per-channel rotation,
-  RFBC/tile/AFBC32x8, 10-bit or AFBC destination offsets,
+  RFBC/AFBC32x8, tile outside simple bitblits, 10-bit or AFBC destination offsets,
   virtual/physical-address, and non-bitblit operation modes.
 * Mixed RGA2/RGA3 multi-task requests.
 
