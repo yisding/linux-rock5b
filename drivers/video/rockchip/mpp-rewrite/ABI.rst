@@ -140,8 +140,11 @@ Implemented
   additional jobs are appended with the BSP ``ADD_MODE`` link-mode bit; if the
   hardware is busy without tracked jobs, the job keeps the direct link-MMIO
   fallback.  Completion matching for the selected active job checks that job's
-  own CCU table, even if an earlier listed table has already finished; automatic
-  completion of other cores' finished jobs from one IRQ worker is still pending.
+  own CCU table, even if an earlier listed table has already finished.  After
+  completing the IRQ core's own job, the thread scans the same coordinator for
+  other table-complete jobs and completes them only when it can claim the exact
+  active job from that job's owning core; busy cores are left for their own IRQ
+  or timeout path.
 * ``MPP_CMD_POLL_HW_IRQ`` for RK3588 RKVENC2 encoder slice result streaming.
   The rewrite advertises the forward-port ``POLL_BUTT`` command boundary,
   detects slice mode from the submitted RKVENC2 register image
@@ -167,9 +170,10 @@ Implemented
   checks, BSP VDPU383 link IRQ decoding, link-table
   layout/materialization/readback/ownership/relinking, CCU-reference lifetime,
   hard-CCU running-list table-chain relinking/scanning/active matching and
-  active-job out-of-order matching/drain detection, hard-CCU table-status
-  readback, hard-CCU idle/add-mode descriptor values, ``POLL_HW_IRQ``
-  flexible-buffer sizing, and RKVENC2 slice-mode detection.
+  active-job out-of-order matching/drain detection, cross-core CCU completion
+  claiming, hard-CCU table-status readback, hard-CCU idle/add-mode descriptor
+  values, ``POLL_HW_IRQ`` flexible-buffer sizing, and RKVENC2 slice-mode
+  detection.
 
 Recognized But Unsupported
 --------------------------
