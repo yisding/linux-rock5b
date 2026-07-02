@@ -123,11 +123,13 @@ Implemented
   decoder jobs reserve one node from a per-core bitmap, stage the BSP
   write/readback register partitions into that job-owned table node, hold a
   counted reference to the referenced CCU coordinator, and release both on
-  completion or abort.  Jobs also record the BSP-shaped hard-CCU submit
-  descriptor values: core-work mask, table address, link-mode word,
-  autogate/work/cfg-done bits, and the link IRQ CCU-mode bit.  The readback
-  helper copies BSP table readback partitions back into the normal register
-  image and applies the VDPU383 link-mode status word.
+  completion or abort.  Jobs also record BSP-shaped hard-CCU submit descriptor
+  values for the selected core: core-work mask, table address, link-mode word,
+  autogate/work/cfg-done bits, and the link IRQ CCU-mode bit.  When the CCU is
+  idle, the rewrite can start that job through the hard-CCU config path and
+  copy BSP table readback partitions back into the normal register image with
+  the VDPU383 link-mode status word.  If the CCU is already active, the job
+  keeps the direct link-MMIO fallback until add-mode queueing is implemented.
 * ``MPP_CMD_POLL_HW_IRQ`` for RK3588 RKVENC2 encoder slice result streaming.
   The rewrite advertises the forward-port ``POLL_BUTT`` command boundary,
   detects slice mode from the submitted RKVENC2 register image
@@ -169,8 +171,9 @@ Outside This Slice
   coordinator to be bound and online, has least-loaded core selection, queued
   dispatch, RKVENC2 DCHS hand-shake remapping, RKVDEC2 CCU-mode task register
   preparation, VDPU383 link-window direct start/IRQ handling, and job-owned
-  link-table materialization/readback helpers, but does not yet mirror the BSP
-  decoder hard-CCU scheduling and table submission policy.
+  link-table materialization/readback helpers with selected-core first-entry
+  hard-CCU submit, but does not yet mirror the BSP decoder hard-CCU add-mode
+  multicore queue scheduling policy.
 * Full BSP-equivalent timeout recovery policy and IOMMU fault recovery,
   including shared reset-domain serialization and MMU-domain refresh.
 * Fence export/import semantics.
