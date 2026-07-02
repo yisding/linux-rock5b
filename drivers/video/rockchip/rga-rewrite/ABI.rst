@@ -39,7 +39,9 @@ Implemented
 * Acquire-fence sync-file validation and ownership for modern request and
   legacy blit paths.  Configured requests hold references to the imported
   ``dma_fence`` objects for submit and close kernel-owned acquire-fence fds
-  once those references have been taken.
+  once those references have been taken.  Preparation failures and legacy
+  blit job-allocation failures also release kernel-owned acquire-fence fds
+  after dropping the imported fence references.
 * ``librga`` acquire-fence ownership semantics.  When a submitted task clears
   ``feature.user_close_fence``, the rewrite closes the imported acquire-fence fd
   after taking its own ``dma_fence`` reference, matching the forward-port
@@ -268,8 +270,9 @@ Implemented
   quantize dispatch/emission, RGA2 RGB alpha-bitmap SRC1/alpha emission,
   RGA2 OSD SRC1/alpha/control emission, RGA2 palette update and color-palette
   command emission,
-  ffmpeg-facing RGA2 RFBC64x4 source profile selection and FBCIN command
-  emission, IOMMU fault target matching, scheduler priority enqueue/aging,
+  acquire-fence fd ownership merging, ffmpeg-facing RGA2 RFBC64x4 source
+  profile selection and FBCIN command emission, IOMMU fault target matching,
+  scheduler priority enqueue/aging,
   RGA3 normal RGB color-key dispatch/emission and inverted-mode rejection,
   RGA3 tile8x8 profile selection and stride emission, RGA3 pattern-backed
   10-bit YUV alpha-overlay emission, and
