@@ -5061,6 +5061,57 @@ static void rk_rga_ffmpeg_alpha_overlay_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 }
 
+static void rk_rga3_alpha_yuv10_overlay_emit_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
+	enum rk_rga_hw_type type = 0;
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_420_SP_10B,
+					  RK_RGA_FORMAT_YCBCR_420_SP_10B);
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 3,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+
+	task.pat = rk_rga_kunit_img(0x30000000, RK_RGA_FORMAT_RGBA_8888,
+				    task.dst.act_w, task.dst.act_h);
+	task.bsfilter_flag = 1;
+	task.alpha_rop_flag = BIT(0) | BIT(3) | BIT(4) | BIT(9);
+	task.PD_mode = RK_RGA_ALPHA_BLEND_DST_OVER;
+	task.feature.global_alpha_en = true;
+	task.fg_global_alpha = 0xff;
+	task.bg_global_alpha = 0xff;
+	task.yuv2rgb_mode = 1 | (2 << 2);
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
+			  RK_RGA3_WIN0_R2Y_EN);
+	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4] &
+			  RK_RGA3_WIN0_YUV10_COMPACT);
+	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WR_CTRL_OFFSET / 4] &
+			  RK_RGA3_WR_YUV10_COMPACT);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_CTRL_OFFSET / 4],
+			FIELD_PREP(RK_RGA3_OVLP_MODE, 0) |
+			RK_RGA3_OVLP_FIELD | RK_RGA3_OVLP_TOP_ALPHA_EN);
+
+	memset(cmd, 0, sizeof(cmd));
+	memset(&task.pat, 0, sizeof(task.pat));
+	task.bsfilter_flag = 0;
+	job.import_count = 2;
+	job.cmd_ready = false;
+	type = 0;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+}
+
 static void rk_rga3_colorkey_emit_kunit(struct kunit *test)
 {
 	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
@@ -5276,6 +5327,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_ffmpeg_fbc_profiles_kunit),
 	KUNIT_CASE(rk_rga3_tile8x8_profile_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_alpha_overlay_kunit),
+	KUNIT_CASE(rk_rga3_alpha_yuv10_overlay_emit_kunit),
 	KUNIT_CASE(rk_rga3_colorkey_emit_kunit),
 	KUNIT_CASE(rk_rga3_alpha_rotate_emit_kunit),
 	KUNIT_CASE(rk_rga3_dst_offset_emit_kunit),
@@ -5578,14 +5630,17 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 	/*
 	 * Keep the alpha subset to the formats emitted by librga/ffmpeg:
 	 * RGB/RGBA pattern over an RGB destination, or the default RKMPP
-	 * overlay path where an 8-bit YUV main image stays in a YUV destination
-	 * and the pattern read window converts RGB/RGBA to that write domain.
+	 * overlay path where an 8- or 10-bit YUV main image stays in a
+	 * matching YUV destination and the pattern read window converts
+	 * RGB/RGBA to that write domain.
 	 */
 	if (!profile->bg_fmt.rgb)
 		return -EOPNOTSUPP;
 	if (!profile->dst_fmt.rgb &&
 	    !(profile->dst_fmt.yuv && profile->src_fmt.yuv &&
-	      !profile->dst_fmt.yuv10 && !profile->src_fmt.yuv10))
+	      ((!profile->dst_fmt.yuv10 && !profile->src_fmt.yuv10) ||
+	       (profile->pattern_blend &&
+		profile->dst_fmt.yuv10 == profile->src_fmt.yuv10))))
 		return -EOPNOTSUPP;
 
 	return 0;
@@ -6657,7 +6712,7 @@ static int rk_rga3_emit_alpha_overlap(struct rk_rga_job *job,
 	if (ret)
 		return ret;
 
-	reg = FIELD_PREP(RK_RGA3_OVLP_MODE, 1) |
+	reg = FIELD_PREP(RK_RGA3_OVLP_MODE, !profile->pattern_blend) |
 	      RK_RGA3_OVLP_TOP_ALPHA_EN;
 	if (profile->dst_fmt.yuv)
 		reg |= RK_RGA3_OVLP_FIELD;
