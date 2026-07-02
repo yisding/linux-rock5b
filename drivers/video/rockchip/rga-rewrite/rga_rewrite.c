@@ -124,6 +124,7 @@
 #define RK_RGA2_SRC_X_FACTOR_OFFSET		0x020
 #define RK_RGA2_SRC_Y_FACTOR_OFFSET		0x024
 #define RK_RGA2_SRC_BG_COLOR_OFFSET		0x028
+#define RK_RGA2_GAUSS_COE_OFFSET		0x028
 #define RK_RGA2_SRC_FG_COLOR_OFFSET		0x02c
 #define RK_RGA2_SRC_TR_COLOR0_OFFSET		0x030
 #define RK_RGA2_CF_GR_A_OFFSET			0x030
@@ -159,6 +160,7 @@
 #define RK_RGA2_MODE_COLOR_FILL_MODE		BIT(4)
 #define RK_RGA2_MODE_INTR_CF_E			BIT(7)
 #define RK_RGA2_MODE_MOSAIC_EN			BIT(9)
+#define RK_RGA2_MODE_SRC_GAUSS_EN		BIT(17)
 #define RK_RGA2_MOSAIC_MODE_OFFSET		0x030
 
 #define RK_RGA2_SRC_FORMAT			GENMASK(3, 0)
@@ -193,7 +195,13 @@
 #define RK_RGA2_ALPHA_ROP_0			BIT(0)
 #define RK_RGA2_ALPHA_ROP_SEL			BIT(1)
 #define RK_RGA2_ALPHA_ROP_MODE			GENMASK(3, 2)
+#define RK_RGA2_ALPHA_SRC_GLOBAL		GENMASK(11, 4)
+#define RK_RGA2_ALPHA_DST_GLOBAL		GENMASK(19, 12)
 #define RK_RGA2_ALPHA_ROP_ENDIAN		BIT(20)
+
+#define RK_RGA2_GAUSS_COE0			GENMASK(5, 0)
+#define RK_RGA2_GAUSS_COE1			GENMASK(13, 8)
+#define RK_RGA2_GAUSS_COE2			GENMASK(23, 16)
 
 #define RK_RGA_ROP_AND				0x88
 #define RK_RGA_ROP_OR				0xee
@@ -836,6 +844,7 @@ struct rk_rga_request {
 	struct rga_req *tasks;
 	struct rk_rga_import **imports;
 	struct dma_fence **acquire_fences;
+	u32 *gauss_coeffs;
 	u32 import_count;
 	u32 acquire_fence_count;
 	bool configured;
@@ -860,6 +869,7 @@ struct rk_rga_job {
 	struct rk_rga_import **imports;
 	struct rk_rga_job_mapping *mappings;
 	struct dma_fence **acquire_fences;
+	u32 *gauss_coeffs;
 	struct rk_rga_fence_waiter *acquire_waiters;
 	struct dma_fence *release_fence;
 	struct device *cmd_dev;
@@ -1214,12 +1224,19 @@ static void rk_rga_request_clear_fences(struct rk_rga_request *request)
 	request->acquire_fence_count = 0;
 }
 
+static void rk_rga_request_clear_gauss(struct rk_rga_request *request)
+{
+	kfree(request->gauss_coeffs);
+	request->gauss_coeffs = NULL;
+}
+
 static void rk_rga_request_free(void *ptr)
 {
 	struct rk_rga_request *request = ptr;
 
 	rk_rga_request_clear_imports(request);
 	rk_rga_request_clear_fences(request);
+	rk_rga_request_clear_gauss(request);
 	kfree(request->tasks);
 	kfree(request);
 }
@@ -2213,6 +2230,7 @@ static void rk_rga_job_free(struct rk_rga_job *job)
 	rk_rga_put_import_array(job->imports, job->import_count);
 	rk_rga_put_fence_array(job->acquire_fences, job->acquire_fence_count);
 	kfree(job->acquire_waiters);
+	kfree(job->gauss_coeffs);
 	kfree(job->tasks);
 	kfree(job);
 }
@@ -2334,6 +2352,54 @@ err_put_resources:
 	return ret;
 }
 
+static int rk_rga_copy_gauss_coeffs(struct rga_req *tasks, u32 task_count,
+				    u32 **coeffs_out)
+{
+	u32 *coeffs = NULL;
+	int ret = 0;
+
+	for (u32 i = 0; i < task_count; i++) {
+		struct rga_req *task = &tasks[i];
+		u32 user_coeffs[3];
+
+		if (!task->gauss_config.size)
+			continue;
+
+		if (task->gauss_config.size != 3 || !task->gauss_config.coe_ptr) {
+			ret = -EINVAL;
+			goto err_free;
+		}
+
+		if (!coeffs) {
+			coeffs = kcalloc(task_count, sizeof(*coeffs), GFP_KERNEL);
+			if (!coeffs) {
+				ret = -ENOMEM;
+				goto err_free;
+			}
+		}
+
+		if (copy_from_user(user_coeffs,
+				   u64_to_user_ptr(task->gauss_config.coe_ptr),
+				   sizeof(user_coeffs))) {
+			ret = -EFAULT;
+			goto err_free;
+		}
+
+		coeffs[i] = FIELD_PREP(RK_RGA2_GAUSS_COE0, user_coeffs[0]) |
+			    FIELD_PREP(RK_RGA2_GAUSS_COE1, user_coeffs[1]) |
+			    FIELD_PREP(RK_RGA2_GAUSS_COE2, user_coeffs[2]);
+	}
+
+	*coeffs_out = coeffs;
+
+	return 0;
+
+err_free:
+	kfree(coeffs);
+
+	return ret;
+}
+
 static int rk_rga_job_clone_request_locked(struct rk_rga_request *request,
 					   struct rk_rga_job **job_out)
 {
@@ -2360,6 +2426,22 @@ static int rk_rga_job_clone_request_locked(struct rk_rga_request *request,
 	if (!job->tasks) {
 		kfree(job);
 		return -ENOMEM;
+	}
+
+	if (request->gauss_coeffs) {
+		bytes = array_size(request->task_count,
+				   sizeof(*job->gauss_coeffs));
+		if (bytes == SIZE_MAX) {
+			rk_rga_job_free(job);
+			return -EOVERFLOW;
+		}
+
+		job->gauss_coeffs = kmemdup(request->gauss_coeffs, bytes,
+					    GFP_KERNEL);
+		if (!job->gauss_coeffs) {
+			rk_rga_job_free(job);
+			return -ENOMEM;
+		}
 	}
 
 	if (request->import_count) {
@@ -2419,6 +2501,7 @@ static int rk_rga_job_take_prepared(struct rga_req *tasks, u32 task_count,
 				    u32 import_count,
 				    struct dma_fence **fences,
 				    u32 fence_count,
+				    u32 *gauss_coeffs,
 				    struct rk_rga_job **job_out)
 {
 	struct rk_rga_job *job;
@@ -2435,6 +2518,7 @@ static int rk_rga_job_take_prepared(struct rga_req *tasks, u32 task_count,
 	job->import_count = import_count;
 	job->acquire_fences = fences;
 	job->acquire_fence_count = fence_count;
+	job->gauss_coeffs = gauss_coeffs;
 	job->priority = rk_rga_job_priority_from_tasks(job->tasks, job->task_count);
 	atomic_inc(&rk_rga.prepared_job_count);
 
@@ -4158,6 +4242,42 @@ static int rk_rga2_validate_rop(const struct rga_req *task)
 	return rk_rga2_rop_ctrl(task->rop_code, &rop_ctrl);
 }
 
+static bool rk_rga2_task_uses_gauss(const struct rga_req *task)
+{
+	return task->gauss_config.size;
+}
+
+static int rk_rga2_validate_gauss(const struct rga_req *task)
+{
+	if (!rk_rga2_task_uses_gauss(task))
+		return 0;
+	if (task->gauss_config.size != 3 || !task->gauss_config.coe_ptr)
+		return -EINVAL;
+	if (task->alpha_rop_flag || task->PD_mode ||
+	    task->rop_code || task->alpha_rop_mode)
+		return -EOPNOTSUPP;
+	if (task->src.format != task->dst.format)
+		return -EOPNOTSUPP;
+	if ((task->src.rd_mode && task->src.rd_mode != RK_RGA_RASTER_MODE) ||
+	    (task->dst.rd_mode && task->dst.rd_mode != RK_RGA_RASTER_MODE))
+		return -EOPNOTSUPP;
+	if (task->src.act_w != task->dst.act_w ||
+	    task->src.act_h != task->dst.act_h)
+		return -EOPNOTSUPP;
+	if (task->src.rotate_mode || task->dst.rotate_mode ||
+	    task->rotate_mode || task->sina || task->cosa)
+		return -EOPNOTSUPP;
+	if (task->interp.horiz || task->interp.verti)
+		return -EOPNOTSUPP;
+	if (task->yuv2rgb_mode || task->full_csc.flag)
+		return -EOPNOTSUPP;
+	if (task->mosaic_info.enable || task->osd_info.enable ||
+	    task->pre_intr_info.enable)
+		return -EOPNOTSUPP;
+
+	return 0;
+}
+
 #if IS_ENABLED(CONFIG_ROCKCHIP_RGA_REWRITE_KUNIT_TEST)
 static int rk_rga2_select_dst_addresses(const struct rga_img_info_t *dst,
 					const struct rk_rga2_format_info *fmt,
@@ -4669,6 +4789,62 @@ static void rk_rga2_rop_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
 			-EOPNOTSUPP);
 	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+}
+
+static void rk_rga2_gauss_emit_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA2_CMD_REG_COUNT] = { };
+	u32 gauss_coeffs[] = {
+		FIELD_PREP(RK_RGA2_GAUSS_COE0, 1) |
+		FIELD_PREP(RK_RGA2_GAUSS_COE1, 2) |
+		FIELD_PREP(RK_RGA2_GAUSS_COE2, 3),
+	};
+	enum rk_rga_hw_type type = 0;
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_RGBA_8888);
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 2,
+		.gauss_coeffs = gauss_coeffs,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+
+	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
+				    1280, 720);
+	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_RGBA_8888,
+				    1280, 720);
+	task.yuv2rgb_mode = 0;
+	task.feature.global_alpha_en = true;
+	task.fg_global_alpha = 0xfe;
+	task.gauss_config.size = 3;
+	task.gauss_config.coe_ptr = 0x1000;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA2_MODE_CTRL_OFFSET / 4] &
+			  RK_RGA2_MODE_SRC_GAUSS_EN);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_GAUSS_COE_OFFSET / 4],
+			gauss_coeffs[0]);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_ALPHA_CTRL0_OFFSET / 4],
+			FIELD_PREP(RK_RGA2_ALPHA_SRC_GLOBAL, 0xfe));
+
+	memset(cmd, 0, sizeof(cmd));
+	job.cmd_ready = false;
+	task.dst.act_w = 640;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+
+	task.dst.act_w = task.src.act_w;
+	task.gauss_config.size = 5;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), -EINVAL);
 }
 
 static void rk_rga_request_check_kunit(struct kunit *test)
@@ -5565,6 +5741,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga2_fill_multitask_hw_type_kunit),
 	KUNIT_CASE(rk_rga2_mosaic_emit_kunit),
 	KUNIT_CASE(rk_rga2_rop_emit_kunit),
+	KUNIT_CASE(rk_rga2_gauss_emit_kunit),
 	KUNIT_CASE(rk_rga_request_check_kunit),
 	KUNIT_CASE(rk_rga_request_ioctl_ret_kunit),
 	KUNIT_CASE(rk_rga_job_free_release_fence_kunit),
@@ -5690,6 +5867,7 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 {
 	struct rga_img_info_t dst;
 	bool uses_rop = rk_rga2_task_uses_rop(task);
+	bool uses_gauss = rk_rga2_task_uses_gauss(task);
 	int ret;
 
 	if (task->render_mode != RK_RGA_RENDER_BITBLT)
@@ -5712,6 +5890,10 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 		ret = rk_rga2_validate_rop(task);
 		if (ret)
 			return ret;
+	} else if (uses_gauss) {
+		ret = rk_rga2_validate_gauss(task);
+		if (ret)
+			return ret;
 	} else {
 		if (task->alpha_rop_flag || task->PD_mode ||
 		    task->feature.global_alpha_en)
@@ -5720,8 +5902,7 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 	ret = rk_rga2_decode_transform(task, &profile->transform);
 	if (ret)
 		return ret;
-	if (task->osd_info.enable || task->pre_intr_info.enable ||
-	    task->gauss_config.size)
+	if (task->osd_info.enable || task->pre_intr_info.enable)
 		return -EOPNOTSUPP;
 	ret = rk_rga2_validate_full_csc(task);
 	if (ret)
@@ -5768,6 +5949,11 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 	     profile->dst_fmt.yuv400 || profile->dst_fmt.yuv10))
 		return -EOPNOTSUPP;
 	if (uses_rop &&
+	    (profile->src_fmt.yuv || profile->src_fmt.yuv400 ||
+	     profile->src_fmt.yuv10 || profile->dst_fmt.yuv ||
+	     profile->dst_fmt.yuv400 || profile->dst_fmt.yuv10))
+		return -EOPNOTSUPP;
+	if (uses_gauss &&
 	    (profile->src_fmt.yuv || profile->src_fmt.yuv400 ||
 	     profile->src_fmt.yuv10 || profile->dst_fmt.yuv ||
 	     profile->dst_fmt.yuv400 || profile->dst_fmt.yuv10))
@@ -6749,7 +6935,9 @@ static int rk_rga2_emit_simple_bitblt(struct rk_rga_job *job)
 				    RK_RGA_RENDER_BITBLT) |
 			 RK_RGA2_MODE_INTR_CF_E |
 			 FIELD_PREP(RK_RGA2_MODE_MOSAIC_EN,
-				    !!task->mosaic_info.enable));
+				    !!task->mosaic_info.enable) |
+			 FIELD_PREP(RK_RGA2_MODE_SRC_GAUSS_EN,
+				    !!task->gauss_config.size));
 
 	ret = rk_rga2_emit_src(job, task, &profile.src_fmt,
 			       &profile.transform);
@@ -6777,12 +6965,25 @@ static int rk_rga2_emit_simple_bitblt(struct rk_rga_job *job)
 		rk_rga_cmd_write(job, RK_RGA2_ROP_CTRL0_OFFSET, rop_ctrl);
 		rk_rga_cmd_write(job, RK_RGA2_ROP_CTRL1_OFFSET, 0);
 	} else {
-		rk_rga_cmd_write(job, RK_RGA2_ALPHA_CTRL0_OFFSET, 0);
+		u32 src_global = 0;
+
+		if (task->gauss_config.size && task->feature.global_alpha_en)
+			src_global = task->fg_global_alpha;
+
+		rk_rga_cmd_write(job, RK_RGA2_ALPHA_CTRL0_OFFSET,
+				 FIELD_PREP(RK_RGA2_ALPHA_SRC_GLOBAL,
+					    src_global));
 		rk_rga_cmd_write(job, RK_RGA2_ALPHA_CTRL1_OFFSET, 0);
 	}
 	if (task->mosaic_info.enable)
 		rk_rga_cmd_write(job, RK_RGA2_MOSAIC_MODE_OFFSET,
 				 task->mosaic_info.mode & 0x7);
+	if (task->gauss_config.size) {
+		if (!job->gauss_coeffs)
+			return -EINVAL;
+		rk_rga_cmd_write(job, RK_RGA2_GAUSS_COE_OFFSET,
+				 job->gauss_coeffs[job->current_task]);
+	}
 
 	job->cmd_ready = true;
 
@@ -8040,6 +8241,7 @@ static int rk_rga_request_config(struct rk_rga_session *session,
 	struct dma_fence **fences = NULL;
 	struct rk_rga_import **imports = NULL;
 	struct rga_req *tasks = NULL;
+	u32 *gauss_coeffs = NULL;
 	u32 acquire_fd_count = 0;
 	u32 fence_count = 0;
 	u32 import_count = 0;
@@ -8050,9 +8252,16 @@ static int rk_rga_request_config(struct rk_rga_session *session,
 	if (ret)
 		return ret;
 
+	ret = rk_rga_copy_gauss_coeffs(tasks, user->task_num, &gauss_coeffs);
+	if (ret) {
+		kfree(tasks);
+		return ret;
+	}
+
 	acquire_fds = kcalloc(RGA_TASK_NUM_MAX + 1, sizeof(*acquire_fds),
 			      GFP_KERNEL);
 	if (!acquire_fds) {
+		kfree(gauss_coeffs);
 		kfree(tasks);
 		return -ENOMEM;
 	}
@@ -8074,10 +8283,12 @@ static int rk_rga_request_config(struct rk_rga_session *session,
 
 	rk_rga_request_clear_fences(request);
 	rk_rga_request_clear_imports(request);
+	rk_rga_request_clear_gauss(request);
 	kfree(request->tasks);
 	request->tasks = tasks;
 	request->imports = imports;
 	request->acquire_fences = fences;
+	request->gauss_coeffs = gauss_coeffs;
 	request->import_count = import_count;
 	request->acquire_fence_count = fence_count;
 	request->task_count = user->task_num;
@@ -8089,6 +8300,7 @@ static int rk_rga_request_config(struct rk_rga_session *session,
 	tasks = NULL;
 	imports = NULL;
 	fences = NULL;
+	gauss_coeffs = NULL;
 	import_count = 0;
 	fence_count = 0;
 	close_acquire_fds = true;
@@ -8106,6 +8318,7 @@ out_unlock:
 						acquire_fd_count);
 	rk_rga_put_import_array(imports, import_count);
 	rk_rga_put_fence_array(fences, fence_count);
+	kfree(gauss_coeffs);
 	kfree(tasks);
 	kfree(acquire_fds);
 
@@ -8640,6 +8853,7 @@ static long rk_rga_ioctl_blit(unsigned long arg, struct rk_rga_session *session,
 	struct dma_fence **fences = NULL;
 	struct rk_rga_import **imports = NULL;
 	struct rga_req *task;
+	u32 *gauss_coeffs = NULL;
 	int release_fence_fd = -1;
 	u32 acquire_fd_count = 0;
 	u32 fence_count = 0;
@@ -8651,9 +8865,16 @@ static long rk_rga_ioctl_blit(unsigned long arg, struct rk_rga_session *session,
 	if (IS_ERR(task))
 		return PTR_ERR(task);
 
+	ret = rk_rga_copy_gauss_coeffs(task, 1, &gauss_coeffs);
+	if (ret) {
+		kfree(task);
+		return ret;
+	}
+
 	acquire_fds = kcalloc(RGA_TASK_NUM_MAX + 1, sizeof(*acquire_fds),
 			      GFP_KERNEL);
 	if (!acquire_fds) {
+		kfree(gauss_coeffs);
 		kfree(task);
 		return -ENOMEM;
 	}
@@ -8666,12 +8887,14 @@ static long rk_rga_ioctl_blit(unsigned long arg, struct rk_rga_session *session,
 	if (!ret) {
 		ret = rk_rga_job_take_prepared(task, 1, sync_mode, imports,
 					       import_count, fences, fence_count,
+					       gauss_coeffs,
 					       &job);
 		if (!ret) {
 			close_acquire_fds = true;
 			task = NULL;
 			imports = NULL;
 			fences = NULL;
+			gauss_coeffs = NULL;
 			import_count = 0;
 			fence_count = 0;
 		}
@@ -8682,6 +8905,7 @@ static long rk_rga_ioctl_blit(unsigned long arg, struct rk_rga_session *session,
 						acquire_fd_count);
 	rk_rga_put_import_array(imports, import_count);
 	rk_rga_put_fence_array(fences, fence_count);
+	kfree(gauss_coeffs);
 	kfree(task);
 	if (ret) {
 		kfree(acquire_fds);
