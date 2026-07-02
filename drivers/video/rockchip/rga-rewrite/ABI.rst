@@ -125,6 +125,9 @@ Implemented
   source/destination images, rejects color-key and unsupported pattern
   operations, and supports the 8-bit RGB/YUV plus semiplanar 10-bit YUV formats
   exposed by common ``librga`` and ``ffmpeg-rockchip`` blit/scale/convert users.
+  Explicit interpolation selectors from current ``librga`` resize calls are
+  accepted on native RGA3 bitblits; like the BSP RGA3 register builder, the
+  rewrite programs only the RGA3 scale direction and factor fields.
   AFBC is accepted through ``RGA_FBC_MODE`` for the RGA3 FBCD/FBCE format subset;
   tile8x8 is accepted through ``RGA_TILE_MODE`` for the BSP RGA3 semiplanar YUV
   tile-format subset in simple raster-to-tile and tile-to-raster bitblits.
