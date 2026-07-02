@@ -130,8 +130,11 @@ Implemented
   overlapping in-place blits, tile alpha/pattern/color-key, and in-place
   scaling/conversion/rotation remain unsupported.  Main request
   rotation/mirror flags are translated to RGA3 WIN0 rotate/mirror controls;
-  per-channel rotate flags remain unsupported.  Destination rectangle offsets
-  are supported by biasing WR plane base addresses for 8-bit formats;
+  BSP's RGA3 policy restriction for source YUV422 90/270-degree rotation is
+  preserved so those jobs fall back to an eligible RGA2 core unless the request
+  forced an RGA3-only core mask.  Per-channel rotate flags remain unsupported.
+  Destination rectangle offsets are supported by biasing WR plane base
+  addresses for 8-bit formats;
   semiplanar YUV offsets must be chroma-aligned.
 * RGA3 Porter-Duff alpha blend for the common A+B composition paths emitted by
   ``librga`` and ``ffmpeg-rockchip``.  Source/foreground is programmed through
