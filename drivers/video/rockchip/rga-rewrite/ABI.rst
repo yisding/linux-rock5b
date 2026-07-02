@@ -72,7 +72,10 @@ Implemented
 * Minimal per-core scheduler boundary: submit paths queue prepared jobs on the
   least-loaded eligible bound RGA core, dispatch one active job per core, wake
   submit waiters on completion, and keep hardware nodes alive until in-flight
-  scheduler users drain during remove.
+  scheduler users drain during remove.  The per-core queue honors current
+  ``librga``/BSP ``rga_req.priority`` values by inserting nonzero-priority
+  jobs ahead of lower-priority queued work and aging displaced queued jobs,
+  with priorities clamped to the BSP 0..6 range.
   Hardware removal stops new dispatch, completes queued and active jobs with
   ``-ENODEV``, and signals any exported async release fence with that result.
 * Backend-aware core selection for prepared jobs.  The scheduler checks the
@@ -192,9 +195,10 @@ Implemented
   multi-task rejection, RGA2 fill RGB/YUV destination-offset emission,
   YUV-fill chroma-alignment rejection, and multi-fill task acceptance, compact
   10-bit RGA2 source dispatch/emission including the no-scale force-tile mode,
-  IOMMU fault target matching, RGA3 normal RGB color-key dispatch/emission and
-  inverted-mode rejection, and ffmpeg-facing RGA3
-  raster/FBC/alpha-overlay profile selection plus destination-offset command
+  IOMMU fault target matching, scheduler priority enqueue/aging, RGA3 normal
+  RGB color-key dispatch/emission and inverted-mode rejection, and
+  ffmpeg-facing RGA3 raster/FBC/alpha-overlay profile selection plus
+  destination-offset command
   emission, source-crop command emission for RGA3 and RGA2, and semiplanar
   chroma-alignment rejection.
 
