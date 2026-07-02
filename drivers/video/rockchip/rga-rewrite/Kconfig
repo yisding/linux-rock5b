@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0
+config ROCKCHIP_RGA_REWRITE
+	tristate "Rockchip RGA compatibility rewrite"
+	depends on ARCH_ROCKCHIP
+	depends on !ROCKCHIP_MULTI_RGA
+	depends on !VIDEO_ROCKCHIP_RGA
+	select DMA_SHARED_BUFFER
+	help
+	  ABI-compatible /dev/rga rewrite for RK3588 bring-up. This driver
+	  preserves version/query, import/release, request lifetime, legacy
+	  ioctl recognition, and the focused RGA2/RGA3 execution profiles used
+	  by current userspace.
+
+config ROCKCHIP_RGA_REWRITE_KUNIT_TEST
+	bool "KUnit tests for Rockchip RGA compatibility rewrite" if !KUNIT_ALL_TESTS
+	depends on ROCKCHIP_RGA_REWRITE && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Unit tests for rewrite-local ABI normalization helpers, including
+	  RGA2 userspace transform decoding and destination-corner selection.
