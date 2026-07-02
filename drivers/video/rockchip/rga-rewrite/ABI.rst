@@ -62,8 +62,8 @@ Implemented
 * Async pending-acquire handling for modern submit and legacy blit paths.  If
   an async job is blocked by an unsignaled acquire fence, the ioctl exports the
   release-fence fd, arms ``dma_fence`` callbacks, queues dispatch work when the
-  acquire fences have signaled, and signals the release fence with the eventual
-  backend result.
+  acquire fences have signaled on the high-priority system workqueue like the
+  forward port, and signals the release fence with the eventual backend result.
 * Ready async jobs for supported hardware profiles now export the release-fence
   fd, queue the prepared job, and return without waiting for IRQ/timeout
   completion.  The queued job owns its own lifetime reference until completion
