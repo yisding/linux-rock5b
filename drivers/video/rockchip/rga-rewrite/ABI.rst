@@ -28,6 +28,8 @@ Implemented
 * Modern request task-array copy into session-owned request objects.  Handle
   backed image addresses are resolved to mapped IOVAs in the kernel-owned task
   copy, and configured requests hold references to their imported dma-bufs.
+  After ``rga_request_check()`` accepts a modern request, config/submit
+  preparation failures are normalized to the BSP ioctl wrapper's ``-EFAULT``.
 * Legacy blit task copy and acquire-fence fd validation.
 * Legacy no-handle blit/fill submissions from ``wrapbuffer_fd()`` and
   ``wrapbuffer_virtualaddr()``.  The rewrite accepts MMU-backed direct fd and
