@@ -7648,6 +7648,45 @@ static void rk_rga3_librga_afbc_copy_emit_kunit(struct kunit *test)
 			1280U | (720U << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
 			1280U | (720U << 16));
+
+	memset(cmd, 0, sizeof(cmd));
+	task.src = rk_rga_kunit_img(0x10000000,
+				    RK_RGA_FORMAT_YCBCR_420_SP_10B,
+				    1280, 720);
+	task.dst = rk_rga_kunit_img(0x20000000,
+				    RK_RGA_FORMAT_YCBCR_420_SP_10B,
+				    1280, 720);
+	task.src.rd_mode = RK_RGA_FBC_MODE;
+	task.dst.rd_mode = RK_RGA_RASTER_MODE;
+	job.cmd_ready = false;
+	type = 0;
+
+	raster_stride = aligned_w >> 2;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+
+	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
+	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WIN0_RD_MODE,
+			FIELD_PREP(RK_RGA3_WIN0_RD_MODE, 1));
+	KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WIN0_YUV10_COMPACT);
+	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WIN0_PIC_FORMAT,
+			FIELD_PREP(RK_RGA3_WIN0_PIC_FORMAT, 0x2));
+	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WIN0_RD_FORMAT,
+			FIELD_PREP(RK_RGA3_WIN0_RD_FORMAT, 1));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_VIR_STRIDE_OFFSET / 4],
+			fbc_header_stride);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_UV_VIR_STRIDE_OFFSET / 4],
+			fbc_header_stride);
+	ctrl = cmd[RK_RGA3_WR_CTRL_OFFSET / 4];
+	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WR_MODE, 0U);
+	KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WR_YUV10_COMPACT);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4],
+			raster_stride);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_PL_VIR_STRIDE_OFFSET / 4],
+			raster_stride);
 }
 
 static void rk_rga3_tile8x8_profile_kunit(struct kunit *test)
