@@ -59,6 +59,7 @@
 #define RK_MPP_RKVENC_MAX_SLICE_FIFO	256
 #define RK_MPP_RKVENC_MAX_DCHS_CORES	4
 #define RK_MPP_RKVENC_MAX_DCHS_ID	4
+#define RK_MPP_RKVDEC_PERF_SEL_NUM	64
 #define RK_MPP_WORK_TIMEOUT_MS		500
 #define RK_MPP_CODEC_INFO_MAX		11
 #define RK_MPP_ENC_INFO_BUTT		RK_MPP_CODEC_INFO_MAX
@@ -226,6 +227,7 @@ struct rk_mpp_reg_image {
 	u32 offset_count;
 	struct rk_mpp_rcb_desc rcb_descs[RK_MPP_MAX_RCB_ELEMS];
 	u32 rcb_count;
+	u32 rkvdec_perf_sel[RK_MPP_RKVDEC_PERF_SEL_NUM];
 	bool translated;
 };
 
@@ -371,6 +373,12 @@ struct rk_mpp_rkvenc_poll_slice_cfg {
 #define RK_MPP_RKVDEC_INT_STA_BASE		0x0380
 #define RK_MPP_RKVDEC_INT_STA_WORD		(RK_MPP_RKVDEC_INT_STA_BASE / sizeof(u32))
 #define RK_MPP_RKVDEC_IRQ_RAW			BIT(1)
+#define RK_MPP_RKVDEC_PERF_SEL_OFFSET		0x20000
+#define RK_MPP_RKVDEC_PERF_SEL_BASE		0x0424
+#define RK_MPP_RKVDEC_SEL_VAL0_BASE		0x0428
+#define RK_MPP_RKVDEC_SEL_VAL1_BASE		0x042c
+#define RK_MPP_RKVDEC_SEL_VAL2_BASE		0x0430
+#define RK_MPP_RKVDEC_SET_PERF_SEL(a, b, c)	((a) | ((b) << 8) | ((c) << 16))
 #define RK_MPP_RKVDEC_CACHE0_SIZE_BASE		0x051c
 #define RK_MPP_RKVDEC_CACHE1_SIZE_BASE		0x055c
 #define RK_MPP_RKVDEC_CACHE2_SIZE_BASE		0x059c
@@ -1058,6 +1066,32 @@ static int rk_mpp_request_check_reg_span(const struct mpp_request *req)
 	return 0;
 }
 
+static bool rk_mpp_job_is_rkvdec_perf_read(struct rk_mpp_job *job,
+					   const struct mpp_request *req)
+{
+	return job->session->client_type == RK_MPP_DEVICE_RKVDEC &&
+	       req->offset >= RK_MPP_RKVDEC_PERF_SEL_OFFSET;
+}
+
+static int rk_mpp_request_check_rkvdec_perf_span(const struct mpp_request *req)
+{
+	u32 max_size = RK_MPP_RKVDEC_PERF_SEL_NUM * sizeof(u32);
+	u32 offset;
+
+	if (!req->size)
+		return 0;
+	if (req->offset < RK_MPP_RKVDEC_PERF_SEL_OFFSET)
+		return -EINVAL;
+	if (req->offset % sizeof(u32) || req->size % sizeof(u32))
+		return -EINVAL;
+
+	offset = req->offset - RK_MPP_RKVDEC_PERF_SEL_OFFSET;
+	if (offset > max_size || req->size > max_size - offset)
+		return -ENOMEM;
+
+	return 0;
+}
+
 static int rk_mpp_poll_irq_check_size(s32 count_max, u32 req_size)
 {
 	size_t slice_bytes;
@@ -1160,6 +1194,42 @@ static void rk_mpp_request_check_reg_span_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_mpp_request_check_reg_span(&req), -ENOMEM);
 }
 
+static void rk_mpp_request_check_rkvdec_perf_span_kunit(struct kunit *test)
+{
+	struct mpp_request req = {};
+	u32 max_size = RK_MPP_RKVDEC_PERF_SEL_NUM * sizeof(u32);
+
+	KUNIT_EXPECT_EQ(test, rk_mpp_request_check_rkvdec_perf_span(&req), 0);
+
+	req.offset = RK_MPP_RKVDEC_PERF_SEL_OFFSET - 4;
+	req.size = 4;
+	KUNIT_EXPECT_EQ(test, rk_mpp_request_check_rkvdec_perf_span(&req),
+			-EINVAL);
+
+	req.offset = RK_MPP_RKVDEC_PERF_SEL_OFFSET;
+	req.size = 4;
+	KUNIT_EXPECT_EQ(test, rk_mpp_request_check_rkvdec_perf_span(&req), 0);
+
+	req.offset = RK_MPP_RKVDEC_PERF_SEL_OFFSET + max_size - 4;
+	req.size = 4;
+	KUNIT_EXPECT_EQ(test, rk_mpp_request_check_rkvdec_perf_span(&req), 0);
+
+	req.offset = RK_MPP_RKVDEC_PERF_SEL_OFFSET + max_size;
+	req.size = 4;
+	KUNIT_EXPECT_EQ(test, rk_mpp_request_check_rkvdec_perf_span(&req),
+			-ENOMEM);
+
+	req.offset = RK_MPP_RKVDEC_PERF_SEL_OFFSET + 1;
+	req.size = 4;
+	KUNIT_EXPECT_EQ(test, rk_mpp_request_check_rkvdec_perf_span(&req),
+			-EINVAL);
+
+	req.offset = RK_MPP_RKVDEC_PERF_SEL_OFFSET;
+	req.size = 5;
+	KUNIT_EXPECT_EQ(test, rk_mpp_request_check_rkvdec_perf_span(&req),
+			-EINVAL);
+}
+
 static void rk_mpp_poll_irq_check_size_kunit(struct kunit *test)
 {
 	u32 base = sizeof(struct rk_mpp_rkvenc_poll_slice_cfg);
@@ -1207,6 +1277,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_get_cmd_butt_kunit),
 	KUNIT_CASE(rk_mpp_cmd_copies_payload_kunit),
 	KUNIT_CASE(rk_mpp_request_check_reg_span_kunit),
+	KUNIT_CASE(rk_mpp_request_check_rkvdec_perf_span_kunit),
 	KUNIT_CASE(rk_mpp_poll_irq_check_size_kunit),
 	KUNIT_CASE(rk_mpp_rkvenc_slice_mode_kunit),
 	{}
@@ -1290,12 +1361,20 @@ static int rk_mpp_job_store_reg_read(struct rk_mpp_job *job,
 	if (!req->size)
 		return 0;
 
+	if (image->read_req_count >= ARRAY_SIZE(image->read_reqs))
+		return -EINVAL;
+
+	if (rk_mpp_job_is_rkvdec_perf_read(job, req)) {
+		ret = rk_mpp_request_check_rkvdec_perf_span(req);
+		if (ret)
+			return ret;
+		image->read_reqs[image->read_req_count++] = *req;
+		return 0;
+	}
+
 	ret = rk_mpp_request_check_reg_span(req);
 	if (ret)
 		return ret;
-
-	if (image->read_req_count >= ARRAY_SIZE(image->read_reqs))
-		return -EINVAL;
 
 	reg_end = req->offset + req->size;
 	ret = rk_mpp_job_ensure_reg_bytes(job, reg_end);
@@ -1466,8 +1545,8 @@ static int rk_mpp_job_translate_table(struct rk_mpp_job *job,
 static int rk_mpp_job_apply_reg_offsets(struct rk_mpp_job *job)
 {
 	struct rk_mpp_reg_image *image = &job->reg_image;
-	u32 i;
 	int ret;
+	u32 i;
 
 	for (i = 0; i < image->offset_count; i++) {
 		u32 index = image->offsets[i].index;
@@ -1916,6 +1995,18 @@ static int rk_mpp_job_copy_readback(struct rk_mpp_job *job)
 
 	for (i = 0; i < image->read_req_count; i++) {
 		const struct mpp_request *req = &image->read_reqs[i];
+
+		if (rk_mpp_job_is_rkvdec_perf_read(job, req)) {
+			u32 offset = req->offset - RK_MPP_RKVDEC_PERF_SEL_OFFSET;
+
+			if (rk_mpp_request_check_rkvdec_perf_span(req))
+				return -EINVAL;
+			if (copy_to_user(req->data,
+					 (u8 *)image->rkvdec_perf_sel + offset,
+					 req->size))
+				return -EFAULT;
+			continue;
+		}
 
 		if (req->offset > image->reg_bytes ||
 		    req->size > image->reg_bytes - req->offset)
@@ -2410,10 +2501,22 @@ static int rk_mpp_job_validate_readbacks(struct rk_mpp_job *job,
 					 struct rk_mpp_hw *hw)
 {
 	struct rk_mpp_reg_image *image = &job->reg_image;
+	int ret;
 	u32 i;
 
 	for (i = 0; i < image->read_req_count; i++) {
 		const struct mpp_request *req = &image->read_reqs[i];
+
+		if (rk_mpp_job_is_rkvdec_perf_read(job, req)) {
+			ret = rk_mpp_request_check_rkvdec_perf_span(req);
+			if (ret)
+				return ret;
+			if (!rk_mpp_hw_reg_range_valid(hw, 0,
+						       RK_MPP_RKVDEC_PERF_SEL_BASE,
+						       4 * sizeof(u32)))
+				return -EOPNOTSUPP;
+			continue;
+		}
 
 		if (req->offset % sizeof(u32) || req->size % sizeof(u32))
 			return -EINVAL;
@@ -2500,6 +2603,35 @@ static int rk_mpp_job_write_regs(struct rk_mpp_job *job, u32 start_offset,
 	return 0;
 }
 
+static void rk_mpp_rkvdec2_read_perf_sel(struct rk_mpp_job *job,
+					 const struct mpp_request *req)
+{
+	struct rk_mpp_reg_image *image = &job->reg_image;
+	struct rk_mpp_hw *hw = job->hw;
+	u32 start = (req->offset - RK_MPP_RKVDEC_PERF_SEL_OFFSET) / sizeof(u32);
+	u32 end = start + req->size / sizeof(u32);
+	u32 i;
+
+	for (i = start; i < end; i += 3) {
+		u32 sel0 = i;
+		u32 sel1 = i + 1 < end ? i + 1 : 0;
+		u32 sel2 = i + 2 < end ? i + 2 : 0;
+		u32 val = RK_MPP_RKVDEC_SET_PERF_SEL(sel0, sel1, sel2);
+
+		writel_relaxed(val, hw->regs[0] + RK_MPP_RKVDEC_PERF_SEL_BASE);
+		image->rkvdec_perf_sel[sel0] =
+			readl_relaxed(hw->regs[0] + RK_MPP_RKVDEC_SEL_VAL0_BASE);
+		if (sel1)
+			image->rkvdec_perf_sel[sel1] =
+				readl_relaxed(hw->regs[0] +
+					      RK_MPP_RKVDEC_SEL_VAL1_BASE);
+		if (sel2)
+			image->rkvdec_perf_sel[sel2] =
+				readl_relaxed(hw->regs[0] +
+					      RK_MPP_RKVDEC_SEL_VAL2_BASE);
+	}
+}
+
 static int rk_mpp_job_read_regs(struct rk_mpp_job *job)
 {
 	struct rk_mpp_reg_image *image = &job->reg_image;
@@ -2510,6 +2642,19 @@ static int rk_mpp_job_read_regs(struct rk_mpp_job *job)
 		const struct mpp_request *req = &image->read_reqs[i];
 		u32 offset;
 		u32 end;
+
+		if (rk_mpp_job_is_rkvdec_perf_read(job, req)) {
+			int ret = rk_mpp_request_check_rkvdec_perf_span(req);
+
+			if (ret)
+				return ret;
+			if (!rk_mpp_hw_reg_range_valid(hw, 0,
+						       RK_MPP_RKVDEC_PERF_SEL_BASE,
+						       4 * sizeof(u32)))
+				return -EOPNOTSUPP;
+			rk_mpp_rkvdec2_read_perf_sel(job, req);
+			continue;
+		}
 
 		if (req->offset % sizeof(u32) || req->size % sizeof(u32))
 			return -EINVAL;
