@@ -97,7 +97,10 @@ Implemented
   the same 500 ms timeout window as the BSP-derived forward port.  A timed-out
   job is removed from the active hardware slot, the core reset line is pulsed
   when available, runtime PM/clocks are released, ``POLL_HW_FINISH`` wakes, and
-  the job returns ``-ETIMEDOUT``.
+  the job returns ``-ETIMEDOUT``.  For hard-CCU RKVDEC2 jobs, timeout recovery
+  first force-stops and resets the coordinator, then opportunistically aborts
+  other active dependent cores without waiting on possibly running timeout
+  workers.
 * RK3588 RKVDEC2 performance-selector readbacks for ``SET_REG_READ`` requests
   in the BSP ``0x20000`` selector window.  The rewrite validates this as a
   64-word logical side buffer, programs the selector register, reads the three
@@ -188,12 +191,13 @@ Outside This Slice
   fixed-IOVA RCB optimization.  The rewrite requires the referenced CCU
   coordinator to be bound and online, has least-loaded core selection, queued
   dispatch, RKVENC2 DCHS hand-shake remapping, RKVDEC2 CCU-mode task register
-  preparation, VDPU383 link-window direct start/IRQ handling, and job-owned
-  link-table materialization/readback helpers with selected-core first-entry
-  hard-CCU submit and coordinator running-list tracking, but does not yet
-  mirror the BSP decoder hard-CCU add-mode multicore queue scheduling policy.
+  preparation, VDPU383 link-window direct start/IRQ handling, job-owned
+  link-table materialization/readback helpers, hard-CCU submit/add-mode append,
+  coordinator running-list tracking, cross-core completion drain, and
+  coordinator timeout containment.
 * Full BSP-equivalent timeout recovery policy and IOMMU fault recovery,
-  including shared reset-domain serialization and MMU-domain refresh.
+  including hard-CCU reset/resend of still-running decoder tasks and MMU-domain
+  refresh.
 * Fence export/import semantics.
 * ``MPP_IOC_CFG_V2``; the BSP-derived 6.18 driver also rejects this in the
   observed path.
