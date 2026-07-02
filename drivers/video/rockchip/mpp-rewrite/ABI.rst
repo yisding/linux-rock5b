@@ -109,12 +109,13 @@ Implemented
   20/50/100 ms timeout-threshold register values that the BSP selects from
   retained decoder width/height/bitdepth codec info when those task register
   words are present in the submitted image.
-* RK3588 VDPU383/RKVDEC2 hard-CCU link-table capability data and backing
-  allocation.  Decoder cores with a ``link`` MMIO window and ``rockchip,ccu``
-  phandle validate the BSP VDPU383 link register offsets and allocate
-  DMA-coherent per-task link-table nodes sized from ``rockchip,task-capacity``
-  using public DMA APIs.  The allocated tables are not used for hardware
-  dispatch until the hard-CCU scheduler is implemented.
+* RK3588 VDPU383/RKVDEC2 hard-CCU link-table capability data, backing
+  allocation, and table materialization.  Decoder cores with a ``link`` MMIO
+  window and ``rockchip,ccu`` phandle validate the BSP VDPU383 link register
+  offsets and allocate DMA-coherent per-task link-table nodes sized from
+  ``rockchip,task-capacity`` using public DMA APIs.  Accepted decoder jobs
+  stage the BSP write/readback register partitions into the first table node so
+  the table-image format is validated before hard-CCU dispatch is enabled.
 * ``MPP_CMD_POLL_HW_IRQ`` for RK3588 RKVENC2 encoder slice result streaming.
   The rewrite advertises the forward-port ``POLL_BUTT`` command boundary,
   detects slice mode from the submitted RKVENC2 register image
@@ -137,8 +138,8 @@ Implemented
   parser helpers, including command range classification, command group
   boundary queries, fixed-width V1/``mpp_bat_msg`` ABI layout, V1-to-native
   request conversion, payload-copy classification, register-span overflow
-  checks, BSP VDPU383 link-table layout, ``POLL_HW_IRQ`` flexible-buffer
-  sizing, and RKVENC2 slice-mode detection.
+  checks, BSP VDPU383 link-table layout/materialization, ``POLL_HW_IRQ``
+  flexible-buffer sizing, and RKVENC2 slice-mode detection.
 
 Recognized But Unsupported
 --------------------------
@@ -153,8 +154,8 @@ Outside This Slice
   fixed-IOVA RCB optimization.  The rewrite requires the referenced CCU
   coordinator to be bound and online, has least-loaded core selection, queued
   dispatch, RKVENC2 DCHS hand-shake remapping, RKVDEC2 CCU-mode task register
-  preparation, and VDPU383 link-table backing allocation, but does not yet
-  mirror the BSP decoder/link scheduling and hard-CCU table submission policy.
+  preparation, and VDPU383 link-table materialization, but does not yet mirror
+  the BSP decoder/link scheduling and hard-CCU table submission policy.
 * Full BSP-equivalent timeout recovery policy and IOMMU fault recovery,
   including shared reset-domain serialization and MMU-domain refresh.
 * Fence export/import semantics.
