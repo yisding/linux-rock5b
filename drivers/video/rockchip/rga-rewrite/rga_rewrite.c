@@ -1293,6 +1293,20 @@ static void rk_rga_request_free(void *ptr)
 	kfree(request);
 }
 
+static bool rk_rga_request_remove_free(struct rk_rga_session *session, __u32 id)
+{
+	struct rk_rga_request *request;
+
+	mutex_lock(&session->lock);
+	request = idr_remove(&session->requests, id);
+	mutex_unlock(&session->lock);
+	if (!request)
+		return false;
+
+	rk_rga_request_free(request);
+	return true;
+}
+
 static int rk_rga_layout_size(size_t pixels, size_t multiplier,
 			      size_t divisor, size_t *size)
 {
@@ -5600,6 +5614,27 @@ static void rk_rga_request_ioctl_ret_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_request_ioctl_ret(-ENOMEM), -EFAULT);
 }
 
+static void rk_rga_request_remove_free_kunit(struct kunit *test)
+{
+	struct rk_rga_session session;
+	struct rk_rga_request *request;
+
+	memset(&session, 0, sizeof(session));
+	mutex_init(&session.lock);
+	idr_init(&session.requests);
+
+	request = kzalloc_obj(*request, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, request);
+	KUNIT_ASSERT_EQ(test, idr_alloc(&session.requests, request, 7, 8,
+				       GFP_KERNEL), 7);
+
+	KUNIT_EXPECT_TRUE(test, rk_rga_request_remove_free(&session, 7));
+	KUNIT_EXPECT_PTR_EQ(test, idr_find(&session.requests, 7), NULL);
+	KUNIT_EXPECT_FALSE(test, rk_rga_request_remove_free(&session, 7));
+
+	idr_destroy(&session.requests);
+}
+
 static void rk_rga_acquire_fd_ownership_kunit(struct kunit *test)
 {
 	struct rk_rga_acquire_fd fds[2] = {};
@@ -6566,6 +6601,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga2_update_palette_emit_kunit),
 	KUNIT_CASE(rk_rga_request_check_kunit),
 	KUNIT_CASE(rk_rga_request_ioctl_ret_kunit),
+	KUNIT_CASE(rk_rga_request_remove_free_kunit),
 	KUNIT_CASE(rk_rga_acquire_fd_ownership_kunit),
 	KUNIT_CASE(rk_rga_job_free_release_fence_kunit),
 	KUNIT_CASE(rk_rga_release_fence_fd_state_kunit),
@@ -10059,10 +10095,7 @@ static long rk_rga_ioctl_request_create(unsigned long arg,
 	}
 
 	if (copy_to_user((void __user *)arg, &id, sizeof(id))) {
-		mutex_lock(&session->lock);
-		idr_remove(&session->requests, id);
-		mutex_unlock(&session->lock);
-		rk_rga_request_free(request);
+		rk_rga_request_remove_free(session, id);
 		return -EFAULT;
 	}
 
@@ -10126,6 +10159,7 @@ static long rk_rga_ioctl_request_submit(unsigned long arg,
 			}
 		}
 		rk_rga_job_put(job);
+		rk_rga_request_remove_free(session, user.id);
 		return ret;
 	}
 
@@ -10135,19 +10169,13 @@ static long rk_rga_ioctl_request_submit(unsigned long arg,
 static long rk_rga_ioctl_request_cancel(unsigned long arg,
 					struct rk_rga_session *session)
 {
-	struct rk_rga_request *request;
 	__u32 id;
 
 	if (copy_from_user(&id, (void __user *)arg, sizeof(id)))
 		return -EFAULT;
 
-	mutex_lock(&session->lock);
-	request = idr_remove(&session->requests, id);
-	mutex_unlock(&session->lock);
-	if (!request)
+	if (!rk_rga_request_remove_free(session, id))
 		return -EINVAL;
-
-	rk_rga_request_free(request);
 
 	return 0;
 }
