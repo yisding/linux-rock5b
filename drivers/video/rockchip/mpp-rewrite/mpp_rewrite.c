@@ -436,6 +436,7 @@ struct rk_mpp_rkvenc_poll_slice_cfg {
 #define RK_MPP_RKVDEC_START_BASE		0x0028
 #define RK_MPP_RKVDEC_START_EN			BIT(0)
 #define RK_MPP_RKVDEC_REG_EN_WORD		(RK_MPP_RKVDEC_START_BASE / sizeof(u32))
+#define RK_MPP_RKVDEC_LINK_STATUS_WORD		15
 #define RK_MPP_RKVDEC_RLC_BASE			0x0200
 #define RK_MPP_RKVDEC_RLC_WORD			(RK_MPP_RKVDEC_RLC_BASE / sizeof(u32))
 #define RK_MPP_RKVDEC_INT_STA_BASE		0x0380
@@ -1250,8 +1251,8 @@ rk_mpp_rkvdec2_link_part_check(const struct rk_mpp_rkvdec2_link_part *part,
 }
 
 static int
-rk_mpp_rkvdec2_link_write_part_check(const struct rk_mpp_rkvdec2_link_part *part,
-				     u32 table_words, u32 reg_words)
+rk_mpp_rkvdec2_link_reg_part_check(const struct rk_mpp_rkvdec2_link_part *part,
+				   u32 table_words, u32 reg_words)
 {
 	int ret;
 
@@ -1283,9 +1284,9 @@ rk_mpp_rkvdec2_fill_link_table(const struct rk_mpp_reg_image *image,
 		const struct rk_mpp_rkvdec2_link_part *part =
 			&info->write_parts[i];
 
-		ret = rk_mpp_rkvdec2_link_write_part_check(part,
-							   info->table_words,
-							   image->reg_words);
+		ret = rk_mpp_rkvdec2_link_reg_part_check(part,
+							 info->table_words,
+							 image->reg_words);
 		if (ret)
 			return ret;
 		memcpy(&table[part->table_word], &image->regs[part->reg_word],
@@ -1317,6 +1318,38 @@ rk_mpp_rkvdec2_fill_link_table(const struct rk_mpp_reg_image *image,
 	if (info->seg2_word >= 0)
 		table[info->seg2_word] = lower_32_bits(table_iova +
 			info->write_parts[2].table_word * sizeof(u32));
+
+	return 0;
+}
+
+static int __maybe_unused
+rk_mpp_rkvdec2_read_link_table(struct rk_mpp_reg_image *image,
+			       const struct rk_mpp_rkvdec2_link_info *info,
+			       const u32 *table, u32 irq_status)
+{
+	u32 i;
+	int ret;
+
+	if (!table)
+		return -EINVAL;
+
+	for (i = 0; i < info->read_part_count; i++) {
+		const struct rk_mpp_rkvdec2_link_part *part =
+			&info->read_parts[i];
+
+		ret = rk_mpp_rkvdec2_link_reg_part_check(part,
+							 info->table_words,
+							 image->reg_words);
+		if (ret)
+			return ret;
+		memcpy(&image->regs[part->reg_word], &table[part->table_word],
+		       part->word_count * sizeof(u32));
+	}
+
+	if (image->reg_words <= RK_MPP_RKVDEC_LINK_STATUS_WORD)
+		return -EINVAL;
+
+	image->regs[RK_MPP_RKVDEC_LINK_STATUS_WORD] = irq_status;
 
 	return 0;
 }
@@ -1619,6 +1652,24 @@ static void rk_mpp_rkvdec2_fill_link_table_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, table[16], 0U);
 	KUNIT_EXPECT_EQ(test, table[20], 0U);
 	KUNIT_EXPECT_EQ(test, table[59], 0U);
+
+	table[16] = 0x11111111;
+	for (i = 0; i < 40; i++)
+		table[20 + i] = 0xbb000000 | i;
+
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_rkvdec2_read_link_table(&image, info, table,
+						       0x1234),
+			0);
+	KUNIT_EXPECT_EQ(test, regs[RK_MPP_RKVDEC_LINK_STATUS_WORD], 0x1234U);
+	KUNIT_EXPECT_EQ(test, regs[320], 0xbb000000U);
+	KUNIT_EXPECT_EQ(test, regs[359], 0xbb000027U);
+
+	image.reg_words = 320;
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_rkvdec2_read_link_table(&image, info, table,
+						       0x1234),
+			-EINVAL);
 
 	image.reg_words = 128;
 	KUNIT_EXPECT_EQ(test,
