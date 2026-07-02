@@ -168,8 +168,8 @@ Implemented
   decoder, transformed destination-corner selection, color-fill core-mask
   dispatch, BSP request task-count limits and return codes, mixed RGA2/RGA3
   multi-task rejection, compact 10-bit RGA2 source dispatch/emission including
-  the no-scale force-tile mode, and ffmpeg-facing RGA3 raster/FBC/alpha-overlay
-  profile selection.
+  the no-scale force-tile mode, IOMMU fault target matching, and ffmpeg-facing
+  RGA3 raster/FBC/alpha-overlay profile selection.
 
 Recognized But Unsupported
 --------------------------
