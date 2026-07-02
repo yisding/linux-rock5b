@@ -7545,6 +7545,26 @@ static void rk_rga3_librga_afbc_copy_emit_kunit(struct kunit *test)
 			lower_32_bits(task.dst.yrgb_addr));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_U_BASE_OFFSET / 4],
 			lower_32_bits(task.dst.uv_addr));
+
+	memset(cmd, 0, sizeof(cmd));
+	task.src.x_offset = 0;
+	task.src.y_offset = 32;
+	job.cmd_ready = false;
+	type = 0;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_SRC_SIZE_OFFSET / 4],
+			1280U | (752U << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_ACT_OFF_OFFSET / 4],
+			32U << 16);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_ACT_SIZE_OFFSET / 4],
+			1280U | (720U << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
+			1280U | (720U << 16));
 }
 
 static void rk_rga3_tile8x8_profile_kunit(struct kunit *test)
