@@ -187,7 +187,12 @@ Implemented
   programmed through the RGA2 FBCIN register aliases while keeping the
   destination raster.  Pattern, color-key, alpha/ROP, tile, AFBC32x8, RFBC
   destination, overlapping in-place blits, in-place scaling/conversion/rotation,
-  incompact 10-bit input, 10-bit output, OSD, mosaic, pre-intr, and gauss
+  incompact 10-bit input, 10-bit output, OSD, pre-intr, and gauss
+  variants remain unsupported.
+* RGA2 in-place RGB mosaic for the current ``librga`` ``immosaic`` single-image
+  path.  The rewrite accepts same-buffer, same-rectangle raster RGB bitblit
+  requests with ``mosaic_info.enable`` and BSP mosaic modes ``0..4``.  Scaled,
+  converted, rotated, YUV, pattern, OSD, gauss, and multi-rectangle mosaic
   variants remain unsupported.
 * Multi-task requests are accepted when every task matches the same supported
   backend profile; tasks run serially under the request's single
@@ -202,6 +207,7 @@ Implemented
   multi-task rejection, RGA2 fill RGB/YUV destination-offset emission,
   YUV-fill chroma-alignment rejection, and multi-fill task acceptance, compact
   10-bit RGA2 source dispatch/emission including the no-scale force-tile mode,
+  RGA2 in-place RGB mosaic dispatch/emission,
   ffmpeg-facing RGA2 RFBC64x4 source profile selection and FBCIN command
   emission, IOMMU fault target matching, scheduler priority enqueue/aging,
   RGA3 normal RGB color-key dispatch/emission and inverted-mode rejection,
