@@ -464,6 +464,7 @@
 #define RK_RGA_CORE_RGA2_MASK		(BIT(2) | BIT(3))
 #define RK_RGA_CORE_MASK		(RK_RGA_CORE_RGA3_MASK | \
 					 RK_RGA_CORE_RGA2_MASK)
+#define RK_RGA_CORE_COUNTER_COUNT	4
 #define RK_RGA_SCHED_PRIORITY_MAX	6
 
 #define RK_RGA_BACKEND_QUEUED		1
@@ -1070,8 +1071,11 @@ struct rk_rga_service {
 	atomic_t release_fence_count;
 	atomic_t completed_job_count;
 	atomic_t scheduled_job_count;
+	atomic_t scheduled_core_count[RK_RGA_CORE_COUNTER_COUNT];
 	atomic_t dispatched_job_count;
+	atomic_t dispatched_core_count[RK_RGA_CORE_COUNTER_COUNT];
 	atomic_t started_job_count;
+	atomic_t started_core_count[RK_RGA_CORE_COUNTER_COUNT];
 	atomic_t cmd_alloc_count;
 	atomic_t power_cycle_count;
 	atomic_t irq_count;
@@ -1085,6 +1089,31 @@ struct rk_rga_service {
 };
 
 static struct rk_rga_service rk_rga;
+
+static int rk_rga_core_counter_index(u32 core_mask)
+{
+	switch (core_mask) {
+	case BIT(0):
+		return 0;
+	case BIT(1):
+		return 1;
+	case BIT(2):
+		return 2;
+	case BIT(3):
+		return 3;
+	default:
+		return -EINVAL;
+	}
+}
+
+static void rk_rga_count_core(atomic_t counters[RK_RGA_CORE_COUNTER_COUNT],
+			      const struct rk_rga_hw *hw)
+{
+	int index = rk_rga_core_counter_index(hw->core_mask);
+
+	if (index >= 0)
+		atomic_inc(&counters[index]);
+}
 
 static void rk_rga_of_node_put(void *data)
 {
@@ -3054,6 +3083,7 @@ static void rk_rga_hw_start(struct rk_rga_hw *hw, struct rk_rga_job *job)
 		rk_rga2_start_hw(hw, job);
 
 	atomic_inc(&rk_rga.started_job_count);
+	rk_rga_count_core(rk_rga.started_core_count, hw);
 	schedule_delayed_work(&hw->timeout_work,
 			      msecs_to_jiffies(RK_RGA_JOB_TIMEOUT_MS));
 }
@@ -6305,6 +6335,34 @@ static void rk_rga_find_best_hw_for_job_kunit(struct kunit *test)
 			    &idle);
 }
 
+static void rk_rga_core_counter_kunit(struct kunit *test)
+{
+	atomic_t counters[RK_RGA_CORE_COUNTER_COUNT];
+	struct rk_rga_hw hw = { .core_mask = BIT(1) };
+
+	for (u32 i = 0; i < ARRAY_SIZE(counters); i++)
+		atomic_set(&counters[i], 0);
+
+	KUNIT_EXPECT_EQ(test, rk_rga_core_counter_index(BIT(0)), 0);
+	KUNIT_EXPECT_EQ(test, rk_rga_core_counter_index(BIT(1)), 1);
+	KUNIT_EXPECT_EQ(test, rk_rga_core_counter_index(BIT(2)), 2);
+	KUNIT_EXPECT_EQ(test, rk_rga_core_counter_index(BIT(3)), 3);
+	KUNIT_EXPECT_EQ(test, rk_rga_core_counter_index(0), -EINVAL);
+	KUNIT_EXPECT_EQ(test, rk_rga_core_counter_index(BIT(0) | BIT(1)),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, rk_rga_core_counter_index(BIT(4)), -EINVAL);
+
+	rk_rga_count_core(counters, &hw);
+	KUNIT_EXPECT_EQ(test, atomic_read(&counters[0]), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&counters[1]), 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&counters[2]), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&counters[3]), 0);
+
+	hw.core_mask = BIT(4);
+	rk_rga_count_core(counters, &hw);
+	KUNIT_EXPECT_EQ(test, atomic_read(&counters[1]), 1);
+}
+
 static void rk_rga_priority_enqueue_kunit(struct kunit *test)
 {
 	struct rk_rga_hw hw = { };
@@ -8606,6 +8664,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_release_fence_fd_state_kunit),
 	KUNIT_CASE(rk_rga_mixed_task_hw_type_kunit),
 	KUNIT_CASE(rk_rga_find_best_hw_for_job_kunit),
+	KUNIT_CASE(rk_rga_core_counter_kunit),
 	KUNIT_CASE(rk_rga_priority_enqueue_kunit),
 	KUNIT_CASE(rk_rga_iommu_fault_match_kunit),
 	KUNIT_CASE(rk_rga_iommu_refresh_kunit),
@@ -11448,6 +11507,7 @@ static void rk_rga_hw_dispatch(struct rk_rga_hw *hw)
 		spin_unlock_irqrestore(&hw->job_lock, flags);
 
 		atomic_inc(&rk_rga.dispatched_job_count);
+		rk_rga_count_core(rk_rga.dispatched_core_count, hw);
 		ret = rk_rga_backend_start(hw, job);
 		if (ret == RK_RGA_BACKEND_QUEUED) {
 			mutex_unlock(&hw->run_lock);
@@ -11530,6 +11590,7 @@ static int rk_rga_job_queue_ref(struct rk_rga_job *job, bool take_ref)
 
 	rk_rga_hw_enqueue_job_locked(hw, job);
 	atomic_inc(&rk_rga.scheduled_job_count);
+	rk_rga_count_core(rk_rga.scheduled_core_count, hw);
 	spin_unlock_irqrestore(&hw->job_lock, flags);
 
 	rk_rga_hw_dispatch(hw);
@@ -12656,6 +12717,26 @@ static const struct file_operations rk_rga_fops = {
 	.llseek		= noop_llseek,
 };
 
+static void
+rk_rga_debugfs_create_core_counts(const char *prefix,
+				  atomic_t counters[RK_RGA_CORE_COUNTER_COUNT])
+{
+	static const char * const core_names[RK_RGA_CORE_COUNTER_COUNT] = {
+		"rga3_core0",
+		"rga3_core1",
+		"rga2_core0",
+		"rga2_core1",
+	};
+	char name[48];
+
+	for (u32 i = 0; i < ARRAY_SIZE(core_names); i++) {
+		snprintf(name, sizeof(name), "%s_%s_count", prefix,
+			 core_names[i]);
+		debugfs_create_atomic_t(name, 0444, rk_rga.debugfs_root,
+					&counters[i]);
+	}
+}
+
 static int __init rk_rga_init(void)
 {
 	int ret;
@@ -12698,12 +12779,18 @@ static int __init rk_rga_init(void)
 	debugfs_create_atomic_t("scheduled_job_count", 0444,
 				rk_rga.debugfs_root,
 				&rk_rga.scheduled_job_count);
+	rk_rga_debugfs_create_core_counts("scheduled",
+					  rk_rga.scheduled_core_count);
 	debugfs_create_atomic_t("dispatched_job_count", 0444,
 				rk_rga.debugfs_root,
 				&rk_rga.dispatched_job_count);
+	rk_rga_debugfs_create_core_counts("dispatched",
+					  rk_rga.dispatched_core_count);
 	debugfs_create_atomic_t("started_job_count", 0444,
 				rk_rga.debugfs_root,
 				&rk_rga.started_job_count);
+	rk_rga_debugfs_create_core_counts("started",
+					  rk_rga.started_core_count);
 	debugfs_create_atomic_t("cmd_alloc_count", 0444, rk_rga.debugfs_root,
 				&rk_rga.cmd_alloc_count);
 	debugfs_create_atomic_t("power_cycle_count", 0444,
