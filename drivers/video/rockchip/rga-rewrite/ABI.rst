@@ -140,6 +140,14 @@ Implemented
   path, including BSP-matched 90-degree sizing for pattern and no-pattern A+B
   jobs.  10-bit YUV-destination alpha, no-pattern YUV A+B->B, and compressed
   in-place write-back remain unsupported.
+* RGA3 normal-mode RGB color-key for the current ``librga`` ``imcolorkey``
+  destination-update path.  The rewrite accepts the two-image raster RGB
+  request shape emitted by ``librga``, routes it through the RGA3 overlap
+  A+B->B topology, converts the 8-bit key min/max fields into the BSP RGA3
+  overlap-key layout, and keeps the destination as the background image.
+  Inverted color-key, pattern color-key, FBC/YUV/10-bit color-key, and
+  hand-built color-key requests outside the normal ``librga`` alpha/zero-key
+  mode remain unsupported.
 * RGA2 solid color fill for the common ``librga`` ``imfill`` destination-only
   path.  The rewrite selects an RGA2-class RK3588 core, creates job-owned
   dma-buf mappings for that core when the imported handle was originally mapped
@@ -184,7 +192,8 @@ Implemented
   multi-task rejection, RGA2 fill RGB/YUV destination-offset emission,
   YUV-fill chroma-alignment rejection, and multi-fill task acceptance, compact
   10-bit RGA2 source dispatch/emission including the no-scale force-tile mode,
-  IOMMU fault target matching, and ffmpeg-facing RGA3
+  IOMMU fault target matching, RGA3 normal RGB color-key dispatch/emission and
+  inverted-mode rejection, and ffmpeg-facing RGA3
   raster/FBC/alpha-overlay profile selection plus destination-offset command
   emission, source-crop command emission for RGA3 and RGA2, and semiplanar
   chroma-alignment rejection.
@@ -194,8 +203,9 @@ Recognized But Unsupported
 
 * RGA2 hardware command generation outside the solid color fill and raster
   bitblit profiles above, including full-CSC outside raster bitblit.
-* RGA3 pattern outside the supported alpha-overlay profile, color-key,
-  no-pattern or 10-bit YUV-destination alpha, per-channel rotation,
+* RGA3 pattern outside the supported alpha-overlay profile, color-key outside
+  the normal RGB ``imcolorkey`` profile, no-pattern or 10-bit YUV-destination
+  alpha, per-channel rotation,
   RFBC/tile/AFBC32x8, 10-bit or AFBC destination offsets,
   virtual/physical-address, and non-bitblit operation modes.
 * Mixed RGA2/RGA3 multi-task requests.
