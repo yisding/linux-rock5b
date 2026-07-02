@@ -80,6 +80,12 @@ Implemented
   preserves the existing session poll ordering, keeps BSP-style submit-time
   validation for invalid register/readback/start descriptors, and reports
   backend start failures through the normal completion path.
+* RK3588 RKVENC2 DCHS dual-core hand-shake setup for queued multicore encoder
+  jobs.  The rewrite mirrors the BSP-visible policy of always enabling TX,
+  allocating per-active-core tx/rx ids, linking RX to a same-session producer
+  when the original ids match, disabling RX when no producer is active, and
+  clearing the DCHS slot on normal completion, submit failure, timeout, reset,
+  close, or device removal.
 * Per-core start/abort/timeout/completion serialization.  ``RESET_SESSION``,
   close, timeout recovery, and device removal cannot reset or power down a core
   while the queued dispatcher is still programming the accepted job.
@@ -120,10 +126,11 @@ Recognized But Unsupported
 Outside This Slice
 ------------------
 
-* Full BSP-equivalent RK3588 CCU task policy and SRAM-backed fixed-IOVA RCB
-  optimization.  The rewrite requires the referenced CCU coordinator to be
-  bound and online, has least-loaded core selection and queued dispatch, but
-  does not yet mirror the BSP dual-core CCU task policy.
+* Full BSP-equivalent RK3588 decoder/link CCU task policy and SRAM-backed
+  fixed-IOVA RCB optimization.  The rewrite requires the referenced CCU
+  coordinator to be bound and online, has least-loaded core selection, queued
+  dispatch, and RKVENC2 DCHS hand-shake remapping, but does not yet mirror the
+  BSP decoder/link CCU policy.
 * Full BSP-equivalent timeout recovery policy and IOMMU fault recovery,
   including shared reset-domain serialization and MMU-domain refresh.
 * Decoder performance-selector readback ranges above the core MMIO resource.
