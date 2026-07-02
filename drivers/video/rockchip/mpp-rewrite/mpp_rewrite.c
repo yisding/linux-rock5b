@@ -133,9 +133,10 @@ struct rk_mpp_hw {
 	struct clk_bulk_data *clks;
 	struct reset_control *resets;
 	struct delayed_work timeout_work;
+	struct mutex run_lock; /* serializes start, abort, timeout, and completion */
 	spinlock_t lock;
 	struct rk_mpp_job *active_job;
-	wait_queue_head_t idle_wait;
+	struct device_node *ccu_node;
 	u32 taskqueue_node;
 	u32 task_capacity;
 	u32 core_mask;
@@ -146,6 +147,7 @@ struct rk_mpp_hw {
 	size_t rcb_size;
 	u32 rcb_min_width;
 	refcount_t refs;
+	atomic_t queued_job_count;
 	struct completion released;
 	int num_regs;
 	int num_clks;
@@ -159,11 +161,15 @@ struct rk_mpp_service {
 	struct dentry *debugfs_root;
 	struct proc_dir_entry *procfs_root;
 	struct mutex hw_lock;
+	struct mutex sched_lock; /* protects queued_jobs */
 	struct list_head hw_list;
+	struct list_head queued_jobs;
+	struct work_struct sched_work;
 	atomic_t ioctl_count;
 	atomic_t unsupported_count;
 	atomic_t import_count;
 	atomic_t submitted_job_count;
+	atomic_t queued_job_count;
 	atomic_t timeout_count;
 	u32 hw_support;
 	u32 bound_hw_count;
@@ -216,6 +222,7 @@ struct rk_mpp_trans_table {
 };
 
 struct rk_mpp_backend_ops {
+	int (*validate)(struct rk_mpp_job *job);
 	int (*submit)(struct rk_mpp_job *job);
 	irqreturn_t (*irq)(struct rk_mpp_hw *hw);
 	irqreturn_t (*thread)(struct rk_mpp_hw *hw);
@@ -224,6 +231,7 @@ struct rk_mpp_backend_ops {
 struct rk_mpp_job {
 	struct list_head link;
 	struct list_head session_link;
+	struct list_head sched_link;
 	struct rk_mpp_session *session;
 	enum rk_mpp_job_state state;
 	struct rk_mpp_hw *hw;
@@ -236,6 +244,7 @@ struct rk_mpp_job {
 	int result;
 	u32 rkvdec_stream_addr;
 	bool poll_irq;
+	bool canceled;
 	bool rkvenc_slice_mode;
 	bool rkvenc_slice_done;
 	bool rkvenc_slice_overflow;
@@ -452,6 +461,34 @@ static void rk_mpp_session_put(struct rk_mpp_session *session)
 		kfree(session);
 }
 
+static bool rk_mpp_hw_ccu_online_locked(struct rk_mpp_service *srv,
+					struct rk_mpp_hw *core)
+{
+	struct rk_mpp_hw *hw;
+
+	if (!core->ccu_node)
+		return true;
+
+	list_for_each_entry(hw, &srv->hw_list, link) {
+		if (hw->dev->of_node == core->ccu_node && hw->online)
+			return true;
+	}
+
+	return false;
+}
+
+static bool rk_mpp_hw_ccu_online(struct rk_mpp_service *srv,
+				 struct rk_mpp_hw *core)
+{
+	bool online;
+
+	mutex_lock(&srv->hw_lock);
+	online = rk_mpp_hw_ccu_online_locked(srv, core);
+	mutex_unlock(&srv->hw_lock);
+
+	return online;
+}
+
 static void rk_mpp_refresh_hw_support_locked(struct rk_mpp_service *srv)
 {
 	struct rk_mpp_hw *hw;
@@ -460,6 +497,7 @@ static void rk_mpp_refresh_hw_support_locked(struct rk_mpp_service *srv)
 
 	list_for_each_entry(hw, &srv->hw_list, link) {
 		if (hw->match->contributes_support &&
+		    rk_mpp_hw_ccu_online_locked(srv, hw) &&
 		    hw->match->type < RK_MPP_DEVICE_BUTT) {
 			support |= BIT(hw->match->type);
 			count++;
@@ -499,24 +537,41 @@ static bool rk_mpp_hw_is_idle(struct rk_mpp_hw *hw)
 	return idle;
 }
 
+static u32 rk_mpp_hw_load(struct rk_mpp_hw *hw)
+{
+	return (rk_mpp_hw_is_idle(hw) ? 0 : 1) +
+	       atomic_read(&hw->queued_job_count);
+}
+
 static struct rk_mpp_hw *rk_mpp_hw_get_for_session(struct rk_mpp_session *session,
 						   bool prefer_idle)
 {
 	struct rk_mpp_service *srv = session->srv;
 	struct rk_mpp_hw *hw;
 	struct rk_mpp_hw *selected = NULL;
+	u32 selected_load = U32_MAX;
 
 	mutex_lock(&srv->hw_lock);
 	list_for_each_entry(hw, &srv->hw_list, link) {
+		u32 load;
+
 		if (!hw->online || !hw->match->contributes_support ||
 		    hw->match->type != session->client_type)
 			continue;
+		if (!rk_mpp_hw_ccu_online_locked(srv, hw))
+			continue;
 
-		if (!selected)
-			selected = hw;
-		if (!prefer_idle || rk_mpp_hw_is_idle(hw)) {
+		if (!prefer_idle) {
 			selected = hw;
 			break;
+		}
+
+		load = rk_mpp_hw_load(hw);
+		if (!selected || load < selected_load) {
+			selected = hw;
+			selected_load = load;
+			if (!load)
+				break;
 		}
 	}
 	if (selected)
@@ -534,6 +589,7 @@ static u32 rk_mpp_get_hw_id(struct rk_mpp_service *srv, u32 client_type)
 	mutex_lock(&srv->hw_lock);
 	list_for_each_entry(hw, &srv->hw_list, link) {
 		if (hw->match->contributes_support &&
+		    rk_mpp_hw_ccu_online_locked(srv, hw) &&
 		    hw->match->type == client_type) {
 			hw_id = hw->hw_id;
 			break;
@@ -1596,26 +1652,6 @@ static int rk_mpp_job_select_hw(struct rk_mpp_job *job)
 	return 0;
 }
 
-static void rk_mpp_job_cancel_active(struct rk_mpp_job *job, int result)
-{
-	struct rk_mpp_session *session = job->session;
-	bool drop = false;
-
-	mutex_lock(&session->lock);
-	if (job->state == RK_MPP_JOB_ACTIVE) {
-		list_del_init(&job->session_link);
-		if (session->active_job_count)
-			session->active_job_count--;
-		drop = true;
-	}
-	job->state = RK_MPP_JOB_STAGED;
-	job->result = result;
-	mutex_unlock(&session->lock);
-
-	if (drop)
-		rk_mpp_job_put(job);
-}
-
 static int rk_mpp_backend_submit_unsupported(struct rk_mpp_job *job)
 {
 	return -EOPNOTSUPP;
@@ -1627,8 +1663,8 @@ static const struct rk_mpp_backend_ops rk_mpp_unsupported_backend_ops = {
 
 static int rk_mpp_job_submit(struct rk_mpp_job *job)
 {
+	struct rk_mpp_service *srv = job->session->srv;
 	const struct rk_mpp_backend_ops *ops;
-	int ret;
 
 	if (!job->hw)
 		return -ENODEV;
@@ -1636,14 +1672,26 @@ static int rk_mpp_job_submit(struct rk_mpp_job *job)
 	ops = job->hw->match->ops;
 	if (!ops || !ops->submit)
 		return -EOPNOTSUPP;
+	if (ops->validate) {
+		int ret = ops->validate(job);
+
+		if (ret)
+			return ret;
+	}
 
 	job->rkvenc_slice_mode = rk_mpp_job_rkvenc_slice_mode(job);
 	rk_mpp_job_activate(job);
-	ret = ops->submit(job);
-	if (ret)
-		rk_mpp_job_cancel_active(job, ret);
+	rk_mpp_job_get(job);
 
-	return ret;
+	mutex_lock(&srv->sched_lock);
+	list_add_tail(&job->sched_link, &srv->queued_jobs);
+	atomic_inc(&job->hw->queued_job_count);
+	atomic_inc(&srv->queued_job_count);
+	mutex_unlock(&srv->sched_lock);
+
+	schedule_work(&srv->sched_work);
+
+	return 0;
 }
 
 static int rk_mpp_job_materialize_request(struct rk_mpp_job *job,
@@ -1707,6 +1755,13 @@ static void rk_mpp_job_put(struct rk_mpp_job *job)
 		rk_mpp_job_release(job);
 }
 
+static void rk_mpp_job_drop_hw(struct rk_mpp_job *job)
+{
+	struct rk_mpp_hw *hw = xchg(&job->hw, NULL);
+
+	rk_mpp_hw_put(hw);
+}
+
 static void rk_mpp_batch_release_jobs(struct rk_mpp_batch_state *batch)
 {
 	struct rk_mpp_job *job, *tmp;
@@ -1739,6 +1794,7 @@ rk_mpp_batch_get_job(struct rk_mpp_batch_state *batch,
 	rk_mpp_session_get(session);
 	INIT_LIST_HEAD(&job->link);
 	INIT_LIST_HEAD(&job->session_link);
+	INIT_LIST_HEAD(&job->sched_link);
 	list_add_tail(&job->link, &batch->jobs);
 	batch->cur_job = job;
 
@@ -1769,7 +1825,104 @@ static void rk_mpp_job_complete(struct rk_mpp_job *job, int result)
 	job->result = result;
 	job->state = RK_MPP_JOB_DONE;
 	mutex_unlock(&session->lock);
+	rk_mpp_job_drop_hw(job);
 	wake_up_all(&session->wait);
+	schedule_work(&session->srv->sched_work);
+}
+
+static void rk_mpp_job_unqueue_locked(struct rk_mpp_job *job)
+{
+	list_del_init(&job->sched_link);
+	atomic_dec(&job->hw->queued_job_count);
+	atomic_dec(&job->session->srv->queued_job_count);
+}
+
+static bool rk_mpp_job_dequeue(struct rk_mpp_job *job)
+{
+	struct rk_mpp_service *srv = job->session->srv;
+	bool removed = false;
+
+	mutex_lock(&srv->sched_lock);
+	if (!list_empty(&job->sched_link)) {
+		rk_mpp_job_unqueue_locked(job);
+		removed = true;
+	}
+	mutex_unlock(&srv->sched_lock);
+
+	if (removed)
+		rk_mpp_job_put(job);
+
+	return removed;
+}
+
+static void rk_mpp_hw_abort_queued(struct rk_mpp_hw *hw, int result)
+{
+	struct rk_mpp_service *srv = &rk_mpp_srv;
+	struct rk_mpp_job *job, *tmp;
+	LIST_HEAD(aborted);
+
+	mutex_lock(&srv->sched_lock);
+	list_for_each_entry_safe(job, tmp, &srv->queued_jobs, sched_link) {
+		if (job->hw != hw)
+			continue;
+
+		WRITE_ONCE(job->canceled, true);
+		rk_mpp_job_unqueue_locked(job);
+		list_add_tail(&job->sched_link, &aborted);
+	}
+	mutex_unlock(&srv->sched_lock);
+
+	list_for_each_entry_safe(job, tmp, &aborted, sched_link) {
+		list_del_init(&job->sched_link);
+		rk_mpp_job_complete(job, result);
+		rk_mpp_job_put(job);
+	}
+}
+
+static struct rk_mpp_job *
+rk_mpp_scheduler_take_job(struct rk_mpp_service *srv)
+{
+	struct rk_mpp_job *job;
+
+	mutex_lock(&srv->sched_lock);
+	list_for_each_entry(job, &srv->queued_jobs, sched_link) {
+		if (!READ_ONCE(job->canceled) && READ_ONCE(job->hw->online) &&
+		    rk_mpp_hw_is_idle(job->hw)) {
+			rk_mpp_job_unqueue_locked(job);
+			mutex_unlock(&srv->sched_lock);
+			return job;
+		}
+	}
+	mutex_unlock(&srv->sched_lock);
+
+	return NULL;
+}
+
+static void rk_mpp_scheduler_work(struct work_struct *work)
+{
+	struct rk_mpp_service *srv =
+		container_of(work, struct rk_mpp_service, sched_work);
+	struct rk_mpp_job *job;
+
+	while ((job = rk_mpp_scheduler_take_job(srv))) {
+		const struct rk_mpp_backend_ops *ops = job->hw->match->ops;
+		int ret;
+
+		if (READ_ONCE(job->canceled))
+			ret = -ECANCELED;
+		else if (!ops || !ops->submit)
+			ret = -EOPNOTSUPP;
+		else
+			ret = ops->submit(job);
+
+		if (ret) {
+			if (ret == -EOPNOTSUPP)
+				atomic_inc(&srv->unsupported_count);
+			rk_mpp_job_complete(job, ret);
+		}
+
+		rk_mpp_job_put(job);
+	}
 }
 
 static bool rk_mpp_hw_reg_range_valid(struct rk_mpp_hw *hw, u32 region,
@@ -1824,47 +1977,30 @@ static void rk_mpp_hw_reset_active(struct rk_mpp_hw *hw)
 	reset_control_deassert(hw->resets);
 }
 
-static bool rk_mpp_hw_idle_or_offline(struct rk_mpp_hw *hw)
-{
-	unsigned long flags;
-	bool ready;
-
-	spin_lock_irqsave(&hw->lock, flags);
-	ready = !hw->active_job || !READ_ONCE(hw->online);
-	spin_unlock_irqrestore(&hw->lock, flags);
-
-	return ready;
-}
-
 static int rk_mpp_hw_begin_active_job(struct rk_mpp_hw *hw,
 				      struct rk_mpp_job *job)
 {
 	unsigned long flags;
+	int ret = 0;
 
-	for (;;) {
-		spin_lock_irqsave(&hw->lock, flags);
-		if (!READ_ONCE(hw->online)) {
-			spin_unlock_irqrestore(&hw->lock, flags);
-			return -ENODEV;
-		}
-		if (!hw->active_job) {
-			rk_mpp_job_get(job);
-			hw->active_job = job;
-			hw->irq_status = 0;
-			spin_unlock_irqrestore(&hw->lock, flags);
-			return 0;
-		}
-		spin_unlock_irqrestore(&hw->lock, flags);
+	if (!rk_mpp_hw_ccu_online(job->session->srv, hw))
+		return -ENODEV;
 
-		if (wait_event_interruptible(hw->idle_wait,
-					     rk_mpp_hw_idle_or_offline(hw)))
-			return -ERESTARTSYS;
+	spin_lock_irqsave(&hw->lock, flags);
+	if (!READ_ONCE(hw->online)) {
+		ret = -ENODEV;
+	} else if (READ_ONCE(job->canceled)) {
+		ret = -ECANCELED;
+	} else if (hw->active_job) {
+		ret = -EBUSY;
+	} else {
+		rk_mpp_job_get(job);
+		hw->active_job = job;
+		hw->irq_status = 0;
 	}
-}
+	spin_unlock_irqrestore(&hw->lock, flags);
 
-static void rk_mpp_hw_wake_idle(struct rk_mpp_hw *hw)
-{
-	wake_up_all(&hw->idle_wait);
+	return ret;
 }
 
 static bool rk_mpp_hw_clear_active_job(struct rk_mpp_hw *hw,
@@ -1885,7 +2021,6 @@ static bool rk_mpp_hw_clear_active_job(struct rk_mpp_hw *hw,
 
 	if (cleared) {
 		cancel_delayed_work(&hw->timeout_work);
-		rk_mpp_hw_wake_idle(hw);
 		rk_mpp_job_put(job);
 	}
 
@@ -1907,9 +2042,6 @@ static struct rk_mpp_job *rk_mpp_hw_take_active_job(struct rk_mpp_hw *hw,
 		hw->irq_status = 0;
 	}
 	spin_unlock_irqrestore(&hw->lock, flags);
-
-	if (job)
-		rk_mpp_hw_wake_idle(hw);
 
 	return job;
 }
@@ -1935,10 +2067,13 @@ static void rk_mpp_hw_abort_job(struct rk_mpp_job *job)
 	if (!hw)
 		return;
 
+	cancel_delayed_work_sync(&hw->timeout_work);
+	mutex_lock(&hw->run_lock);
 	if (rk_mpp_hw_clear_active_job(hw, job, NULL)) {
 		rk_mpp_hw_reset_active(hw);
 		rk_mpp_hw_power_off(hw);
 	}
+	mutex_unlock(&hw->run_lock);
 }
 
 static void rk_mpp_hw_schedule_timeout(struct rk_mpp_hw *hw)
@@ -1954,9 +2089,12 @@ static void rk_mpp_hw_timeout_work(struct work_struct *work)
 			     timeout_work);
 	struct rk_mpp_job *job;
 
+	mutex_lock(&hw->run_lock);
 	job = rk_mpp_hw_take_active_job(hw, NULL);
-	if (!job)
+	if (!job) {
+		mutex_unlock(&hw->run_lock);
 		return;
+	}
 
 	atomic_inc(&job->session->srv->timeout_count);
 	dev_err(hw->dev, "session client %u job %u timed out\n",
@@ -1965,6 +2103,7 @@ static void rk_mpp_hw_timeout_work(struct work_struct *work)
 	rk_mpp_hw_reset_active(hw);
 	rk_mpp_hw_power_off(hw);
 	rk_mpp_job_complete(job, -ETIMEDOUT);
+	mutex_unlock(&hw->run_lock);
 	rk_mpp_job_put(job);
 }
 
@@ -1974,14 +2113,81 @@ static void rk_mpp_hw_abort_active(struct rk_mpp_hw *hw, int result)
 
 	cancel_delayed_work_sync(&hw->timeout_work);
 
+	mutex_lock(&hw->run_lock);
 	job = rk_mpp_hw_take_active_job(hw, NULL);
-	if (!job)
+	if (!job) {
+		mutex_unlock(&hw->run_lock);
 		return;
+	}
 
 	rk_mpp_hw_reset_active(hw);
 	rk_mpp_hw_power_off(hw);
 	rk_mpp_job_complete(job, result);
+	mutex_unlock(&hw->run_lock);
 	rk_mpp_job_put(job);
+}
+
+static struct rk_mpp_hw **
+rk_mpp_hw_collect_ccu_dependents(struct rk_mpp_hw *ccu, u32 *count)
+{
+	struct rk_mpp_service *srv = &rk_mpp_srv;
+	struct rk_mpp_hw **deps;
+	struct rk_mpp_hw *hw;
+	u32 i = 0;
+	u32 n = 0;
+
+	*count = 0;
+
+	mutex_lock(&srv->hw_lock);
+	list_for_each_entry(hw, &srv->hw_list, link) {
+		if (hw->online && hw->ccu_node == ccu->dev->of_node)
+			n++;
+	}
+	mutex_unlock(&srv->hw_lock);
+	if (!n)
+		return NULL;
+
+	deps = kcalloc(n, sizeof(*deps), GFP_KERNEL);
+	if (!deps)
+		return ERR_PTR(-ENOMEM);
+
+	mutex_lock(&srv->hw_lock);
+	list_for_each_entry(hw, &srv->hw_list, link) {
+		if (!hw->online || hw->ccu_node != ccu->dev->of_node)
+			continue;
+		if (i >= n)
+			break;
+
+		refcount_inc(&hw->refs);
+		deps[i++] = hw;
+	}
+	mutex_unlock(&srv->hw_lock);
+
+	*count = i;
+
+	return deps;
+}
+
+static void rk_mpp_hw_abort_ccu_dependents(struct rk_mpp_hw *ccu)
+{
+	struct rk_mpp_hw **deps;
+	u32 count;
+	u32 i;
+
+	deps = rk_mpp_hw_collect_ccu_dependents(ccu, &count);
+	if (IS_ERR(deps)) {
+		dev_warn(ccu->dev, "failed to collect CCU dependents: %pe\n",
+			 deps);
+		return;
+	}
+
+	for (i = 0; i < count; i++) {
+		rk_mpp_hw_abort_queued(deps[i], -ENODEV);
+		rk_mpp_hw_abort_active(deps[i], -ENODEV);
+		rk_mpp_hw_put(deps[i]);
+	}
+
+	kfree(deps);
 }
 
 static int rk_mpp_job_store_reg_word(struct rk_mpp_job *job, u32 offset,
@@ -2016,6 +2222,41 @@ static int rk_mpp_job_validate_readbacks(struct rk_mpp_job *job,
 	}
 
 	return 0;
+}
+
+static int rk_mpp_job_validate_write_regs(struct rk_mpp_job *job,
+					  u32 start_offset)
+{
+	struct rk_mpp_reg_image *image = &job->reg_image;
+	struct rk_mpp_hw *hw = job->hw;
+	bool start_seen = false;
+	u32 i;
+
+	for (i = 0; i < job->req_cnt; i++) {
+		const struct mpp_request *req = &job->reqs[i].req;
+		u32 offset;
+		u32 end;
+
+		if (req->cmd != MPP_CMD_SET_REG_WRITE || !req->size)
+			continue;
+		if (req->offset % sizeof(u32) || req->size % sizeof(u32))
+			return -EINVAL;
+		if (req->offset > image->reg_bytes ||
+		    req->size > image->reg_bytes - req->offset)
+			return -EINVAL;
+		if (!rk_mpp_hw_reg_range_valid(hw, 0, req->offset, req->size))
+			return -EINVAL;
+
+		end = req->offset + req->size;
+		for (offset = req->offset; offset < end; offset += sizeof(u32)) {
+			if (offset == start_offset) {
+				start_seen = true;
+				break;
+			}
+		}
+	}
+
+	return start_seen ? 0 : -EINVAL;
 }
 
 static int rk_mpp_job_write_regs(struct rk_mpp_job *job, u32 start_offset,
@@ -2088,6 +2329,24 @@ static int rk_mpp_job_read_regs(struct rk_mpp_job *job)
 	return 0;
 }
 
+static int rk_mpp_rkvenc2_validate(struct rk_mpp_job *job)
+{
+	struct rk_mpp_hw *hw = job->hw;
+	int ret;
+
+	if (hw->irq < 0 || !hw->regs[0])
+		return -ENODEV;
+	if (!rk_mpp_hw_reg_range_valid(hw, 0, RK_MPP_RKVENC_START_BASE,
+				       sizeof(u32)))
+		return -ENODEV;
+
+	ret = rk_mpp_job_validate_readbacks(job, hw);
+	if (ret)
+		return ret;
+
+	return rk_mpp_job_validate_write_regs(job, RK_MPP_RKVENC_START_BASE);
+}
+
 static int rk_mpp_rkvenc2_submit(struct rk_mpp_job *job)
 {
 	struct rk_mpp_hw *hw = job->hw;
@@ -2105,13 +2364,18 @@ static int rk_mpp_rkvenc2_submit(struct rk_mpp_job *job)
 	if (ret)
 		return ret;
 
+	mutex_lock(&hw->run_lock);
 	ret = rk_mpp_hw_begin_active_job(hw, job);
 	if (ret)
-		return ret;
+		goto err_unlock;
 
 	ret = rk_mpp_hw_power_on(hw);
 	if (ret)
 		goto err_clear_active;
+	if (!READ_ONCE(hw->online) || READ_ONCE(job->canceled)) {
+		ret = READ_ONCE(job->canceled) ? -ECANCELED : -ENODEV;
+		goto err_power_off;
+	}
 
 	if (rk_mpp_hw_reg_range_valid(hw, 0, RK_MPP_RKVENC_CLR_BASE, sizeof(u32))) {
 		writel_relaxed(0x2, hw->regs[0] + RK_MPP_RKVENC_CLR_BASE);
@@ -2130,10 +2394,15 @@ static int rk_mpp_rkvenc2_submit(struct rk_mpp_job *job)
 		ret = -EINVAL;
 		goto err_power_off;
 	}
+	if (!READ_ONCE(hw->online) || READ_ONCE(job->canceled)) {
+		ret = READ_ONCE(job->canceled) ? -ECANCELED : -ENODEV;
+		goto err_power_off;
+	}
 
 	rk_mpp_hw_schedule_timeout(hw);
 	wmb();
 	writel(start_value, hw->regs[0] + RK_MPP_RKVENC_START_BASE);
+	mutex_unlock(&hw->run_lock);
 
 	return 0;
 
@@ -2141,6 +2410,8 @@ err_power_off:
 	rk_mpp_hw_power_off(hw);
 err_clear_active:
 	rk_mpp_hw_clear_active_job(hw, job, NULL);
+err_unlock:
+	mutex_unlock(&hw->run_lock);
 	return ret;
 }
 
@@ -2265,9 +2536,12 @@ static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 	u32 irq_status = 0;
 	int ret;
 
+	mutex_lock(&hw->run_lock);
 	job = rk_mpp_hw_take_active_job(hw, &irq_status);
-	if (!job)
+	if (!job) {
+		mutex_unlock(&hw->run_lock);
 		return IRQ_HANDLED;
+	}
 	cancel_delayed_work(&hw->timeout_work);
 
 	ret = rk_mpp_job_read_regs(job);
@@ -2277,6 +2551,7 @@ static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 
 	rk_mpp_hw_power_off(hw);
 	rk_mpp_job_complete(job, ret);
+	mutex_unlock(&hw->run_lock);
 	rk_mpp_job_put(job);
 
 	return IRQ_HANDLED;
@@ -2305,13 +2580,18 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 		job->rkvdec_stream_addr =
 			job->reg_image.regs[RK_MPP_RKVDEC_RLC_WORD];
 
+	mutex_lock(&hw->run_lock);
 	ret = rk_mpp_hw_begin_active_job(hw, job);
 	if (ret)
-		return ret;
+		goto err_unlock;
 
 	ret = rk_mpp_hw_power_on(hw);
 	if (ret)
 		goto err_clear_active;
+	if (!READ_ONCE(hw->online) || READ_ONCE(job->canceled)) {
+		ret = READ_ONCE(job->canceled) ? -ECANCELED : -ENODEV;
+		goto err_power_off;
+	}
 
 	if (rk_mpp_hw_reg_range_valid(hw, 0, RK_MPP_RKVDEC_CACHE0_SIZE_BASE,
 				      sizeof(u32)))
@@ -2343,11 +2623,16 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 		ret = -EINVAL;
 		goto err_power_off;
 	}
+	if (!READ_ONCE(hw->online) || READ_ONCE(job->canceled)) {
+		ret = READ_ONCE(job->canceled) ? -ECANCELED : -ENODEV;
+		goto err_power_off;
+	}
 
 	rk_mpp_hw_schedule_timeout(hw);
 	wmb();
 	writel(start_value | RK_MPP_RKVDEC_START_EN,
 	       hw->regs[0] + RK_MPP_RKVDEC_START_BASE);
+	mutex_unlock(&hw->run_lock);
 
 	return 0;
 
@@ -2355,7 +2640,29 @@ err_power_off:
 	rk_mpp_hw_power_off(hw);
 err_clear_active:
 	rk_mpp_hw_clear_active_job(hw, job, NULL);
+err_unlock:
+	mutex_unlock(&hw->run_lock);
 	return ret;
+}
+
+static int rk_mpp_rkvdec2_validate(struct rk_mpp_job *job)
+{
+	struct rk_mpp_hw *hw = job->hw;
+	int ret;
+
+	if (hw->irq < 0 || !hw->regs[0])
+		return -ENODEV;
+	if (!rk_mpp_hw_reg_range_valid(hw, 0, RK_MPP_RKVDEC_START_BASE,
+				       sizeof(u32)) ||
+	    !rk_mpp_hw_reg_range_valid(hw, 0, RK_MPP_RKVDEC_INT_STA_BASE,
+				       sizeof(u32)))
+		return -ENODEV;
+
+	ret = rk_mpp_job_validate_readbacks(job, hw);
+	if (ret)
+		return ret;
+
+	return rk_mpp_job_validate_write_regs(job, RK_MPP_RKVDEC_START_BASE);
 }
 
 static irqreturn_t rk_mpp_rkvdec2_irq(struct rk_mpp_hw *hw)
@@ -2385,9 +2692,12 @@ static irqreturn_t rk_mpp_rkvdec2_thread(struct rk_mpp_hw *hw)
 	u32 irq_status = 0;
 	int ret;
 
+	mutex_lock(&hw->run_lock);
 	job = rk_mpp_hw_take_active_job(hw, &irq_status);
-	if (!job)
+	if (!job) {
+		mutex_unlock(&hw->run_lock);
 		return IRQ_HANDLED;
+	}
 	cancel_delayed_work(&hw->timeout_work);
 
 	ret = rk_mpp_job_read_regs(job);
@@ -2403,18 +2713,21 @@ static irqreturn_t rk_mpp_rkvdec2_thread(struct rk_mpp_hw *hw)
 
 	rk_mpp_hw_power_off(hw);
 	rk_mpp_job_complete(job, ret);
+	mutex_unlock(&hw->run_lock);
 	rk_mpp_job_put(job);
 
 	return IRQ_HANDLED;
 }
 
 static const struct rk_mpp_backend_ops rk_mpp_rkvenc2_backend_ops = {
+	.validate = rk_mpp_rkvenc2_validate,
 	.submit = rk_mpp_rkvenc2_submit,
 	.irq = rk_mpp_rkvenc2_irq,
 	.thread = rk_mpp_rkvenc2_thread,
 };
 
 static const struct rk_mpp_backend_ops rk_mpp_rkvdec2_backend_ops = {
+	.validate = rk_mpp_rkvdec2_validate,
 	.submit = rk_mpp_rkvdec2_submit,
 	.irq = rk_mpp_rkvdec2_irq,
 	.thread = rk_mpp_rkvdec2_thread,
@@ -2447,6 +2760,7 @@ static void rk_mpp_session_abort_jobs(struct rk_mpp_session *session)
 
 	mutex_lock(&session->lock);
 	list_for_each_entry_safe(job, tmp, &session->active_jobs, session_link) {
+		WRITE_ONCE(job->canceled, true);
 		list_move_tail(&job->session_link, &aborted);
 		job->result = -ECANCELED;
 		job->state = RK_MPP_JOB_DONE;
@@ -2457,6 +2771,7 @@ static void rk_mpp_session_abort_jobs(struct rk_mpp_session *session)
 
 	list_for_each_entry_safe(job, tmp, &aborted, session_link) {
 		list_del_init(&job->session_link);
+		rk_mpp_job_dequeue(job);
 		rk_mpp_hw_abort_job(job);
 		rk_mpp_job_put(job);
 	}
@@ -3081,6 +3396,11 @@ static void rk_mpp_hw_pm_disable(void *data)
 	pm_runtime_disable(dev);
 }
 
+static void rk_mpp_of_node_put(void *data)
+{
+	of_node_put(data);
+}
+
 static int rk_mpp_hw_alloc_rcb(struct rk_mpp_hw *hw)
 {
 	struct device *dev = hw->dev;
@@ -3155,9 +3475,20 @@ static int rk_mpp_hw_probe(struct platform_device *pdev)
 	hw->taskqueue_node = U32_MAX;
 	refcount_set(&hw->refs, 1);
 	init_completion(&hw->released);
+	mutex_init(&hw->run_lock);
 	spin_lock_init(&hw->lock);
-	init_waitqueue_head(&hw->idle_wait);
 	INIT_DELAYED_WORK(&hw->timeout_work, rk_mpp_hw_timeout_work);
+
+	if (of_find_property(dev->of_node, "rockchip,ccu", NULL)) {
+		hw->ccu_node = of_parse_phandle(dev->of_node, "rockchip,ccu", 0);
+		if (!hw->ccu_node)
+			return -EINVAL;
+
+		ret = devm_add_action_or_reset(dev, rk_mpp_of_node_put,
+					       hw->ccu_node);
+		if (ret)
+			return ret;
+	}
 
 	for (i = 0; i < RK_MPP_MAX_HW_REGS; i++) {
 		struct resource *res;
@@ -3236,9 +3567,10 @@ static int rk_mpp_hw_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, hw);
 
-	dev_info(dev, "bound %s core %d hw_id %#x irq %d regs %d clocks %d\n",
+	dev_info(dev, "bound %s core %d hw_id %#x irq %d regs %d clocks %d%s\n",
 		 match->name, hw->core_id, hw->hw_id, hw->irq,
-		 hw->num_regs, hw->num_clks);
+		 hw->num_regs, hw->num_clks,
+		 hw->ccu_node ? " ccu-gated" : "");
 
 	return 0;
 }
@@ -3252,8 +3584,10 @@ static void rk_mpp_hw_remove(struct platform_device *pdev)
 	list_del_init(&hw->link);
 	rk_mpp_refresh_hw_support_locked(&rk_mpp_srv);
 	mutex_unlock(&rk_mpp_srv.hw_lock);
-	wake_up_all(&hw->idle_wait);
 
+	if (!hw->match->contributes_support)
+		rk_mpp_hw_abort_ccu_dependents(hw);
+	rk_mpp_hw_abort_queued(hw, -ENODEV);
 	rk_mpp_hw_abort_active(hw, -ENODEV);
 	rk_mpp_hw_put(hw);
 	wait_for_completion(&hw->released);
@@ -3273,7 +3607,10 @@ static int __init rk_mpp_init(void)
 	int ret;
 
 	mutex_init(&rk_mpp_srv.hw_lock);
+	mutex_init(&rk_mpp_srv.sched_lock);
 	INIT_LIST_HEAD(&rk_mpp_srv.hw_list);
+	INIT_LIST_HEAD(&rk_mpp_srv.queued_jobs);
+	INIT_WORK(&rk_mpp_srv.sched_work, rk_mpp_scheduler_work);
 
 	ret = platform_driver_register(&rk_mpp_hw_driver);
 	if (ret)
@@ -3305,6 +3642,9 @@ static int __init rk_mpp_init(void)
 	debugfs_create_atomic_t("submitted_job_count", 0444,
 				rk_mpp_srv.debugfs_root,
 				&rk_mpp_srv.submitted_job_count);
+	debugfs_create_atomic_t("queued_job_count", 0444,
+				rk_mpp_srv.debugfs_root,
+				&rk_mpp_srv.queued_job_count);
 	debugfs_create_atomic_t("timeout_count", 0444, rk_mpp_srv.debugfs_root,
 				&rk_mpp_srv.timeout_count);
 
@@ -3326,6 +3666,7 @@ static void __exit rk_mpp_exit(void)
 	debugfs_remove_recursive(rk_mpp_srv.debugfs_root);
 	misc_deregister(&rk_mpp_srv.miscdev);
 	platform_driver_unregister(&rk_mpp_hw_driver);
+	flush_work(&rk_mpp_srv.sched_work);
 }
 
 module_init(rk_mpp_init);

@@ -17,8 +17,9 @@ Implemented
   MMIO, IRQ, clock, and reset discovery.
 * ``MPP_CMD_QUERY_HW_SUPPORT`` from bound RK3588 MPP hardware cores.
 * ``MPP_CMD_QUERY_HW_ID`` returns the register-0 hardware id captured from the
-  bound RK3588 RKVENC2/RKVDEC2 core at probe time, matching the forward port's
-  userspace-visible HAL-selection contract.
+  first bound RK3588 RKVENC2/RKVDEC2 core whose referenced CCU coordinator is
+  online, matching the forward port's userspace-visible HAL-selection
+  contract for enabled RK3588 nodes.
 * ``MPP_CMD_QUERY_CMD_SUPPORT`` group boundary queries.
 * Minimal ``/proc/mpp_service/supports-cmd`` and
   ``/proc/mpp_service/support_cmd`` discovery markers so current
@@ -55,11 +56,16 @@ Implemented
   transitions.  ``RESET_SESSION`` and file close abort active rewrite jobs
   before releasing imports.
 * Prepared register jobs select and hold a counted reference to an online
-  RK3588 hardware core.  Kernel-translated jobs prefer an idle matching core;
-  jobs flagged ``MPP_FLAGS_REG_FD_NO_TRANS`` stay on the default matching core
-  so explicit ``TRANS_FD_TO_IOVA`` results remain device-consistent.  Core
-  removal unlists the device and waits for prepared job references to drain
-  before devm-managed resources are released.
+  RK3588 hardware core whose ``rockchip,ccu`` phandle, when present, resolves
+  to a bound online CCU coordinator.  Kernel-translated jobs choose the
+  least-loaded matching core and prefer an idle core; jobs flagged
+  ``MPP_FLAGS_REG_FD_NO_TRANS`` stay on the default matching core so explicit
+  ``TRANS_FD_TO_IOVA`` results remain device-consistent.  Core removal unlists
+  the device and waits for prepared job references to drain before devm-managed
+  resources are released.
+* CCU coordinator removal makes dependent cores unavailable for new prepared
+  jobs and completes already queued or active dependent-core jobs with
+  ``-ENODEV``.
 * Pending-job poll/abort lifetime infrastructure: accepted jobs remain on the
   session pending list until ``POLL_HW_FINISH`` consumes the completed result
   or reset/close aborts the session.
@@ -69,8 +75,14 @@ Implemented
   deferral, IRQ-driven completion, retained ``SET_REG_READ`` register readback,
   BSP-style interrupt-status readback override, and decoder RLC decoded-length
   adjustment.
-* Contended submits against the selected hardware core wait interruptibly for
-  the core to become idle instead of returning ``-EBUSY``.
+* Contended submits queue internally instead of sleeping in the ioctl submit
+  path.  A rewrite-local dispatcher feeds queued jobs to idle selected cores,
+  preserves the existing session poll ordering, keeps BSP-style submit-time
+  validation for invalid register/readback/start descriptors, and reports
+  backend start failures through the normal completion path.
+* Per-core start/abort/timeout/completion serialization.  ``RESET_SESSION``,
+  close, timeout recovery, and device removal cannot reset or power down a core
+  while the queued dispatcher is still programming the accepted job.
 * Per-core software timeout completion for active RKVENC2/RKVDEC2 jobs using
   the same 500 ms timeout window as the BSP-derived forward port.  A timed-out
   job is removed from the active hardware slot, the core reset line is pulsed
@@ -108,9 +120,10 @@ Recognized But Unsupported
 Outside This Slice
 ------------------
 
-* Full BSP-equivalent RK3588 scheduling beyond simple idle-core selection:
-  queued software scheduling separate from the submitter wait path, dual-core
-  CCU policy, and SRAM-backed fixed-IOVA RCB optimization.
+* Full BSP-equivalent RK3588 CCU task policy and SRAM-backed fixed-IOVA RCB
+  optimization.  The rewrite requires the referenced CCU coordinator to be
+  bound and online, has least-loaded core selection and queued dispatch, but
+  does not yet mirror the BSP dual-core CCU task policy.
 * Full BSP-equivalent timeout recovery policy and IOMMU fault recovery,
   including shared reset-domain serialization and MMU-domain refresh.
 * Decoder performance-selector readback ranges above the core MMIO resource.
