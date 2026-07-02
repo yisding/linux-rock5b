@@ -186,6 +186,7 @@
 #define RK_RGA2_SCALE_BYPASS			0
 #define RK_RGA2_SCALE_DOWN			1
 #define RK_RGA2_SCALE_UP			2
+#define RK_RGA2_SCALE_FORCE_TILE		3
 #define RK_RGA2_BILINEAR_PREC			12
 #define RK_RGA2_INTERP_DEFAULT			0
 #define RK_RGA2_INTERP_LINEAR			1
@@ -4287,6 +4288,20 @@ static void rk_rga2_compact_10bit_profile_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, src_info & RK_RGA2_SRC_YUV10_EN);
 	KUNIT_EXPECT_TRUE(test, src_info & RK_RGA2_SRC_YUV10_ROUND_EN);
 
+	memset(cmd, 0, sizeof(cmd));
+	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_YCBCR_420_SP,
+				    1920, 1080);
+	job.cmd_ready = false;
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	src_info = cmd[RK_RGA2_SRC_INFO_OFFSET / 4];
+	KUNIT_EXPECT_EQ(test, src_info & RK_RGA2_SRC_HSCL_MODE,
+			FIELD_PREP(RK_RGA2_SRC_HSCL_MODE,
+				   RK_RGA2_SCALE_FORCE_TILE));
+	KUNIT_EXPECT_EQ(test, src_info & RK_RGA2_SRC_VSCL_MODE,
+			FIELD_PREP(RK_RGA2_SRC_VSCL_MODE,
+				   RK_RGA2_SCALE_FORCE_TILE));
+
 	task.src.compact_mode = RK_RGA_10BIT_INCOMPACT;
 	job.cmd_ready = false;
 	type = 0;
@@ -5258,6 +5273,34 @@ static int rk_rga2_scale_factor(u32 src, u32 dst, u8 interp, u32 *mode,
 	return 0;
 }
 
+static bool rk_rga2_format_needs_force_tile(u32 format)
+{
+	switch (format) {
+	case RK_RGA_FORMAT_YCBCR_420_SP_10B:
+	case RK_RGA_FORMAT_YCRCB_420_SP_10B:
+	case RK_RGA_FORMAT_YCBCR_422_SP_10B:
+	case RK_RGA_FORMAT_YCRCB_422_SP_10B:
+	case RK_RGA_FORMAT_YCBCR_444_SP:
+	case RK_RGA_FORMAT_YCRCB_444_SP:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool rk_rga2_needs_force_tile(const struct rga_req *task,
+				     const struct rk_rga2_transform *transform,
+				     u32 dst_w, u32 dst_h)
+{
+	if (task->src.act_w != dst_w || task->src.act_h != dst_h)
+		return false;
+	if (transform->src_rot_mode || transform->src_mir_mode)
+		return false;
+
+	return rk_rga2_format_needs_force_tile(task->src.format) ||
+	       rk_rga2_format_needs_force_tile(task->dst.format);
+}
+
 static int rk_rga2_emit_src(struct rk_rga_job *job,
 			    const struct rga_req *task,
 			    const struct rk_rga2_format_info *src_fmt,
@@ -5300,6 +5343,14 @@ static int rk_rga2_emit_src(struct rk_rga_job *job,
 				   &v_filter);
 	if (ret)
 		return ret;
+	if (rk_rga2_needs_force_tile(task, transform, dst_w, dst_h)) {
+		h_mode = RK_RGA2_SCALE_FORCE_TILE;
+		v_mode = RK_RGA2_SCALE_FORCE_TILE;
+		x_factor = 0;
+		y_factor = 0;
+		h_filter = false;
+		v_filter = false;
+	}
 
 	src_info = FIELD_PREP(RK_RGA2_SRC_FORMAT, src_fmt->hw_format) |
 		   FIELD_PREP(RK_RGA2_SRC_RB_SWAP, src_fmt->rb_swap) |
