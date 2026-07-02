@@ -358,6 +358,15 @@ static void rk_iommu_base_command(void __iomem *base, u32 command)
 {
 	writel(command, base + RK_MMU_COMMAND);
 }
+
+static void rk_iommu_zap_cache(struct rk_iommu *iommu)
+{
+	int i;
+
+	for (i = 0; i < iommu->num_mmu; i++)
+		rk_iommu_base_command(iommu->bases[i], RK_MMU_CMD_ZAP_CACHE);
+}
+
 static void rk_iommu_zap_lines(struct rk_iommu *iommu, dma_addr_t iova_start,
 			       size_t size)
 {
@@ -703,6 +712,30 @@ static void rk_iommu_zap_iova(struct rk_iommu_domain *rk_domain,
 			clk_bulk_disable(iommu->num_clocks, iommu->clocks);
 			pm_runtime_put(iommu->dev);
 		}
+	}
+	spin_unlock_irqrestore(&rk_domain->iommus_lock, flags);
+}
+
+static void rk_iommu_flush_iotlb_all(struct iommu_domain *domain)
+{
+	struct rk_iommu_domain *rk_domain = to_rk_domain(domain);
+	struct rk_iommu *iommu;
+	unsigned long flags;
+
+	spin_lock_irqsave(&rk_domain->iommus_lock, flags);
+	list_for_each_entry(iommu, &rk_domain->iommus, node) {
+		int ret;
+
+		ret = pm_runtime_get_if_in_use(iommu->dev);
+		if (WARN_ON_ONCE(ret < 0))
+			continue;
+		if (!ret)
+			continue;
+
+		WARN_ON(clk_bulk_enable(iommu->num_clocks, iommu->clocks));
+		rk_iommu_zap_cache(iommu);
+		clk_bulk_disable(iommu->num_clocks, iommu->clocks);
+		pm_runtime_put(iommu->dev);
 	}
 	spin_unlock_irqrestore(&rk_domain->iommus_lock, flags);
 }
@@ -1195,6 +1228,7 @@ static const struct iommu_ops rk_iommu_ops = {
 		.attach_dev	= rk_iommu_attach_device,
 		.map_pages	= rk_iommu_map,
 		.unmap_pages	= rk_iommu_unmap,
+		.flush_iotlb_all	= rk_iommu_flush_iotlb_all,
 		.iova_to_phys	= rk_iommu_iova_to_phys,
 		.free		= rk_iommu_domain_free,
 	}
