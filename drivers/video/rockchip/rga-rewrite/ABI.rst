@@ -138,11 +138,14 @@ Implemented
 * RGA2 solid color fill for the common ``librga`` ``imfill`` destination-only
   path.  The rewrite selects an RGA2-class RK3588 core, creates job-owned
   dma-buf mappings for that core when the imported handle was originally mapped
-  elsewhere, and emits a minimal raster RGB-family fill command.  This is
-  deliberately an RGA2 profile: the RK3588 forward-port RGA3 capability table
-  does not advertise ``RGA_COLOR_FILL``, so requests forced to RGA3 core bits
-  fail with ``-EOPNOTSUPP``.  Pattern fill, alpha/ROP/color-key, rotation,
-  tile/FBC, and YUV fill variants remain unsupported.
+  elsewhere, and emits a minimal raster RGB-family fill command.  Destination
+  rectangle offsets are applied by biasing the fill destination base address,
+  covering the ``imfill`` and decomposed ``imrectangle``/``imrectangleTask``
+  paths used by current ``librga`` samples.  This is deliberately an RGA2
+  profile: the RK3588 forward-port RGA3 capability table does not advertise
+  ``RGA_COLOR_FILL``, so requests forced to RGA3 core bits fail with
+  ``-EOPNOTSUPP``.  Pattern fill, alpha/ROP/color-key, rotation, tile/FBC, and
+  YUV fill variants remain unsupported.
 * RGA2 raster bitblit for the common upstream-consumer fallback formats that
   RGA3 does not cover: planar YUV420/YUV422, YCbCr400/gray, NV24/NV42-style
   YUV444 semiplanar, compact 10-bit semiplanar source, RGB555-family, and
@@ -168,10 +171,11 @@ Implemented
   normalization helpers, including the RGA2 ``rotate_mode``/``sina``/``cosa``
   decoder, transformed destination-corner selection, color-fill core-mask
   dispatch, BSP request task-count limits and return codes, mixed RGA2/RGA3
-  multi-task rejection, compact 10-bit RGA2 source dispatch/emission including
-  the no-scale force-tile mode, IOMMU fault target matching, and ffmpeg-facing
-  RGA3 raster/FBC/alpha-overlay profile selection plus destination-offset
-  command emission and semiplanar chroma-alignment rejection.
+  multi-task rejection, RGA2 fill destination-offset emission and multi-fill
+  task acceptance, compact 10-bit RGA2 source dispatch/emission including the
+  no-scale force-tile mode, IOMMU fault target matching, and ffmpeg-facing RGA3
+  raster/FBC/alpha-overlay profile selection plus destination-offset command
+  emission and semiplanar chroma-alignment rejection.
 
 Recognized But Unsupported
 --------------------------
