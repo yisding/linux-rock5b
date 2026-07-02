@@ -167,6 +167,8 @@
 #define RK_RGA2_SRC_VSCL_MODE			GENMASK(17, 16)
 #define RK_RGA2_SRC_SCL_FILTER			GENMASK(25, 24)
 #define RK_RGA2_SRC_VSP_MODE_SEL		BIT(26)
+#define RK_RGA2_SRC_YUV10_EN			BIT(27)
+#define RK_RGA2_SRC_YUV10_ROUND_EN		BIT(28)
 #define RK_RGA2_SRC_VSD_MODE_SEL		BIT(29)
 #define RK_RGA2_SRC_HSP_MODE_SEL		BIT(30)
 #define RK_RGA2_SRC_HSD_MODE_SEL		BIT(31)
@@ -2842,6 +2844,7 @@ struct rk_rga2_format_info {
 	bool uv_swap;
 	bool yuv;
 	bool yuv400;
+	bool yuv10;
 	bool packed_yuv420;
 	bool packed_yuv422;
 	bool planar_420;
@@ -3295,6 +3298,42 @@ static int rk_rga2_format_info(u32 format, bool write,
 		info->x_div = 2;
 		info->y_div = 2;
 		info->uv_swap = true;
+		return 0;
+	case RK_RGA_FORMAT_YCBCR_420_SP_10B:
+		if (write)
+			return -EOPNOTSUPP;
+		info->hw_format = 0xa;
+		info->plane_width = 2;
+		info->x_div = 2;
+		info->y_div = 2;
+		info->yuv10 = true;
+		return 0;
+	case RK_RGA_FORMAT_YCRCB_420_SP_10B:
+		if (write)
+			return -EOPNOTSUPP;
+		info->hw_format = 0xa;
+		info->plane_width = 2;
+		info->x_div = 2;
+		info->y_div = 2;
+		info->uv_swap = true;
+		info->yuv10 = true;
+		return 0;
+	case RK_RGA_FORMAT_YCBCR_422_SP_10B:
+		if (write)
+			return -EOPNOTSUPP;
+		info->hw_format = 0x8;
+		info->plane_width = 2;
+		info->x_div = 2;
+		info->yuv10 = true;
+		return 0;
+	case RK_RGA_FORMAT_YCRCB_422_SP_10B:
+		if (write)
+			return -EOPNOTSUPP;
+		info->hw_format = 0x8;
+		info->plane_width = 2;
+		info->x_div = 2;
+		info->uv_swap = true;
+		info->yuv10 = true;
 		return 0;
 	case RK_RGA_FORMAT_YCBCR_420_P:
 		info->hw_format = 0xb;
@@ -3803,6 +3842,7 @@ static int rk_rga2_select_dst_addresses(const struct rga_img_info_t *dst,
 					__u64 *v_addr);
 static int rk_rga_job_hw_type(struct rk_rga_job *job,
 			      enum rk_rga_hw_type *type);
+static int rk_rga2_emit_simple_bitblt(struct rk_rga_job *job);
 static int rk_rga3_emit_simple_bitblt(struct rk_rga_job *job);
 static int rk_rga_request_check(const struct rga_user_request *user);
 static int rk_rga_request_ioctl_ret(int ret);
@@ -4220,6 +4260,48 @@ static void rk_rga_ffmpeg_rga3_profiles_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 }
 
+static void rk_rga2_compact_10bit_profile_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA2_CMD_REG_COUNT] = { };
+	enum rk_rga_hw_type type = 0;
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_420_SP_10B,
+					  RK_RGA_FORMAT_YCBCR_420_SP);
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 2,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+	u32 src_info;
+
+	task.core = BIT(2);
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+
+	src_info = cmd[RK_RGA2_SRC_INFO_OFFSET / 4];
+	KUNIT_EXPECT_EQ(test, src_info & RK_RGA2_SRC_FORMAT, 0xa);
+	KUNIT_EXPECT_TRUE(test, src_info & RK_RGA2_SRC_YUV10_EN);
+	KUNIT_EXPECT_TRUE(test, src_info & RK_RGA2_SRC_YUV10_ROUND_EN);
+
+	task.src.compact_mode = RK_RGA_10BIT_INCOMPACT;
+	job.cmd_ready = false;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
+
+	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_420_SP,
+					 RK_RGA_FORMAT_YCBCR_420_SP_10B);
+	task.core = BIT(2);
+	job.tasks = &task;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
+}
+
 static void rk_rga_ffmpeg_fbc_profiles_kunit(struct kunit *test)
 {
 	enum rk_rga_hw_type type = 0;
@@ -4367,6 +4449,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_mixed_task_hw_type_kunit),
 	KUNIT_CASE(rk_rga_find_best_hw_for_job_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_rga3_profiles_kunit),
+	KUNIT_CASE(rk_rga2_compact_10bit_profile_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_fbc_profiles_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_alpha_overlay_kunit),
 	KUNIT_CASE(rk_rga3_alpha_rotate_emit_kunit),
@@ -4490,6 +4573,9 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 				  &profile->dst_fmt);
 	if (ret)
 		return ret;
+	if (profile->src_fmt.yuv10 &&
+	    !rk_rga_img_yuv10_compact(&task->src))
+		return -EOPNOTSUPP;
 
 	ret = rk_rga2_validate_image(&task->src, &profile->src_fmt);
 	if (ret)
@@ -5238,6 +5324,9 @@ static int rk_rga2_emit_src(struct rk_rga_job *job,
 		else if (v_mode == RK_RGA2_SCALE_DOWN)
 			src_info |= RK_RGA2_SRC_VSD_MODE_SEL;
 	}
+	if (src_fmt->yuv10)
+		src_info |= RK_RGA2_SRC_YUV10_EN |
+			    RK_RGA2_SRC_YUV10_ROUND_EN;
 
 	if (check_add_overflow(task->src.yrgb_addr, (__u64)y_offset,
 			       &y_addr))
