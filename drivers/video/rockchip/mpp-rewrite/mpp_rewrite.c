@@ -405,6 +405,8 @@ rk_mpp_hw_abort_ccu_active_dependents(struct rk_mpp_hw *ccu,
 static bool rk_mpp_job_rkvenc_slice_mode(struct rk_mpp_job *job);
 static bool rk_mpp_job_rkvenc_slice_ready(struct rk_mpp_job *job);
 static bool rk_mpp_job_rkvenc_slice_done(struct rk_mpp_job *job);
+static void rk_mpp_job_push_rkvenc_slice(struct rk_mpp_job *job, u32 value);
+static int rk_mpp_job_pop_rkvenc_slice(struct rk_mpp_job *job, u32 *value);
 static int rk_mpp_job_apply_rcb_info(struct rk_mpp_job *job);
 static struct rk_mpp_hw *
 rk_mpp_iommu_find_fault_hw(struct list_head *fault_hws,
@@ -3316,6 +3318,57 @@ static void rk_mpp_rkvenc_slice_mode_kunit(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, rk_mpp_job_rkvenc_slice_mode(&job));
 }
 
+static void rk_mpp_rkvenc_slice_fifo_kunit(struct kunit *test)
+{
+	struct rk_mpp_job *full_job;
+	struct rk_mpp_job *last_job;
+	u32 value = 0;
+	int i;
+
+	full_job = kunit_kzalloc(test, sizeof(*full_job), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, full_job);
+	last_job = kunit_kzalloc(test, sizeof(*last_job), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, last_job);
+
+	spin_lock_init(&last_job->rkvenc_slice_lock);
+	INIT_KFIFO(last_job->rkvenc_slice_fifo);
+
+	KUNIT_EXPECT_FALSE(test, rk_mpp_job_rkvenc_slice_ready(last_job));
+	KUNIT_EXPECT_FALSE(test, rk_mpp_job_rkvenc_slice_done(last_job));
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_job_pop_rkvenc_slice(last_job, &value),
+			-EAGAIN);
+
+	rk_mpp_job_push_rkvenc_slice(last_job,
+				     RK_MPP_RKVENC_SLICE_LAST | 0x1234);
+
+	KUNIT_EXPECT_TRUE(test, rk_mpp_job_rkvenc_slice_ready(last_job));
+	KUNIT_EXPECT_TRUE(test, rk_mpp_job_rkvenc_slice_done(last_job));
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_job_pop_rkvenc_slice(last_job, &value), 0);
+	KUNIT_EXPECT_EQ(test, value, RK_MPP_RKVENC_SLICE_LAST | 0x1234);
+	KUNIT_EXPECT_FALSE(test, rk_mpp_job_rkvenc_slice_ready(last_job));
+	KUNIT_EXPECT_TRUE(test, rk_mpp_job_rkvenc_slice_done(last_job));
+
+	spin_lock_init(&full_job->rkvenc_slice_lock);
+	INIT_KFIFO(full_job->rkvenc_slice_fifo);
+
+	for (i = 0; i < RK_MPP_RKVENC_MAX_SLICE_FIFO; i++)
+		rk_mpp_job_push_rkvenc_slice(full_job, i);
+
+	KUNIT_EXPECT_TRUE(test, rk_mpp_job_rkvenc_slice_ready(full_job));
+	KUNIT_EXPECT_FALSE(test, rk_mpp_job_rkvenc_slice_done(full_job));
+
+	rk_mpp_job_push_rkvenc_slice(full_job, RK_MPP_RKVENC_SLICE_LAST);
+
+	KUNIT_EXPECT_TRUE(test, rk_mpp_job_rkvenc_slice_ready(full_job));
+	KUNIT_EXPECT_TRUE(test, rk_mpp_job_rkvenc_slice_done(full_job));
+	KUNIT_EXPECT_TRUE(test, full_job->rkvenc_slice_overflow);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_job_pop_rkvenc_slice(full_job, &value),
+			-EOVERFLOW);
+}
+
 static void rk_mpp_rkvenc2_dchs_remap_kunit(struct kunit *test)
 {
 	struct rk_mpp_service *srv;
@@ -3631,6 +3684,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_iommu_fault_match_kunit),
 	KUNIT_CASE(rk_mpp_poll_irq_check_size_kunit),
 	KUNIT_CASE(rk_mpp_rkvenc_slice_mode_kunit),
+	KUNIT_CASE(rk_mpp_rkvenc_slice_fifo_kunit),
 	KUNIT_CASE(rk_mpp_rkvenc2_dchs_remap_kunit),
 	KUNIT_CASE(rk_mpp_rkvenc2_dchs_independent_cores_kunit),
 	KUNIT_CASE(rk_mpp_rcb_invalid_index_kunit),
