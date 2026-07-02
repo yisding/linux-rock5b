@@ -216,9 +216,12 @@ Implemented
   subsets below remain unsupported.
 * RGA2 in-place RGB mosaic for the current ``librga`` ``immosaic`` single-image
   path.  The rewrite accepts same-buffer, same-rectangle raster RGB bitblit
-  requests with ``mosaic_info.enable`` and BSP mosaic modes ``0..4``.  Scaled,
-  converted, rotated, YUV, pattern, OSD, gauss, and multi-rectangle mosaic
-  variants remain unsupported.
+  requests with ``mosaic_info.enable`` and BSP mosaic modes ``0..4``.
+  ``immosaicTaskArray()`` jobs are covered as serial multi-task RGA2 mosaic
+  batches under one request completion/fence.  The plain ``immosaicArray()``
+  helper submits one supported mosaic task per rectangle and merges async
+  fences in current ``librga`` userspace.  Scaled, converted, rotated, YUV,
+  pattern, OSD, gauss, and mixed-feature mosaic variants remain unsupported.
 * RGA2 RGB ROP bitblit for the current ``librga`` ``imrop`` single-task path.
   The rewrite accepts same-size, raster RGB source/destination requests encoded
   with ``alpha_rop_flag == 0x3``, ``alpha_rop_mode == 0x1``, and the public
@@ -294,6 +297,7 @@ Implemented
   ``librga`` rectangle-task serial fill command emission, compact 10-bit RGA2
   source dispatch/emission including the no-scale force-tile mode, RGA2
   in-place RGB mosaic dispatch/emission, RGA2 RGB ROP dispatch/emission, RGA2
+  multi-rectangle ``librga`` mosaic-task serial emission,
   RGB gauss coefficient lifetime and command emission, RGA2 RGB NN quantize
   dispatch/emission, RGA2 RGB alpha-bitmap SRC1/alpha emission, RGA2 OSD
   SRC1/alpha/control emission, RGA2 palette update and color-palette command
