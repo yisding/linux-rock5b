@@ -201,6 +201,14 @@ Implemented
   ``IM_ROP_XOR``, or ``IM_ROP_NOT_XOR`` opcode values.  Pattern, mask, ROP4,
   scaled, converted, rotated, YUV, and in-place overlapping ROP variants remain
   unsupported.
+* RGA2 RGB gaussian blur for the current ``librga`` ``imgaussianBlur`` and
+  ``IM_GAUSS`` sample paths.  The rewrite copies the userspace-generated 3x3
+  coefficient triplet into kernel-owned request/job storage during preparation,
+  so async and acquire-fence-deferred jobs do not depend on the userspace
+  coefficient pointer after ioctl return.  Only same-size, raster RGB
+  source/destination bitblit requests with ``gauss_config.size == 3`` are
+  accepted; scaled, converted, rotated, YUV, pattern, ROP, OSD, and
+  multi-kernel gauss variants remain unsupported.
 * Multi-task requests are accepted when every task matches the same supported
   backend profile; tasks run serially under the request's single
   completion/fence.  The RGA3 no-blend emitted command includes overlap field
@@ -215,6 +223,7 @@ Implemented
   YUV-fill chroma-alignment rejection, and multi-fill task acceptance, compact
   10-bit RGA2 source dispatch/emission including the no-scale force-tile mode,
   RGA2 in-place RGB mosaic dispatch/emission, RGA2 RGB ROP dispatch/emission,
+  RGA2 RGB gauss coefficient lifetime and command emission,
   ffmpeg-facing RGA2 RFBC64x4 source profile selection and FBCIN command
   emission, IOMMU fault target matching, scheduler priority enqueue/aging,
   RGA3 normal RGB color-key dispatch/emission and inverted-mode rejection,
