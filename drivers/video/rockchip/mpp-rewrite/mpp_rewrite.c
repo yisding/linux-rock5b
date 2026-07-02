@@ -209,6 +209,7 @@ struct rk_mpp_hw {
 	spinlock_t lock;
 	struct rk_mpp_job *active_job;
 	struct device_node *ccu_node;
+	struct list_head rkvdec_link_jobs;
 	u32 taskqueue_node;
 	u32 task_capacity;
 	u32 core_mask;
@@ -315,6 +316,7 @@ struct rk_mpp_job {
 	struct list_head link;
 	struct list_head session_link;
 	struct list_head sched_link;
+	struct list_head rkvdec_link_node;
 	struct rk_mpp_session *session;
 	enum rk_mpp_job_state state;
 	struct rk_mpp_hw *hw;
@@ -341,6 +343,7 @@ struct rk_mpp_job {
 	bool poll_irq;
 	bool canceled;
 	bool rkvdec_link_active;
+	bool rkvdec_link_listed;
 	bool rkvdec_ccu_desc_valid;
 	bool rkvdec_ccu_powered;
 	bool rkvdec_ccu_started;
@@ -1432,6 +1435,61 @@ static u32 rk_mpp_rkvdec2_ccu_core_mask(struct rk_mpp_service *srv,
 static int rk_mpp_hw_power_on(struct rk_mpp_hw *hw);
 static void rk_mpp_hw_power_off(struct rk_mpp_hw *hw);
 
+static dma_addr_t rk_mpp_rkvdec2_next_unused_link_iova(struct rk_mpp_hw *hw)
+{
+	unsigned long index;
+
+	if (!hw->rkvdec_link_used || !hw->rkvdec_link_capacity)
+		return 0;
+
+	index = find_first_zero_bit(hw->rkvdec_link_used,
+				    hw->rkvdec_link_capacity);
+	if (index >= hw->rkvdec_link_capacity)
+		return 0;
+
+	return hw->rkvdec_link_iova + index * hw->rkvdec_link_node_size;
+}
+
+static void rk_mpp_rkvdec2_relink_tables_locked(struct rk_mpp_hw *hw)
+{
+	const struct rk_mpp_rkvdec2_link_info *info =
+		&rk_mpp_rkvdec2_vdpu383_link_info;
+	struct rk_mpp_job *job;
+
+	list_for_each_entry(job, &hw->rkvdec_link_jobs, rkvdec_link_node) {
+		struct rk_mpp_job *next;
+		dma_addr_t next_iova;
+		u32 *table = job->rkvdec_link_vaddr;
+
+		if (!table)
+			continue;
+
+		if (list_is_last(&job->rkvdec_link_node, &hw->rkvdec_link_jobs)) {
+			next_iova = rk_mpp_rkvdec2_next_unused_link_iova(hw);
+		} else {
+			next = list_next_entry(job, rkvdec_link_node);
+			next_iova = next->rkvdec_link_iova;
+		}
+
+		table[info->next_word] = lower_32_bits(next_iova);
+	}
+}
+
+static void rk_mpp_rkvdec2_link_table_list_add(struct rk_mpp_job *job)
+{
+	struct rk_mpp_hw *hw = job->hw;
+	unsigned long flags;
+
+	if (!hw || job->rkvdec_link_listed)
+		return;
+
+	spin_lock_irqsave(&hw->lock, flags);
+	list_add_tail(&job->rkvdec_link_node, &hw->rkvdec_link_jobs);
+	job->rkvdec_link_listed = true;
+	rk_mpp_rkvdec2_relink_tables_locked(hw);
+	spin_unlock_irqrestore(&hw->lock, flags);
+}
+
 static void rk_mpp_rkvdec2_release_link_table(struct rk_mpp_job *job)
 {
 	struct rk_mpp_hw *hw = job->hw;
@@ -1450,6 +1508,11 @@ static void rk_mpp_rkvdec2_release_link_table(struct rk_mpp_job *job)
 		spin_lock_irqsave(&hw->lock, flags);
 		if (job->rkvdec_link_index < hw->rkvdec_link_capacity)
 			clear_bit(job->rkvdec_link_index, hw->rkvdec_link_used);
+		if (job->rkvdec_link_listed) {
+			list_del_init(&job->rkvdec_link_node);
+			job->rkvdec_link_listed = false;
+		}
+		rk_mpp_rkvdec2_relink_tables_locked(hw);
 		spin_unlock_irqrestore(&hw->lock, flags);
 	}
 
@@ -1457,6 +1520,7 @@ static void rk_mpp_rkvdec2_release_link_table(struct rk_mpp_job *job)
 	job->rkvdec_link_iova = 0;
 	job->rkvdec_link_index = 0;
 	job->rkvdec_link_active = false;
+	job->rkvdec_link_listed = false;
 	job->rkvdec_ccu_core_work = 0;
 	job->rkvdec_ccu_cfg_addr = 0;
 	job->rkvdec_ccu_link_mode = 0;
@@ -1582,7 +1646,10 @@ static void rk_mpp_rkvdec2_stage_link_table(struct rk_mpp_job *job)
 		dev_dbg(hw->dev, "failed to prepare rkvdec ccu descriptor: %d\n",
 			ret);
 		rk_mpp_rkvdec2_release_link_table(job);
+		return;
 	}
+
+	rk_mpp_rkvdec2_link_table_list_add(job);
 }
 
 static int rk_mpp_poll_irq_check_size(s32 count_max, u32 req_size)
@@ -1957,6 +2024,10 @@ static void rk_mpp_rkvdec2_link_table_ownership_kunit(struct kunit *test)
 	job2->hw = hw;
 	job2->reg_image = image;
 	spin_lock_init(&hw->lock);
+	INIT_LIST_HEAD(&hw->rkvdec_link_jobs);
+	INIT_LIST_HEAD(&job0->rkvdec_link_node);
+	INIT_LIST_HEAD(&job1->rkvdec_link_node);
+	INIT_LIST_HEAD(&job2->rkvdec_link_node);
 
 	for (i = 0; i < image.reg_words; i++)
 		regs[i] = 0xa5000000 | i;
@@ -1966,21 +2037,33 @@ static void rk_mpp_rkvdec2_link_table_ownership_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, job0->rkvdec_link_index, 0U);
 	KUNIT_EXPECT_TRUE(test, test_bit(0, used));
 	KUNIT_EXPECT_EQ(test, ((u32 *)job0->rkvdec_link_vaddr)[80], regs[8]);
+	KUNIT_EXPECT_EQ(test, ((u32 *)job0->rkvdec_link_vaddr)[info->next_word],
+			(u32)(hw->rkvdec_link_iova + hw->rkvdec_link_node_size));
 
 	rk_mpp_rkvdec2_stage_link_table(job1);
 	KUNIT_EXPECT_TRUE(test, job1->rkvdec_link_active);
 	KUNIT_EXPECT_EQ(test, job1->rkvdec_link_index, 1U);
 	KUNIT_EXPECT_TRUE(test, test_bit(1, used));
+	KUNIT_EXPECT_EQ(test, ((u32 *)job0->rkvdec_link_vaddr)[info->next_word],
+			(u32)job1->rkvdec_link_iova);
+	KUNIT_EXPECT_EQ(test, ((u32 *)job1->rkvdec_link_vaddr)[info->next_word],
+			0U);
 
 	rk_mpp_rkvdec2_release_link_table(job0);
 	KUNIT_EXPECT_FALSE(test, job0->rkvdec_link_active);
 	KUNIT_EXPECT_FALSE(test, test_bit(0, used));
 	KUNIT_EXPECT_TRUE(test, test_bit(1, used));
+	KUNIT_EXPECT_EQ(test, ((u32 *)job1->rkvdec_link_vaddr)[info->next_word],
+			(u32)hw->rkvdec_link_iova);
 
 	rk_mpp_rkvdec2_stage_link_table(job2);
 	KUNIT_EXPECT_TRUE(test, job2->rkvdec_link_active);
 	KUNIT_EXPECT_EQ(test, job2->rkvdec_link_index, 0U);
 	KUNIT_EXPECT_TRUE(test, test_bit(0, used));
+	KUNIT_EXPECT_EQ(test, ((u32 *)job1->rkvdec_link_vaddr)[info->next_word],
+			(u32)job2->rkvdec_link_iova);
+	KUNIT_EXPECT_EQ(test, ((u32 *)job2->rkvdec_link_vaddr)[info->next_word],
+			0U);
 
 	rk_mpp_rkvdec2_release_link_table(job1);
 	rk_mpp_rkvdec2_release_link_table(job2);
@@ -2906,6 +2989,7 @@ rk_mpp_batch_get_job(struct rk_mpp_batch_state *batch,
 	INIT_LIST_HEAD(&job->link);
 	INIT_LIST_HEAD(&job->session_link);
 	INIT_LIST_HEAD(&job->sched_link);
+	INIT_LIST_HEAD(&job->rkvdec_link_node);
 	list_add_tail(&job->link, &batch->jobs);
 	batch->cur_job = job;
 
@@ -4928,6 +5012,7 @@ static int rk_mpp_hw_probe(struct platform_device *pdev)
 	init_completion(&hw->released);
 	mutex_init(&hw->run_lock);
 	spin_lock_init(&hw->lock);
+	INIT_LIST_HEAD(&hw->rkvdec_link_jobs);
 	INIT_DELAYED_WORK(&hw->timeout_work, rk_mpp_hw_timeout_work);
 
 	if (of_find_property(dev->of_node, "rockchip,ccu", NULL)) {
