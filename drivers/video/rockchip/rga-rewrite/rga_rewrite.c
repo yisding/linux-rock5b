@@ -5924,6 +5924,109 @@ static void rk_rga_acquire_fd_ownership_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, count, 2U);
 }
 
+static void rk_rga_acquire_fence_status_kunit(struct kunit *test)
+{
+	struct dma_fence *fences[2];
+	struct dma_fence *err_fence;
+	struct rk_rga_job job = {
+		.acquire_fences = fences,
+		.acquire_fence_count = ARRAY_SIZE(fences),
+	};
+	bool pending = false;
+
+	fences[0] = rk_rga_kunit_alloc_fence();
+	KUNIT_ASSERT_NOT_NULL(test, fences[0]);
+	fences[1] = rk_rga_kunit_alloc_fence();
+	KUNIT_ASSERT_NOT_NULL(test, fences[1]);
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_acquire_status(&job, &pending), 0);
+	KUNIT_EXPECT_TRUE(test, pending);
+
+	rk_rga_fence_signal(fences[0], 0);
+	pending = false;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_acquire_status(&job, &pending), 0);
+	KUNIT_EXPECT_TRUE(test, pending);
+
+	rk_rga_fence_signal(fences[1], 0);
+	pending = false;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_acquire_status(&job, &pending), 0);
+	KUNIT_EXPECT_FALSE(test, pending);
+	KUNIT_EXPECT_EQ(test, rk_rga_job_wait_acquire_fences(&job), 0);
+
+	dma_fence_put(fences[0]);
+	dma_fence_put(fences[1]);
+
+	err_fence = rk_rga_kunit_alloc_fence();
+	KUNIT_ASSERT_NOT_NULL(test, err_fence);
+	rk_rga_fence_signal(err_fence, -EIO);
+	job.acquire_fences = &err_fence;
+	job.acquire_fence_count = 1;
+	pending = false;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_acquire_status(&job, &pending),
+			-EIO);
+	KUNIT_EXPECT_FALSE(test, pending);
+	KUNIT_EXPECT_EQ(test, rk_rga_job_wait_acquire_fences(&job), -EIO);
+
+	dma_fence_put(err_fence);
+}
+
+static void rk_rga_acquire_callbacks_result_kunit(struct kunit *test)
+{
+	struct rk_rga_job *job;
+	int ret;
+
+	job = kzalloc_obj(*job, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+	rk_rga_job_init(job);
+
+	job->acquire_fences = kcalloc(2, sizeof(*job->acquire_fences),
+				      GFP_KERNEL);
+	if (!job->acquire_fences) {
+		kfree(job);
+		KUNIT_FAIL(test, "failed to allocate acquire fence array");
+		return;
+	}
+	job->acquire_fence_count = 2;
+
+	job->acquire_fences[0] = rk_rga_kunit_alloc_fence();
+	if (!job->acquire_fences[0]) {
+		kfree(job->acquire_fences);
+		kfree(job);
+		KUNIT_FAIL(test, "failed to allocate ready fence");
+		return;
+	}
+	job->acquire_fences[1] = rk_rga_kunit_alloc_fence();
+	if (!job->acquire_fences[1]) {
+		dma_fence_put(job->acquire_fences[0]);
+		kfree(job->acquire_fences);
+		kfree(job);
+		KUNIT_FAIL(test, "failed to allocate pending fence");
+		return;
+	}
+
+	rk_rga_fence_signal(job->acquire_fences[0], 0);
+	rk_rga_job_get(job);
+	ret = rk_rga_job_arm_acquire_callbacks(job);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	if (ret) {
+		rk_rga_job_put(job);
+		rk_rga_job_put(job);
+		return;
+	}
+
+	KUNIT_EXPECT_EQ(test, atomic_read(&job->pending_acquire_count), 1);
+	KUNIT_EXPECT_FALSE(test, job->done);
+
+	rk_rga_fence_signal(job->acquire_fences[1], -EIO);
+	flush_work(&job->acquire_work);
+
+	KUNIT_EXPECT_EQ(test, job->result, -EIO);
+	KUNIT_EXPECT_TRUE(test, job->done);
+
+	rk_rga_job_put(job);
+}
+
 static void rk_rga_job_free_release_fence_kunit(struct kunit *test)
 {
 	struct rk_rga_job *job;
@@ -8018,6 +8121,8 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_request_ioctl_ret_kunit),
 	KUNIT_CASE(rk_rga_request_remove_free_kunit),
 	KUNIT_CASE(rk_rga_acquire_fd_ownership_kunit),
+	KUNIT_CASE(rk_rga_acquire_fence_status_kunit),
+	KUNIT_CASE(rk_rga_acquire_callbacks_result_kunit),
 	KUNIT_CASE(rk_rga_job_free_release_fence_kunit),
 	KUNIT_CASE(rk_rga_release_fence_fd_state_kunit),
 	KUNIT_CASE(rk_rga_mixed_task_hw_type_kunit),
