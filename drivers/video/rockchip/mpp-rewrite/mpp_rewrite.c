@@ -66,6 +66,8 @@
 #define RK_MPP_RKVDEC_LINK_NODE_ALIGN	256
 #define RK_MPP_RKVDEC_LINK_WRITE_PARTS	3
 #define RK_MPP_RKVDEC_LINK_READ_PARTS	2
+#define RK_MPP_RKVDEC_LINK_ADD_CFG_NUM	1
+#define RK_MPP_RKVDEC_LINK_CCU_WORK_MODE	BIT(17)
 #define RK_MPP_WORK_TIMEOUT_MS		500
 #define RK_MPP_CODEC_INFO_MAX		11
 #define RK_MPP_ENC_INFO_BUTT		RK_MPP_CODEC_INFO_MAX
@@ -326,10 +328,18 @@ struct rk_mpp_job {
 	void *rkvdec_link_vaddr;
 	dma_addr_t rkvdec_link_iova;
 	u32 rkvdec_link_index;
+	u32 rkvdec_ccu_core_work;
+	u32 rkvdec_ccu_cfg_addr;
+	u32 rkvdec_ccu_link_mode;
+	u32 rkvdec_ccu_ctrl;
+	u32 rkvdec_ccu_work;
+	u32 rkvdec_ccu_cfg_done;
+	u32 rkvdec_link_irq_mode;
 	u32 rkvenc_dchs_core_id;
 	bool poll_irq;
 	bool canceled;
 	bool rkvdec_link_active;
+	bool rkvdec_ccu_desc_valid;
 	bool rkvenc_dchs_active;
 	bool rkvenc_slice_mode;
 	bool rkvenc_slice_done;
@@ -467,6 +477,17 @@ struct rk_mpp_rkvenc_poll_slice_cfg {
 #define RK_MPP_RKVDEC_CLR_CACHE1_BASE		0x0550
 #define RK_MPP_RKVDEC_CLR_CACHE2_BASE		0x0590
 #define RK_MPP_RKVDEC_CACHE_CFG			(BIT(0) | BIT(1) | BIT(4))
+#define RK_MPP_RKVDEC_CCU_CTRL_BASE		0x0000
+#define RK_MPP_RKVDEC_CCU_AUTOGATE		BIT(0)
+#define RK_MPP_RKVDEC_CCU_CFG_ADDR_BASE		0x0004
+#define RK_MPP_RKVDEC_CCU_LINK_MODE_BASE	0x0008
+#define RK_MPP_RKVDEC_CCU_ADD_MODE		BIT(31)
+#define RK_MPP_RKVDEC_CCU_CFG_DONE_BASE		0x000c
+#define RK_MPP_RKVDEC_CCU_CFG_DONE		BIT(0)
+#define RK_MPP_RKVDEC_CCU_WORK_BASE		0x0018
+#define RK_MPP_RKVDEC_CCU_WORK_EN		BIT(0)
+#define RK_MPP_RKVDEC_CCU_CORE_WORK_BASE	0x0044
+#define RK_MPP_RKVDEC_CCU_CORE_STA_BASE		0x0048
 
 enum rk_mpp_rkvdec_fmt {
 	RK_MPP_RKVDEC_FMT_H265D	= 0,
@@ -1402,6 +1423,14 @@ static void rk_mpp_rkvdec2_release_link_table(struct rk_mpp_job *job)
 	job->rkvdec_link_iova = 0;
 	job->rkvdec_link_index = 0;
 	job->rkvdec_link_active = false;
+	job->rkvdec_ccu_core_work = 0;
+	job->rkvdec_ccu_cfg_addr = 0;
+	job->rkvdec_ccu_link_mode = 0;
+	job->rkvdec_ccu_ctrl = 0;
+	job->rkvdec_ccu_work = 0;
+	job->rkvdec_ccu_cfg_done = 0;
+	job->rkvdec_link_irq_mode = 0;
+	job->rkvdec_ccu_desc_valid = false;
 
 	rk_mpp_hw_put(ccu);
 }
@@ -1446,6 +1475,47 @@ static int rk_mpp_rkvdec2_reserve_link_table(struct rk_mpp_job *job)
 	return 0;
 }
 
+static bool rk_mpp_rkvdec2_ccu_regs_ready(struct rk_mpp_hw *ccu);
+static u32 rk_mpp_rkvdec2_ccu_core_mask(struct rk_mpp_service *srv,
+					struct rk_mpp_hw *ccu);
+
+static int rk_mpp_rkvdec2_fill_ccu_descriptor(struct rk_mpp_job *job,
+					      u32 core_work)
+{
+	if (!job->rkvdec_link_active || !job->rkvdec_ccu)
+		return -EINVAL;
+	if (!core_work)
+		return -EINVAL;
+
+	job->rkvdec_ccu_core_work = core_work;
+	job->rkvdec_ccu_cfg_addr = lower_32_bits(job->rkvdec_link_iova);
+	job->rkvdec_ccu_link_mode = RK_MPP_RKVDEC_LINK_ADD_CFG_NUM;
+	job->rkvdec_ccu_ctrl = RK_MPP_RKVDEC_CCU_AUTOGATE;
+	job->rkvdec_ccu_work = RK_MPP_RKVDEC_CCU_WORK_EN;
+	job->rkvdec_ccu_cfg_done = RK_MPP_RKVDEC_CCU_CFG_DONE;
+	job->rkvdec_link_irq_mode = RK_MPP_RKVDEC_LINK_CCU_WORK_MODE;
+	job->rkvdec_ccu_desc_valid = true;
+
+	return 0;
+}
+
+static int rk_mpp_rkvdec2_prepare_ccu_descriptor(struct rk_mpp_job *job)
+{
+	u32 core_work;
+
+	if (!job->rkvdec_ccu)
+		return 0;
+	if (!rk_mpp_rkvdec2_ccu_regs_ready(job->rkvdec_ccu))
+		return -EOPNOTSUPP;
+
+	core_work = rk_mpp_rkvdec2_ccu_core_mask(job->session->srv,
+						 job->rkvdec_ccu);
+	if (!core_work)
+		return -ENODEV;
+
+	return rk_mpp_rkvdec2_fill_ccu_descriptor(job, core_work);
+}
+
 static void rk_mpp_rkvdec2_stage_link_table(struct rk_mpp_job *job)
 {
 	struct rk_mpp_hw *hw = job->hw;
@@ -1469,6 +1539,14 @@ static void rk_mpp_rkvdec2_stage_link_table(struct rk_mpp_job *job)
 					     next_iova);
 	if (ret) {
 		dev_dbg(hw->dev, "failed to stage rkvdec link table: %d\n", ret);
+		rk_mpp_rkvdec2_release_link_table(job);
+		return;
+	}
+
+	ret = rk_mpp_rkvdec2_prepare_ccu_descriptor(job);
+	if (ret) {
+		dev_dbg(hw->dev, "failed to prepare rkvdec ccu descriptor: %d\n",
+			ret);
 		rk_mpp_rkvdec2_release_link_table(job);
 	}
 }
@@ -1869,6 +1947,40 @@ static void rk_mpp_rkvdec2_link_table_ccu_ref_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, completion_done(&ccu->released));
 }
 
+static void rk_mpp_rkvdec2_ccu_descriptor_kunit(struct kunit *test)
+{
+	struct rk_mpp_hw ccu = {};
+	struct rk_mpp_job *job;
+
+	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+
+	job->rkvdec_ccu = &ccu;
+	job->rkvdec_link_iova = 0x12345000;
+	job->rkvdec_link_active = true;
+
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_fill_ccu_descriptor(job,
+								 0x30000), 0);
+	KUNIT_EXPECT_TRUE(test, job->rkvdec_ccu_desc_valid);
+	KUNIT_EXPECT_EQ(test, job->rkvdec_ccu_core_work, 0x30000U);
+	KUNIT_EXPECT_EQ(test, job->rkvdec_ccu_cfg_addr, 0x12345000U);
+	KUNIT_EXPECT_EQ(test, job->rkvdec_ccu_link_mode,
+			(u32)RK_MPP_RKVDEC_LINK_ADD_CFG_NUM);
+	KUNIT_EXPECT_EQ(test, job->rkvdec_ccu_ctrl,
+			(u32)RK_MPP_RKVDEC_CCU_AUTOGATE);
+	KUNIT_EXPECT_EQ(test, job->rkvdec_ccu_work,
+			(u32)RK_MPP_RKVDEC_CCU_WORK_EN);
+	KUNIT_EXPECT_EQ(test, job->rkvdec_ccu_cfg_done,
+			(u32)RK_MPP_RKVDEC_CCU_CFG_DONE);
+	KUNIT_EXPECT_EQ(test, job->rkvdec_link_irq_mode,
+			(u32)RK_MPP_RKVDEC_LINK_CCU_WORK_MODE);
+
+	job->rkvdec_ccu_desc_valid = false;
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_fill_ccu_descriptor(job, 0),
+			-EINVAL);
+	KUNIT_EXPECT_FALSE(test, job->rkvdec_ccu_desc_valid);
+}
+
 static void rk_mpp_poll_irq_check_size_kunit(struct kunit *test)
 {
 	u32 base = sizeof(struct rk_mpp_rkvenc_poll_slice_cfg);
@@ -1924,6 +2036,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_rkvdec2_fill_link_table_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_link_table_ownership_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_link_table_ccu_ref_kunit),
+	KUNIT_CASE(rk_mpp_rkvdec2_ccu_descriptor_kunit),
 	KUNIT_CASE(rk_mpp_poll_irq_check_size_kunit),
 	KUNIT_CASE(rk_mpp_rkvenc_slice_mode_kunit),
 	{}
@@ -2889,6 +3002,44 @@ rk_mpp_rkvdec2_link_regs_ready(struct rk_mpp_hw *hw,
 					 info->ip_time_base, sizeof(u32)) &&
 	       rk_mpp_hw_reg_range_valid(hw, RK_MPP_RKVDEC_LINK_REGION,
 					 info->ip_en_base, sizeof(u32));
+}
+
+static bool rk_mpp_rkvdec2_ccu_regs_ready(struct rk_mpp_hw *ccu)
+{
+	return ccu &&
+	       rk_mpp_hw_reg_range_valid(ccu, 0, RK_MPP_RKVDEC_CCU_CTRL_BASE,
+					 sizeof(u32)) &&
+	       rk_mpp_hw_reg_range_valid(ccu, 0, RK_MPP_RKVDEC_CCU_CFG_ADDR_BASE,
+					 sizeof(u32)) &&
+	       rk_mpp_hw_reg_range_valid(ccu, 0, RK_MPP_RKVDEC_CCU_LINK_MODE_BASE,
+					 sizeof(u32)) &&
+	       rk_mpp_hw_reg_range_valid(ccu, 0, RK_MPP_RKVDEC_CCU_CFG_DONE_BASE,
+					 sizeof(u32)) &&
+	       rk_mpp_hw_reg_range_valid(ccu, 0, RK_MPP_RKVDEC_CCU_WORK_BASE,
+					 sizeof(u32)) &&
+	       rk_mpp_hw_reg_range_valid(ccu, 0, RK_MPP_RKVDEC_CCU_CORE_WORK_BASE,
+					 sizeof(u32)) &&
+	       rk_mpp_hw_reg_range_valid(ccu, 0, RK_MPP_RKVDEC_CCU_CORE_STA_BASE,
+					 sizeof(u32));
+}
+
+static u32 rk_mpp_rkvdec2_ccu_core_mask(struct rk_mpp_service *srv,
+					struct rk_mpp_hw *ccu)
+{
+	struct rk_mpp_hw *hw;
+	u32 mask = 0;
+
+	if (!srv || !ccu || !ccu->dev)
+		return 0;
+
+	mutex_lock(&srv->hw_lock);
+	list_for_each_entry(hw, &srv->hw_list, link) {
+		if (hw->online && hw->ccu_node == ccu->dev->of_node)
+			mask |= hw->core_mask;
+	}
+	mutex_unlock(&srv->hw_lock);
+
+	return mask;
 }
 
 static int rk_mpp_hw_power_on(struct rk_mpp_hw *hw)
