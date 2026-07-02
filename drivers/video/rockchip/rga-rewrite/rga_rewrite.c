@@ -279,6 +279,8 @@
 #define RK_RGA3_WIN1_UV_VIR_STRIDE_OFFSET	0x078
 #define RK_RGA3_OVLP_CTRL_OFFSET		0x080
 #define RK_RGA3_OVLP_OFF_OFFSET			0x084
+#define RK_RGA3_OVLP_TOP_KEY_MIN_OFFSET		0x088
+#define RK_RGA3_OVLP_TOP_KEY_MAX_OFFSET		0x08c
 #define RK_RGA3_OVLP_TOP_CTRL_OFFSET		0x090
 #define RK_RGA3_OVLP_BOT_CTRL_OFFSET		0x094
 #define RK_RGA3_OVLP_TOP_ALPHA_OFFSET		0x098
@@ -313,6 +315,7 @@
 #define RK_RGA3_OVLP_MODE			GENMASK(1, 0)
 #define RK_RGA3_OVLP_FIELD			BIT(2)
 #define RK_RGA3_OVLP_TOP_ALPHA_EN		BIT(4)
+#define RK_RGA3_OVLP_TOP_KEY_EN		GENMASK(19, 5)
 
 #define RK_RGA3_ALPHA_COLOR_MODE		BIT(0)
 #define RK_RGA3_ALPHA_MODE			BIT(1)
@@ -2845,6 +2848,7 @@ struct rk_rga3_bitblt_profile {
 	u32 rotate_flags;
 	bool alpha_blend;
 	bool pattern_blend;
+	bool color_key;
 	bool overlap_copy;
 };
 
@@ -3652,6 +3656,11 @@ static bool rk_rga3_task_uses_alpha_blend(const struct rga_req *task)
 	return task->alpha_rop_flag & BIT(0);
 }
 
+static bool rk_rga3_task_uses_color_key(const struct rga_req *task)
+{
+	return task->color_key_min || task->color_key_max;
+}
+
 static int rk_rga3_validate_alpha_blend(const struct rga_req *task)
 {
 	if (!rk_rga3_task_uses_alpha_blend(task))
@@ -3678,6 +3687,24 @@ static int rk_rga3_validate_alpha_blend(const struct rga_req *task)
 	default:
 		return -EOPNOTSUPP;
 	}
+}
+
+static int rk_rga3_validate_color_key(const struct rga_req *task, bool has_pat)
+{
+	if (!rk_rga3_task_uses_color_key(task))
+		return 0;
+	if (has_pat)
+		return -EOPNOTSUPP;
+	if (!rk_rga3_task_uses_alpha_blend(task))
+		return -EOPNOTSUPP;
+	if (task->src_trans_mode != 0x1e)
+		return -EOPNOTSUPP;
+	if (task->alpha_rop_mode != 0x11)
+		return -EOPNOTSUPP;
+	if (task->PD_mode != RK_RGA_ALPHA_BLEND_SRC)
+		return -EOPNOTSUPP;
+
+	return 0;
 }
 
 static int rk_rga2_validate_full_csc(const struct rga_req *task)
@@ -4783,6 +4810,61 @@ static void rk_rga_ffmpeg_alpha_overlay_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 }
 
+static void rk_rga3_colorkey_emit_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
+	enum rk_rga_hw_type type = 0;
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_BGRA_8888);
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 2,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+	u32 expected_ctrl;
+	u32 expected_min;
+	u32 expected_max;
+
+	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
+				    320, 240);
+	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_BGRA_8888,
+				    320, 240);
+	task.yuv2rgb_mode = 0;
+	task.alpha_rop_flag = BIT(0) | BIT(3) | BIT(4) | BIT(9);
+	task.alpha_rop_mode = 0x11;
+	task.PD_mode = RK_RGA_ALPHA_BLEND_SRC;
+	task.src_trans_mode = 0x1e;
+	task.color_key_min = 0x00112233;
+	task.color_key_max = 0x00445566;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+
+	expected_ctrl = FIELD_PREP(RK_RGA3_OVLP_MODE, 1) |
+			RK_RGA3_OVLP_TOP_ALPHA_EN |
+			FIELD_PREP(RK_RGA3_OVLP_TOP_KEY_EN, 1);
+	expected_min = (0x33 << 22) | (0x22 << 2) | (0x11 << 12);
+	expected_max = (0x66 << 22) | (0x55 << 2) | (0x44 << 12);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_CTRL_OFFSET / 4],
+			expected_ctrl);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_TOP_KEY_MIN_OFFSET / 4],
+			expected_min);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_TOP_KEY_MAX_OFFSET / 4],
+			expected_max);
+
+	memset(cmd, 0, sizeof(cmd));
+	job.cmd_ready = false;
+	task.src_trans_mode = 0x1f;
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+}
+
 static void rk_rga3_alpha_rotate_emit_kunit(struct kunit *test)
 {
 	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
@@ -4941,6 +5023,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga2_src_crop_emit_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_fbc_profiles_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_alpha_overlay_kunit),
+	KUNIT_CASE(rk_rga3_colorkey_emit_kunit),
 	KUNIT_CASE(rk_rga3_alpha_rotate_emit_kunit),
 	KUNIT_CASE(rk_rga3_dst_offset_emit_kunit),
 	KUNIT_CASE(rk_rga3_src_crop_emit_kunit),
@@ -5111,8 +5194,7 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 
 	if (task->render_mode != RK_RGA_RENDER_BITBLT)
 		return -EOPNOTSUPP;
-	if (task->rop_mask_addr || task->LUT_addr ||
-	    task->color_key_min || task->color_key_max)
+	if (task->rop_mask_addr || task->LUT_addr)
 		return -EOPNOTSUPP;
 	if (task->bsfilter_flag != has_pat)
 		return -EOPNOTSUPP;
@@ -5126,9 +5208,13 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 	ret = rk_rga3_validate_alpha_blend(task);
 	if (ret)
 		return ret;
+	ret = rk_rga3_validate_color_key(task, has_pat);
+	if (ret)
+		return ret;
 
 	profile->alpha_blend = rk_rga3_task_uses_alpha_blend(task);
 	profile->pattern_blend = has_pat;
+	profile->color_key = rk_rga3_task_uses_color_key(task);
 	profile->overlap_copy = false;
 	if (profile->pattern_blend && !profile->alpha_blend)
 		return -EOPNOTSUPP;
@@ -5190,6 +5276,10 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 		return -EOPNOTSUPP;
 	if (profile->dst_fmt.yuv10 &&
 	    (task->dst.x_offset || task->dst.y_offset))
+		return -EOPNOTSUPP;
+	if (profile->color_key &&
+	    (profile->src_mode || profile->dst_mode ||
+	     !profile->src_fmt.rgb || !profile->dst_fmt.rgb))
 		return -EOPNOTSUPP;
 	profile->overlap_copy = task->src.yrgb_addr == task->dst.yrgb_addr &&
 				!profile->alpha_blend;
@@ -6186,6 +6276,13 @@ static int rk_rga3_alpha_factors(u8 pd_mode, u32 *top_factor,
 	}
 }
 
+static u32 rk_rga3_color_key_8_to_10(u32 color)
+{
+	return ((color & 0xff) << 22) |
+	       (((color >> 8) & 0xff) << 2) |
+	       (((color >> 16) & 0xff) << 12);
+}
+
 static int rk_rga3_emit_alpha_overlap(struct rk_rga_job *job,
 				      const struct rga_req *task,
 				      const struct rk_rga3_bitblt_profile *profile)
@@ -6248,9 +6345,17 @@ static int rk_rga3_emit_alpha_overlap(struct rk_rga_job *job,
 	      RK_RGA3_OVLP_TOP_ALPHA_EN;
 	if (profile->dst_fmt.yuv)
 		reg |= RK_RGA3_OVLP_FIELD;
+	if (profile->color_key)
+		reg |= FIELD_PREP(RK_RGA3_OVLP_TOP_KEY_EN, 1);
 
 	rk_rga_cmd_write(job, RK_RGA3_OVLP_CTRL_OFFSET, reg);
 	rk_rga_cmd_write(job, RK_RGA3_OVLP_OFF_OFFSET, ovlp_off);
+	if (profile->color_key) {
+		rk_rga_cmd_write(job, RK_RGA3_OVLP_TOP_KEY_MIN_OFFSET,
+				 rk_rga3_color_key_8_to_10(task->color_key_min));
+		rk_rga_cmd_write(job, RK_RGA3_OVLP_TOP_KEY_MAX_OFFSET,
+				 rk_rga3_color_key_8_to_10(task->color_key_max));
+	}
 	rk_rga_cmd_write(job, RK_RGA3_OVLP_TOP_CTRL_OFFSET, top_ctrl);
 	rk_rga_cmd_write(job, RK_RGA3_OVLP_BOT_CTRL_OFFSET, bottom_ctrl);
 	rk_rga_cmd_write(job, RK_RGA3_OVLP_TOP_ALPHA_OFFSET, top_alpha);
