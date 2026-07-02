@@ -2194,6 +2194,8 @@ static int rk_mpp_poll_irq_check_size(s32 count_max, u32 req_size)
 }
 
 #if IS_ENABLED(CONFIG_ROCKCHIP_MPP_REWRITE_KUNIT_TEST)
+static bool rk_mpp_hw_prepare_active_retry(struct rk_mpp_hw *hw,
+					   struct rk_mpp_job *match);
 static void rk_mpp_rkvenc2_dchs_patch(struct rk_mpp_job *job);
 static void rk_mpp_rkvenc2_dchs_release(struct rk_mpp_job *job);
 
@@ -3097,6 +3099,33 @@ static void rk_mpp_hw_take_active_if_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, hw.irq_status, 0U);
 }
 
+static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
+{
+	struct rk_mpp_hw hw = {};
+	struct rk_mpp_job *job0;
+	struct rk_mpp_job *job1;
+
+	job0 = kunit_kzalloc(test, sizeof(*job0), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job0);
+	job1 = kunit_kzalloc(test, sizeof(*job1), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job1);
+
+	spin_lock_init(&hw.lock);
+	hw.active_job = job0;
+	hw.irq_status = 0x1234;
+	atomic_set(&hw.iommu_fault_pending, 1);
+
+	KUNIT_EXPECT_FALSE(test, rk_mpp_hw_prepare_active_retry(&hw, job1));
+	KUNIT_EXPECT_PTR_EQ(test, hw.active_job, job0);
+	KUNIT_EXPECT_EQ(test, hw.irq_status, 0x1234U);
+	KUNIT_EXPECT_EQ(test, atomic_read(&hw.iommu_fault_pending), 1);
+
+	KUNIT_EXPECT_TRUE(test, rk_mpp_hw_prepare_active_retry(&hw, job0));
+	KUNIT_EXPECT_PTR_EQ(test, hw.active_job, job0);
+	KUNIT_EXPECT_EQ(test, hw.irq_status, 0U);
+	KUNIT_EXPECT_EQ(test, atomic_read(&hw.iommu_fault_pending), 0);
+}
+
 static void rk_mpp_iommu_fault_match_kunit(struct kunit *test)
 {
 	struct rk_mpp_iommu_fault_match_fixture {
@@ -3408,6 +3437,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_descriptor_core_mask_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_fixed_rcb_link_kunit),
 	KUNIT_CASE(rk_mpp_hw_take_active_if_kunit),
+	KUNIT_CASE(rk_mpp_hw_prepare_active_retry_kunit),
 	KUNIT_CASE(rk_mpp_iommu_fault_match_kunit),
 	KUNIT_CASE(rk_mpp_poll_irq_check_size_kunit),
 	KUNIT_CASE(rk_mpp_rkvenc_slice_mode_kunit),
@@ -4730,6 +4760,28 @@ out_unlock:
 	return ret;
 }
 
+static int rk_mpp_rkvdec2_prepare_ccu_retry_job(struct rk_mpp_job *job)
+{
+	struct rk_mpp_hw *hw = job->hw;
+	int ret = 0;
+
+	if (!hw || !job->rkvdec_ccu_started || !job->rkvdec_ccu)
+		return -EINVAL;
+	if (!mutex_trylock(&hw->run_lock))
+		return -EBUSY;
+	if (!rk_mpp_hw_prepare_active_retry(hw, job)) {
+		ret = -ENOENT;
+		goto out_unlock;
+	}
+
+	cancel_delayed_work(&hw->timeout_work);
+	rk_mpp_hw_reset_active(hw);
+
+out_unlock:
+	mutex_unlock(&hw->run_lock);
+	return ret;
+}
+
 static int rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(struct rk_mpp_hw *ccu)
 {
 	struct rk_mpp_job **jobs;
@@ -4742,11 +4794,18 @@ static int rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(struct rk_mpp_hw *ccu)
 		return ret;
 
 	for (i = 0; i < count; i++) {
+		ret = rk_mpp_rkvdec2_prepare_ccu_retry_job(jobs[i]);
+		if (ret)
+			goto out_put_jobs;
+	}
+
+	for (i = 0; i < count; i++) {
 		ret = rk_mpp_rkvdec2_restart_ccu_job(jobs[i]);
 		if (ret)
 			break;
 	}
 
+out_put_jobs:
 	for (i = 0; i < count; i++)
 		rk_mpp_job_put(jobs[i]);
 	kfree(jobs);
