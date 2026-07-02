@@ -68,10 +68,10 @@ Implemented
   fd, queue the prepared job, and return without waiting for IRQ/timeout
   completion.  The queued job owns its own lifetime reference until completion
   signals the release fence.
-* Minimal per-core scheduler boundary: submit paths queue prepared jobs on a
-  bound RGA core, dispatch one active job per core, wake submit waiters on
-  completion, and keep hardware nodes alive until in-flight scheduler users
-  drain during remove.
+* Minimal per-core scheduler boundary: submit paths queue prepared jobs on the
+  least-loaded eligible bound RGA core, dispatch one active job per core, wake
+  submit waiters on completion, and keep hardware nodes alive until in-flight
+  scheduler users drain during remove.
   Hardware removal stops new dispatch, completes queued and active jobs with
   ``-ENODEV``, and signals any exported async release fence with that result.
 * Backend-aware core selection for prepared jobs.  The scheduler checks the

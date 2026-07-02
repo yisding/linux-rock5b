@@ -3806,6 +3806,9 @@ static int rk_rga_job_hw_type(struct rk_rga_job *job,
 static int rk_rga3_emit_simple_bitblt(struct rk_rga_job *job);
 static int rk_rga_request_check(const struct rga_user_request *user);
 static int rk_rga_request_ioctl_ret(int ret);
+static struct rk_rga_hw *
+rk_rga_find_best_hw_for_job(struct list_head *hw_list, struct rk_rga_job *job,
+			    enum rk_rga_hw_type type);
 
 static void rk_rga2_transform_expect(struct kunit *test, u8 rotate_mode,
 				     s32 sina, s32 cosa, u8 rot, u8 mir,
@@ -4121,6 +4124,65 @@ static void rk_rga_mixed_task_hw_type_kunit(struct kunit *test)
 			-EOPNOTSUPP);
 }
 
+static void rk_rga_find_best_hw_for_job_kunit(struct kunit *test)
+{
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_BGRA_8888);
+	struct rk_rga_job active = { };
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+	};
+	struct rk_rga_hw busy = {
+		.type = RK_RGA_HW_RGA3,
+		.core_mask = BIT(0),
+		.queued_jobs = 2,
+	};
+	struct rk_rga_hw idle = {
+		.type = RK_RGA_HW_RGA3,
+		.core_mask = BIT(1),
+	};
+	LIST_HEAD(hw_list);
+
+	spin_lock_init(&busy.job_lock);
+	spin_lock_init(&idle.job_lock);
+	list_add_tail(&busy.node, &hw_list);
+	list_add_tail(&idle.node, &hw_list);
+
+	KUNIT_EXPECT_PTR_EQ(test,
+			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+							RK_RGA_HW_RGA3),
+			    &idle);
+
+	task.core = BIT(0);
+	KUNIT_EXPECT_PTR_EQ(test,
+			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+							RK_RGA_HW_RGA3),
+			    &busy);
+
+	task.core = BIT(1);
+	KUNIT_EXPECT_PTR_EQ(test,
+			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+							RK_RGA_HW_RGA3),
+			    &idle);
+
+	task.core = 0;
+	idle.active_job = &active;
+	idle.queued_jobs = 3;
+	KUNIT_EXPECT_PTR_EQ(test,
+			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+							RK_RGA_HW_RGA3),
+			    &busy);
+
+	task.core = BIT(0);
+	busy.removing = true;
+	KUNIT_EXPECT_PTR_EQ(test,
+			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+							RK_RGA_HW_RGA3),
+			    NULL);
+}
+
 static void rk_rga_ffmpeg_rga3_profiles_kunit(struct kunit *test)
 {
 	enum rk_rga_hw_type type = 0;
@@ -4303,6 +4365,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_request_ioctl_ret_kunit),
 	KUNIT_CASE(rk_rga_job_free_release_fence_kunit),
 	KUNIT_CASE(rk_rga_mixed_task_hw_type_kunit),
+	KUNIT_CASE(rk_rga_find_best_hw_for_job_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_rga3_profiles_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_fbc_profiles_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_alpha_overlay_kunit),
@@ -5791,6 +5854,49 @@ static bool rk_rga_job_core_allows_hw(struct rk_rga_job *job,
 	return true;
 }
 
+static u32 rk_rga_hw_load(struct rk_rga_hw *hw)
+{
+	unsigned long flags;
+	u32 load;
+
+	spin_lock_irqsave(&hw->job_lock, flags);
+	load = hw->queued_jobs;
+	if (hw->active_job && load < U32_MAX)
+		load++;
+	spin_unlock_irqrestore(&hw->job_lock, flags);
+
+	return load;
+}
+
+static struct rk_rga_hw *
+rk_rga_find_best_hw_for_job(struct list_head *hw_list, struct rk_rga_job *job,
+			    enum rk_rga_hw_type type)
+{
+	struct rk_rga_hw *best = NULL;
+	struct rk_rga_hw *hw;
+	u32 best_load = U32_MAX;
+
+	list_for_each_entry(hw, hw_list, node) {
+		u32 load;
+
+		if (hw->removing || hw->type != type)
+			continue;
+		if (!rk_rga_job_core_allows_hw(job, hw))
+			continue;
+
+		load = rk_rga_hw_load(hw);
+		if (best && load >= best_load)
+			continue;
+
+		best = hw;
+		best_load = load;
+		if (!load)
+			break;
+	}
+
+	return best;
+}
+
 static u32 rk_rga_hw_core_mask(enum rk_rga_hw_type type, u32 core_index)
 {
 	if (core_index >= 2)
@@ -5905,12 +6011,8 @@ static struct rk_rga_hw *rk_rga_hw_get_for_job(struct rk_rga_job *job,
 	}
 
 	mutex_lock(&rk_rga.hw_lock);
-	list_for_each_entry(hw, &rk_rga.hw_list, node) {
-		if (hw->removing || hw->type != type)
-			continue;
-		if (!rk_rga_job_core_allows_hw(job, hw))
-			continue;
-
+	hw = rk_rga_find_best_hw_for_job(&rk_rga.hw_list, job, type);
+	if (hw) {
 		refcount_inc(&hw->refs);
 		mutex_unlock(&rk_rga.hw_lock);
 		*error = 0;
