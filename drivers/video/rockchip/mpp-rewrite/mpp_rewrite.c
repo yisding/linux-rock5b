@@ -386,6 +386,7 @@ rk_mpp_hw_abort_ccu_active_dependents(struct rk_mpp_hw *ccu,
 static bool rk_mpp_job_rkvenc_slice_mode(struct rk_mpp_job *job);
 static bool rk_mpp_job_rkvenc_slice_ready(struct rk_mpp_job *job);
 static bool rk_mpp_job_rkvenc_slice_done(struct rk_mpp_job *job);
+static int rk_mpp_job_apply_rcb_info(struct rk_mpp_job *job);
 static struct rk_mpp_service rk_mpp_srv;
 
 static const struct rk_mpp_hw_match rk_mpp_rkvenc2_core = {
@@ -2507,6 +2508,42 @@ static void rk_mpp_rkvenc_slice_mode_kunit(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, rk_mpp_job_rkvenc_slice_mode(&job));
 }
 
+static void rk_mpp_rcb_invalid_index_kunit(struct kunit *test)
+{
+	struct rk_mpp_session session = {
+		.client_type = RK_MPP_DEVICE_RKVENC,
+	};
+	struct rk_mpp_hw hw = {
+		.rcb_iova = 0x80000000,
+		.rcb_size = 0x300,
+	};
+	u32 max_words = RK_MPP_MAX_REG_IMAGE_BYTES / sizeof(u32);
+	struct rk_mpp_job *job;
+
+	mutex_init(&session.lock);
+
+	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+
+	job->session = &session;
+	job->hw = &hw;
+	job->reg_image.rcb_count = 3;
+	job->reg_image.rcb_descs[0].index = 2;
+	job->reg_image.rcb_descs[0].size = 0x100;
+	job->reg_image.rcb_descs[1].index = max_words;
+	job->reg_image.rcb_descs[1].size = 0x100;
+	job->reg_image.rcb_descs[2].index = 4;
+	job->reg_image.rcb_descs[2].size = 0x100;
+
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_rcb_info(job), 0);
+	KUNIT_ASSERT_NOT_NULL(test, job->reg_image.regs);
+	KUNIT_ASSERT_GT(test, job->reg_image.reg_words, 4U);
+	KUNIT_EXPECT_EQ(test, job->reg_image.regs[2], 0x80000000U);
+	KUNIT_EXPECT_EQ(test, job->reg_image.regs[4], 0x80000100U);
+
+	kfree(job->reg_image.regs);
+}
+
 static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_check_cmd_v1_kunit),
 	KUNIT_CASE(rk_mpp_get_cmd_butt_kunit),
@@ -2526,6 +2563,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_hw_take_active_if_kunit),
 	KUNIT_CASE(rk_mpp_poll_irq_check_size_kunit),
 	KUNIT_CASE(rk_mpp_rkvenc_slice_mode_kunit),
+	KUNIT_CASE(rk_mpp_rcb_invalid_index_kunit),
 	{}
 };
 
@@ -2859,8 +2897,11 @@ static int rk_mpp_job_apply_rcb_info(struct rk_mpp_job *job)
 
 	for (i = 0; i < image->rcb_count; i++) {
 		const struct rk_mpp_rcb_desc *desc = &image->rcb_descs[i];
+		u32 max_words = RK_MPP_MAX_REG_IMAGE_BYTES / sizeof(*image->regs);
 		u32 next_offset;
 
+		if (desc->index >= max_words)
+			continue;
 		if (check_add_overflow(rcb_offset, desc->size, &next_offset) ||
 		    next_offset > job->hw->rcb_size)
 			continue;
