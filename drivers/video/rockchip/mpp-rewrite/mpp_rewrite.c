@@ -1824,10 +1824,10 @@ static int rk_mpp_rkvdec2_prepare_ccu_descriptor(struct rk_mpp_job *job)
 	if (!rk_mpp_rkvdec2_ccu_regs_ready(job->rkvdec_ccu))
 		return -EOPNOTSUPP;
 
-	core_work = job->hw ? job->hw->core_mask : 0;
+	core_work = rk_mpp_rkvdec2_ccu_core_mask(job->session->srv,
+						 job->rkvdec_ccu);
 	if (!core_work)
-		core_work = rk_mpp_rkvdec2_ccu_core_mask(job->session->srv,
-							 job->rkvdec_ccu);
+		core_work = job->hw ? job->hw->core_mask : 0;
 	if (!core_work)
 		return -ENODEV;
 
@@ -2452,6 +2452,68 @@ static void rk_mpp_rkvdec2_ccu_descriptor_kunit(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, job->rkvdec_ccu_desc_valid);
 }
 
+static void rk_mpp_rkvdec2_ccu_descriptor_core_mask_kunit(struct kunit *test)
+{
+	struct rk_mpp_session *session;
+	struct device_node *ccu_node;
+	struct rk_mpp_service *srv;
+	struct rk_mpp_hw *core0;
+	struct rk_mpp_hw *core1;
+	struct device *ccu_dev;
+	struct rk_mpp_hw *ccu;
+	struct rk_mpp_job *job;
+
+	ccu_node = kunit_kzalloc(test, sizeof(*ccu_node), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ccu_node);
+	ccu_dev = kunit_kzalloc(test, sizeof(*ccu_dev), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ccu_dev);
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
+	session = kunit_kzalloc(test, sizeof(*session), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, session);
+	ccu = kunit_kzalloc(test, sizeof(*ccu), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ccu);
+	core0 = kunit_kzalloc(test, sizeof(*core0), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, core0);
+	core1 = kunit_kzalloc(test, sizeof(*core1), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, core1);
+	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+
+	ccu_dev->of_node = ccu_node;
+	mutex_init(&srv->hw_lock);
+	INIT_LIST_HEAD(&srv->hw_list);
+	session->srv = srv;
+	ccu->dev = ccu_dev;
+	ccu->regs[0] = (void __iomem *)0x1;
+	ccu->reg_size[0] = RK_MPP_RKVDEC_CCU_CORE_STA_BASE + sizeof(u32);
+	core0->ccu_node = ccu_node;
+	core0->core_mask = 0x00010001;
+	core0->online = true;
+	core1->ccu_node = ccu_node;
+	core1->core_mask = 0x00020002;
+	core1->online = true;
+	INIT_LIST_HEAD(&ccu->link);
+	INIT_LIST_HEAD(&core0->link);
+	INIT_LIST_HEAD(&core1->link);
+	list_add_tail(&core0->link, &srv->hw_list);
+	list_add_tail(&core1->link, &srv->hw_list);
+
+	job->session = session;
+	job->hw = core0;
+	job->rkvdec_ccu = ccu;
+	job->rkvdec_link_iova = 0x12345000;
+	job->rkvdec_link_active = true;
+
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_prepare_ccu_descriptor(job), 0);
+	KUNIT_EXPECT_EQ(test, job->rkvdec_ccu_core_work, 0x00030003U);
+
+	core1->online = false;
+	job->rkvdec_ccu_desc_valid = false;
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_prepare_ccu_descriptor(job), 0);
+	KUNIT_EXPECT_EQ(test, job->rkvdec_ccu_core_work, 0x00010001U);
+}
+
 static void rk_mpp_hw_take_active_if_kunit(struct kunit *test)
 {
 	struct rk_mpp_hw hw = {};
@@ -2785,6 +2847,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_rkvdec2_link_table_ccu_ref_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_running_list_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_descriptor_kunit),
+	KUNIT_CASE(rk_mpp_rkvdec2_ccu_descriptor_core_mask_kunit),
 	KUNIT_CASE(rk_mpp_hw_take_active_if_kunit),
 	KUNIT_CASE(rk_mpp_iommu_fault_match_kunit),
 	KUNIT_CASE(rk_mpp_poll_irq_check_size_kunit),
