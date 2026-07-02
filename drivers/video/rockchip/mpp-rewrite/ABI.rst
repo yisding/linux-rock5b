@@ -198,10 +198,11 @@ Implemented
   layout/materialization/readback/ownership/relinking, CCU-reference lifetime,
   hard-CCU running-list table-chain relinking/scanning/active matching and
   active-job out-of-order matching/drain detection, hard-CCU done-table
-  detection, peer-core power ownership transfer, unfinished-chain relinking for
-  hard-CCU resend preparation, unfinished-job collection for hard-CCU resend,
-  active-slot retry preservation, cross-core CCU completion claiming,
-  hard-CCU table-status readback,
+  detection, peer-core power ownership transfer, release-time peer-core
+  ownership transfer, unfinished-chain relinking for hard-CCU resend
+  preparation, unfinished-job collection for hard-CCU resend, active-slot retry
+  preservation, cross-core CCU completion claiming, hard-CCU table-status
+  readback,
   hard-CCU idle/add-mode descriptor values, hard-CCU all-core work-mask
   selection, fixed-RCB link-latch
   programming, IOMMU fault target matching, RKVENC2 DCHS tx/rx id remapping
