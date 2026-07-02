@@ -25,6 +25,8 @@ Implemented
   jobs create job-owned remaps against the selected RGA2 device.
 * ``RGA_IOC_REQUEST_CREATE``, ``RGA_IOC_REQUEST_CONFIG``, and
   ``RGA_IOC_REQUEST_CANCEL`` request lifetime management.
+  ``RGA_IOC_REQUEST_SUBMIT`` consumes the session request after cloning the
+  prepared job resources, matching current ``librga`` task-job lifetime.
 * Modern request task-array copy into session-owned request objects.  Handle
   backed image addresses are resolved to mapped IOVAs in the kernel-owned task
   copy, and configured requests hold references to their imported dma-bufs.
@@ -266,7 +268,8 @@ Implemented
   normalization helpers, including the RGA2 ``rotate_mode``/``sina``/``cosa``
   decoder, transformed destination-corner selection, color-fill core-mask
   dispatch, BSP request task-count limits and return codes, mixed RGA2/RGA3
-  multi-task rejection, RGA2 fill RGB/YUV destination-offset emission,
+  multi-task rejection, request-id removal on terminal submit, RGA2 fill
+  RGB/YUV destination-offset emission,
   YUV-fill chroma-alignment rejection, and multi-fill task acceptance, compact
   10-bit RGA2 source dispatch/emission including the no-scale force-tile mode,
   RGA2 in-place RGB mosaic dispatch/emission, RGA2 RGB ROP dispatch/emission,
