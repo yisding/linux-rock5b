@@ -101,10 +101,12 @@ Implemented
   first force-stops and resets the coordinator, preserves table-complete jobs
   that raced the timeout by reading back their CCU link tables, then relinks
   unfinished tables, resets matched active dependent cores, and resends those
-  jobs through the coordinator.  If an unfinished job can no longer be matched
-  to its active core slot, recovery falls back to opportunistically aborting
-  unfinished active dependent cores without waiting on possibly running timeout
-  workers.
+  jobs through the coordinator.  After reset and before resend, each matched
+  active core asks the public IOMMU layer to flush the core's attached domain;
+  in the target Rockchip IOMMU driver this maps to the hardware ``ZAP_CACHE``
+  command.  If an unfinished job can no longer be matched to its active core
+  slot, recovery falls back to opportunistically aborting unfinished active
+  dependent cores without waiting on possibly running timeout workers.
 * Public IOMMU fault callback registration for bound MPP cores.  A fault
   records ``iommu_fault_count`` in debugfs, logs the IOVA/status, marks the
   active job for immediate recovery through the same serialized reset path,
@@ -201,8 +203,8 @@ Implemented
   detection, peer-core power ownership transfer, release-time peer-core
   ownership transfer, unfinished-chain relinking for hard-CCU resend
   preparation, unfinished-job collection for hard-CCU resend, active-slot retry
-  preservation, cross-core CCU completion claiming, hard-CCU table-status
-  readback,
+  preservation and IOMMU refresh accounting, cross-core CCU completion
+  claiming, hard-CCU table-status readback,
   hard-CCU idle/add-mode descriptor values, hard-CCU all-core work-mask
   selection, fixed-RCB link-latch
   programming, IOMMU fault target matching, RKVENC2 DCHS tx/rx id remapping
@@ -218,10 +220,8 @@ Recognized But Unsupported
 Outside This Slice
 ------------------
 
-* Full BSP-equivalent timeout recovery policy beyond preserving completed
-  hard-CCU tables and preparing an unfinished resend chain before immediate
-  reset/abort, including runtime reset/resend of still-running decoder tasks
-  after recoverable faults and MMU-domain refresh.
+* Board-level stress validation of hard-CCU timeout/error recovery under real
+  IOMMU faults, runtime suspend, and decoder reset races on RK3588 hardware.
 * MPP fence export/import semantics.  The observed RK3588 MPP UAPI in
   ``include/uapi/linux/rk-mpp.h`` exposes no fence command or fence flags, and
   the BSP-derived 6.18 driver does not provide a sync-file fence path in the
