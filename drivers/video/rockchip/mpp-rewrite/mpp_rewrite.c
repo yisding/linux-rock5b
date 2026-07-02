@@ -1744,6 +1744,21 @@ static bool rk_mpp_rkvdec2_ccu_has_jobs(struct rk_mpp_hw *ccu)
 	return has_jobs;
 }
 
+static bool
+rk_mpp_rkvdec2_ccu_job_done(const struct rk_mpp_job *job,
+			    const struct rk_mpp_rkvdec2_link_info *info)
+{
+	const u32 *table;
+
+	if (!job || !info)
+		return false;
+	table = job->rkvdec_link_vaddr;
+	if (!table || info->irq_status_word >= info->table_words)
+		return false;
+
+	return table[info->irq_status_word];
+}
+
 static void rk_mpp_rkvdec2_ccu_job_add(struct rk_mpp_job *job)
 {
 	struct rk_mpp_hw *ccu = job->rkvdec_ccu;
@@ -1791,9 +1806,7 @@ static struct rk_mpp_job *rk_mpp_rkvdec2_ccu_first_done_job(struct rk_mpp_hw *cc
 
 	spin_lock_irqsave(&ccu->lock, flags);
 	list_for_each_entry(job, &ccu->rkvdec_ccu_jobs, rkvdec_ccu_node) {
-		u32 *table = job->rkvdec_link_vaddr;
-
-		if (table && table[info->irq_status_word]) {
+		if (rk_mpp_rkvdec2_ccu_job_done(job, info)) {
 			rk_mpp_job_get(job);
 			spin_unlock_irqrestore(&ccu->lock, flags);
 			return job;
@@ -1812,7 +1825,6 @@ rk_mpp_rkvdec2_ccu_done_active_job(struct rk_mpp_job *active)
 	struct rk_mpp_hw *ccu;
 	struct rk_mpp_job *done = NULL;
 	unsigned long flags;
-	u32 *table;
 
 	if (!active || !active->rkvdec_ccu_started)
 		return NULL;
@@ -1822,9 +1834,8 @@ rk_mpp_rkvdec2_ccu_done_active_job(struct rk_mpp_job *active)
 		return NULL;
 
 	spin_lock_irqsave(&ccu->lock, flags);
-	table = active->rkvdec_link_vaddr;
-	if (active->rkvdec_ccu_listed && table &&
-	    table[info->irq_status_word]) {
+	if (active->rkvdec_ccu_listed &&
+	    rk_mpp_rkvdec2_ccu_job_done(active, info)) {
 		rk_mpp_job_get(active);
 		done = active;
 	}
@@ -2558,6 +2569,26 @@ static void rk_mpp_rkvdec2_ccu_running_list_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, list_empty(&ccu->rkvdec_ccu_jobs));
 }
 
+static void rk_mpp_rkvdec2_ccu_job_done_kunit(struct kunit *test)
+{
+	const struct rk_mpp_rkvdec2_link_info *info =
+		&rk_mpp_rkvdec2_vdpu383_link_info;
+	struct rk_mpp_job job = {};
+	u32 *table;
+
+	table = kunit_kcalloc(test, info->table_words, sizeof(*table),
+			      GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, table);
+
+	KUNIT_EXPECT_FALSE(test, rk_mpp_rkvdec2_ccu_job_done(NULL, info));
+	KUNIT_EXPECT_FALSE(test, rk_mpp_rkvdec2_ccu_job_done(&job, info));
+
+	job.rkvdec_link_vaddr = table;
+	KUNIT_EXPECT_FALSE(test, rk_mpp_rkvdec2_ccu_job_done(&job, info));
+	table[info->irq_status_word] = 0x40;
+	KUNIT_EXPECT_TRUE(test, rk_mpp_rkvdec2_ccu_job_done(&job, info));
+}
+
 static void rk_mpp_rkvdec2_ccu_descriptor_kunit(struct kunit *test)
 {
 	struct rk_mpp_hw ccu = {};
@@ -3042,6 +3073,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_rkvdec2_link_table_ownership_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_link_table_ccu_ref_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_running_list_kunit),
+	KUNIT_CASE(rk_mpp_rkvdec2_ccu_job_done_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_descriptor_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_descriptor_core_mask_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_fixed_rcb_link_kunit),
@@ -4373,7 +4405,10 @@ static void rk_mpp_hw_timeout_work(struct work_struct *work)
 	struct rk_mpp_job *job;
 	struct rk_mpp_hw *ccu = NULL;
 	bool hard_ccu_recovery;
+	bool ccu_done = false;
+	bool ccu_error = false;
 	bool iommu_fault;
+	int recovery_result;
 	int result;
 
 	mutex_lock(&hw->run_lock);
@@ -4389,14 +4424,32 @@ static void rk_mpp_hw_timeout_work(struct work_struct *work)
 		ccu = job->rkvdec_ccu;
 		rk_mpp_hw_get(ccu);
 		rk_mpp_rkvdec2_force_stop_ccu(ccu);
+		ccu_done =
+			rk_mpp_rkvdec2_ccu_job_done(job,
+						    &rk_mpp_rkvdec2_vdpu383_link_info);
+		if (ccu_done) {
+			result =
+				rk_mpp_rkvdec2_read_ccu_link_table(job,
+					&rk_mpp_rkvdec2_vdpu383_link_info, 0);
+			ccu_error = !result &&
+				rk_mpp_rkvdec2_ccu_job_error(job,
+					&rk_mpp_rkvdec2_vdpu383_link_info);
+		}
 	}
 
 	if (iommu_fault) {
 		result = -EIO;
+		recovery_result = result;
 		dev_err(hw->dev, "session client %u job %u failed on IOMMU fault\n",
 			job->session->client_type, job->id);
+	} else if (ccu_done) {
+		recovery_result = ccu_error ? -EIO : -ETIMEDOUT;
+		if (result)
+			dev_err(hw->dev, "session client %u job %u hard-CCU readback failed: %d\n",
+				job->session->client_type, job->id, result);
 	} else {
 		result = -ETIMEDOUT;
+		recovery_result = result;
 		atomic_inc(&job->session->srv->timeout_count);
 		dev_err(hw->dev, "session client %u job %u timed out\n",
 			job->session->client_type, job->id);
@@ -4408,8 +4461,10 @@ static void rk_mpp_hw_timeout_work(struct work_struct *work)
 	rk_mpp_job_complete(job, result);
 	mutex_unlock(&hw->run_lock);
 	rk_mpp_job_put(job);
-	if (hard_ccu_recovery)
-		rk_mpp_hw_abort_ccu_active_dependents(ccu, hw, result);
+	if (hard_ccu_recovery) {
+		rk_mpp_rkvdec2_drain_ccu_done_jobs(ccu);
+		rk_mpp_hw_abort_ccu_active_dependents(ccu, hw, recovery_result);
+	}
 	rk_mpp_hw_put(ccu);
 }
 
@@ -5365,10 +5420,12 @@ static irqreturn_t rk_mpp_rkvdec2_thread(struct rk_mpp_hw *hw)
 	rk_mpp_job_complete(job, ret);
 	mutex_unlock(&hw->run_lock);
 	rk_mpp_job_put(job);
-	if (ccu_error)
-		rk_mpp_hw_abort_ccu_active_dependents(ccu, hw, -EIO);
-	else
+	if (ccu_error) {
 		rk_mpp_rkvdec2_drain_ccu_done_jobs(ccu);
+		rk_mpp_hw_abort_ccu_active_dependents(ccu, hw, -EIO);
+	} else {
+		rk_mpp_rkvdec2_drain_ccu_done_jobs(ccu);
+	}
 	rk_mpp_hw_put(ccu);
 
 	return IRQ_HANDLED;
