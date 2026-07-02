@@ -288,7 +288,8 @@ Implemented
   post-reset IOMMU refresh accounting, scheduler priority enqueue/aging,
   RGA3 normal RGB color-key dispatch/emission and inverted-mode rejection,
   RGA3 tile8x8 profile selection and stride emission, RGA3 pattern-backed
-  10-bit YUV alpha-overlay emission, and
+  8-bit ``librga`` alpha-YUV overlay emission, ``librga`` global-alpha
+  register emission, 10-bit YUV alpha-overlay emission, and
   ffmpeg-facing RGA3 raster/FBC/alpha-overlay profile selection plus
   destination-offset command
   emission, source-crop command emission for RGA3 and RGA2, and semiplanar
