@@ -346,7 +346,8 @@ Implemented
   ``librga`` global-alpha register emission, RGA3 ``librga`` three-channel
   RGB alpha-composite routing/emission, current ``librga`` Porter-Duff blend-mode factor mapping
   and CLEAR rejection, 10-bit YUV alpha-overlay emission, and
-  ffmpeg-facing RGA3 raster/FBC/alpha-overlay profile selection plus
+  ffmpeg-facing RGA3 raster/FBC/alpha-overlay profile selection, P210-style
+  unpacked 10-bit 4:2:2 stride/offset emission, plus
   destination-offset command
   emission, source-crop command emission for RGA3 and RGA2, and semiplanar
   chroma-alignment rejection.
