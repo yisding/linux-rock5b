@@ -1019,6 +1019,7 @@ struct rk_rga_service {
 	atomic_t irq_spurious_count;
 	atomic_t timeout_count;
 	atomic_t iommu_fault_count;
+	atomic_t iommu_refresh_count;
 	atomic_t unsupported_count;
 };
 
@@ -2866,6 +2867,15 @@ static int rk_rga3_soft_reset(struct rk_rga_hw *hw)
 	return i == RK_RGA_RESET_TIMEOUT_US ? -ETIMEDOUT : 0;
 }
 
+static void rk_rga_hw_refresh_iommu(struct rk_rga_hw *hw)
+{
+	if (!hw->iommu_domain)
+		return;
+
+	iommu_flush_iotlb_all(hw->iommu_domain);
+	atomic_inc(&rk_rga.iommu_refresh_count);
+}
+
 static void rk_rga_hw_reset_for_recovery(struct rk_rga_hw *hw)
 {
 	int ret;
@@ -2875,20 +2885,26 @@ static void rk_rga_hw_reset_for_recovery(struct rk_rga_hw *hw)
 	else
 		ret = rk_rga2_soft_reset(hw);
 
-	if (!ret)
+	if (!ret) {
+		rk_rga_hw_refresh_iommu(hw);
 		return;
+	}
 
 	dev_warn(hw->dev, "%s soft reset during recovery failed: %d\n",
 		 hw->match->name, ret);
 
-	if (!hw->resets)
+	if (!hw->resets) {
+		rk_rga_hw_refresh_iommu(hw);
 		return;
+	}
 
 	ret = reset_control_reset(hw->resets);
 	if (ret)
 		dev_warn(hw->dev,
 			 "%s reset-control recovery fallback failed: %d\n",
 			 hw->match->name, ret);
+
+	rk_rga_hw_refresh_iommu(hw);
 }
 
 static void rk_rga2_start_hw(struct rk_rga_hw *hw, struct rk_rga_job *job)
@@ -5809,6 +5825,25 @@ static void rk_rga_iommu_fault_match_kunit(struct kunit *test)
 			    NULL);
 }
 
+static void rk_rga_iommu_refresh_kunit(struct kunit *test)
+{
+	static const struct iommu_domain_ops iommu_ops;
+	struct iommu_domain domain = {
+		.ops = &iommu_ops,
+	};
+	struct rk_rga_hw hw = {
+		.iommu_domain = &domain,
+	};
+
+	atomic_set(&rk_rga.iommu_refresh_count, 0);
+	rk_rga_hw_refresh_iommu(&hw);
+	KUNIT_EXPECT_EQ(test, atomic_read(&rk_rga.iommu_refresh_count), 1);
+
+	hw.iommu_domain = NULL;
+	rk_rga_hw_refresh_iommu(&hw);
+	KUNIT_EXPECT_EQ(test, atomic_read(&rk_rga.iommu_refresh_count), 1);
+}
+
 static void rk_rga_ffmpeg_rga3_profiles_kunit(struct kunit *test)
 {
 	enum rk_rga_hw_type type = 0;
@@ -6450,6 +6485,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_find_best_hw_for_job_kunit),
 	KUNIT_CASE(rk_rga_priority_enqueue_kunit),
 	KUNIT_CASE(rk_rga_iommu_fault_match_kunit),
+	KUNIT_CASE(rk_rga_iommu_refresh_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_rga3_profiles_kunit),
 	KUNIT_CASE(rk_rga_in_place_border_bitblt_kunit),
 	KUNIT_CASE(rk_rga2_compact_10bit_profile_kunit),
@@ -10491,6 +10527,9 @@ static int __init rk_rga_init(void)
 	debugfs_create_atomic_t("iommu_fault_count", 0444,
 				rk_rga.debugfs_root,
 				&rk_rga.iommu_fault_count);
+	debugfs_create_atomic_t("iommu_refresh_count", 0444,
+				rk_rga.debugfs_root,
+				&rk_rga.iommu_refresh_count);
 	debugfs_create_atomic_t("unsupported_count", 0444, rk_rga.debugfs_root,
 				&rk_rga.unsupported_count);
 
