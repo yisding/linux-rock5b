@@ -8182,6 +8182,33 @@ static void rk_rga3_alpha_yuv10_overlay_emit_kunit(struct kunit *test)
 			RK_RGA3_OVLP_FIELD | RK_RGA3_OVLP_TOP_ALPHA_EN);
 
 	memset(cmd, 0, sizeof(cmd));
+	task.dst.rd_mode = RK_RGA_FBC_MODE;
+	job.cmd_ready = false;
+	type = 0;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
+			  RK_RGA3_WIN0_R2Y_EN);
+	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4] &
+			  RK_RGA3_WIN0_YUV10_COMPACT);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_CTRL_OFFSET / 4] &
+			RK_RGA3_WR_MODE, FIELD_PREP(RK_RGA3_WR_MODE, 1));
+	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WR_CTRL_OFFSET / 4] &
+			  RK_RGA3_WR_YUV10_COMPACT);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_PL_VIR_STRIDE_OFFSET / 4],
+			1280U >> 1);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_U_BASE_OFFSET / 4],
+			lower_32_bits(task.dst.uv_addr +
+				      ((1280U >> 2) * 720U) / 4));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_CTRL_OFFSET / 4],
+			FIELD_PREP(RK_RGA3_OVLP_MODE, 0) |
+			RK_RGA3_OVLP_FIELD | RK_RGA3_OVLP_TOP_ALPHA_EN);
+
+	memset(cmd, 0, sizeof(cmd));
+	task.dst.rd_mode = RK_RGA_RASTER_MODE;
 	memset(&task.pat, 0, sizeof(task.pat));
 	task.bsfilter_flag = 0;
 	job.import_count = 2;
