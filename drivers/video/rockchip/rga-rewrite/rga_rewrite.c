@@ -6649,6 +6649,37 @@ static void rk_rga3_librga_translate_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_Y_BASE_OFFSET / 4],
 			lower_32_bits(task.dst.yrgb_addr +
 				      300ULL * stride_bytes + 300ULL * 4ULL));
+
+	memset(cmd, 0, sizeof(cmd));
+	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
+				    640, 360);
+	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_RGBA_8888,
+				    1920, 1080);
+	task.dst.act_w = 640;
+	task.dst.act_h = 360;
+	task.dst.x_offset = 320;
+	task.dst.y_offset = 180;
+	job.cmd_ready = false;
+	type = 0;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_VIR_STRIDE_OFFSET / 4] << 2,
+			640U * 4U);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_SRC_SIZE_OFFSET / 4],
+			640U | (360U << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_ACT_SIZE_OFFSET / 4],
+			640U | (360U << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
+			640U | (360U << 16));
+	stride_bytes = cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4] << 2;
+	KUNIT_EXPECT_EQ(test, stride_bytes, 1920U * 4U);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_Y_BASE_OFFSET / 4],
+			lower_32_bits(task.dst.yrgb_addr +
+				      180ULL * stride_bytes + 320ULL * 4ULL));
 }
 
 static void rk_rga3_librga_rotate_emit_kunit(struct kunit *test)
