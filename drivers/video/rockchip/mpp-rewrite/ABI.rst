@@ -15,6 +15,8 @@ Implemented
   The externally parsed message is the fixed-width 24-byte V1 record with a
   64-bit userspace data pointer; the driver converts it to a native internal
   ``struct mpp_request`` only after copying the V1 record from userspace.
+* Build-time assertions guard the fixed-width V1 message and batch-entry
+  layouts plus the ``MPP_IOC_CFG_V1`` type, number, direction, and size.
 * ``MPP_CMD_SET_SESSION_FD`` session switching, restricted to other
   ``/dev/mpp_service`` file descriptors.  Switching sessions closes the
   current staged job and starts a distinct job for subsequent register/poll

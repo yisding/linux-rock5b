@@ -109,6 +109,9 @@ static_assert(offsetof(struct rk_mpp_msg_v1, data_ptr) ==
 static_assert(sizeof(struct mpp_bat_msg) == RK_MPP_BAT_MSG_ABI_SIZE);
 static_assert(offsetof(struct mpp_bat_msg, ret) ==
 	      RK_MPP_BAT_MSG_RET_ABI_OFFSET);
+static_assert(_IOC_TYPE(MPP_IOC_CFG_V1) == MPP_IOC_MAGIC);
+static_assert(_IOC_NR(MPP_IOC_CFG_V1) == 1);
+static_assert(_IOC_DIR(MPP_IOC_CFG_V1) == _IOC_WRITE);
 static_assert(_IOC_SIZE(MPP_IOC_CFG_V1) == sizeof(unsigned int));
 
 struct rk_mpp_import {
