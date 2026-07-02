@@ -388,6 +388,10 @@ static const struct file_operations rk_mpp_fops;
 static const struct rk_mpp_backend_ops rk_mpp_unsupported_backend_ops;
 static const struct rk_mpp_backend_ops rk_mpp_rkvenc2_backend_ops;
 static const struct rk_mpp_backend_ops rk_mpp_rkvdec2_backend_ops;
+static void rk_mpp_batch_release_jobs(struct rk_mpp_batch_state *batch);
+static struct rk_mpp_job *
+rk_mpp_batch_get_job(struct rk_mpp_batch_state *batch,
+		     struct rk_mpp_session *session);
 static void rk_mpp_job_activate(struct rk_mpp_job *job);
 static void rk_mpp_job_get(struct rk_mpp_job *job);
 static void rk_mpp_job_put(struct rk_mpp_job *job);
@@ -3484,6 +3488,59 @@ static void rk_mpp_rcb_invalid_index_kunit(struct kunit *test)
 	kfree(job->reg_image.regs);
 }
 
+static void rk_mpp_batch_session_switch_split_kunit(struct kunit *test)
+{
+	struct rk_mpp_session session0 = {};
+	struct rk_mpp_session session1 = {};
+	struct rk_mpp_batch_state batch = {};
+	struct rk_mpp_job *job0;
+	struct rk_mpp_job *job0_again;
+	struct rk_mpp_job *job0_second;
+	struct rk_mpp_job *job1;
+	struct rk_mpp_job *iter;
+
+	INIT_LIST_HEAD(&batch.jobs);
+	refcount_set(&session0.refs, 1);
+	refcount_set(&session1.refs, 1);
+
+	job0 = rk_mpp_batch_get_job(&batch, &session0);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(job0));
+	job0_again = rk_mpp_batch_get_job(&batch, &session0);
+	KUNIT_EXPECT_PTR_EQ(test, job0_again, job0);
+	KUNIT_EXPECT_TRUE(test, list_is_singular(&batch.jobs));
+	KUNIT_EXPECT_EQ(test, refcount_read(&session0.refs), 2);
+	KUNIT_EXPECT_EQ(test, refcount_read(&session1.refs), 1);
+
+	batch.cur_job = NULL;
+	job1 = rk_mpp_batch_get_job(&batch, &session1);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(job1));
+	KUNIT_EXPECT_PTR_NE(test, job1, job0);
+	KUNIT_EXPECT_EQ(test, refcount_read(&session0.refs), 2);
+	KUNIT_EXPECT_EQ(test, refcount_read(&session1.refs), 2);
+
+	batch.cur_job = NULL;
+	job0_second = rk_mpp_batch_get_job(&batch, &session0);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(job0_second));
+	KUNIT_EXPECT_PTR_NE(test, job0_second, job0);
+	KUNIT_EXPECT_PTR_NE(test, job0_second, job1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&session0.refs), 3);
+	KUNIT_EXPECT_EQ(test, refcount_read(&session1.refs), 2);
+
+	iter = list_first_entry(&batch.jobs, struct rk_mpp_job, link);
+	KUNIT_EXPECT_PTR_EQ(test, iter, job0);
+	iter = list_next_entry(iter, link);
+	KUNIT_EXPECT_PTR_EQ(test, iter, job1);
+	iter = list_next_entry(iter, link);
+	KUNIT_EXPECT_PTR_EQ(test, iter, job0_second);
+	KUNIT_EXPECT_TRUE(test, list_is_last(&iter->link, &batch.jobs));
+
+	rk_mpp_batch_release_jobs(&batch);
+	KUNIT_EXPECT_TRUE(test, list_empty(&batch.jobs));
+	KUNIT_EXPECT_PTR_EQ(test, batch.cur_job, NULL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&session0.refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&session1.refs), 1);
+}
+
 static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_check_cmd_v1_kunit),
 	KUNIT_CASE(rk_mpp_get_cmd_butt_kunit),
@@ -3514,6 +3571,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_rkvenc_slice_mode_kunit),
 	KUNIT_CASE(rk_mpp_rkvenc2_dchs_remap_kunit),
 	KUNIT_CASE(rk_mpp_rcb_invalid_index_kunit),
+	KUNIT_CASE(rk_mpp_batch_session_switch_split_kunit),
 	{}
 };
 
