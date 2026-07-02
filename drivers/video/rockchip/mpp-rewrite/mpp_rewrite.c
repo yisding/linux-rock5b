@@ -264,6 +264,7 @@ struct rk_mpp_service {
 	atomic_t queued_job_count;
 	atomic_t timeout_count;
 	atomic_t iommu_fault_count;
+	atomic_t iommu_refresh_count;
 	atomic_t next_session_id;
 	struct rk_mpp_rkvenc_dchs_entry rkvenc_dchs[RK_MPP_RKVENC_MAX_DCHS_CORES];
 	u32 hw_support;
@@ -2196,6 +2197,8 @@ static int rk_mpp_poll_irq_check_size(s32 count_max, u32 req_size)
 #if IS_ENABLED(CONFIG_ROCKCHIP_MPP_REWRITE_KUNIT_TEST)
 static bool rk_mpp_hw_prepare_active_retry(struct rk_mpp_hw *hw,
 					   struct rk_mpp_job *match);
+static void rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw,
+				    struct rk_mpp_job *job);
 static void rk_mpp_rkvenc2_dchs_patch(struct rk_mpp_job *job);
 static void rk_mpp_rkvenc2_dchs_release(struct rk_mpp_job *job);
 
@@ -3148,6 +3151,14 @@ static void rk_mpp_hw_take_active_if_kunit(struct kunit *test)
 
 static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 {
+	static const struct iommu_domain_ops iommu_ops;
+	struct rk_mpp_service srv = {};
+	struct rk_mpp_session session = {
+		.srv = &srv,
+	};
+	struct iommu_domain domain = {
+		.ops = &iommu_ops,
+	};
 	struct rk_mpp_hw hw = {};
 	struct rk_mpp_job *job0;
 	struct rk_mpp_job *job1;
@@ -3158,6 +3169,9 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, job1);
 
 	spin_lock_init(&hw.lock);
+	hw.iommu_domain = &domain;
+	job0->session = &session;
+	job1->session = &session;
 	hw.active_job = job0;
 	hw.irq_status = 0x1234;
 	atomic_set(&hw.iommu_fault_pending, 1);
@@ -3166,11 +3180,20 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, hw.active_job, job0);
 	KUNIT_EXPECT_EQ(test, hw.irq_status, 0x1234U);
 	KUNIT_EXPECT_EQ(test, atomic_read(&hw.iommu_fault_pending), 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&srv.iommu_refresh_count), 0);
 
 	KUNIT_EXPECT_TRUE(test, rk_mpp_hw_prepare_active_retry(&hw, job0));
 	KUNIT_EXPECT_PTR_EQ(test, hw.active_job, job0);
 	KUNIT_EXPECT_EQ(test, hw.irq_status, 0U);
 	KUNIT_EXPECT_EQ(test, atomic_read(&hw.iommu_fault_pending), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&srv.iommu_refresh_count), 0);
+
+	rk_mpp_hw_refresh_iommu(&hw, job0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&srv.iommu_refresh_count), 1);
+
+	hw.iommu_domain = NULL;
+	rk_mpp_hw_refresh_iommu(&hw, job0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&srv.iommu_refresh_count), 1);
 }
 
 static void rk_mpp_iommu_fault_match_kunit(struct kunit *test)
@@ -4646,6 +4669,20 @@ static bool rk_mpp_hw_prepare_active_retry(struct rk_mpp_hw *hw,
 	return active;
 }
 
+static void rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw,
+				    struct rk_mpp_job *job)
+{
+	struct rk_mpp_service *srv = job && job->session ?
+				     job->session->srv : NULL;
+
+	if (!hw->iommu_domain)
+		return;
+
+	iommu_flush_iotlb_all(hw->iommu_domain);
+	if (srv)
+		atomic_inc(&srv->iommu_refresh_count);
+}
+
 static struct rk_mpp_job *rk_mpp_hw_get_active_job(struct rk_mpp_hw *hw)
 {
 	struct rk_mpp_job *job;
@@ -4823,6 +4860,7 @@ static int rk_mpp_rkvdec2_prepare_ccu_retry_job(struct rk_mpp_job *job)
 
 	cancel_delayed_work(&hw->timeout_work);
 	rk_mpp_hw_reset_active(hw);
+	rk_mpp_hw_refresh_iommu(hw, job);
 
 out_unlock:
 	mutex_unlock(&hw->run_lock);
@@ -6980,6 +7018,9 @@ static int __init rk_mpp_init(void)
 	debugfs_create_atomic_t("iommu_fault_count", 0444,
 				rk_mpp_srv.debugfs_root,
 				&rk_mpp_srv.iommu_fault_count);
+	debugfs_create_atomic_t("iommu_refresh_count", 0444,
+				rk_mpp_srv.debugfs_root,
+				&rk_mpp_srv.iommu_refresh_count);
 
 	pr_info("registered /dev/mpp_service (%s), hw_support=0x%08x\n",
 		RK_MPP_REWRITE_VERSION, rk_mpp_srv.hw_support);
