@@ -142,6 +142,8 @@
 #define RK_RGA2_ROP_CTRL1_OFFSET		0x064
 #define RK_RGA2_CF_GR_G_OFFSET			0x060
 #define RK_RGA2_CF_GR_R_OFFSET			0x064
+#define RK_RGA2_DST_QUANTIZE_SCALE_OFFSET	0x060
+#define RK_RGA2_DST_QUANTIZE_OFFSET_OFFSET	0x064
 #define RK_RGA2_DST_CSC_00_OFFSET		0x060
 #define RK_RGA2_DST_CSC_01_OFFSET		0x064
 #define RK_RGA2_DST_CSC_02_OFFSET		0x068
@@ -191,6 +193,7 @@
 #define RK_RGA2_DST_FULL_CSC_EN		BIT(19)
 #define RK_RGA2_DST_YUV400_EN			BIT(24)
 #define RK_RGA2_DST_Y4_EN			BIT(25)
+#define RK_RGA2_DST_NN_QUANTIZE_EN		BIT(26)
 
 #define RK_RGA2_ALPHA_ROP_0			BIT(0)
 #define RK_RGA2_ALPHA_ROP_SEL			BIT(1)
@@ -202,6 +205,8 @@
 #define RK_RGA2_GAUSS_COE0			GENMASK(5, 0)
 #define RK_RGA2_GAUSS_COE1			GENMASK(13, 8)
 #define RK_RGA2_GAUSS_COE2			GENMASK(23, 16)
+
+#define RK_RGA2_NN_QUANTIZE_MASK		GENMASK(9, 0)
 
 #define RK_RGA_ROP_AND				0x88
 #define RK_RGA_ROP_OR				0xee
@@ -4155,8 +4160,13 @@ static bool rk_rga2_in_place_mosaic_allowed(const struct rga_req *task)
 
 static bool rk_rga2_task_uses_rop(const struct rga_req *task)
 {
-	return task->rop_code || task->alpha_rop_flag ||
+	return task->rop_code || (task->alpha_rop_flag & ~BIT(8)) ||
 	       task->alpha_rop_mode;
+}
+
+static bool rk_rga2_task_uses_quantize(const struct rga_req *task)
+{
+	return task->alpha_rop_flag & BIT(8);
 }
 
 static bool rk_rga2_rop_bitblt_allowed(const struct rga_req *task)
@@ -4247,6 +4257,54 @@ static bool rk_rga2_task_uses_gauss(const struct rga_req *task)
 	return task->gauss_config.size;
 }
 
+static int rk_rga2_validate_quantize_value(__s16 value, bool scale)
+{
+	if (scale && value < 0)
+		return -EINVAL;
+	if (value < -255 || value > 0x3ff)
+		return -EINVAL;
+
+	return 0;
+}
+
+static int rk_rga2_validate_quantize(const struct rga_req *task)
+{
+	if (!rk_rga2_task_uses_quantize(task))
+		return 0;
+	if (task->alpha_rop_flag != BIT(8))
+		return -EOPNOTSUPP;
+	if (task->PD_mode || task->feature.global_alpha_en ||
+	    task->rop_code || task->alpha_rop_mode)
+		return -EOPNOTSUPP;
+	if (task->src.format != task->dst.format)
+		return -EOPNOTSUPP;
+	if ((task->src.rd_mode && task->src.rd_mode != RK_RGA_RASTER_MODE) ||
+	    (task->dst.rd_mode && task->dst.rd_mode != RK_RGA_RASTER_MODE))
+		return -EOPNOTSUPP;
+	if (task->src.act_w != task->dst.act_w ||
+	    task->src.act_h != task->dst.act_h)
+		return -EOPNOTSUPP;
+	if (task->src.rotate_mode || task->dst.rotate_mode ||
+	    task->rotate_mode || task->sina || task->cosa)
+		return -EOPNOTSUPP;
+	if (task->interp.horiz || task->interp.verti)
+		return -EOPNOTSUPP;
+	if (task->yuv2rgb_mode || task->full_csc.flag)
+		return -EOPNOTSUPP;
+	if (task->mosaic_info.enable || task->osd_info.enable ||
+	    task->pre_intr_info.enable || task->gauss_config.size)
+		return -EOPNOTSUPP;
+	if (rk_rga2_validate_quantize_value(task->gr_color.gr_x_r, true) ||
+	    rk_rga2_validate_quantize_value(task->gr_color.gr_x_g, true) ||
+	    rk_rga2_validate_quantize_value(task->gr_color.gr_x_b, true) ||
+	    rk_rga2_validate_quantize_value(task->gr_color.gr_y_r, false) ||
+	    rk_rga2_validate_quantize_value(task->gr_color.gr_y_g, false) ||
+	    rk_rga2_validate_quantize_value(task->gr_color.gr_y_b, false))
+		return -EINVAL;
+
+	return 0;
+}
+
 static int rk_rga2_validate_gauss(const struct rga_req *task)
 {
 	if (!rk_rga2_task_uses_gauss(task))
@@ -4290,6 +4348,7 @@ static int rk_rga_job_hw_type(struct rk_rga_job *job,
 			      enum rk_rga_hw_type *type);
 static int rk_rga2_emit_simple_bitblt(struct rk_rga_job *job);
 static int rk_rga2_emit_color_fill(struct rk_rga_job *job);
+static u32 rk_rga2_pack_nn_quantize(__s16 r, __s16 g, __s16 b);
 static int rk_rga3_emit_simple_bitblt(struct rk_rga_job *job);
 static int rk_rga_request_check(const struct rga_user_request *user);
 static int rk_rga_request_ioctl_ret(int ret);
@@ -4845,6 +4904,63 @@ static void rk_rga2_gauss_emit_kunit(struct kunit *test)
 	task.gauss_config.size = 5;
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), -EINVAL);
+}
+
+static void rk_rga2_quantize_emit_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA2_CMD_REG_COUNT] = { };
+	enum rk_rga_hw_type type = 0;
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_RGBA_8888);
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 2,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+	u32 expected_scale;
+	u32 expected_offset;
+
+	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
+				    1280, 720);
+	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_RGBA_8888,
+				    1280, 720);
+	task.yuv2rgb_mode = 0;
+	task.alpha_rop_flag = BIT(8);
+	task.gr_color.gr_x_r = 0x100;
+	task.gr_color.gr_x_g = 0x080;
+	task.gr_color.gr_x_b = 0x3ff;
+	task.gr_color.gr_y_r = -1;
+	task.gr_color.gr_y_g = 0x020;
+	task.gr_color.gr_y_b = 0x100;
+	expected_scale = rk_rga2_pack_nn_quantize(0x100, 0x080, 0x3ff);
+	expected_offset = rk_rga2_pack_nn_quantize(-1, 0x020, 0x100);
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA2_DST_INFO_OFFSET / 4] &
+			  RK_RGA2_DST_NN_QUANTIZE_EN);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_QUANTIZE_SCALE_OFFSET / 4],
+			expected_scale);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_QUANTIZE_OFFSET_OFFSET / 4],
+			expected_offset);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_ALPHA_CTRL0_OFFSET / 4], 0U);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_ALPHA_CTRL1_OFFSET / 4], 0U);
+
+	memset(cmd, 0, sizeof(cmd));
+	job.cmd_ready = false;
+	task.gr_color.gr_x_g = 0x400;
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), -EINVAL);
+	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+
+	task.gr_color.gr_x_g = 0x080;
+	task.alpha_rop_flag = BIT(8) | BIT(0);
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job),
+			-EOPNOTSUPP);
 }
 
 static void rk_rga_request_check_kunit(struct kunit *test)
@@ -5742,6 +5858,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga2_mosaic_emit_kunit),
 	KUNIT_CASE(rk_rga2_rop_emit_kunit),
 	KUNIT_CASE(rk_rga2_gauss_emit_kunit),
+	KUNIT_CASE(rk_rga2_quantize_emit_kunit),
 	KUNIT_CASE(rk_rga_request_check_kunit),
 	KUNIT_CASE(rk_rga_request_ioctl_ret_kunit),
 	KUNIT_CASE(rk_rga_job_free_release_fence_kunit),
@@ -5867,6 +5984,7 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 {
 	struct rga_img_info_t dst;
 	bool uses_rop = rk_rga2_task_uses_rop(task);
+	bool uses_quantize = rk_rga2_task_uses_quantize(task);
 	bool uses_gauss = rk_rga2_task_uses_gauss(task);
 	int ret;
 
@@ -5886,7 +6004,11 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 	} else if (!rk_rga_in_place_bitblt_allowed(task)) {
 		return -EOPNOTSUPP;
 	}
-	if (uses_rop) {
+	if (uses_quantize) {
+		ret = rk_rga2_validate_quantize(task);
+		if (ret)
+			return ret;
+	} else if (uses_rop) {
 		ret = rk_rga2_validate_rop(task);
 		if (ret)
 			return ret;
@@ -5958,6 +6080,11 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 	     profile->src_fmt.yuv10 || profile->dst_fmt.yuv ||
 	     profile->dst_fmt.yuv400 || profile->dst_fmt.yuv10))
 		return -EOPNOTSUPP;
+	if (uses_quantize &&
+	    (profile->src_fmt.yuv || profile->src_fmt.yuv400 ||
+	     profile->src_fmt.yuv10 || profile->dst_fmt.yuv ||
+	     profile->dst_fmt.yuv400 || profile->dst_fmt.yuv10))
+		return -EOPNOTSUPP;
 
 	return 0;
 }
@@ -5979,6 +6106,8 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 	if (task->full_csc.flag || task->mosaic_info.enable ||
 	    task->osd_info.enable || task->pre_intr_info.enable ||
 	    task->gauss_config.size)
+		return -EOPNOTSUPP;
+	if (task->alpha_rop_flag & BIT(8))
 		return -EOPNOTSUPP;
 
 	ret = rk_rga3_validate_alpha_blend(task);
@@ -6897,6 +7026,8 @@ static int rk_rga2_emit_dst(struct rk_rga_job *job,
 		dst_info |= RK_RGA2_DST_FULL_CSC_EN;
 	if (dst_fmt->yuv400)
 		dst_info |= RK_RGA2_DST_YUV400_EN;
+	if (rk_rga2_task_uses_quantize(task))
+		dst_info |= RK_RGA2_DST_NN_QUANTIZE_EN;
 
 	rk_rga_cmd_write(job, RK_RGA2_DST_INFO_OFFSET, dst_info);
 	rk_rga_cmd_write(job, RK_RGA2_DST_BASE0_OFFSET, lower_32_bits(y_addr));
@@ -6919,10 +7050,19 @@ static int rk_rga2_emit_dst(struct rk_rga_job *job,
 	return 0;
 }
 
+static u32 rk_rga2_pack_nn_quantize(__s16 r, __s16 g, __s16 b)
+{
+	return ((u32)r & RK_RGA2_NN_QUANTIZE_MASK) |
+	       (((u32)g & RK_RGA2_NN_QUANTIZE_MASK) << 10) |
+	       (((u32)b & RK_RGA2_NN_QUANTIZE_MASK) << 20);
+}
+
 static int rk_rga2_emit_simple_bitblt(struct rk_rga_job *job)
 {
 	struct rga_req *task = &job->tasks[job->current_task];
 	struct rk_rga2_bitblt_profile profile;
+	u32 quant_offset;
+	u32 quant_scale;
 	u32 rop_ctrl;
 	int ret;
 
@@ -6983,6 +7123,18 @@ static int rk_rga2_emit_simple_bitblt(struct rk_rga_job *job)
 			return -EINVAL;
 		rk_rga_cmd_write(job, RK_RGA2_GAUSS_COE_OFFSET,
 				 job->gauss_coeffs[job->current_task]);
+	}
+	if (rk_rga2_task_uses_quantize(task)) {
+		quant_scale = rk_rga2_pack_nn_quantize(task->gr_color.gr_x_r,
+						       task->gr_color.gr_x_g,
+						       task->gr_color.gr_x_b);
+		quant_offset = rk_rga2_pack_nn_quantize(task->gr_color.gr_y_r,
+							task->gr_color.gr_y_g,
+							task->gr_color.gr_y_b);
+		rk_rga_cmd_write(job, RK_RGA2_DST_QUANTIZE_SCALE_OFFSET,
+				 quant_scale);
+		rk_rga_cmd_write(job, RK_RGA2_DST_QUANTIZE_OFFSET_OFFSET,
+				 quant_offset);
 	}
 
 	job->cmd_ready = true;
