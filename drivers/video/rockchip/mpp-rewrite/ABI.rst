@@ -117,9 +117,11 @@ Implemented
   decoder jobs reserve one node from a per-core bitmap, stage the BSP
   write/readback register partitions into that job-owned table node, hold a
   counted reference to the referenced CCU coordinator, and release both on
-  completion or abort.  The readback helper copies BSP table readback partitions
-  back into the normal register image and applies the VDPU383 link-mode status
-  word.
+  completion or abort.  Jobs also record the BSP-shaped hard-CCU submit
+  descriptor values: core-work mask, table address, link-mode word,
+  autogate/work/cfg-done bits, and the link IRQ CCU-mode bit.  The readback
+  helper copies BSP table readback partitions back into the normal register
+  image and applies the VDPU383 link-mode status word.
 * ``MPP_CMD_POLL_HW_IRQ`` for RK3588 RKVENC2 encoder slice result streaming.
   The rewrite advertises the forward-port ``POLL_BUTT`` command boundary,
   detects slice mode from the submitted RKVENC2 register image
@@ -143,8 +145,8 @@ Implemented
   boundary queries, fixed-width V1/``mpp_bat_msg`` ABI layout, V1-to-native
   request conversion, payload-copy classification, register-span overflow
   checks, BSP VDPU383 link-table layout/materialization/readback/ownership,
-  CCU-reference lifetime, ``POLL_HW_IRQ`` flexible-buffer sizing, and RKVENC2
-  slice-mode detection.
+  CCU-reference lifetime, hard-CCU descriptor values, ``POLL_HW_IRQ``
+  flexible-buffer sizing, and RKVENC2 slice-mode detection.
 
 Recognized But Unsupported
 --------------------------
