@@ -2410,7 +2410,7 @@ static void rk_rga_job_set_acquire_result(struct rk_rga_job *job, int result)
 static void rk_rga_job_queue_acquire_work(struct rk_rga_job *job)
 {
 	if (atomic_cmpxchg(&job->acquire_work_queued, 0, 1) == 0)
-		queue_work(system_wq, &job->acquire_work);
+		queue_work(system_highpri_wq, &job->acquire_work);
 }
 
 static void rk_rga_job_acquire_cb(struct dma_fence *fence,
