@@ -135,27 +135,31 @@ Implemented
   node is staged or released, so the tail points at an unused node and earlier
   active tables point at the next active table, matching the BSP add-mode queue
   invariant.  Jobs also record BSP-shaped hard-CCU submit descriptor values for
-  the selected core: core-work mask, table address, link-mode word,
+  all online cores behind the selected coordinator: core-work mask, table
+  address, link-mode word,
   autogate/work/cfg-done bits, and the link IRQ CCU-mode bit.  When the CCU is
-  idle, the rewrite can start that job through the hard-CCU config path, track
-  the started job on the coordinator's running list, relink that list as a
-  coordinator-wide table chain, scan it on completion, and copy BSP table
-  readback partitions back into the normal register image with the VDPU383
-  link-mode status word from the table interrupt-status word.  Hard-CCU
-  register start/stop writes are serialized on the coordinator, and completion
-  releases stop CCU work only after the coordinator running list drains.  If
-  the CCU is already active and the rewrite has a tracked coordinator chain,
-  additional jobs are appended with the BSP ``ADD_MODE`` link-mode bit; if the
-  hardware is busy without tracked jobs, the job keeps the direct link-MMIO
-  fallback.  Completion matching for the selected active job checks that job's
-  own CCU table, even if an earlier listed table has already finished.  After
-  completing the IRQ core's own job, the thread scans the same coordinator for
-  other table-complete jobs and completes them only when it can claim the exact
-  active job from that job's owning core; busy cores are left for their own IRQ
-  or timeout path.  If a hard-CCU completion table reports a VDPU383 error bit,
-  the rewrite preserves the readback status for userspace but force-stops and
-  resets the coordinator, resets the reporting core, and aborts other active
-  dependent cores to contain the failed chain.
+  idle, the rewrite powers the selected core's online peer decoder cores,
+  programs each powered core's link window for CCU-work mode, mirrors the BSP
+  fixed-RCB setup by writing the device-tree ``rockchip,rcb-info`` register
+  layout once per core and setting the fixed-RCB link latch, starts that job
+  through the hard-CCU config path, tracks the started job on the coordinator's
+  running list, relinks that list as a coordinator-wide table chain, scans it on
+  completion, and copies BSP table readback partitions back into the normal
+  register image with the VDPU383 link-mode status word from the table
+  interrupt-status word.  Hard-CCU register start/stop writes are serialized on
+  the coordinator, and completion releases stop CCU work only after the
+  coordinator running list drains.  If the CCU is already active and the rewrite
+  has a tracked coordinator chain, additional jobs are appended with the BSP
+  ``ADD_MODE`` link-mode bit; if the hardware is busy without tracked jobs, the
+  job keeps the direct link-MMIO fallback.  Completion matching for the selected
+  active job checks that job's own CCU table, even if an earlier listed table
+  has already finished.  After completing the IRQ core's own job, the thread
+  scans the same coordinator for other table-complete jobs and completes them
+  only when it can claim the exact active job from that job's owning core; busy
+  cores are left for their own IRQ or timeout path.  If a hard-CCU completion
+  table reports a VDPU383 error bit, the rewrite preserves the readback status
+  for userspace but force-stops and resets the coordinator, resets the reporting
+  core, and aborts other active dependent cores to contain the failed chain.
 * ``MPP_CMD_POLL_HW_IRQ`` for RK3588 RKVENC2 encoder slice result streaming.
   The rewrite advertises the forward-port ``POLL_BUTT`` command boundary,
   detects slice mode from the submitted RKVENC2 register image
@@ -184,8 +188,9 @@ Implemented
   hard-CCU running-list table-chain relinking/scanning/active matching and
   active-job out-of-order matching/drain detection, cross-core CCU completion
   claiming, hard-CCU table-status readback, hard-CCU idle/add-mode descriptor
-  values, IOMMU fault target matching, RKVENC2 DCHS tx/rx id remapping and
-  release, ``POLL_HW_IRQ`` flexible-buffer sizing, and RKVENC2 slice-mode
+  values, hard-CCU all-core work-mask selection, fixed-RCB link-latch
+  programming, IOMMU fault target matching, RKVENC2 DCHS tx/rx id remapping
+  and release, ``POLL_HW_IRQ`` flexible-buffer sizing, and RKVENC2 slice-mode
   detection.
 
 Recognized But Unsupported
@@ -197,17 +202,13 @@ Recognized But Unsupported
 Outside This Slice
 ------------------
 
-* Full BSP-equivalent RK3588 decoder/link CCU task policy and SRAM-backed
-  fixed-IOVA RCB optimization.  The rewrite requires the referenced CCU
-  coordinator to be bound and online, has least-loaded core selection, queued
-  dispatch, RKVENC2 DCHS hand-shake remapping, RKVDEC2 CCU-mode task register
-  preparation, VDPU383 link-window direct start/IRQ handling, job-owned
-  link-table materialization/readback helpers, hard-CCU submit/add-mode append,
-  coordinator running-list tracking, cross-core completion drain, and
-  coordinator timeout/error containment.
 * Full BSP-equivalent timeout recovery policy beyond immediate reset/abort,
   including hard-CCU reset/resend of still-running decoder tasks after
   recoverable faults and MMU-domain refresh.
-* Fence export/import semantics.
+* MPP fence export/import semantics.  The observed RK3588 MPP UAPI in
+  ``include/uapi/linux/rk-mpp.h`` exposes no fence command or fence flags, and
+  the BSP-derived 6.18 driver does not provide a sync-file fence path in the
+  checked MPP service sources; this remains a future compatibility item only if
+  current userspace evidence appears.
 * ``MPP_IOC_CFG_V2``; the BSP-derived 6.18 driver also rejects this in the
   observed path.
