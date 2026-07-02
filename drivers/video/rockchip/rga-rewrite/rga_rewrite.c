@@ -8169,11 +8169,31 @@ static void rk_rga3_dst_offset_emit_kunit(struct kunit *test)
 			lower_32_bits(task.dst.uv_addr +
 				      4 * uv_stride_bytes + 64 * 2));
 
+	memset(cmd, 0, sizeof(cmd));
 	task.dst.compact_mode = 0;
+	task.dst.is_10b_endian = 0;
 	job.cmd_ready = false;
 	type = 0;
-	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
-			-EOPNOTSUPP);
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WR_CTRL_OFFSET / 4] &
+			  RK_RGA3_WR_YUV10_COMPACT);
+	KUNIT_EXPECT_FALSE(test, cmd[RK_RGA3_WR_CTRL_OFFSET / 4] &
+			   RK_RGA3_WR_ENDIAN_MODE);
+
+	y_stride_bytes = cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4] << 2;
+	uv_stride_bytes = cmd[RK_RGA3_WR_PL_VIR_STRIDE_OFFSET / 4] << 2;
+	KUNIT_EXPECT_EQ(test, y_stride_bytes, 1280U);
+	KUNIT_EXPECT_EQ(test, uv_stride_bytes, 1280U);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_Y_BASE_OFFSET / 4],
+			lower_32_bits(task.dst.yrgb_addr +
+				      8 * y_stride_bytes + 64));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_U_BASE_OFFSET / 4],
+			lower_32_bits(task.dst.uv_addr +
+				      4 * uv_stride_bytes + 64));
 }
 
 static void rk_rga3_ffmpeg_p210_emit_kunit(struct kunit *test)
@@ -8825,10 +8845,6 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 		return -EOPNOTSUPP;
 	if (profile->dst_mode == 2 &&
 	    !rk_rga3_tile_format_supported(task->dst.format))
-		return -EOPNOTSUPP;
-	if (profile->dst_fmt.yuv10 &&
-	    (task->dst.x_offset || task->dst.y_offset) &&
-	    rk_rga_img_yuv10_compact(&task->dst))
 		return -EOPNOTSUPP;
 	if (profile->color_key &&
 	    (profile->src_mode || profile->dst_mode ||
