@@ -62,6 +62,7 @@
 #define RK_MPP_RKVENC_MAX_SLICE_FIFO	256
 #define RK_MPP_RKVENC_MAX_DCHS_CORES	4
 #define RK_MPP_RKVENC_MAX_DCHS_ID	4
+#define RK_MPP_RKVDEC_MAX_CCU_CORES	4
 #define RK_MPP_RKVDEC_PERF_SEL_NUM	64
 #define RK_MPP_RKVDEC_LINK_REGION	1
 #define RK_MPP_RKVDEC_LINK_NODE_ALIGN	256
@@ -350,6 +351,8 @@ struct rk_mpp_job {
 	u32 rkvdec_ccu_cfg_done;
 	u32 rkvdec_link_irq_mode;
 	u32 rkvenc_dchs_core_id;
+	struct rk_mpp_hw *rkvdec_ccu_powered_cores[RK_MPP_RKVDEC_MAX_CCU_CORES];
+	u32 rkvdec_ccu_powered_core_count;
 	bool poll_irq;
 	bool canceled;
 	bool rkvdec_link_active;
@@ -1504,6 +1507,74 @@ static void rk_mpp_hw_power_off(struct rk_mpp_hw *hw);
 static void rk_mpp_job_get(struct rk_mpp_job *job);
 static void rk_mpp_job_put(struct rk_mpp_job *job);
 
+static void rk_mpp_rkvdec2_power_off_ccu_cores(struct rk_mpp_job *job)
+{
+	u32 i;
+
+	for (i = 0; i < job->rkvdec_ccu_powered_core_count; i++) {
+		struct rk_mpp_hw *hw = job->rkvdec_ccu_powered_cores[i];
+
+		rk_mpp_hw_power_off(hw);
+		rk_mpp_hw_put(hw);
+		job->rkvdec_ccu_powered_cores[i] = NULL;
+	}
+	job->rkvdec_ccu_powered_core_count = 0;
+}
+
+static int rk_mpp_rkvdec2_power_on_ccu_cores(struct rk_mpp_job *job)
+{
+	struct rk_mpp_hw *cores[RK_MPP_RKVDEC_MAX_CCU_CORES];
+	struct rk_mpp_service *srv = job->session->srv;
+	struct rk_mpp_hw *ccu = job->rkvdec_ccu;
+	struct rk_mpp_hw *hw;
+	u32 count = 0;
+	u32 i;
+	int ret;
+
+	if (!srv || !ccu || !ccu->dev)
+		return 0;
+
+	mutex_lock(&srv->hw_lock);
+	list_for_each_entry(hw, &srv->hw_list, link) {
+		if (!hw->online || hw == job->hw ||
+		    hw->ccu_node != ccu->dev->of_node)
+			continue;
+		if (count >= ARRAY_SIZE(cores)) {
+			ret = -EOPNOTSUPP;
+			goto err_put_locked;
+		}
+		rk_mpp_hw_get(hw);
+		cores[count++] = hw;
+	}
+	mutex_unlock(&srv->hw_lock);
+
+	for (i = 0; i < count; i++) {
+		ret = rk_mpp_hw_power_on(cores[i]);
+		if (ret)
+			goto err_power_off;
+		job->rkvdec_ccu_powered_cores[i] = cores[i];
+		job->rkvdec_ccu_powered_core_count++;
+	}
+
+	return 0;
+
+err_power_off:
+	while (i--) {
+		rk_mpp_hw_power_off(cores[i]);
+		rk_mpp_hw_put(cores[i]);
+	}
+	for (i = job->rkvdec_ccu_powered_core_count; i < count; i++)
+		rk_mpp_hw_put(cores[i]);
+	job->rkvdec_ccu_powered_core_count = 0;
+	return ret;
+
+err_put_locked:
+	while (count--)
+		rk_mpp_hw_put(cores[count]);
+	mutex_unlock(&srv->hw_lock);
+	return ret;
+}
+
 static dma_addr_t rk_mpp_rkvdec2_next_unused_link_iova(struct rk_mpp_hw *hw)
 {
 	unsigned long index;
@@ -1722,6 +1793,7 @@ static void rk_mpp_rkvdec2_release_link_table(struct rk_mpp_job *job)
 
 	if (job->rkvdec_ccu_powered && ccu)
 		rk_mpp_hw_power_off(ccu);
+	rk_mpp_rkvdec2_power_off_ccu_cores(job);
 
 	if (job->rkvdec_link_active && hw && hw->rkvdec_link_used) {
 		spin_lock_irqsave(&hw->lock, flags);
@@ -4019,6 +4091,7 @@ static void rk_mpp_hw_abort_job(struct rk_mpp_job *job)
 		rk_mpp_rkvenc2_dchs_release(job);
 		rk_mpp_hw_reset_active(hw);
 		rk_mpp_hw_power_off(hw);
+		rk_mpp_rkvdec2_power_off_ccu_cores(job);
 	}
 	mutex_unlock(&hw->run_lock);
 }
@@ -4078,6 +4151,10 @@ static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
 	}
 
 	if (!add_mode) {
+		ret = rk_mpp_rkvdec2_power_on_ccu_cores(job);
+		if (ret)
+			goto err_unlock_ccu;
+
 		writel_relaxed(job->rkvdec_ccu_core_work,
 			       ccu_regs + RK_MPP_RKVDEC_CCU_CORE_WORK_BASE);
 		writel_relaxed(job->rkvdec_ccu_ctrl,
@@ -4104,6 +4181,7 @@ static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
 err_unlock_ccu:
 	mutex_unlock(&ccu->run_lock);
 err_power_off:
+	rk_mpp_rkvdec2_power_off_ccu_cores(job);
 	rk_mpp_hw_power_off(ccu);
 	job->rkvdec_ccu_powered = false;
 	return ret;
@@ -4144,6 +4222,7 @@ static void rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu)
 		if (ccu_error)
 			rk_mpp_hw_reset_active(hw);
 		rk_mpp_hw_power_off(hw);
+		rk_mpp_rkvdec2_power_off_ccu_cores(job);
 		rk_mpp_job_complete(job, ret);
 		mutex_unlock(&hw->run_lock);
 		rk_mpp_job_put(job);
@@ -4194,6 +4273,7 @@ static void rk_mpp_hw_timeout_work(struct work_struct *work)
 
 	rk_mpp_hw_reset_active(hw);
 	rk_mpp_hw_power_off(hw);
+	rk_mpp_rkvdec2_power_off_ccu_cores(job);
 	rk_mpp_job_complete(job, result);
 	mutex_unlock(&hw->run_lock);
 	rk_mpp_job_put(job);
@@ -4217,6 +4297,7 @@ static void rk_mpp_hw_abort_active(struct rk_mpp_hw *hw, int result)
 
 	rk_mpp_hw_reset_active(hw);
 	rk_mpp_hw_power_off(hw);
+	rk_mpp_rkvdec2_power_off_ccu_cores(job);
 	rk_mpp_job_complete(job, result);
 	mutex_unlock(&hw->run_lock);
 	rk_mpp_job_put(job);
@@ -5149,6 +5230,7 @@ static irqreturn_t rk_mpp_rkvdec2_thread(struct rk_mpp_hw *hw)
 		rk_mpp_hw_reset_active(hw);
 	}
 	rk_mpp_hw_power_off(hw);
+	rk_mpp_rkvdec2_power_off_ccu_cores(job);
 	rk_mpp_job_complete(job, ret);
 	mutex_unlock(&hw->run_lock);
 	rk_mpp_job_put(job);
