@@ -100,10 +100,11 @@ Implemented
   the job returns ``-ETIMEDOUT``.  For hard-CCU RKVDEC2 jobs, timeout recovery
   first force-stops and resets the coordinator, preserves table-complete jobs
   that raced the timeout by reading back their CCU link tables, then relinks
-  and resends unfinished active dependent jobs through the coordinator.  If an
-  unfinished job can no longer be matched to its active core slot, recovery
-  falls back to opportunistically aborting unfinished active dependent cores
-  without waiting on possibly running timeout workers.
+  unfinished tables, resets matched active dependent cores, and resends those
+  jobs through the coordinator.  If an unfinished job can no longer be matched
+  to its active core slot, recovery falls back to opportunistically aborting
+  unfinished active dependent cores without waiting on possibly running timeout
+  workers.
 * Public IOMMU fault callback registration for bound MPP cores.  A fault
   records ``iommu_fault_count`` in debugfs, logs the IOVA/status, marks the
   active job for immediate recovery through the same serialized reset path,
@@ -166,9 +167,10 @@ Implemented
   table reports a VDPU383 error bit, the rewrite preserves the readback status
   for userspace but force-stops and resets the coordinator, resets the reporting
   core, drains any other table-complete jobs it can claim, relinks unfinished
-  tables, and resends active dependent cores that can still be matched to their
-  owning hardware slots.  If resend cannot safely restart every unfinished job,
-  recovery aborts the remaining active dependents to contain the failed chain.
+  tables, resets active dependent cores that can still be matched to their
+  owning hardware slots, and resends them.  If resend cannot safely restart
+  every unfinished job, recovery aborts the remaining active dependents to
+  contain the failed chain.
 * ``MPP_CMD_POLL_HW_IRQ`` for RK3588 RKVENC2 encoder slice result streaming.
   The rewrite advertises the forward-port ``POLL_BUTT`` command boundary,
   detects slice mode from the submitted RKVENC2 register image
@@ -198,7 +200,8 @@ Implemented
   active-job out-of-order matching/drain detection, hard-CCU done-table
   detection, peer-core power ownership transfer, unfinished-chain relinking for
   hard-CCU resend preparation, unfinished-job collection for hard-CCU resend,
-  cross-core CCU completion claiming, hard-CCU table-status readback,
+  active-slot retry preservation, cross-core CCU completion claiming,
+  hard-CCU table-status readback,
   hard-CCU idle/add-mode descriptor values, hard-CCU all-core work-mask
   selection, fixed-RCB link-latch
   programming, IOMMU fault target matching, RKVENC2 DCHS tx/rx id remapping
