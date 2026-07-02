@@ -309,7 +309,8 @@ Implemented
   decoder, transformed destination-corner selection, color-fill core-mask
   dispatch, BSP request task-count limits and return codes, mixed RGA2/RGA3
   multi-task classification with per-task core-mask forcing, request-id removal
-  on terminal submit, RGA2 fill RGB/YUV destination-offset emission,
+  on terminal submit, ``librga`` virtual-address import sizing and physical
+  import rejection, RGA2 fill RGB/YUV destination-offset emission,
   YUV-fill chroma-alignment rejection, multi-fill task acceptance, and
   ``librga`` rectangle-task serial fill command emission, compact 10-bit RGA2
   source dispatch/emission including the no-scale force-tile mode, RGA2
@@ -354,7 +355,7 @@ Recognized But Unsupported
   the normal RGB ``imcolorkey`` profile, converted no-pattern or mixed-depth
   8/10-bit YUV-destination alpha, per-channel rotation,
   RFBC/AFBC32x8, tile outside simple bitblits, compact 10-bit or AFBC
-  destination offsets, virtual/physical-address, and non-bitblit operation
+  destination offsets, physical-address channels, and non-bitblit operation
   modes.
 Unsupported submit profiles return ``-EOPNOTSUPP`` after copying, validating,
 preparing, queuing, dispatching, resolving imported buffers, allocating an owned
