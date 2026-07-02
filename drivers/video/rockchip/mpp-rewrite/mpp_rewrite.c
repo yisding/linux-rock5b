@@ -1520,6 +1520,32 @@ static void rk_mpp_rkvdec2_link_table_list_add(struct rk_mpp_job *job)
 	spin_unlock_irqrestore(&hw->lock, flags);
 }
 
+static void rk_mpp_rkvdec2_ccu_relink_tables_locked(struct rk_mpp_hw *ccu)
+{
+	const struct rk_mpp_rkvdec2_link_info *info =
+		&rk_mpp_rkvdec2_vdpu383_link_info;
+	struct rk_mpp_job *job;
+
+	list_for_each_entry(job, &ccu->rkvdec_ccu_jobs, rkvdec_ccu_node) {
+		struct rk_mpp_job *next;
+		dma_addr_t next_iova;
+		u32 *table = job->rkvdec_link_vaddr;
+
+		if (!table)
+			continue;
+
+		if (list_is_last(&job->rkvdec_ccu_node,
+				 &ccu->rkvdec_ccu_jobs)) {
+			next_iova = rk_mpp_rkvdec2_next_unused_link_iova(job->hw);
+		} else {
+			next = list_next_entry(job, rkvdec_ccu_node);
+			next_iova = next->rkvdec_link_iova;
+		}
+
+		table[info->next_word] = lower_32_bits(next_iova);
+	}
+}
+
 static void rk_mpp_rkvdec2_ccu_job_add(struct rk_mpp_job *job)
 {
 	struct rk_mpp_hw *ccu = job->rkvdec_ccu;
@@ -1531,6 +1557,7 @@ static void rk_mpp_rkvdec2_ccu_job_add(struct rk_mpp_job *job)
 	spin_lock_irqsave(&ccu->lock, flags);
 	list_add_tail(&job->rkvdec_ccu_node, &ccu->rkvdec_ccu_jobs);
 	job->rkvdec_ccu_listed = true;
+	rk_mpp_rkvdec2_ccu_relink_tables_locked(ccu);
 	spin_unlock_irqrestore(&ccu->lock, flags);
 }
 
@@ -1547,6 +1574,8 @@ rk_mpp_rkvdec2_ccu_job_del(struct rk_mpp_job *job, struct rk_mpp_hw *ccu)
 	list_del_init(&job->rkvdec_ccu_node);
 	job->rkvdec_ccu_listed = false;
 	empty = list_empty(&ccu->rkvdec_ccu_jobs);
+	if (!empty)
+		rk_mpp_rkvdec2_ccu_relink_tables_locked(ccu);
 	spin_unlock_irqrestore(&ccu->lock, flags);
 
 	return empty;
@@ -2253,13 +2282,18 @@ static void rk_mpp_rkvdec2_ccu_running_list_kunit(struct kunit *test)
 	refcount_set(&job1->refs, 1);
 	job0->rkvdec_ccu = ccu;
 	job0->rkvdec_link_vaddr = table0;
+	job0->rkvdec_link_iova = 0x1000;
 	job1->rkvdec_ccu = ccu;
 	job1->rkvdec_link_vaddr = table1;
+	job1->rkvdec_link_iova = 0x2000;
 
 	rk_mpp_rkvdec2_ccu_job_add(job0);
+	KUNIT_EXPECT_EQ(test, table0[info->next_word], 0U);
 	rk_mpp_rkvdec2_ccu_job_add(job1);
 	KUNIT_EXPECT_TRUE(test, job0->rkvdec_ccu_listed);
 	KUNIT_EXPECT_TRUE(test, job1->rkvdec_ccu_listed);
+	KUNIT_EXPECT_EQ(test, table0[info->next_word], 0x2000U);
+	KUNIT_EXPECT_EQ(test, table1[info->next_word], 0U);
 	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_rkvdec2_ccu_first_done_job(ccu),
 			    NULL);
 
@@ -2278,6 +2312,7 @@ static void rk_mpp_rkvdec2_ccu_running_list_kunit(struct kunit *test)
 
 	KUNIT_EXPECT_FALSE(test, rk_mpp_rkvdec2_ccu_job_del(job1, ccu));
 	KUNIT_EXPECT_FALSE(test, job1->rkvdec_ccu_listed);
+	KUNIT_EXPECT_EQ(test, table0[info->next_word], 0U);
 	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_rkvdec2_ccu_first_done_job(ccu),
 			    NULL);
 
