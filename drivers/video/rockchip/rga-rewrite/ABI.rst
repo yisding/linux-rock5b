@@ -223,11 +223,23 @@ Implemented
   accepts separate raster RGB source/destination images plus an RGBA/BGRA/ARGB/
   ABGR5551 pattern image, the BSP-normalized ``DST_OVER | PRE_MUL`` alpha flag
   encoding, and the two alpha values carried by ``rgba5551_alpha``.  It programs
-  RGA2 SRC1 format/address state, the A1555 alpha remap enable, alpha0/alpha1
-  color registers, and the BSP-compatible alpha control registers.  Other
-  Porter-Duff modes, scaling, conversion, rotation, YUV/FBC, in-place,
+  RGA2 SRC1 format/address/stride state, the A1555 alpha remap enable,
+  alpha0/alpha1 color registers, the BSP bitblt-mode selection for SRC1, and
+  the BSP-compatible alpha control registers.  Other Porter-Duff modes,
+  scaling, conversion, rotation, YUV/FBC, in-place,
   non-5551 pattern, OSD, gauss, ROP, and mixed-feature alpha-bitmap variants
   remain unsupported.
+* RGA2 OSD alpha overlay for the current ``librga`` ``imosd`` and
+  ``rga_alpha_osd_demo`` path.  The rewrite accepts the BSP shape emitted by
+  userspace: same-buffer, same-rectangle RGB background source/destination,
+  RGBA-family raster OSD image in SRC1, ``DST_OVER`` alpha controls, normal
+  fixed-width OSD blocks, and the auto-invert/flag fields copied from
+  ``im_osd_t``.  It programs SRC1 address/stride, the RGA2 bitblt-mode and OSD
+  mode bits, BSP-compatible OSD control/flag/calibration registers, and the
+  OSD-specific alpha premultiplication policy.  Scaled/rotated/converted, YUV,
+  FBC/tile, RGBA2BPP/external-color, non-fixed-width, non-``DST_OVER``,
+  ROP/color-key, mosaic, gauss, and mixed-feature OSD variants remain
+  unsupported.
 * RGA2 color palette for the current ``librga`` ``impalette`` sample path.
   The rewrite accepts the BSP two-command sequence emitted by userspace: first
   ``UPDATE_PALETTE_TABLE`` with the 16x16 RGBA8888 LUT image, then
@@ -254,7 +266,8 @@ Implemented
   RGA2 in-place RGB mosaic dispatch/emission, RGA2 RGB ROP dispatch/emission,
   RGA2 RGB gauss coefficient lifetime and command emission, RGA2 RGB NN
   quantize dispatch/emission, RGA2 RGB alpha-bitmap SRC1/alpha emission,
-  RGA2 palette update and color-palette command emission,
+  RGA2 OSD SRC1/alpha/control emission, RGA2 palette update and color-palette
+  command emission,
   ffmpeg-facing RGA2 RFBC64x4 source profile selection and FBCIN command
   emission, IOMMU fault target matching, scheduler priority enqueue/aging,
   RGA3 normal RGB color-key dispatch/emission and inverted-mode rejection,
