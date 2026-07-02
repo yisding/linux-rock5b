@@ -271,6 +271,9 @@ Implemented
   profile; tasks run serially under the request's single completion/fence.
   Mixed RGA2/RGA3 batches validate the complete request up front, then select
   an eligible backend for each task as it reaches the head of the serial batch.
+  The current ``librga`` copy-splice task shape, two RGBA source tiles written
+  into left/right rectangles of one larger RGBA destination, is covered by the
+  RGA3 no-blend bitblit path and preserves each task's destination offset.
   The RGA3 no-blend emitted command includes overlap field and
   alpha/default-global-alpha controls.
 * Legacy ``RGA_CACHE_FLUSH``, ``RGA_FLUSH``, ``RGA_GET_RESULT``, and
@@ -292,6 +295,7 @@ Implemented
   profile selection and FBCIN command emission, IOMMU fault target matching,
   post-reset IOMMU refresh accounting, scheduler priority enqueue/aging,
   RGA3 normal RGB color-key dispatch/emission and inverted-mode rejection,
+  RGA3 ``librga`` copy-splice multi-task destination-offset emission,
   RGA3 tile8x8 profile selection and stride emission, RGA3 pattern-backed
   8-bit ``librga`` alpha-YUV overlay emission, ``librga`` global-alpha
   register emission, 10-bit YUV alpha-overlay emission, and
