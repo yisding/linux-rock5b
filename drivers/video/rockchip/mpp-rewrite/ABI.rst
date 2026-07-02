@@ -103,6 +103,12 @@ Implemented
   64-word logical side buffer, programs the selector register, reads the three
   selector-value registers, and copies results back through the normal
   readback path without treating the selector window as real MMIO.
+* RK3588 VDPU383/RKVDEC2 link-MMIO direct start and IRQ handling.  Decoder
+  cores with a validated ``link`` MMIO window follow the BSP VDPU383 start path:
+  program link timeout/IP-enable registers, clear stale link IRQ/status
+  latches, start through the link enable register, and complete from the
+  link IRQ/status registers.  Cores without that window retain the direct
+  decoder start-register fallback.
 * RK3588 RKVDEC2 CCU-mode task register preparation for cores that declare a
   ``rockchip,ccu`` phandle.  The rewrite patches the BSP session/film index,
   disables the multicore PU/COLMV offset timeout reset bit, and writes the same
@@ -144,9 +150,10 @@ Implemented
   parser helpers, including command range classification, command group
   boundary queries, fixed-width V1/``mpp_bat_msg`` ABI layout, V1-to-native
   request conversion, payload-copy classification, register-span overflow
-  checks, BSP VDPU383 link-table layout/materialization/readback/ownership,
-  CCU-reference lifetime, hard-CCU descriptor values, ``POLL_HW_IRQ``
-  flexible-buffer sizing, and RKVENC2 slice-mode detection.
+  checks, BSP VDPU383 link IRQ decoding, link-table
+  layout/materialization/readback/ownership, CCU-reference lifetime,
+  hard-CCU descriptor values, ``POLL_HW_IRQ`` flexible-buffer sizing, and
+  RKVENC2 slice-mode detection.
 
 Recognized But Unsupported
 --------------------------
@@ -161,9 +168,9 @@ Outside This Slice
   fixed-IOVA RCB optimization.  The rewrite requires the referenced CCU
   coordinator to be bound and online, has least-loaded core selection, queued
   dispatch, RKVENC2 DCHS hand-shake remapping, RKVDEC2 CCU-mode task register
-  preparation, and VDPU383 job-owned link-table materialization/readback
-  helpers, but does not yet mirror the BSP decoder/link scheduling and hard-CCU
-  table submission policy.
+  preparation, VDPU383 link-window direct start/IRQ handling, and job-owned
+  link-table materialization/readback helpers, but does not yet mirror the BSP
+  decoder hard-CCU scheduling and table submission policy.
 * Full BSP-equivalent timeout recovery policy and IOMMU fault recovery,
   including shared reset-domain serialization and MMU-domain refresh.
 * Fence export/import semantics.
