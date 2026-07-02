@@ -185,15 +185,22 @@ Implemented
   tasks.  RFBC64x4 source images emitted by ``ffmpeg-rockchip`` for Rockchip
   RFBC DRM frames are accepted for the BSP RGA2P YUV source-format subset and
   programmed through the RGA2 FBCIN register aliases while keeping the
-  destination raster.  Pattern, color-key, alpha/ROP, tile, AFBC32x8, RFBC
-  destination, overlapping in-place blits, in-place scaling/conversion/rotation,
-  incompact 10-bit input, 10-bit output, OSD, pre-intr, and gauss
-  variants remain unsupported.
+  destination raster.  Pattern, color-key, alpha blend, ROP outside the
+  ``imrop`` subset below, tile, AFBC32x8, RFBC destination, overlapping
+  in-place blits, in-place scaling/conversion/rotation, incompact 10-bit input,
+  10-bit output, OSD, pre-intr, and gauss variants remain unsupported.
 * RGA2 in-place RGB mosaic for the current ``librga`` ``immosaic`` single-image
   path.  The rewrite accepts same-buffer, same-rectangle raster RGB bitblit
   requests with ``mosaic_info.enable`` and BSP mosaic modes ``0..4``.  Scaled,
   converted, rotated, YUV, pattern, OSD, gauss, and multi-rectangle mosaic
   variants remain unsupported.
+* RGA2 RGB ROP bitblit for the current ``librga`` ``imrop`` single-task path.
+  The rewrite accepts same-size, raster RGB source/destination requests encoded
+  with ``alpha_rop_flag == 0x3``, ``alpha_rop_mode == 0x1``, and the public
+  ``IM_ROP_AND``, ``IM_ROP_OR``, ``IM_ROP_NOT_DST``, ``IM_ROP_NOT_SRC``,
+  ``IM_ROP_XOR``, or ``IM_ROP_NOT_XOR`` opcode values.  Pattern, mask, ROP4,
+  scaled, converted, rotated, YUV, and in-place overlapping ROP variants remain
+  unsupported.
 * Multi-task requests are accepted when every task matches the same supported
   backend profile; tasks run serially under the request's single
   completion/fence.  The RGA3 no-blend emitted command includes overlap field
@@ -207,7 +214,7 @@ Implemented
   multi-task rejection, RGA2 fill RGB/YUV destination-offset emission,
   YUV-fill chroma-alignment rejection, and multi-fill task acceptance, compact
   10-bit RGA2 source dispatch/emission including the no-scale force-tile mode,
-  RGA2 in-place RGB mosaic dispatch/emission,
+  RGA2 in-place RGB mosaic dispatch/emission, RGA2 RGB ROP dispatch/emission,
   ffmpeg-facing RGA2 RFBC64x4 source profile selection and FBCIN command
   emission, IOMMU fault target matching, scheduler priority enqueue/aging,
   RGA3 normal RGB color-key dispatch/emission and inverted-mode rejection,
