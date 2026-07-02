@@ -156,6 +156,8 @@
 #define RK_RGA2_MODE_BITBLT_MODE		BIT(3)
 #define RK_RGA2_MODE_COLOR_FILL_MODE		BIT(4)
 #define RK_RGA2_MODE_INTR_CF_E			BIT(7)
+#define RK_RGA2_MODE_MOSAIC_EN			BIT(9)
+#define RK_RGA2_MOSAIC_MODE_OFFSET		0x030
 
 #define RK_RGA2_SRC_FORMAT			GENMASK(3, 0)
 #define RK_RGA2_SRC_FBCIN_MODE			GENMASK(1, 0)
@@ -4018,6 +4020,41 @@ static bool rk_rga_in_place_bitblt_allowed(const struct rga_req *task)
 	return rk_rga_img_rects_disjoint(&task->src, &task->dst);
 }
 
+static bool rk_rga2_in_place_mosaic_allowed(const struct rga_req *task)
+{
+	if (!task->mosaic_info.enable)
+		return false;
+	if (task->mosaic_info.mode > 4)
+		return false;
+	if (!task->src.yrgb_addr || task->src.yrgb_addr != task->dst.yrgb_addr)
+		return false;
+	if (task->src.uv_addr != task->dst.uv_addr ||
+	    task->src.v_addr != task->dst.v_addr)
+		return false;
+	if (task->src.format != task->dst.format)
+		return false;
+	if (task->src.rd_mode != task->dst.rd_mode)
+		return false;
+	if (task->src.rd_mode && task->src.rd_mode != RK_RGA_RASTER_MODE)
+		return false;
+	if (task->src.vir_w != task->dst.vir_w ||
+	    task->src.vir_h != task->dst.vir_h)
+		return false;
+	if (task->src.x_offset != task->dst.x_offset ||
+	    task->src.y_offset != task->dst.y_offset)
+		return false;
+	if (task->src.act_w != task->dst.act_w ||
+	    task->src.act_h != task->dst.act_h)
+		return false;
+	if (task->src.rotate_mode || task->dst.rotate_mode ||
+	    task->rotate_mode || task->sina || task->cosa)
+		return false;
+	if (task->yuv2rgb_mode || task->full_csc.flag)
+		return false;
+
+	return true;
+}
+
 #if IS_ENABLED(CONFIG_ROCKCHIP_RGA_REWRITE_KUNIT_TEST)
 static int rk_rga2_select_dst_addresses(const struct rga_img_info_t *dst,
 					const struct rk_rga2_format_info *fmt,
@@ -4419,6 +4456,64 @@ static void rk_rga2_fill_multitask_hw_type_kunit(struct kunit *test)
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
+}
+
+static void rk_rga2_mosaic_emit_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA2_CMD_REG_COUNT] = { };
+	enum rk_rga_hw_type type = 0;
+	struct rga_img_info_t img =
+		rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_RGBA_8888,
+				 1280, 720);
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_RGBA_8888);
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 2,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+
+	img.act_w = 300;
+	img.act_h = 200;
+	task.src = img;
+	task.dst = img;
+	task.yuv2rgb_mode = 0;
+	task.mosaic_info.enable = 1;
+	task.mosaic_info.mode = 2;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA2_MODE_CTRL_OFFSET / 4] &
+			  RK_RGA2_MODE_MOSAIC_EN);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_MOSAIC_MODE_OFFSET / 4], 2U);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_BASE0_OFFSET / 4],
+			lower_32_bits(img.yrgb_addr));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_BASE0_OFFSET / 4],
+			lower_32_bits(img.yrgb_addr));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_ACT_INFO_OFFSET / 4],
+			299U | (199U << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_ACT_INFO_OFFSET / 4],
+			299U | (199U << 16));
+
+	memset(cmd, 0, sizeof(cmd));
+	job.cmd_ready = false;
+	task.mosaic_info.mode = 5;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+
+	task.mosaic_info.mode = 2;
+	task.dst.x_offset = 4;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
 }
 
 static void rk_rga_request_check_kunit(struct kunit *test)
@@ -5313,6 +5408,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga2_fill_dst_offset_emit_kunit),
 	KUNIT_CASE(rk_rga2_fill_yuv_emit_kunit),
 	KUNIT_CASE(rk_rga2_fill_multitask_hw_type_kunit),
+	KUNIT_CASE(rk_rga2_mosaic_emit_kunit),
 	KUNIT_CASE(rk_rga_request_check_kunit),
 	KUNIT_CASE(rk_rga_request_ioctl_ret_kunit),
 	KUNIT_CASE(rk_rga_job_free_release_fence_kunit),
@@ -5446,16 +5542,20 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 		return -EOPNOTSUPP;
 	if (task->pat.yrgb_addr || task->pat.uv_addr || task->pat.v_addr)
 		return -EOPNOTSUPP;
-	if (!rk_rga_in_place_bitblt_allowed(task))
+	if (task->mosaic_info.enable) {
+		if (!rk_rga2_in_place_mosaic_allowed(task))
+			return -EOPNOTSUPP;
+	} else if (!rk_rga_in_place_bitblt_allowed(task)) {
 		return -EOPNOTSUPP;
+	}
 	if (task->alpha_rop_flag || task->PD_mode ||
 	    task->feature.global_alpha_en)
 		return -EOPNOTSUPP;
 	ret = rk_rga2_decode_transform(task, &profile->transform);
 	if (ret)
 		return ret;
-	if (task->mosaic_info.enable || task->osd_info.enable ||
-	    task->pre_intr_info.enable || task->gauss_config.size)
+	if (task->osd_info.enable || task->pre_intr_info.enable ||
+	    task->gauss_config.size)
 		return -EOPNOTSUPP;
 	ret = rk_rga2_validate_full_csc(task);
 	if (ret)
@@ -5496,6 +5596,11 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 	ret = rk_rga2_validate_image(&dst, &profile->dst_fmt);
 	if (ret)
 		return ret;
+	if (task->mosaic_info.enable &&
+	    (profile->src_fmt.yuv || profile->src_fmt.yuv400 ||
+	     profile->src_fmt.yuv10 || profile->dst_fmt.yuv ||
+	     profile->dst_fmt.yuv400 || profile->dst_fmt.yuv10))
+		return -EOPNOTSUPP;
 
 	return 0;
 }
@@ -6470,7 +6575,9 @@ static int rk_rga2_emit_simple_bitblt(struct rk_rga_job *job)
 	rk_rga_cmd_write(job, RK_RGA2_MODE_CTRL_OFFSET,
 			 FIELD_PREP(RK_RGA2_MODE_RENDER_MODE,
 				    RK_RGA_RENDER_BITBLT) |
-			 RK_RGA2_MODE_INTR_CF_E);
+			 RK_RGA2_MODE_INTR_CF_E |
+			 FIELD_PREP(RK_RGA2_MODE_MOSAIC_EN,
+				    !!task->mosaic_info.enable));
 
 	ret = rk_rga2_emit_src(job, task, &profile.src_fmt,
 			       &profile.transform);
@@ -6483,6 +6590,9 @@ static int rk_rga2_emit_simple_bitblt(struct rk_rga_job *job)
 
 	rk_rga_cmd_write(job, RK_RGA2_ALPHA_CTRL0_OFFSET, 0);
 	rk_rga_cmd_write(job, RK_RGA2_ALPHA_CTRL1_OFFSET, 0);
+	if (task->mosaic_info.enable)
+		rk_rga_cmd_write(job, RK_RGA2_MOSAIC_MODE_OFFSET,
+				 task->mosaic_info.mode & 0x7);
 
 	job->cmd_ready = true;
 
