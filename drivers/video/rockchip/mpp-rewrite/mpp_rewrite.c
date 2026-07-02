@@ -1463,6 +1463,7 @@ static u32 rk_mpp_rkvdec2_ccu_core_mask(struct rk_mpp_service *srv,
 static int rk_mpp_hw_power_on(struct rk_mpp_hw *hw);
 static void rk_mpp_hw_power_off(struct rk_mpp_hw *hw);
 static void rk_mpp_job_get(struct rk_mpp_job *job);
+static void rk_mpp_job_put(struct rk_mpp_job *job);
 
 static dma_addr_t rk_mpp_rkvdec2_next_unused_link_iova(struct rk_mpp_hw *hw)
 {
@@ -1547,8 +1548,7 @@ rk_mpp_rkvdec2_ccu_job_del(struct rk_mpp_job *job, struct rk_mpp_hw *ccu)
 	spin_unlock_irqrestore(&ccu->lock, flags);
 }
 
-static __maybe_unused struct rk_mpp_job *
-rk_mpp_rkvdec2_ccu_first_done_job(struct rk_mpp_hw *ccu)
+static struct rk_mpp_job *rk_mpp_rkvdec2_ccu_first_done_job(struct rk_mpp_hw *ccu)
 {
 	const struct rk_mpp_rkvdec2_link_info *info =
 		&rk_mpp_rkvdec2_vdpu383_link_info;
@@ -1571,6 +1571,25 @@ rk_mpp_rkvdec2_ccu_first_done_job(struct rk_mpp_hw *ccu)
 	spin_unlock_irqrestore(&ccu->lock, flags);
 
 	return NULL;
+}
+
+static struct rk_mpp_job *
+rk_mpp_rkvdec2_ccu_done_active_job(struct rk_mpp_job *active)
+{
+	struct rk_mpp_job *done;
+
+	if (!active || !active->rkvdec_ccu_started)
+		return NULL;
+
+	done = rk_mpp_rkvdec2_ccu_first_done_job(active->rkvdec_ccu);
+	if (!done)
+		return NULL;
+	if (done != active) {
+		rk_mpp_job_put(done);
+		return NULL;
+	}
+
+	return done;
 }
 
 static void rk_mpp_rkvdec2_release_link_table(struct rk_mpp_job *job)
@@ -2233,6 +2252,13 @@ static void rk_mpp_rkvdec2_ccu_running_list_kunit(struct kunit *test)
 
 	table1[info->irq_status_word] = 0x1234;
 	done = rk_mpp_rkvdec2_ccu_first_done_job(ccu);
+	KUNIT_EXPECT_PTR_EQ(test, done, job1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&job1->refs), 2);
+	refcount_dec(&job1->refs);
+	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_rkvdec2_ccu_done_active_job(job0),
+			    NULL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&job1->refs), 1);
+	done = rk_mpp_rkvdec2_ccu_done_active_job(job1);
 	KUNIT_EXPECT_PTR_EQ(test, done, job1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&job1->refs), 2);
 	refcount_dec(&job1->refs);
@@ -4352,8 +4378,12 @@ static irqreturn_t rk_mpp_rkvdec2_thread(struct rk_mpp_hw *hw)
 	cancel_delayed_work(&hw->timeout_work);
 
 	if (job->rkvdec_ccu_started) {
-		ret = rk_mpp_rkvdec2_read_ccu_link_table(job, link_info,
+		struct rk_mpp_job *done;
+
+		done = rk_mpp_rkvdec2_ccu_done_active_job(job);
+		ret = rk_mpp_rkvdec2_read_ccu_link_table(done ?: job, link_info,
 							 irq_status);
+		rk_mpp_job_put(done);
 	} else {
 		ret = rk_mpp_job_read_regs(job);
 		if (!ret)
