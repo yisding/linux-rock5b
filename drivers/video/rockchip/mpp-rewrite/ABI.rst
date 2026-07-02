@@ -99,9 +99,11 @@ Implemented
   when available, runtime PM/clocks are released, ``POLL_HW_FINISH`` wakes, and
   the job returns ``-ETIMEDOUT``.  For hard-CCU RKVDEC2 jobs, timeout recovery
   first force-stops and resets the coordinator, preserves table-complete jobs
-  that raced the timeout by reading back their CCU link tables, then
-  opportunistically aborts unfinished active dependent cores without waiting on
-  possibly running timeout workers.
+  that raced the timeout by reading back their CCU link tables, then relinks
+  and resends unfinished active dependent jobs through the coordinator.  If an
+  unfinished job can no longer be matched to its active core slot, recovery
+  falls back to opportunistically aborting unfinished active dependent cores
+  without waiting on possibly running timeout workers.
 * Public IOMMU fault callback registration for bound MPP cores.  A fault
   records ``iommu_fault_count`` in debugfs, logs the IOVA/status, marks the
   active job for immediate recovery through the same serialized reset path,
@@ -163,8 +165,10 @@ Implemented
   cores are left for their own IRQ or timeout path.  If a hard-CCU completion
   table reports a VDPU383 error bit, the rewrite preserves the readback status
   for userspace but force-stops and resets the coordinator, resets the reporting
-  core, drains any other table-complete jobs it can claim, and aborts unfinished
-  active dependent cores to contain the failed chain.
+  core, drains any other table-complete jobs it can claim, relinks unfinished
+  tables, and resends active dependent cores that can still be matched to their
+  owning hardware slots.  If resend cannot safely restart every unfinished job,
+  recovery aborts the remaining active dependents to contain the failed chain.
 * ``MPP_CMD_POLL_HW_IRQ`` for RK3588 RKVENC2 encoder slice result streaming.
   The rewrite advertises the forward-port ``POLL_BUTT`` command boundary,
   detects slice mode from the submitted RKVENC2 register image
@@ -193,8 +197,8 @@ Implemented
   hard-CCU running-list table-chain relinking/scanning/active matching and
   active-job out-of-order matching/drain detection, hard-CCU done-table
   detection, peer-core power ownership transfer, unfinished-chain relinking for
-  hard-CCU resend preparation, cross-core CCU completion claiming,
-  hard-CCU table-status readback,
+  hard-CCU resend preparation, unfinished-job collection for hard-CCU resend,
+  cross-core CCU completion claiming, hard-CCU table-status readback,
   hard-CCU idle/add-mode descriptor values, hard-CCU all-core work-mask
   selection, fixed-RCB link-latch
   programming, IOMMU fault target matching, RKVENC2 DCHS tx/rx id remapping

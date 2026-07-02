@@ -1832,6 +1832,60 @@ static u32 rk_mpp_rkvdec2_ccu_prepare_resend_chain(struct rk_mpp_hw *ccu)
 	return count;
 }
 
+static int
+rk_mpp_rkvdec2_collect_unfinished_ccu_jobs(struct rk_mpp_hw *ccu,
+					   struct rk_mpp_job ***jobs_out,
+					   u32 *count_out)
+{
+	const struct rk_mpp_rkvdec2_link_info *info =
+		&rk_mpp_rkvdec2_vdpu383_link_info;
+	struct rk_mpp_job **jobs;
+	struct rk_mpp_job *job;
+	unsigned long flags;
+	u32 count = 0;
+	u32 i = 0;
+
+	*jobs_out = NULL;
+	*count_out = 0;
+
+	if (!ccu)
+		return 0;
+
+	spin_lock_irqsave(&ccu->lock, flags);
+	list_for_each_entry(job, &ccu->rkvdec_ccu_jobs, rkvdec_ccu_node) {
+		if (!rk_mpp_rkvdec2_ccu_job_done(job, info))
+			count++;
+	}
+	spin_unlock_irqrestore(&ccu->lock, flags);
+	if (!count)
+		return 0;
+
+	jobs = kcalloc(count, sizeof(*jobs), GFP_KERNEL);
+	if (!jobs)
+		return -ENOMEM;
+
+	spin_lock_irqsave(&ccu->lock, flags);
+	list_for_each_entry(job, &ccu->rkvdec_ccu_jobs, rkvdec_ccu_node) {
+		if (rk_mpp_rkvdec2_ccu_job_done(job, info))
+			continue;
+		if (i >= count)
+			break;
+		rk_mpp_job_get(job);
+		jobs[i++] = job;
+	}
+	spin_unlock_irqrestore(&ccu->lock, flags);
+
+	if (!i) {
+		kfree(jobs);
+		return 0;
+	}
+
+	*jobs_out = jobs;
+	*count_out = i;
+
+	return 0;
+}
+
 static void rk_mpp_rkvdec2_ccu_job_add(struct rk_mpp_job *job)
 {
 	struct rk_mpp_hw *ccu = job->rkvdec_ccu;
@@ -2796,6 +2850,72 @@ static void rk_mpp_rkvdec2_ccu_relink_unfinished_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, table2[info->next_word], 0U);
 }
 
+static void rk_mpp_rkvdec2_ccu_collect_unfinished_kunit(struct kunit *test)
+{
+	const struct rk_mpp_rkvdec2_link_info *info =
+		&rk_mpp_rkvdec2_vdpu383_link_info;
+	struct rk_mpp_job **jobs = NULL;
+	struct rk_mpp_hw *ccu;
+	struct rk_mpp_job *job0;
+	struct rk_mpp_job *job1;
+	struct rk_mpp_job *job2;
+	u32 *table0;
+	u32 *table1;
+	u32 *table2;
+	u32 count = 0;
+
+	ccu = kunit_kzalloc(test, sizeof(*ccu), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ccu);
+	job0 = kunit_kzalloc(test, sizeof(*job0), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job0);
+	job1 = kunit_kzalloc(test, sizeof(*job1), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job1);
+	job2 = kunit_kzalloc(test, sizeof(*job2), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job2);
+	table0 = kunit_kcalloc(test, info->table_words, sizeof(*table0),
+			       GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, table0);
+	table1 = kunit_kcalloc(test, info->table_words, sizeof(*table1),
+			       GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, table1);
+	table2 = kunit_kcalloc(test, info->table_words, sizeof(*table2),
+			       GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, table2);
+
+	spin_lock_init(&ccu->lock);
+	INIT_LIST_HEAD(&ccu->rkvdec_ccu_jobs);
+	INIT_LIST_HEAD(&job0->rkvdec_ccu_node);
+	INIT_LIST_HEAD(&job1->rkvdec_ccu_node);
+	INIT_LIST_HEAD(&job2->rkvdec_ccu_node);
+	refcount_set(&job0->refs, 1);
+	refcount_set(&job1->refs, 1);
+	refcount_set(&job2->refs, 1);
+	job0->rkvdec_link_vaddr = table0;
+	job1->rkvdec_link_vaddr = table1;
+	job2->rkvdec_link_vaddr = table2;
+	table1[info->irq_status_word] = 0x40;
+
+	list_add_tail(&job0->rkvdec_ccu_node, &ccu->rkvdec_ccu_jobs);
+	list_add_tail(&job1->rkvdec_ccu_node, &ccu->rkvdec_ccu_jobs);
+	list_add_tail(&job2->rkvdec_ccu_node, &ccu->rkvdec_ccu_jobs);
+
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_rkvdec2_collect_unfinished_ccu_jobs(ccu, &jobs,
+								   &count),
+			0);
+	KUNIT_ASSERT_EQ(test, count, 2U);
+	KUNIT_ASSERT_NOT_NULL(test, jobs);
+	KUNIT_EXPECT_PTR_EQ(test, jobs[0], job0);
+	KUNIT_EXPECT_PTR_EQ(test, jobs[1], job2);
+	KUNIT_EXPECT_EQ(test, refcount_read(&job0->refs), 2);
+	KUNIT_EXPECT_EQ(test, refcount_read(&job1->refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&job2->refs), 2);
+
+	rk_mpp_job_put(job0);
+	rk_mpp_job_put(job2);
+	kfree(jobs);
+}
+
 static void rk_mpp_rkvdec2_ccu_descriptor_kunit(struct kunit *test)
 {
 	struct rk_mpp_hw ccu = {};
@@ -3283,6 +3403,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_job_done_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_power_transfer_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_relink_unfinished_kunit),
+	KUNIT_CASE(rk_mpp_rkvdec2_ccu_collect_unfinished_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_descriptor_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_descriptor_core_mask_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_fixed_rcb_link_kunit),
@@ -4430,6 +4551,23 @@ static bool rk_mpp_hw_take_active_if(struct rk_mpp_hw *hw,
 	return taken;
 }
 
+static bool rk_mpp_hw_prepare_active_retry(struct rk_mpp_hw *hw,
+					   struct rk_mpp_job *match)
+{
+	unsigned long flags;
+	bool active = false;
+
+	spin_lock_irqsave(&hw->lock, flags);
+	if (hw->active_job == match) {
+		hw->irq_status = 0;
+		atomic_set(&hw->iommu_fault_pending, 0);
+		active = true;
+	}
+	spin_unlock_irqrestore(&hw->lock, flags);
+
+	return active;
+}
+
 static struct rk_mpp_job *rk_mpp_hw_get_active_job(struct rk_mpp_hw *hw)
 {
 	struct rk_mpp_job *job;
@@ -4480,6 +4618,8 @@ static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
 	u32 ccu_en;
 	u32 i;
 	bool add_mode;
+	bool ccu_powered_now = false;
+	bool cores_powered_now = false;
 	int ret;
 
 	if (!job->rkvdec_ccu_desc_valid || !job->rkvdec_link_active)
@@ -4490,10 +4630,13 @@ static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
 	if (!job->rkvdec_ccu_core_work)
 		return -EINVAL;
 
-	ret = rk_mpp_hw_power_on(ccu);
-	if (ret)
-		return ret;
-	job->rkvdec_ccu_powered = true;
+	if (!job->rkvdec_ccu_powered) {
+		ret = rk_mpp_hw_power_on(ccu);
+		if (ret)
+			return ret;
+		job->rkvdec_ccu_powered = true;
+		ccu_powered_now = true;
+	}
 
 	if (!READ_ONCE(ccu->online) || !READ_ONCE(hw->online) ||
 	    READ_ONCE(job->canceled)) {
@@ -4518,9 +4661,12 @@ static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
 	}
 
 	if (!add_mode) {
-		ret = rk_mpp_rkvdec2_power_on_ccu_cores(job);
-		if (ret)
-			goto err_unlock_ccu;
+		if (!job->rkvdec_ccu_powered_core_count) {
+			ret = rk_mpp_rkvdec2_power_on_ccu_cores(job);
+			if (ret)
+				goto err_unlock_ccu;
+			cores_powered_now = true;
+		}
 
 		rk_mpp_rkvdec2_prepare_core_for_ccu(hw);
 		for (i = 0; i < job->rkvdec_ccu_powered_core_count; i++)
@@ -4553,10 +4699,59 @@ static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
 err_unlock_ccu:
 	mutex_unlock(&ccu->run_lock);
 err_power_off:
-	rk_mpp_rkvdec2_power_off_ccu_cores(job);
-	rk_mpp_hw_power_off(ccu);
-	job->rkvdec_ccu_powered = false;
+	if (cores_powered_now)
+		rk_mpp_rkvdec2_power_off_ccu_cores(job);
+	if (ccu_powered_now) {
+		rk_mpp_hw_power_off(ccu);
+		job->rkvdec_ccu_powered = false;
+	}
 	return ret;
+}
+
+static int rk_mpp_rkvdec2_restart_ccu_job(struct rk_mpp_job *job)
+{
+	struct rk_mpp_hw *hw = job->hw;
+	int ret;
+
+	if (!hw || !job->rkvdec_ccu_started || !job->rkvdec_ccu)
+		return -EINVAL;
+	if (!mutex_trylock(&hw->run_lock))
+		return -EBUSY;
+	if (!rk_mpp_hw_prepare_active_retry(hw, job)) {
+		ret = -ENOENT;
+		goto out_unlock;
+	}
+
+	cancel_delayed_work(&hw->timeout_work);
+	ret = rk_mpp_rkvdec2_start_ccu_job(job);
+
+out_unlock:
+	mutex_unlock(&hw->run_lock);
+	return ret;
+}
+
+static int rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(struct rk_mpp_hw *ccu)
+{
+	struct rk_mpp_job **jobs;
+	u32 count;
+	u32 i;
+	int ret;
+
+	ret = rk_mpp_rkvdec2_collect_unfinished_ccu_jobs(ccu, &jobs, &count);
+	if (ret || !count)
+		return ret;
+
+	for (i = 0; i < count; i++) {
+		ret = rk_mpp_rkvdec2_restart_ccu_job(jobs[i]);
+		if (ret)
+			break;
+	}
+
+	for (i = 0; i < count; i++)
+		rk_mpp_job_put(jobs[i]);
+	kfree(jobs);
+
+	return ret ?: (int)count;
 }
 
 static void rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu)
@@ -4671,9 +4866,19 @@ static void rk_mpp_hw_timeout_work(struct work_struct *work)
 	mutex_unlock(&hw->run_lock);
 	rk_mpp_job_put(job);
 	if (hard_ccu_recovery) {
+		int restart_ret = -EIO;
+
 		rk_mpp_rkvdec2_drain_ccu_done_jobs(ccu);
-		rk_mpp_rkvdec2_ccu_prepare_resend_chain(ccu);
-		rk_mpp_hw_abort_ccu_active_dependents(ccu, hw, recovery_result);
+		if (!iommu_fault) {
+			rk_mpp_rkvdec2_ccu_prepare_resend_chain(ccu);
+			restart_ret =
+				rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(ccu);
+		}
+		if (restart_ret < 0) {
+			rk_mpp_rkvdec2_force_stop_ccu(ccu);
+			rk_mpp_hw_abort_ccu_active_dependents(ccu, hw,
+							      recovery_result);
+		}
 	}
 	rk_mpp_hw_put(ccu);
 }
@@ -5631,9 +5836,15 @@ static irqreturn_t rk_mpp_rkvdec2_thread(struct rk_mpp_hw *hw)
 	mutex_unlock(&hw->run_lock);
 	rk_mpp_job_put(job);
 	if (ccu_error) {
+		int restart_ret;
+
 		rk_mpp_rkvdec2_drain_ccu_done_jobs(ccu);
 		rk_mpp_rkvdec2_ccu_prepare_resend_chain(ccu);
-		rk_mpp_hw_abort_ccu_active_dependents(ccu, hw, -EIO);
+		restart_ret = rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(ccu);
+		if (restart_ret < 0) {
+			rk_mpp_rkvdec2_force_stop_ccu(ccu);
+			rk_mpp_hw_abort_ccu_active_dependents(ccu, hw, -EIO);
+		}
 	} else {
 		rk_mpp_rkvdec2_drain_ccu_done_jobs(ccu);
 	}
