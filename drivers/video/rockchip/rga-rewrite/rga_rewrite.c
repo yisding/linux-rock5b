@@ -7042,6 +7042,100 @@ static void rk_rga_ffmpeg_fbc_profiles_kunit(struct kunit *test)
 			-EOPNOTSUPP);
 }
 
+static void rk_rga3_librga_afbc_copy_emit_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
+	enum rk_rga_hw_type type = 0;
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_420_SP,
+					  RK_RGA_FORMAT_YCBCR_420_SP);
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 2,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+	u32 aligned_w;
+	u32 aligned_h;
+	u32 fbc_header_stride;
+	u32 fbc_payload_stride;
+	u32 fbc_header_size;
+	u32 raster_stride;
+	u32 ctrl;
+
+	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_YCBCR_420_SP,
+				    1280, 720);
+	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_YCBCR_420_SP,
+				    1280, 720);
+	task.yuv2rgb_mode = 0;
+	task.dst.rd_mode = RK_RGA_FBC_MODE;
+
+	aligned_w = ALIGN((u32)task.dst.vir_w, 16);
+	aligned_h = ALIGN((u32)task.dst.vir_h, 16);
+	fbc_header_stride = aligned_w >> 2;
+	fbc_payload_stride = (aligned_w >> 3) * 3;
+	fbc_header_size = (fbc_header_stride * aligned_h) >> 2;
+	raster_stride = aligned_w >> 2;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+
+	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
+	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WIN0_RD_MODE, 0U);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_VIR_STRIDE_OFFSET / 4],
+			raster_stride);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_UV_VIR_STRIDE_OFFSET / 4],
+			raster_stride);
+	ctrl = cmd[RK_RGA3_WR_CTRL_OFFSET / 4];
+	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WR_MODE,
+			FIELD_PREP(RK_RGA3_WR_MODE, 1));
+	KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WR_FBCE_SPARSE_EN);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4],
+			fbc_header_stride);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_PL_VIR_STRIDE_OFFSET / 4],
+			fbc_payload_stride);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_Y_BASE_OFFSET / 4],
+			lower_32_bits(task.dst.yrgb_addr));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_U_BASE_OFFSET / 4],
+			lower_32_bits(task.dst.uv_addr + fbc_header_size));
+
+	memset(cmd, 0, sizeof(cmd));
+	task.src.rd_mode = RK_RGA_FBC_MODE;
+	task.dst.rd_mode = RK_RGA_RASTER_MODE;
+	job.cmd_ready = false;
+	type = 0;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+
+	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
+	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WIN0_RD_MODE,
+			FIELD_PREP(RK_RGA3_WIN0_RD_MODE, 1));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_VIR_STRIDE_OFFSET / 4],
+			fbc_header_stride);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_UV_VIR_STRIDE_OFFSET / 4],
+			fbc_header_stride);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_Y_BASE_OFFSET / 4],
+			lower_32_bits(task.src.yrgb_addr));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_U_BASE_OFFSET / 4],
+			lower_32_bits(task.src.uv_addr));
+	ctrl = cmd[RK_RGA3_WR_CTRL_OFFSET / 4];
+	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WR_MODE, 0U);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4],
+			raster_stride);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_PL_VIR_STRIDE_OFFSET / 4],
+			raster_stride);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_Y_BASE_OFFSET / 4],
+			lower_32_bits(task.dst.yrgb_addr));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_U_BASE_OFFSET / 4],
+			lower_32_bits(task.dst.uv_addr));
+}
+
 static void rk_rga3_tile8x8_profile_kunit(struct kunit *test)
 {
 	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
@@ -7814,6 +7908,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga2_librga_full_csc_emit_kunit),
 	KUNIT_CASE(rk_rga2_src_crop_emit_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_fbc_profiles_kunit),
+	KUNIT_CASE(rk_rga3_librga_afbc_copy_emit_kunit),
 	KUNIT_CASE(rk_rga3_tile8x8_profile_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_alpha_overlay_kunit),
 	KUNIT_CASE(rk_rga3_librga_alpha_yuv_emit_kunit),
