@@ -379,6 +379,10 @@ static void rk_mpp_job_put(struct rk_mpp_job *job);
 static bool rk_mpp_hw_take_active_if(struct rk_mpp_hw *hw,
 				     struct rk_mpp_job *match,
 				     u32 *irq_status);
+static void rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu);
+static void
+rk_mpp_hw_abort_ccu_active_dependents(struct rk_mpp_hw *ccu,
+				      struct rk_mpp_hw *skip, int result);
 static bool rk_mpp_job_rkvenc_slice_mode(struct rk_mpp_job *job);
 static bool rk_mpp_job_rkvenc_slice_ready(struct rk_mpp_job *job);
 static bool rk_mpp_job_rkvenc_slice_done(struct rk_mpp_job *job);
@@ -3797,12 +3801,20 @@ static void rk_mpp_hw_timeout_work(struct work_struct *work)
 		container_of(to_delayed_work(work), struct rk_mpp_hw,
 			     timeout_work);
 	struct rk_mpp_job *job;
+	struct rk_mpp_hw *ccu = NULL;
+	bool hard_ccu_timeout;
 
 	mutex_lock(&hw->run_lock);
 	job = rk_mpp_hw_take_active_job(hw, NULL);
 	if (!job) {
 		mutex_unlock(&hw->run_lock);
 		return;
+	}
+	hard_ccu_timeout = job->rkvdec_ccu_started && job->rkvdec_ccu;
+	if (hard_ccu_timeout) {
+		ccu = job->rkvdec_ccu;
+		rk_mpp_hw_get(ccu);
+		rk_mpp_rkvdec2_force_stop_ccu(ccu);
 	}
 
 	atomic_inc(&job->session->srv->timeout_count);
@@ -3814,6 +3826,9 @@ static void rk_mpp_hw_timeout_work(struct work_struct *work)
 	rk_mpp_job_complete(job, -ETIMEDOUT);
 	mutex_unlock(&hw->run_lock);
 	rk_mpp_job_put(job);
+	if (hard_ccu_timeout)
+		rk_mpp_hw_abort_ccu_active_dependents(ccu, hw, -ETIMEDOUT);
+	rk_mpp_hw_put(ccu);
 }
 
 static void rk_mpp_hw_abort_active(struct rk_mpp_hw *hw, int result)
@@ -3834,6 +3849,41 @@ static void rk_mpp_hw_abort_active(struct rk_mpp_hw *hw, int result)
 	rk_mpp_job_complete(job, result);
 	mutex_unlock(&hw->run_lock);
 	rk_mpp_job_put(job);
+}
+
+static void rk_mpp_hw_abort_active_nowait(struct rk_mpp_hw *hw, int result)
+{
+	struct rk_mpp_job *job;
+
+	if (!mutex_trylock(&hw->run_lock))
+		return;
+
+	cancel_delayed_work(&hw->timeout_work);
+	job = rk_mpp_hw_take_active_job(hw, NULL);
+	if (!job) {
+		mutex_unlock(&hw->run_lock);
+		return;
+	}
+
+	rk_mpp_hw_reset_active(hw);
+	rk_mpp_hw_power_off(hw);
+	rk_mpp_job_complete(job, result);
+	mutex_unlock(&hw->run_lock);
+	rk_mpp_job_put(job);
+}
+
+static void rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu)
+{
+	if (!ccu)
+		return;
+
+	mutex_lock(&ccu->run_lock);
+	if (rk_mpp_rkvdec2_ccu_regs_ready(ccu))
+		writel_relaxed(0,
+			       ccu->regs[0] +
+			       RK_MPP_RKVDEC_CCU_WORK_BASE);
+	rk_mpp_hw_reset_active(ccu);
+	mutex_unlock(&ccu->run_lock);
 }
 
 static struct rk_mpp_hw **
@@ -3893,6 +3943,30 @@ static void rk_mpp_hw_abort_ccu_dependents(struct rk_mpp_hw *ccu)
 	for (i = 0; i < count; i++) {
 		rk_mpp_hw_abort_queued(deps[i], -ENODEV);
 		rk_mpp_hw_abort_active(deps[i], -ENODEV);
+		rk_mpp_hw_put(deps[i]);
+	}
+
+	kfree(deps);
+}
+
+static void
+rk_mpp_hw_abort_ccu_active_dependents(struct rk_mpp_hw *ccu,
+				      struct rk_mpp_hw *skip, int result)
+{
+	struct rk_mpp_hw **deps;
+	u32 count;
+	u32 i;
+
+	deps = rk_mpp_hw_collect_ccu_dependents(ccu, &count);
+	if (IS_ERR(deps)) {
+		dev_warn(ccu->dev, "failed to collect CCU dependents: %pe\n",
+			 deps);
+		return;
+	}
+
+	for (i = 0; i < count; i++) {
+		if (deps[i] != skip)
+			rk_mpp_hw_abort_active_nowait(deps[i], result);
 		rk_mpp_hw_put(deps[i]);
 	}
 
