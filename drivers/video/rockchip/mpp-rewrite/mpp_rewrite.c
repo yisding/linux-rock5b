@@ -2787,6 +2787,53 @@ static void rk_mpp_rkvdec2_ccu_power_transfer_kunit(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, to->rkvdec_ccu_powered_cores[1], core1);
 }
 
+static void rk_mpp_rkvdec2_release_power_transfer_kunit(struct kunit *test)
+{
+	struct rk_mpp_hw *ccu;
+	struct rk_mpp_hw *core0;
+	struct rk_mpp_hw *core1;
+	struct rk_mpp_job *from;
+	struct rk_mpp_job *to;
+
+	ccu = kunit_kzalloc(test, sizeof(*ccu), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ccu);
+	core0 = kunit_kzalloc(test, sizeof(*core0), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, core0);
+	core1 = kunit_kzalloc(test, sizeof(*core1), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, core1);
+	from = kunit_kzalloc(test, sizeof(*from), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, from);
+	to = kunit_kzalloc(test, sizeof(*to), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, to);
+
+	spin_lock_init(&ccu->lock);
+	mutex_init(&ccu->run_lock);
+	INIT_LIST_HEAD(&ccu->rkvdec_ccu_jobs);
+	refcount_set(&ccu->refs, 1);
+	init_completion(&ccu->released);
+	INIT_LIST_HEAD(&from->rkvdec_ccu_node);
+	INIT_LIST_HEAD(&to->rkvdec_ccu_node);
+	list_add_tail(&from->rkvdec_ccu_node, &ccu->rkvdec_ccu_jobs);
+	list_add_tail(&to->rkvdec_ccu_node, &ccu->rkvdec_ccu_jobs);
+	from->rkvdec_ccu = ccu;
+	from->rkvdec_ccu_started = true;
+	from->rkvdec_ccu_listed = true;
+	from->rkvdec_ccu_powered_cores[0] = core0;
+	from->rkvdec_ccu_powered_cores[1] = core1;
+	from->rkvdec_ccu_powered_core_count = 2;
+
+	rk_mpp_rkvdec2_release_link_table(from);
+
+	KUNIT_EXPECT_PTR_EQ(test, from->rkvdec_ccu, NULL);
+	KUNIT_EXPECT_FALSE(test, from->rkvdec_ccu_started);
+	KUNIT_EXPECT_EQ(test, from->rkvdec_ccu_powered_core_count, 0U);
+	KUNIT_EXPECT_FALSE(test, from->rkvdec_ccu_listed);
+	KUNIT_EXPECT_EQ(test, to->rkvdec_ccu_powered_core_count, 2U);
+	KUNIT_EXPECT_PTR_EQ(test, to->rkvdec_ccu_powered_cores[0], core0);
+	KUNIT_EXPECT_PTR_EQ(test, to->rkvdec_ccu_powered_cores[1], core1);
+	KUNIT_EXPECT_TRUE(test, completion_done(&ccu->released));
+}
+
 static void rk_mpp_rkvdec2_ccu_relink_unfinished_kunit(struct kunit *test)
 {
 	const struct rk_mpp_rkvdec2_link_info *info =
@@ -3431,6 +3478,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_running_list_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_job_done_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_power_transfer_kunit),
+	KUNIT_CASE(rk_mpp_rkvdec2_release_power_transfer_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_relink_unfinished_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_collect_unfinished_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_descriptor_kunit),
@@ -4625,7 +4673,6 @@ static void rk_mpp_hw_abort_job(struct rk_mpp_job *job)
 		rk_mpp_rkvenc2_dchs_release(job);
 		rk_mpp_hw_reset_active(hw);
 		rk_mpp_hw_power_off(hw);
-		rk_mpp_rkvdec2_power_off_ccu_cores(job);
 	}
 	mutex_unlock(&hw->run_lock);
 }
@@ -4848,7 +4895,6 @@ static void rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu)
 		if (ccu_error)
 			rk_mpp_hw_reset_active(hw);
 		rk_mpp_hw_power_off(hw);
-		rk_mpp_rkvdec2_power_off_ccu_cores(job);
 		rk_mpp_job_complete(job, ret);
 		mutex_unlock(&hw->run_lock);
 		rk_mpp_job_put(job);
@@ -4920,7 +4966,6 @@ static void rk_mpp_hw_timeout_work(struct work_struct *work)
 
 	rk_mpp_hw_reset_active(hw);
 	rk_mpp_hw_power_off(hw);
-	rk_mpp_rkvdec2_power_off_ccu_cores(job);
 	rk_mpp_job_complete(job, result);
 	mutex_unlock(&hw->run_lock);
 	rk_mpp_job_put(job);
@@ -4957,7 +5002,6 @@ static void rk_mpp_hw_abort_active(struct rk_mpp_hw *hw, int result)
 
 	rk_mpp_hw_reset_active(hw);
 	rk_mpp_hw_power_off(hw);
-	rk_mpp_rkvdec2_power_off_ccu_cores(job);
 	rk_mpp_job_complete(job, result);
 	mutex_unlock(&hw->run_lock);
 	rk_mpp_job_put(job);
@@ -5890,7 +5934,6 @@ static irqreturn_t rk_mpp_rkvdec2_thread(struct rk_mpp_hw *hw)
 		rk_mpp_hw_reset_active(hw);
 	}
 	rk_mpp_hw_power_off(hw);
-	rk_mpp_rkvdec2_power_off_ccu_cores(job);
 	rk_mpp_job_complete(job, ret);
 	mutex_unlock(&hw->run_lock);
 	rk_mpp_job_put(job);
