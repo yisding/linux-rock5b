@@ -147,7 +147,10 @@ Implemented
   completing the IRQ core's own job, the thread scans the same coordinator for
   other table-complete jobs and completes them only when it can claim the exact
   active job from that job's owning core; busy cores are left for their own IRQ
-  or timeout path.
+  or timeout path.  If a hard-CCU completion table reports a VDPU383 error bit,
+  the rewrite preserves the readback status for userspace but force-stops and
+  resets the coordinator, resets the reporting core, and aborts other active
+  dependent cores to contain the failed chain.
 * ``MPP_CMD_POLL_HW_IRQ`` for RK3588 RKVENC2 encoder slice result streaming.
   The rewrite advertises the forward-port ``POLL_BUTT`` command boundary,
   detects slice mode from the submitted RKVENC2 register image
@@ -194,10 +197,10 @@ Outside This Slice
   preparation, VDPU383 link-window direct start/IRQ handling, job-owned
   link-table materialization/readback helpers, hard-CCU submit/add-mode append,
   coordinator running-list tracking, cross-core completion drain, and
-  coordinator timeout containment.
+  coordinator timeout/error containment.
 * Full BSP-equivalent timeout recovery policy and IOMMU fault recovery,
-  including hard-CCU reset/resend of still-running decoder tasks and MMU-domain
-  refresh.
+  including hard-CCU reset/resend of still-running decoder tasks after
+  recoverable faults and MMU-domain refresh.
 * Fence export/import semantics.
 * ``MPP_IOC_CFG_V2``; the BSP-derived 6.18 driver also rejects this in the
   observed path.
