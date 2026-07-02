@@ -184,8 +184,8 @@ Implemented
   hard-CCU running-list table-chain relinking/scanning/active matching and
   active-job out-of-order matching/drain detection, cross-core CCU completion
   claiming, hard-CCU table-status readback, hard-CCU idle/add-mode descriptor
-  values, ``POLL_HW_IRQ`` flexible-buffer sizing, and RKVENC2 slice-mode
-  detection.
+  values, IOMMU fault target matching, ``POLL_HW_IRQ`` flexible-buffer sizing,
+  and RKVENC2 slice-mode detection.
 
 Recognized But Unsupported
 --------------------------
