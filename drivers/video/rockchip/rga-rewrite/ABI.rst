@@ -144,7 +144,8 @@ Implemented
   forced an RGA3-only core mask.  Per-channel rotate flags remain unsupported.
   Destination rectangle offsets are supported by biasing WR plane base
   addresses for 8-bit formats and raster unpacked semiplanar 10-bit YUV
-  destinations; this covers current ``librga`` ``imtranslate()`` RGB requests.
+  destinations; this covers current ``librga`` ``imtranslate()`` RGB requests
+  and centered RGB rotate requests with explicit destination rectangles.
   Semiplanar YUV offsets must be chroma-aligned.
 * RGA3 Porter-Duff alpha blend for the common A+B composition paths emitted by
   ``librga`` and ``ffmpeg-rockchip``.  Source/foreground is programmed through
@@ -303,7 +304,7 @@ Implemented
   RGA3 ``librga`` copy-splice multi-task destination-offset emission,
   RGA3 ``librga`` RGB translate destination-offset emission,
   RGA3 ``librga`` RGB rotate, flip/mirror, and combined rotate/mirror
-  emission,
+  emission, RGA3 ``librga`` centered RGB rotate destination-offset emission,
   RGA3 tile8x8 profile selection and stride emission, RGA3 pattern-backed
   8-bit ``librga`` alpha-YUV overlay emission, ``librga`` global-alpha
   register emission, 10-bit YUV alpha-overlay emission, and
