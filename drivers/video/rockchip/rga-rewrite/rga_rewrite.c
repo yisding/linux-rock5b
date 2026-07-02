@@ -385,6 +385,7 @@
 #define RK_RGA_CORE_RGA2_MASK		(BIT(2) | BIT(3))
 #define RK_RGA_CORE_MASK		(RK_RGA_CORE_RGA3_MASK | \
 					 RK_RGA_CORE_RGA2_MASK)
+#define RK_RGA_SCHED_PRIORITY_MAX	6
 
 #define RK_RGA_BACKEND_QUEUED		1
 #define RK_RGA_MMU_SRC0		BIT(8)
@@ -859,6 +860,7 @@ struct rk_rga_job {
 	u32 cmd_status;
 	u32 work_cycle;
 	__u32 sync_mode;
+	u8 priority;
 	int release_fence_fd;
 	int irq_result;
 	int result;
@@ -2185,6 +2187,19 @@ static void rk_rga_job_init(struct rk_rga_job *job)
 	job->release_fence_fd = -1;
 }
 
+static u8 rk_rga_job_priority_from_tasks(const struct rga_req *tasks,
+					 u32 task_count)
+{
+	u8 priority = 0;
+
+	for (u32 i = 0; i < task_count; i++)
+		priority = max_t(u8, priority,
+				 min_t(u8, tasks[i].priority,
+				       RK_RGA_SCHED_PRIORITY_MAX));
+
+	return priority;
+}
+
 static int rk_rga_prepare_tasks_locked(struct rk_rga_session *session,
 				       struct rga_req *tasks,
 				       __u32 task_count,
@@ -2336,6 +2351,7 @@ static int rk_rga_job_clone_request_locked(struct rk_rga_request *request,
 	job->acquire_fence_count = request->acquire_fence_count;
 	job->task_count = request->task_count;
 	job->sync_mode = request->sync_mode;
+	job->priority = rk_rga_job_priority_from_tasks(job->tasks, job->task_count);
 	atomic_inc(&rk_rga.prepared_job_count);
 
 	*job_out = job;
@@ -2365,6 +2381,7 @@ static int rk_rga_job_take_prepared(struct rga_req *tasks, u32 task_count,
 	job->import_count = import_count;
 	job->acquire_fences = fences;
 	job->acquire_fence_count = fence_count;
+	job->priority = rk_rga_job_priority_from_tasks(job->tasks, job->task_count);
 	atomic_inc(&rk_rga.prepared_job_count);
 
 	*job_out = job;
@@ -3908,6 +3925,8 @@ static int rk_rga_request_ioctl_ret(int ret);
 static struct rk_rga_hw *
 rk_rga_find_best_hw_for_job(struct list_head *hw_list, struct rk_rga_job *job,
 			    enum rk_rga_hw_type type);
+static void rk_rga_hw_enqueue_job_locked(struct rk_rga_hw *hw,
+					 struct rk_rga_job *job);
 static struct rk_rga_hw *
 rk_rga_iommu_find_fault_hw(struct list_head *fault_hws,
 			   struct iommu_domain *domain,
@@ -4447,6 +4466,41 @@ static void rk_rga_find_best_hw_for_job_kunit(struct kunit *test)
 			    rk_rga_find_best_hw_for_job(&hw_list, &job,
 							RK_RGA_HW_RGA3),
 			    NULL);
+}
+
+static void rk_rga_priority_enqueue_kunit(struct kunit *test)
+{
+	struct rk_rga_hw hw = { };
+	struct rk_rga_job low = { .priority = 1 };
+	struct rk_rga_job default_prio = { };
+	struct rk_rga_job high = { .priority = 3 };
+	struct rk_rga_job equal = { .priority = 2 };
+	struct rk_rga_job *pos;
+
+	INIT_LIST_HEAD(&hw.job_queue);
+	INIT_LIST_HEAD(&low.node);
+	INIT_LIST_HEAD(&default_prio.node);
+	INIT_LIST_HEAD(&high.node);
+	INIT_LIST_HEAD(&equal.node);
+
+	rk_rga_hw_enqueue_job_locked(&hw, &low);
+	rk_rga_hw_enqueue_job_locked(&hw, &default_prio);
+	rk_rga_hw_enqueue_job_locked(&hw, &high);
+	rk_rga_hw_enqueue_job_locked(&hw, &equal);
+
+	KUNIT_EXPECT_EQ(test, hw.queued_jobs, 4U);
+	pos = list_first_entry(&hw.job_queue, struct rk_rga_job, node);
+	KUNIT_EXPECT_PTR_EQ(test, pos, &high);
+	pos = list_next_entry(pos, node);
+	KUNIT_EXPECT_PTR_EQ(test, pos, &low);
+	pos = list_next_entry(pos, node);
+	KUNIT_EXPECT_PTR_EQ(test, pos, &equal);
+	pos = list_next_entry(pos, node);
+	KUNIT_EXPECT_PTR_EQ(test, pos, &default_prio);
+
+	KUNIT_EXPECT_EQ(test, low.priority, 2);
+	KUNIT_EXPECT_EQ(test, default_prio.priority, 2);
+	KUNIT_EXPECT_EQ(test, equal.priority, 2);
 }
 
 static void rk_rga_iommu_fault_match_kunit(struct kunit *test)
@@ -5016,6 +5070,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_job_free_release_fence_kunit),
 	KUNIT_CASE(rk_rga_mixed_task_hw_type_kunit),
 	KUNIT_CASE(rk_rga_find_best_hw_for_job_kunit),
+	KUNIT_CASE(rk_rga_priority_enqueue_kunit),
 	KUNIT_CASE(rk_rga_iommu_fault_match_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_rga3_profiles_kunit),
 	KUNIT_CASE(rk_rga_in_place_border_bitblt_kunit),
@@ -7108,6 +7163,43 @@ static void rk_rga_hw_dispatch(struct rk_rga_hw *hw)
 	}
 }
 
+static void rk_rga_hw_age_jobs_after(struct rk_rga_hw *hw,
+				     struct rk_rga_job *job)
+{
+	struct list_head *entry;
+
+	for (entry = job->node.next; entry != &hw->job_queue;
+	     entry = entry->next) {
+		struct rk_rga_job *pos =
+			list_entry(entry, struct rk_rga_job, node);
+
+		if (pos->priority < RK_RGA_SCHED_PRIORITY_MAX)
+			pos->priority++;
+	}
+}
+
+static void rk_rga_hw_enqueue_job_locked(struct rk_rga_hw *hw,
+					 struct rk_rga_job *job)
+{
+	struct rk_rga_job *pos;
+
+	job->queued = true;
+	if (job->priority) {
+		list_for_each_entry(pos, &hw->job_queue, node) {
+			if (job->priority > pos->priority) {
+				list_add_tail(&job->node, &pos->node);
+				rk_rga_hw_age_jobs_after(hw, job);
+				goto queued;
+			}
+		}
+	}
+
+	list_add_tail(&job->node, &hw->job_queue);
+
+queued:
+	hw->queued_jobs++;
+}
+
 static int rk_rga_job_queue(struct rk_rga_job *job)
 {
 	struct rk_rga_hw *hw;
@@ -7132,9 +7224,7 @@ static int rk_rga_job_queue(struct rk_rga_job *job)
 		return -ENODEV;
 	}
 
-	job->queued = true;
-	list_add_tail(&job->node, &hw->job_queue);
-	hw->queued_jobs++;
+	rk_rga_hw_enqueue_job_locked(hw, job);
 	atomic_inc(&rk_rga.scheduled_job_count);
 	spin_unlock_irqrestore(&hw->job_lock, flags);
 
