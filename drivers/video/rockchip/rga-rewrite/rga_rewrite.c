@@ -167,6 +167,7 @@
 #define RK_RGA2_MODE_MOSAIC_EN			BIT(9)
 #define RK_RGA2_MODE_SRC_GAUSS_EN		BIT(17)
 #define RK_RGA2_MOSAIC_MODE_OFFSET		0x030
+#define RK_RGA2_HW_RENDER_UPDATE_PALETTE	3
 
 #define RK_RGA2_SRC_FORMAT			GENMASK(3, 0)
 #define RK_RGA2_SRC_FBCIN_MODE			GENMASK(1, 0)
@@ -5245,7 +5246,7 @@ static void rk_rga2_update_palette_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_MODE_CTRL_OFFSET / 4],
 			FIELD_PREP(RK_RGA2_MODE_RENDER_MODE,
-				   RK_RGA_RENDER_UPDATE_PALETTE) |
+				   RK_RGA2_HW_RENDER_UPDATE_PALETTE) |
 			RK_RGA2_MODE_INTR_CF_E);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_FADING_CTRL_OFFSET / 4],
 			0xff00U);
@@ -7613,7 +7614,7 @@ static int rk_rga2_emit_update_palette(struct rk_rga_job *job)
 
 	rk_rga_cmd_write(job, RK_RGA2_MODE_CTRL_OFFSET,
 			 FIELD_PREP(RK_RGA2_MODE_RENDER_MODE,
-				    RK_RGA_RENDER_UPDATE_PALETTE) |
+				    RK_RGA2_HW_RENDER_UPDATE_PALETTE) |
 			 RK_RGA2_MODE_INTR_CF_E);
 	rk_rga_cmd_write(job, RK_RGA2_FADING_CTRL_OFFSET,
 			 (u32)task->fading.g << 8);
