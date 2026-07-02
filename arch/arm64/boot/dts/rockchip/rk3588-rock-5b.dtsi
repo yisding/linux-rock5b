@@ -84,3 +84,110 @@
 	pinctrl-0 = <&pcie2_0_vcc3v3_en>;
 	status = "okay";
 };
+
+&mpp_srv {
+	status = "okay";
+};
+
+&rkvenc_ccu {
+	status = "okay";
+};
+
+&rkvenc0 {
+	status = "okay";
+};
+
+&rkvenc0_mmu {
+	status = "okay";
+};
+
+&rkvenc1 {
+	status = "okay";
+};
+
+&rkvenc1_mmu {
+	status = "okay";
+};
+
+&rkvdec_ccu {
+	status = "okay";
+};
+
+&{/aliases} {
+	rkvdec0 = &vdec0;
+	rkvdec1 = &vdec1;
+};
+
+&vdec0 {
+	compatible = "rockchip,rkv-decoder-v2";
+	reg = <0x0 0xfdc38100 0x0 0x400>, <0x0 0xfdc38000 0x0 0x100>;
+	reg-names = "regs", "link";
+	interrupt-names = "irq_rkvdec0";
+	clocks = <&cru ACLK_RKVDEC0>, <&cru HCLK_RKVDEC0>,
+		 <&cru CLK_RKVDEC0_CORE>, <&cru CLK_RKVDEC0_CA>,
+		 <&cru CLK_RKVDEC0_HEVC_CA>;
+	clock-names = "aclk_vcodec", "hclk_vcodec", "clk_core",
+		      "clk_cabac", "clk_hevc_cabac";
+	rockchip,normal-rates = <800000000>, <0>, <600000000>,
+				<600000000>, <1000000000>;
+	resets = <&cru SRST_A_RKVDEC0>, <&cru SRST_H_RKVDEC0>,
+		 <&cru SRST_RKVDEC0_CORE>, <&cru SRST_RKVDEC0_CA>,
+		 <&cru SRST_RKVDEC0_HEVC_CA>;
+	reset-names = "video_a", "video_h", "video_core",
+		      "video_cabac", "video_hevc_cabac";
+	rockchip,skip-pmu-idle-request;
+	rockchip,srv = <&mpp_srv>;
+	rockchip,ccu = <&rkvdec_ccu>;
+	rockchip,core-mask = <0x00010001>;
+	rockchip,task-capacity = <16>;
+	rockchip,taskqueue-node = <9>;
+	rockchip,sram = <&vdec0_sram>;
+	rockchip,rcb-iova = <0xFFF00000 0x100000>;
+	rockchip,rcb-info = <136 24576>, <137 49152>, <141 90112>, <140 49152>,
+			    <139 180224>, <133 49152>, <134 8192>, <135 4352>,
+			    <138 13056>, <142 291584>;
+	rockchip,rcb-min-width = <512>;
+	status = "okay";
+};
+
+&vdec0_mmu {
+	rockchip,disable-mmu-reset;
+	status = "okay";
+};
+
+&vdec1 {
+	compatible = "rockchip,rkv-decoder-v2";
+	reg = <0x0 0xfdc40100 0x0 0x400>, <0x0 0xfdc40000 0x0 0x100>;
+	reg-names = "regs", "link";
+	interrupt-names = "irq_rkvdec1";
+	clocks = <&cru ACLK_RKVDEC1>, <&cru HCLK_RKVDEC1>,
+		 <&cru CLK_RKVDEC1_CORE>, <&cru CLK_RKVDEC1_CA>,
+		 <&cru CLK_RKVDEC1_HEVC_CA>;
+	clock-names = "aclk_vcodec", "hclk_vcodec", "clk_core",
+		      "clk_cabac", "clk_hevc_cabac";
+	rockchip,normal-rates = <800000000>, <0>, <600000000>,
+				<600000000>, <1000000000>;
+	resets = <&cru SRST_A_RKVDEC1>, <&cru SRST_H_RKVDEC1>,
+		 <&cru SRST_RKVDEC1_CORE>, <&cru SRST_RKVDEC1_CA>,
+		 <&cru SRST_RKVDEC1_HEVC_CA>;
+	reset-names = "video_a", "video_h", "video_core",
+		      "video_cabac", "video_hevc_cabac";
+	rockchip,skip-pmu-idle-request;
+	rockchip,srv = <&mpp_srv>;
+	rockchip,ccu = <&rkvdec_ccu>;
+	rockchip,core-mask = <0x00020002>;
+	rockchip,task-capacity = <16>;
+	rockchip,taskqueue-node = <9>;
+	rockchip,sram = <&vdec1_sram>;
+	rockchip,rcb-iova = <0xFFE00000 0x100000>;
+	rockchip,rcb-info = <136 24576>, <137 49152>, <141 90112>, <140 49152>,
+			    <139 180224>, <133 49152>, <134 8192>, <135 4352>,
+			    <138 13056>, <142 291584>;
+	rockchip,rcb-min-width = <512>;
+	status = "okay";
+};
+
+&vdec1_mmu {
+	rockchip,disable-mmu-reset;
+	status = "okay";
+};
