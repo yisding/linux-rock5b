@@ -68,6 +68,8 @@ Implemented
   bound RGA core, dispatch one active job per core, wake submit waiters on
   completion, and keep hardware nodes alive until in-flight scheduler users
   drain during remove.
+  Hardware removal stops new dispatch, completes queued and active jobs with
+  ``-ENODEV``, and signals any exported async release fence with that result.
 * Backend-aware core selection for prepared jobs.  The scheduler checks the
   same supported-operation profile used by command generation, selects an RGA3
   core for the current hardware-backed profile, and requires that core to match

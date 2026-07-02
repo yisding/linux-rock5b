@@ -879,6 +879,7 @@ struct rk_rga_hw {
 	refcount_t refs;
 	wait_queue_head_t idle;
 	spinlock_t job_lock;
+	struct mutex run_lock; /* serializes start, timeout, IRQ, and remove */
 	struct delayed_work timeout_work;
 	struct list_head job_queue;
 	struct rk_rga_job *active_job;
@@ -5791,9 +5792,12 @@ static irqreturn_t rk_rga_irq_thread(int irq, void *data)
 	int ret;
 
 	atomic_inc(&rk_rga.irq_thread_count);
+	mutex_lock(&hw->run_lock);
 	job = rk_rga_hw_take_active(hw);
-	if (!job)
+	if (!job) {
+		mutex_unlock(&hw->run_lock);
 		return IRQ_HANDLED;
+	}
 
 	cancel_delayed_work(&hw->timeout_work);
 	result = job->irq_result;
@@ -5808,8 +5812,10 @@ static irqreturn_t rk_rga_irq_thread(int irq, void *data)
 			spin_unlock_irqrestore(&hw->job_lock, flags);
 
 			ret = rk_rga_backend_start(hw, job);
-			if (ret == RK_RGA_BACKEND_QUEUED)
+			if (ret == RK_RGA_BACKEND_QUEUED) {
+				mutex_unlock(&hw->run_lock);
 				return IRQ_HANDLED;
+			}
 
 			spin_lock_irqsave(&hw->job_lock, flags);
 			if (hw->active_job == job)
@@ -5824,6 +5830,7 @@ static irqreturn_t rk_rga_irq_thread(int irq, void *data)
 	}
 
 	rk_rga_job_complete_queued(job, result);
+	mutex_unlock(&hw->run_lock);
 	rk_rga_hw_dispatch(hw);
 
 	return IRQ_HANDLED;
@@ -5850,10 +5857,12 @@ static void rk_rga_hw_timeout_work(struct work_struct *work)
 	struct rk_rga_job *job;
 	unsigned long flags;
 
+	mutex_lock(&hw->run_lock);
 	spin_lock_irqsave(&hw->job_lock, flags);
 	job = hw->active_job;
 	if (!job || job->irq_seen) {
 		spin_unlock_irqrestore(&hw->job_lock, flags);
+		mutex_unlock(&hw->run_lock);
 		return;
 	}
 
@@ -5869,6 +5878,7 @@ static void rk_rga_hw_timeout_work(struct work_struct *work)
 	rk_rga_hw_reset_after_timeout(hw);
 	rk_rga_hw_power_off(hw);
 	rk_rga_job_complete_queued(job, -EBUSY);
+	mutex_unlock(&hw->run_lock);
 	rk_rga_hw_dispatch(hw);
 }
 
@@ -5879,9 +5889,12 @@ static void rk_rga_hw_dispatch(struct rk_rga_hw *hw)
 		unsigned long flags;
 		int ret;
 
+		mutex_lock(&hw->run_lock);
 		spin_lock_irqsave(&hw->job_lock, flags);
-		if (hw->active_job || list_empty(&hw->job_queue)) {
+		if (hw->removing || hw->active_job ||
+		    list_empty(&hw->job_queue)) {
 			spin_unlock_irqrestore(&hw->job_lock, flags);
+			mutex_unlock(&hw->run_lock);
 			return;
 		}
 
@@ -5895,8 +5908,10 @@ static void rk_rga_hw_dispatch(struct rk_rga_hw *hw)
 
 		atomic_inc(&rk_rga.dispatched_job_count);
 		ret = rk_rga_backend_start(hw, job);
-		if (ret == RK_RGA_BACKEND_QUEUED)
+		if (ret == RK_RGA_BACKEND_QUEUED) {
+			mutex_unlock(&hw->run_lock);
 			return;
+		}
 
 		spin_lock_irqsave(&hw->job_lock, flags);
 		if (hw->active_job == job)
@@ -5904,6 +5919,7 @@ static void rk_rga_hw_dispatch(struct rk_rga_hw *hw)
 		spin_unlock_irqrestore(&hw->job_lock, flags);
 
 		rk_rga_job_complete_queued(job, ret);
+		mutex_unlock(&hw->run_lock);
 	}
 }
 
@@ -5925,6 +5941,12 @@ static int rk_rga_job_queue(struct rk_rga_job *job)
 	rk_rga_job_get(job);
 
 	spin_lock_irqsave(&hw->job_lock, flags);
+	if (hw->removing) {
+		spin_unlock_irqrestore(&hw->job_lock, flags);
+		rk_rga_job_complete_queued(job, -ENODEV);
+		return -ENODEV;
+	}
+
 	job->queued = true;
 	list_add_tail(&job->node, &hw->job_queue);
 	hw->queued_jobs++;
@@ -5949,6 +5971,43 @@ static int rk_rga_job_queue_and_wait(struct rk_rga_job *job)
 	ret = job->result;
 
 	return ret;
+}
+
+static void rk_rga_hw_abort_jobs(struct rk_rga_hw *hw, int result)
+{
+	struct rk_rga_job *job, *tmp;
+	struct rk_rga_job *active;
+	unsigned long flags;
+	LIST_HEAD(aborted);
+
+	cancel_delayed_work_sync(&hw->timeout_work);
+
+	mutex_lock(&hw->run_lock);
+	spin_lock_irqsave(&hw->job_lock, flags);
+	active = hw->active_job;
+	hw->active_job = NULL;
+	list_for_each_entry_safe(job, tmp, &hw->job_queue, node) {
+		list_del_init(&job->node);
+		job->queued = false;
+		list_add_tail(&job->node, &aborted);
+	}
+	hw->queued_jobs = 0;
+	spin_unlock_irqrestore(&hw->job_lock, flags);
+
+	if (active) {
+		rk_rga_hw_reset_after_timeout(hw);
+		rk_rga_hw_power_off(hw);
+	}
+	mutex_unlock(&hw->run_lock);
+	cancel_delayed_work_sync(&hw->timeout_work);
+
+	if (active)
+		rk_rga_job_complete_queued(active, result);
+
+	list_for_each_entry_safe(job, tmp, &aborted, node) {
+		list_del_init(&job->node);
+		rk_rga_job_complete_queued(job, result);
+	}
 }
 
 static void rk_rga_job_acquire_work(struct work_struct *work)
@@ -6867,6 +6926,7 @@ static int rk_rga_hw_probe(struct platform_device *pdev)
 	refcount_set(&hw->refs, 1);
 	init_waitqueue_head(&hw->idle);
 	spin_lock_init(&hw->job_lock);
+	mutex_init(&hw->run_lock);
 	INIT_DELAYED_WORK(&hw->timeout_work, rk_rga_hw_timeout_work);
 	INIT_LIST_HEAD(&hw->job_queue);
 	platform_set_drvdata(pdev, hw);
@@ -6911,8 +6971,8 @@ static void rk_rga_hw_remove(struct platform_device *pdev)
 	rk_rga_refresh_hw_versions_locked();
 	mutex_unlock(&rk_rga.hw_lock);
 
+	rk_rga_hw_abort_jobs(hw, -ENODEV);
 	wait_event(hw->idle, refcount_read(&hw->refs) == 1);
-	cancel_delayed_work_sync(&hw->timeout_work);
 	pm_runtime_disable(&pdev->dev);
 }
 
