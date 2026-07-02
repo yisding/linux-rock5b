@@ -101,6 +101,11 @@ Implemented
   first force-stops and resets the coordinator, then opportunistically aborts
   other active dependent cores without waiting on possibly running timeout
   workers.
+* Public IOMMU fault callback registration for bound MPP cores.  A fault
+  records ``iommu_fault_count`` in debugfs, logs the IOVA/status, marks the
+  active job for immediate recovery through the same serialized reset path,
+  and completes the job with ``-EIO``.  This deliberately avoids private
+  Rockchip IOMMU state and page-table walking.
 * RK3588 RKVDEC2 performance-selector readbacks for ``SET_REG_READ`` requests
   in the BSP ``0x20000`` selector window.  The rewrite validates this as a
   64-word logical side buffer, programs the selector register, reads the three
@@ -199,7 +204,7 @@ Outside This Slice
   link-table materialization/readback helpers, hard-CCU submit/add-mode append,
   coordinator running-list tracking, cross-core completion drain, and
   coordinator timeout/error containment.
-* Full BSP-equivalent timeout recovery policy and IOMMU fault recovery,
+* Full BSP-equivalent timeout recovery policy beyond immediate reset/abort,
   including hard-CCU reset/resend of still-running decoder tasks after
   recoverable faults and MMU-domain refresh.
 * Fence export/import semantics.
