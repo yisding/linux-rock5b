@@ -2963,6 +2963,7 @@ static void rk_rga_job_release_hw(struct rk_rga_job *job)
 static void rk_rga_hw_dispatch(struct rk_rga_hw *hw);
 static struct rk_rga_job *rk_rga_hw_take_active(struct rk_rga_hw *hw);
 static void rk_rga_hw_timeout_work(struct work_struct *work);
+static void rk_rga_hw_abort_jobs(struct rk_rga_hw *hw, int result);
 static int rk_rga_job_queue_ref(struct rk_rga_job *job, bool take_ref);
 
 static inline u32 rk_rga_read(struct rk_rga_hw *hw, u32 offset)
@@ -6822,6 +6823,71 @@ static void rk_rga_release_fence_fd_state_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, job.release_fence_fd, -1);
 }
 
+static void rk_rga_hw_abort_queued_jobs_kunit(struct kunit *test)
+{
+	struct rk_rga_hw hw = { };
+	struct rk_rga_job *job0;
+	struct rk_rga_job *job1;
+	struct dma_fence *fence0;
+	struct dma_fence *fence1;
+
+	mutex_init(&hw.run_lock);
+	spin_lock_init(&hw.job_lock);
+	init_waitqueue_head(&hw.idle);
+	INIT_LIST_HEAD(&hw.job_queue);
+	INIT_DELAYED_WORK(&hw.timeout_work, rk_rga_hw_timeout_work);
+	refcount_set(&hw.refs, 3);
+
+	job0 = kzalloc_obj(*job0, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job0);
+	job1 = kzalloc_obj(*job1, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job1);
+	rk_rga_job_init(job0);
+	rk_rga_job_init(job1);
+	rk_rga_job_get(job0);
+	rk_rga_job_get(job1);
+	job0->hw = &hw;
+	job1->hw = &hw;
+	job0->queued = true;
+	job1->queued = true;
+
+	fence0 = rk_rga_kunit_alloc_fence();
+	KUNIT_ASSERT_NOT_NULL(test, fence0);
+	fence1 = rk_rga_kunit_alloc_fence();
+	KUNIT_ASSERT_NOT_NULL(test, fence1);
+	dma_fence_get(fence0);
+	dma_fence_get(fence1);
+	job0->release_fence = fence0;
+	job1->release_fence = fence1;
+
+	list_add_tail(&job0->node, &hw.job_queue);
+	list_add_tail(&job1->node, &hw.job_queue);
+	hw.queued_jobs = 2;
+
+	rk_rga_hw_abort_jobs(&hw, -ENODEV);
+
+	KUNIT_EXPECT_TRUE(test, list_empty(&hw.job_queue));
+	KUNIT_EXPECT_EQ(test, hw.queued_jobs, 0U);
+	KUNIT_EXPECT_FALSE(test, job0->queued);
+	KUNIT_EXPECT_FALSE(test, job1->queued);
+	KUNIT_EXPECT_TRUE(test, job0->done);
+	KUNIT_EXPECT_TRUE(test, job1->done);
+	KUNIT_EXPECT_EQ(test, job0->result, -ENODEV);
+	KUNIT_EXPECT_EQ(test, job1->result, -ENODEV);
+	KUNIT_EXPECT_PTR_EQ(test, job0->hw, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, job1->hw, NULL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&job0->refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&job1->refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&hw.refs), 1);
+	KUNIT_EXPECT_EQ(test, dma_fence_get_status(fence0), -ENODEV);
+	KUNIT_EXPECT_EQ(test, dma_fence_get_status(fence1), -ENODEV);
+
+	rk_rga_job_put(job0);
+	rk_rga_job_put(job1);
+	dma_fence_put(fence0);
+	dma_fence_put(fence1);
+}
+
 static void rk_rga_mixed_task_hw_type_kunit(struct kunit *test)
 {
 	enum rk_rga_hw_type type = 0;
@@ -9751,6 +9817,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_acquire_callbacks_result_kunit),
 	KUNIT_CASE(rk_rga_job_free_release_fence_kunit),
 	KUNIT_CASE(rk_rga_release_fence_fd_state_kunit),
+	KUNIT_CASE(rk_rga_hw_abort_queued_jobs_kunit),
 	KUNIT_CASE(rk_rga_mixed_task_hw_type_kunit),
 	KUNIT_CASE(rk_rga_bitblt_hw_type_mask_kunit),
 	KUNIT_CASE(rk_rga_find_best_hw_for_job_kunit),
