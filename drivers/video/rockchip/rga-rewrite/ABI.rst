@@ -29,6 +29,10 @@ Implemented
   jobs create job-owned remaps against the selected RGA2 device.
 * ``RGA_IOC_REQUEST_CREATE``, ``RGA_IOC_REQUEST_CONFIG``, and
   ``RGA_IOC_REQUEST_CANCEL`` request lifetime management.
+  ``RGA_IOC_REQUEST_CONFIG`` is a staging operation: it copies the userspace
+  task array into the session request, resolves imported-buffer handles to
+  mapped IOVAs, keeps the request id live, and does not submit hardware or
+  export a release fence by itself.
   ``RGA_IOC_REQUEST_SUBMIT`` consumes the session request after cloning the
   prepared job resources, matching current ``librga`` task-job lifetime.
 * Modern request task-array copy into session-owned request objects.  Handle
