@@ -68,6 +68,10 @@ Implemented
 * Session-owned active-job bookkeeping with explicit submit/complete/abort
   transitions.  ``RESET_SESSION`` and file close abort active rewrite jobs
   before releasing imports.
+  KUnit coverage checks that reset/close-style abort removes both queued and
+  session-active jobs from the session-visible list, drops queued counters and
+  scheduler ownership, reports ``-ECANCELED`` internally, and leaves
+  subsequent nonblocking poll with the BSP-compatible empty-session ``-EIO``.
 * Prepared register jobs select and hold a counted reference to an online
   RK3588 hardware core whose ``rockchip,ccu`` phandle, when present, resolves
   to a bound online CCU coordinator.  Kernel-translated jobs choose the
