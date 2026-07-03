@@ -9025,193 +9025,203 @@ static void rk_rga_bitblt_hw_type_mask_kunit(struct kunit *test)
 
 static void rk_rga_find_best_hw_for_job_kunit(struct kunit *test)
 {
-	struct rga_req task =
-		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
-					  RK_RGA_FORMAT_BGRA_8888);
+	struct rga_req *task;
 	struct rga_req *tasks;
-	struct rk_rga_job active = { };
-	struct rk_rga_job job = {
-		.tasks = &task,
-		.task_count = 1,
-	};
-	struct rk_rga_hw busy = {
-		.type = RK_RGA_HW_RGA3,
-		.core_mask = BIT(0),
-		.queued_jobs = 2,
-	};
-	struct rk_rga_hw idle = {
-		.type = RK_RGA_HW_RGA3,
-		.core_mask = BIT(1),
-	};
-	struct rk_rga_hw rga2_idle = {
-		.type = RK_RGA_HW_RGA2,
-		.core_mask = BIT(2),
-	};
+	struct rk_rga_job *active;
+	struct rk_rga_job *job;
+	struct rk_rga_hw *busy;
+	struct rk_rga_hw *idle;
+	struct rk_rga_hw *rga2_idle;
 	struct rk_rga_hw *rga2_other;
 	struct rk_rga_hw *selected;
 	u32 rr_start;
 	LIST_HEAD(hw_list);
 
-	spin_lock_init(&busy.job_lock);
-	spin_lock_init(&idle.job_lock);
-	spin_lock_init(&rga2_idle.job_lock);
-	list_add_tail(&busy.node, &hw_list);
-	list_add_tail(&idle.node, &hw_list);
-	list_add_tail(&rga2_idle.node, &hw_list);
+	task = kunit_kzalloc(test, sizeof(*task), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, task);
 	tasks = kunit_kcalloc(test, 2, sizeof(*tasks), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, tasks);
+	active = kunit_kzalloc(test, sizeof(*active), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, active);
+	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+	busy = kunit_kzalloc(test, sizeof(*busy), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, busy);
+	idle = kunit_kzalloc(test, sizeof(*idle), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, idle);
+	rga2_idle = kunit_kzalloc(test, sizeof(*rga2_idle), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, rga2_idle);
 	rga2_other = kunit_kzalloc(test, sizeof(*rga2_other), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, rga2_other);
+
+	*task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_BGRA_8888);
+	job->tasks = task;
+	job->task_count = 1;
+	busy->type = RK_RGA_HW_RGA3;
+	busy->core_mask = BIT(0);
+	busy->queued_jobs = 2;
+	idle->type = RK_RGA_HW_RGA3;
+	idle->core_mask = BIT(1);
+	rga2_idle->type = RK_RGA_HW_RGA2;
+	rga2_idle->core_mask = BIT(2);
 	rga2_other->type = RK_RGA_HW_RGA2;
 	rga2_other->core_mask = BIT(3);
+
+	spin_lock_init(&busy->job_lock);
+	spin_lock_init(&idle->job_lock);
+	spin_lock_init(&rga2_idle->job_lock);
 	spin_lock_init(&rga2_other->job_lock);
+	list_add_tail(&busy->node, &hw_list);
+	list_add_tail(&idle->node, &hw_list);
+	list_add_tail(&rga2_idle->node, &hw_list);
 
 	KUNIT_EXPECT_PTR_EQ(test,
-			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+			    rk_rga_find_best_hw_for_job(&hw_list, job,
 							RK_RGA_HW_TYPE_MASK_RGA3,
 							0),
-			    &idle);
+			    idle);
 
-	task.core = BIT(0);
+	task->core = BIT(0);
 	KUNIT_EXPECT_PTR_EQ(test,
-			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+			    rk_rga_find_best_hw_for_job(&hw_list, job,
 							RK_RGA_HW_TYPE_MASK_ALL,
 							0),
-			    &busy);
+			    busy);
 
-	task.core = BIT(1);
+	task->core = BIT(1);
 	KUNIT_EXPECT_PTR_EQ(test,
-			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+			    rk_rga_find_best_hw_for_job(&hw_list, job,
 							RK_RGA_HW_TYPE_MASK_ALL,
 							0),
-			    &idle);
+			    idle);
 
-	task.core = 0;
-	idle.active_job = &active;
-	idle.queued_jobs = 3;
+	task->core = 0;
+	idle->active_job = active;
+	idle->queued_jobs = 3;
 	KUNIT_EXPECT_PTR_EQ(test,
-			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+			    rk_rga_find_best_hw_for_job(&hw_list, job,
 							RK_RGA_HW_TYPE_MASK_RGA3,
 							0),
-			    &busy);
+			    busy);
 	KUNIT_EXPECT_PTR_EQ(test,
-			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+			    rk_rga_find_best_hw_for_job(&hw_list, job,
 							RK_RGA_HW_TYPE_MASK_ALL,
 							0),
-			    &rga2_idle);
+			    rga2_idle);
 
-	task.core = BIT(3);
+	task->core = BIT(3);
 	KUNIT_EXPECT_PTR_EQ(test,
-			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+			    rk_rga_find_best_hw_for_job(&hw_list, job,
 							RK_RGA_HW_TYPE_MASK_ALL,
 							0),
 			    NULL);
 
-	task.core = BIT(2) | BIT(3);
+	task->core = BIT(2) | BIT(3);
 	KUNIT_EXPECT_PTR_EQ(test,
-			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+			    rk_rga_find_best_hw_for_job(&hw_list, job,
 							RK_RGA_HW_TYPE_MASK_ALL,
 							0),
-			    &rga2_idle);
+			    rga2_idle);
 
-	task.core = BIT(0);
-	busy.removing = true;
+	task->core = BIT(0);
+	busy->removing = true;
 	KUNIT_EXPECT_PTR_EQ(test,
-			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+			    rk_rga_find_best_hw_for_job(&hw_list, job,
 							RK_RGA_HW_TYPE_MASK_ALL,
 							0),
 			    NULL);
 
-	tasks[0] = task;
+	tasks[0] = *task;
 	tasks[0].core = BIT(0);
-	tasks[1] = task;
+	tasks[1] = *task;
 	tasks[1].core = BIT(1);
-	busy.removing = false;
-	job.tasks = tasks;
-	job.task_count = 2;
-	job.current_task = 1;
+	busy->removing = false;
+	job->tasks = tasks;
+	job->task_count = 2;
+	job->current_task = 1;
 	KUNIT_EXPECT_PTR_EQ(test,
-			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+			    rk_rga_find_best_hw_for_job(&hw_list, job,
 							RK_RGA_HW_TYPE_MASK_ALL,
 							0),
-			    &idle);
+			    idle);
 
-	job.tasks = &task;
-	job.task_count = 1;
-	job.current_task = 0;
-	task.core = 0;
-	idle.active_job = NULL;
-	idle.queued_jobs = 0;
-	busy.active_job = NULL;
-	busy.queued_jobs = 0;
-	busy.removing = false;
+	job->tasks = task;
+	job->task_count = 1;
+	job->current_task = 0;
+	task->core = 0;
+	idle->active_job = NULL;
+	idle->queued_jobs = 0;
+	busy->active_job = NULL;
+	busy->queued_jobs = 0;
+	busy->removing = false;
 	KUNIT_EXPECT_PTR_EQ(test,
-			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+			    rk_rga_find_best_hw_for_job(&hw_list, job,
 							RK_RGA_HW_TYPE_MASK_RGA3,
 							0),
-			    &busy);
+			    busy);
 	KUNIT_EXPECT_PTR_EQ(test,
-			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+			    rk_rga_find_best_hw_for_job(&hw_list, job,
 							RK_RGA_HW_TYPE_MASK_RGA3,
 							1),
-			    &idle);
+			    idle);
 	KUNIT_EXPECT_PTR_EQ(test,
-			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+			    rk_rga_find_best_hw_for_job(&hw_list, job,
 							RK_RGA_HW_TYPE_MASK_ALL,
 							2),
-			    &busy);
+			    busy);
 
-	task.core = BIT(2) | BIT(3);
+	task->core = BIT(2) | BIT(3);
 	list_add_tail(&rga2_other->node, &hw_list);
 	KUNIT_EXPECT_PTR_EQ(test,
-			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+			    rk_rga_find_best_hw_for_job(&hw_list, job,
 							RK_RGA_HW_TYPE_MASK_RGA2,
 							2),
-			    &rga2_idle);
+			    rga2_idle);
 	KUNIT_EXPECT_PTR_EQ(test,
-			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+			    rk_rga_find_best_hw_for_job(&hw_list, job,
 							RK_RGA_HW_TYPE_MASK_RGA2,
 							3),
 			    rga2_other);
 
-	task.core = 0;
+	task->core = 0;
 	rr_start = 0;
-	selected = rk_rga_find_best_hw_for_job(&hw_list, &job,
+	selected = rk_rga_find_best_hw_for_job(&hw_list, job,
 					       RK_RGA_HW_TYPE_MASK_RGA3,
 					       rr_start);
-	KUNIT_ASSERT_PTR_EQ(test, selected, &busy);
+	KUNIT_ASSERT_PTR_EQ(test, selected, busy);
 	rr_start = rk_rga_core_select_next(selected, rr_start);
-	selected = rk_rga_find_best_hw_for_job(&hw_list, &job,
+	selected = rk_rga_find_best_hw_for_job(&hw_list, job,
 					       RK_RGA_HW_TYPE_MASK_RGA3,
 					       rr_start);
-	KUNIT_ASSERT_PTR_EQ(test, selected, &idle);
+	KUNIT_ASSERT_PTR_EQ(test, selected, idle);
 	rr_start = rk_rga_core_select_next(selected, rr_start);
-	selected = rk_rga_find_best_hw_for_job(&hw_list, &job,
+	selected = rk_rga_find_best_hw_for_job(&hw_list, job,
 					       RK_RGA_HW_TYPE_MASK_RGA3,
 					       rr_start);
-	KUNIT_ASSERT_PTR_EQ(test, selected, &busy);
+	KUNIT_ASSERT_PTR_EQ(test, selected, busy);
 	rr_start = rk_rga_core_select_next(selected, rr_start);
-	selected = rk_rga_find_best_hw_for_job(&hw_list, &job,
+	selected = rk_rga_find_best_hw_for_job(&hw_list, job,
 					       RK_RGA_HW_TYPE_MASK_RGA3,
 					       rr_start);
-	KUNIT_ASSERT_PTR_EQ(test, selected, &idle);
+	KUNIT_ASSERT_PTR_EQ(test, selected, idle);
 
-	task.core = BIT(2) | BIT(3);
+	task->core = BIT(2) | BIT(3);
 	rr_start = 2;
-	selected = rk_rga_find_best_hw_for_job(&hw_list, &job,
+	selected = rk_rga_find_best_hw_for_job(&hw_list, job,
 					       RK_RGA_HW_TYPE_MASK_RGA2,
 					       rr_start);
-	KUNIT_ASSERT_PTR_EQ(test, selected, &rga2_idle);
+	KUNIT_ASSERT_PTR_EQ(test, selected, rga2_idle);
 	rr_start = rk_rga_core_select_next(selected, rr_start);
-	selected = rk_rga_find_best_hw_for_job(&hw_list, &job,
+	selected = rk_rga_find_best_hw_for_job(&hw_list, job,
 					       RK_RGA_HW_TYPE_MASK_RGA2,
 					       rr_start);
 	KUNIT_ASSERT_PTR_EQ(test, selected, rga2_other);
 	rr_start = rk_rga_core_select_next(selected, rr_start);
-	selected = rk_rga_find_best_hw_for_job(&hw_list, &job,
+	selected = rk_rga_find_best_hw_for_job(&hw_list, job,
 					       RK_RGA_HW_TYPE_MASK_RGA2,
 					       rr_start);
-	KUNIT_EXPECT_PTR_EQ(test, selected, &rga2_idle);
+	KUNIT_EXPECT_PTR_EQ(test, selected, rga2_idle);
 }
 
 static void rk_rga_core_counter_kunit(struct kunit *test)
