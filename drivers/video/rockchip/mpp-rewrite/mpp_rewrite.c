@@ -49,6 +49,8 @@
 #include <uapi/linux/rk-mpp.h>
 
 #if IS_ENABLED(CONFIG_ROCKCHIP_MPP_REWRITE_KUNIT_TEST)
+#include <linux/mm.h>
+#include <linux/mman.h>
 #include <kunit/test.h>
 #endif
 
@@ -2299,8 +2301,32 @@ static bool rk_mpp_hw_prepare_active_retry(struct rk_mpp_hw *hw,
 					   struct rk_mpp_job *match);
 static void rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw,
 				    struct rk_mpp_job *job);
+static bool rk_mpp_job_rkvdec_rcb_enabled(struct rk_mpp_job *job);
 static void rk_mpp_rkvenc2_dchs_patch(struct rk_mpp_job *job);
 static void rk_mpp_rkvenc2_dchs_release(struct rk_mpp_job *job);
+
+static void __user *rk_mpp_kunit_user_payload(struct kunit *test,
+					      const void *src, size_t size)
+{
+	unsigned long useraddr;
+	void __user *dst;
+
+	useraddr = kunit_vm_mmap(test, NULL, 0, PAGE_ALIGN(size ? size : 1),
+				 PROT_READ | PROT_WRITE,
+				 MAP_ANONYMOUS | MAP_PRIVATE, 0);
+	if (!useraddr || useraddr >= TASK_SIZE) {
+		KUNIT_FAIL(test, "failed to allocate userspace payload");
+		return NULL;
+	}
+
+	dst = (void __user *)useraddr;
+	if (size && copy_to_user(dst, src, size)) {
+		KUNIT_FAIL(test, "failed to copy userspace payload");
+		return NULL;
+	}
+
+	return dst;
+}
 
 static void rk_mpp_check_cmd_v1_kunit(struct kunit *test)
 {
@@ -2416,6 +2442,69 @@ static void rk_mpp_cmd_copies_payload_kunit(struct kunit *test)
 			   rk_mpp_cmd_copies_payload(MPP_CMD_POLL_HW_FINISH));
 	KUNIT_EXPECT_FALSE(test,
 			   rk_mpp_cmd_copies_payload(MPP_CMD_TRANS_FD_TO_IOVA));
+}
+
+static void rk_mpp_store_codec_info_kunit(struct kunit *test)
+{
+	struct rk_mpp_codec_info_elem elems[] = {
+		{
+			.type = RK_MPP_DEC_INFO_WIDTH,
+			.flag = 1,
+			.data = 1920,
+		}, {
+			.type = 0,
+			.flag = 1,
+			.data = 111,
+		}, {
+			.type = RK_MPP_DEC_INFO_HEIGHT,
+			.flag = 2,
+			.data = 1080,
+		}, {
+			.type = RK_MPP_DEC_INFO_BITDEPTH,
+			.flag = RK_MPP_CODEC_INFO_FLAG_BUTT,
+			.data = 12,
+		}, {
+			.type = RK_MPP_DEC_INFO_BUTT,
+			.flag = 1,
+			.data = 4096,
+		}, {
+			.type = RK_MPP_DEC_INFO_BITDEPTH,
+			.flag = 1,
+			.data = 10,
+		},
+	};
+	u8 payload[sizeof(elems) + 3] = {};
+	struct rk_mpp_session session = {
+		.client_type = RK_MPP_DEVICE_RKVDEC,
+	};
+	struct mpp_request req = {
+		.size = sizeof(payload),
+	};
+
+	mutex_init(&session.lock);
+	memcpy(payload, elems, sizeof(elems));
+	req.data = rk_mpp_kunit_user_payload(test, payload, sizeof(payload));
+	KUNIT_ASSERT_NOT_NULL(test, req.data);
+
+	KUNIT_EXPECT_EQ(test, rk_mpp_store_codec_info(&session, &req), 0);
+	KUNIT_EXPECT_EQ(test,
+			session.codec_info[RK_MPP_DEC_INFO_WIDTH].flag, 1U);
+	KUNIT_EXPECT_EQ(test,
+			session.codec_info[RK_MPP_DEC_INFO_WIDTH].val, 1920ULL);
+	KUNIT_EXPECT_EQ(test,
+			session.codec_info[RK_MPP_DEC_INFO_HEIGHT].flag, 2U);
+	KUNIT_EXPECT_EQ(test,
+			session.codec_info[RK_MPP_DEC_INFO_HEIGHT].val, 1080ULL);
+	KUNIT_EXPECT_EQ(test,
+			session.codec_info[RK_MPP_DEC_INFO_BITDEPTH].flag, 1U);
+	KUNIT_EXPECT_EQ(test,
+			session.codec_info[RK_MPP_DEC_INFO_BITDEPTH].val, 10ULL);
+	KUNIT_EXPECT_EQ(test, session.codec_info[0].flag, 0U);
+	KUNIT_EXPECT_EQ(test, session.codec_info[0].val, 0ULL);
+	KUNIT_EXPECT_EQ(test,
+			session.codec_info[RK_MPP_DEC_INFO_BUTT].flag, 0U);
+	KUNIT_EXPECT_EQ(test,
+			session.codec_info[RK_MPP_DEC_INFO_BUTT].val, 0ULL);
 }
 
 static void rk_mpp_request_check_reg_span_kunit(struct kunit *test)
@@ -3768,6 +3857,36 @@ static void rk_mpp_rcb_invalid_index_kunit(struct kunit *test)
 	kfree(job->reg_image.regs);
 }
 
+static void rk_mpp_rkvdec_rcb_width_gate_kunit(struct kunit *test)
+{
+	struct rk_mpp_session session = {
+		.client_type = RK_MPP_DEVICE_RKVDEC,
+	};
+	struct rk_mpp_hw hw = {
+		.rcb_min_width = 1920,
+	};
+	struct rk_mpp_job job = {
+		.session = &session,
+		.hw = &hw,
+	};
+
+	mutex_init(&session.lock);
+
+	session.codec_info[RK_MPP_DEC_INFO_WIDTH].val = 1919;
+	KUNIT_EXPECT_FALSE(test, rk_mpp_job_rkvdec_rcb_enabled(&job));
+
+	session.codec_info[RK_MPP_DEC_INFO_WIDTH].val = 1920;
+	KUNIT_EXPECT_TRUE(test, rk_mpp_job_rkvdec_rcb_enabled(&job));
+
+	session.codec_info[RK_MPP_DEC_INFO_WIDTH].val = 0;
+	hw.rcb_min_width = 0;
+	KUNIT_EXPECT_TRUE(test, rk_mpp_job_rkvdec_rcb_enabled(&job));
+
+	hw.rcb_min_width = 1920;
+	session.client_type = RK_MPP_DEVICE_RKVENC;
+	KUNIT_EXPECT_TRUE(test, rk_mpp_job_rkvdec_rcb_enabled(&job));
+}
+
 static void rk_mpp_batch_session_switch_split_kunit(struct kunit *test)
 {
 	struct rk_mpp_session session0 = {};
@@ -3828,6 +3947,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_abi_layout_kunit),
 	KUNIT_CASE(rk_mpp_msg_v1_to_request_kunit),
 	KUNIT_CASE(rk_mpp_cmd_copies_payload_kunit),
+	KUNIT_CASE(rk_mpp_store_codec_info_kunit),
 	KUNIT_CASE(rk_mpp_request_check_reg_span_kunit),
 	KUNIT_CASE(rk_mpp_request_check_rkvdec_perf_span_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_timeout_threshold_kunit),
@@ -3855,6 +3975,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_rkvenc2_dchs_remap_kunit),
 	KUNIT_CASE(rk_mpp_rkvenc2_dchs_independent_cores_kunit),
 	KUNIT_CASE(rk_mpp_rcb_invalid_index_kunit),
+	KUNIT_CASE(rk_mpp_rkvdec_rcb_width_gate_kunit),
 	KUNIT_CASE(rk_mpp_batch_session_switch_split_kunit),
 	{}
 };
