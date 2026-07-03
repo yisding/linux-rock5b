@@ -285,6 +285,7 @@ struct rk_mpp_service {
 	struct rk_mpp_rkvenc_dchs_entry rkvenc_dchs[RK_MPP_RKVENC_MAX_DCHS_CORES];
 	u32 hw_support;
 	u32 bound_hw_count;
+	u32 core_select_seq;
 };
 
 struct rk_mpp_session {
@@ -861,6 +862,29 @@ static u32 rk_mpp_hw_load(struct rk_mpp_hw *hw)
 	       atomic_read(&hw->queued_job_count);
 }
 
+static u32 rk_mpp_hw_core_distance(const struct rk_mpp_hw *hw, u32 start)
+{
+	u32 core_id;
+
+	if (hw->core_id < 0 || hw->core_id >= RK_MPP_CORE_COUNTER_COUNT)
+		return U32_MAX;
+
+	core_id = hw->core_id;
+	return (core_id + RK_MPP_CORE_COUNTER_COUNT -
+		(start % RK_MPP_CORE_COUNTER_COUNT)) %
+	       RK_MPP_CORE_COUNTER_COUNT;
+}
+
+static bool rk_mpp_hw_tie_better(struct rk_mpp_hw *selected,
+				 struct rk_mpp_hw *candidate, u32 start)
+{
+	if (!selected)
+		return true;
+
+	return rk_mpp_hw_core_distance(candidate, start) <
+	       rk_mpp_hw_core_distance(selected, start);
+}
+
 static struct rk_mpp_hw *rk_mpp_hw_get_for_session(struct rk_mpp_session *session,
 						   bool prefer_idle)
 {
@@ -868,6 +892,7 @@ static struct rk_mpp_hw *rk_mpp_hw_get_for_session(struct rk_mpp_session *sessio
 	struct rk_mpp_hw *hw;
 	struct rk_mpp_hw *selected = NULL;
 	u32 selected_load = U32_MAX;
+	u32 rr_start = srv->core_select_seq;
 
 	mutex_lock(&srv->hw_lock);
 	list_for_each_entry(hw, &srv->hw_list, link) {
@@ -885,15 +910,19 @@ static struct rk_mpp_hw *rk_mpp_hw_get_for_session(struct rk_mpp_session *sessio
 		}
 
 		load = rk_mpp_hw_load(hw);
-		if (!selected || load < selected_load) {
+		if (!selected || load < selected_load ||
+		    (load == selected_load &&
+		     rk_mpp_hw_tie_better(selected, hw, rr_start))) {
 			selected = hw;
 			selected_load = load;
-			if (!load)
-				break;
 		}
 	}
-	if (selected)
+	if (selected) {
 		refcount_inc(&selected->refs);
+		if (prefer_idle && selected->core_id >= 0 &&
+		    selected->core_id < RK_MPP_CORE_COUNTER_COUNT)
+			srv->core_select_seq = selected->core_id + 1;
+	}
 	mutex_unlock(&srv->hw_lock);
 
 	return selected;
@@ -3567,6 +3596,79 @@ static void rk_mpp_core_counter_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&rkvdec[2]), 1);
 }
 
+static void rk_mpp_hw_select_rotation_kunit(struct kunit *test)
+{
+	struct rk_mpp_service srv = {};
+	struct rk_mpp_session session = {
+		.srv = &srv,
+		.client_type = RK_MPP_DEVICE_RKVENC,
+	};
+	struct rk_mpp_hw *hw0;
+	struct rk_mpp_hw *hw1;
+	struct rk_mpp_hw *hw2;
+	struct rk_mpp_hw *selected;
+
+	mutex_init(&srv.hw_lock);
+	INIT_LIST_HEAD(&srv.hw_list);
+	hw0 = kunit_kzalloc(test, sizeof(*hw0), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw0);
+	hw1 = kunit_kzalloc(test, sizeof(*hw1), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw1);
+	hw2 = kunit_kzalloc(test, sizeof(*hw2), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw2);
+
+	hw0->match = &rk_mpp_rkvenc2_core;
+	hw0->core_id = 0;
+	hw0->online = true;
+	hw1->match = &rk_mpp_rkvenc2_core;
+	hw1->core_id = 1;
+	hw1->online = true;
+	hw2->match = &rk_mpp_rkvenc2_core;
+	hw2->core_id = 2;
+	hw2->online = true;
+	spin_lock_init(&hw0->lock);
+	spin_lock_init(&hw1->lock);
+	spin_lock_init(&hw2->lock);
+	refcount_set(&hw0->refs, 1);
+	refcount_set(&hw1->refs, 1);
+	refcount_set(&hw2->refs, 1);
+	INIT_LIST_HEAD(&hw0->link);
+	INIT_LIST_HEAD(&hw1->link);
+	INIT_LIST_HEAD(&hw2->link);
+	list_add_tail(&hw0->link, &srv.hw_list);
+	list_add_tail(&hw1->link, &srv.hw_list);
+	list_add_tail(&hw2->link, &srv.hw_list);
+
+	selected = rk_mpp_hw_get_for_session(&session, true);
+	KUNIT_EXPECT_PTR_EQ(test, selected, hw0);
+	KUNIT_EXPECT_EQ(test, srv.core_select_seq, 1U);
+	rk_mpp_hw_put(selected);
+
+	selected = rk_mpp_hw_get_for_session(&session, true);
+	KUNIT_EXPECT_PTR_EQ(test, selected, hw1);
+	KUNIT_EXPECT_EQ(test, srv.core_select_seq, 2U);
+	rk_mpp_hw_put(selected);
+
+	selected = rk_mpp_hw_get_for_session(&session, true);
+	KUNIT_EXPECT_PTR_EQ(test, selected, hw2);
+	KUNIT_EXPECT_EQ(test, srv.core_select_seq, 3U);
+	rk_mpp_hw_put(selected);
+
+	srv.core_select_seq = 2;
+	atomic_set(&hw2->queued_job_count, 1);
+	selected = rk_mpp_hw_get_for_session(&session, true);
+	KUNIT_EXPECT_PTR_EQ(test, selected, hw0);
+	KUNIT_EXPECT_EQ(test, srv.core_select_seq, 1U);
+	rk_mpp_hw_put(selected);
+	atomic_set(&hw2->queued_job_count, 0);
+
+	srv.core_select_seq = 2;
+	selected = rk_mpp_hw_get_for_session(&session, false);
+	KUNIT_EXPECT_PTR_EQ(test, selected, hw0);
+	KUNIT_EXPECT_EQ(test, srv.core_select_seq, 2U);
+	rk_mpp_hw_put(selected);
+}
+
 static void rk_mpp_iommu_fault_match_kunit(struct kunit *test)
 {
 	struct rk_mpp_iommu_fault_match_fixture {
@@ -4206,6 +4308,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_hw_take_active_if_kunit),
 	KUNIT_CASE(rk_mpp_hw_prepare_active_retry_kunit),
 	KUNIT_CASE(rk_mpp_core_counter_kunit),
+	KUNIT_CASE(rk_mpp_hw_select_rotation_kunit),
 	KUNIT_CASE(rk_mpp_iommu_fault_match_kunit),
 	KUNIT_CASE(rk_mpp_poll_irq_check_size_kunit),
 	KUNIT_CASE(rk_mpp_rkvenc_slice_mode_kunit),
