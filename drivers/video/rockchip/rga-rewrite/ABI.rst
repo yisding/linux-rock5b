@@ -349,7 +349,8 @@ Implemented
   normalization helpers, including the RGA2 ``rotate_mode``/``sina``/``cosa``
   decoder, transformed destination-corner selection, color-fill core-mask
   dispatch, BSP request task-count limits and return codes, legacy/modern
-  version-query strings and positive success returns, mixed RGA2/RGA3 multi-task
+  version-query strings, positive success returns, and absent-RGA2 failure,
+  mixed RGA2/RGA3 multi-task
   classification with per-task core-mask forcing, request-id removal on terminal
   submit, request create/cancel ioctl id allocation, usercopy, and miss handling,
   import-buffer ioctl physical-address rejection and malformed-pool returns,
