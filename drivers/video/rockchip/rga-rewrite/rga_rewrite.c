@@ -4212,7 +4212,7 @@ static int rk_rga3_validate_color_key(const struct rga_req *task, bool has_pat)
 		return -EOPNOTSUPP;
 	if (!rk_rga3_task_uses_alpha_blend(task))
 		return -EOPNOTSUPP;
-	if (task->src_trans_mode != 0x1e)
+	if (task->src_trans_mode != 0x1e && task->src_trans_mode != 0x1f)
 		return -EOPNOTSUPP;
 	if (task->alpha_rop_mode != 0x11)
 		return -EOPNOTSUPP;
@@ -9084,9 +9084,14 @@ static void rk_rga3_colorkey_emit_kunit(struct kunit *test)
 	memset(cmd, 0, sizeof(cmd));
 	job.cmd_ready = false;
 	task.src_trans_mode = 0x1f;
-	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job),
-			-EOPNOTSUPP);
-	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_CTRL_OFFSET / 4],
+			expected_ctrl);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_TOP_KEY_MIN_OFFSET / 4],
+			expected_min);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_TOP_KEY_MAX_OFFSET / 4],
+			expected_max);
 }
 
 static void rk_rga3_alpha_rotate_emit_kunit(struct kunit *test)
