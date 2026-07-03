@@ -62,6 +62,7 @@
 #define RK_MPP_RKVENC_MAX_SLICE_FIFO	256
 #define RK_MPP_RKVENC_MAX_DCHS_CORES	4
 #define RK_MPP_RKVENC_MAX_DCHS_ID	4
+#define RK_MPP_CORE_COUNTER_COUNT	4
 #define RK_MPP_RKVDEC_MAX_CCU_CORES	4
 #define RK_MPP_RKVDEC_PERF_SEL_NUM	64
 #define RK_MPP_RKVDEC_LINK_REGION	1
@@ -264,6 +265,15 @@ struct rk_mpp_service {
 	atomic_t unsupported_count;
 	atomic_t import_count;
 	atomic_t submitted_job_count;
+	atomic_t scheduled_job_count;
+	atomic_t scheduled_rkvenc_core_count[RK_MPP_CORE_COUNTER_COUNT];
+	atomic_t scheduled_rkvdec_core_count[RK_MPP_CORE_COUNTER_COUNT];
+	atomic_t dispatched_job_count;
+	atomic_t dispatched_rkvenc_core_count[RK_MPP_CORE_COUNTER_COUNT];
+	atomic_t dispatched_rkvdec_core_count[RK_MPP_CORE_COUNTER_COUNT];
+	atomic_t started_job_count;
+	atomic_t started_rkvenc_core_count[RK_MPP_CORE_COUNTER_COUNT];
+	atomic_t started_rkvdec_core_count[RK_MPP_CORE_COUNTER_COUNT];
 	atomic_t queued_job_count;
 	atomic_t timeout_count;
 	atomic_t iommu_fault_count;
@@ -416,6 +426,62 @@ rk_mpp_iommu_find_fault_hw(struct list_head *fault_hws,
 			   struct iommu_domain *domain,
 			   struct device *iommu_dev);
 static struct rk_mpp_service rk_mpp_srv;
+
+static int rk_mpp_core_counter_index(const struct rk_mpp_hw *hw)
+{
+	if (!hw || !hw->match || !hw->match->contributes_support)
+		return -EINVAL;
+	if (hw->match->type != RK_MPP_DEVICE_RKVENC &&
+	    hw->match->type != RK_MPP_DEVICE_RKVDEC)
+		return -EINVAL;
+	if (hw->core_id < 0 || hw->core_id >= RK_MPP_CORE_COUNTER_COUNT)
+		return -EINVAL;
+
+	return hw->core_id;
+}
+
+static void
+rk_mpp_count_core(atomic_t rkvenc_counters[RK_MPP_CORE_COUNTER_COUNT],
+		  atomic_t rkvdec_counters[RK_MPP_CORE_COUNTER_COUNT],
+		  const struct rk_mpp_hw *hw)
+{
+	int index = rk_mpp_core_counter_index(hw);
+
+	if (index < 0)
+		return;
+
+	if (hw->match->type == RK_MPP_DEVICE_RKVENC)
+		atomic_inc(&rkvenc_counters[index]);
+	else
+		atomic_inc(&rkvdec_counters[index]);
+}
+
+static void rk_mpp_count_scheduled_core(struct rk_mpp_job *job)
+{
+	struct rk_mpp_service *srv = job->session->srv;
+
+	atomic_inc(&srv->scheduled_job_count);
+	rk_mpp_count_core(srv->scheduled_rkvenc_core_count,
+			  srv->scheduled_rkvdec_core_count, job->hw);
+}
+
+static void rk_mpp_count_dispatched_core(struct rk_mpp_job *job)
+{
+	struct rk_mpp_service *srv = job->session->srv;
+
+	atomic_inc(&srv->dispatched_job_count);
+	rk_mpp_count_core(srv->dispatched_rkvenc_core_count,
+			  srv->dispatched_rkvdec_core_count, job->hw);
+}
+
+static void rk_mpp_count_started_core(struct rk_mpp_job *job)
+{
+	struct rk_mpp_service *srv = job->session->srv;
+
+	atomic_inc(&srv->started_job_count);
+	rk_mpp_count_core(srv->started_rkvenc_core_count,
+			  srv->started_rkvdec_core_count, job->hw);
+}
 
 static const struct rk_mpp_hw_match rk_mpp_rkvenc2_core = {
 	.name = "rkvenc2",
@@ -3205,6 +3271,49 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv.iommu_refresh_count), 1);
 }
 
+static void rk_mpp_core_counter_kunit(struct kunit *test)
+{
+	atomic_t rkvenc[RK_MPP_CORE_COUNTER_COUNT];
+	atomic_t rkvdec[RK_MPP_CORE_COUNTER_COUNT];
+	struct rk_mpp_hw hw = {
+		.match = &rk_mpp_rkvenc2_core,
+		.core_id = 1,
+	};
+
+	for (u32 i = 0; i < RK_MPP_CORE_COUNTER_COUNT; i++) {
+		atomic_set(&rkvenc[i], 0);
+		atomic_set(&rkvdec[i], 0);
+	}
+
+	KUNIT_EXPECT_EQ(test, rk_mpp_core_counter_index(&hw), 1);
+	rk_mpp_count_core(rkvenc, rkvdec, &hw);
+	KUNIT_EXPECT_EQ(test, atomic_read(&rkvenc[1]), 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&rkvdec[1]), 0);
+
+	hw.match = &rk_mpp_rkvdec2_core;
+	hw.core_id = 2;
+	KUNIT_EXPECT_EQ(test, rk_mpp_core_counter_index(&hw), 2);
+	rk_mpp_count_core(rkvenc, rkvdec, &hw);
+	KUNIT_EXPECT_EQ(test, atomic_read(&rkvenc[2]), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&rkvdec[2]), 1);
+
+	hw.core_id = RK_MPP_CORE_COUNTER_COUNT;
+	KUNIT_EXPECT_EQ(test, rk_mpp_core_counter_index(&hw), -EINVAL);
+	rk_mpp_count_core(rkvenc, rkvdec, &hw);
+
+	hw.core_id = -1;
+	KUNIT_EXPECT_EQ(test, rk_mpp_core_counter_index(&hw), -EINVAL);
+	rk_mpp_count_core(rkvenc, rkvdec, &hw);
+
+	hw.match = &rk_mpp_rkvenc2_ccu;
+	hw.core_id = 0;
+	KUNIT_EXPECT_EQ(test, rk_mpp_core_counter_index(&hw), -EINVAL);
+	rk_mpp_count_core(rkvenc, rkvdec, &hw);
+
+	KUNIT_EXPECT_EQ(test, atomic_read(&rkvenc[1]), 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&rkvdec[2]), 1);
+}
+
 static void rk_mpp_iommu_fault_match_kunit(struct kunit *test)
 {
 	struct rk_mpp_iommu_fault_match_fixture {
@@ -3684,6 +3793,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_rkvdec2_fixed_rcb_link_kunit),
 	KUNIT_CASE(rk_mpp_hw_take_active_if_kunit),
 	KUNIT_CASE(rk_mpp_hw_prepare_active_retry_kunit),
+	KUNIT_CASE(rk_mpp_core_counter_kunit),
 	KUNIT_CASE(rk_mpp_iommu_fault_match_kunit),
 	KUNIT_CASE(rk_mpp_poll_irq_check_size_kunit),
 	KUNIT_CASE(rk_mpp_rkvenc_slice_mode_kunit),
@@ -4372,6 +4482,7 @@ static int rk_mpp_job_submit(struct rk_mpp_job *job)
 	list_add_tail(&job->sched_link, &srv->queued_jobs);
 	atomic_inc(&job->hw->queued_job_count);
 	atomic_inc(&srv->queued_job_count);
+	rk_mpp_count_scheduled_core(job);
 	mutex_unlock(&srv->sched_lock);
 
 	schedule_work(&srv->sched_work);
@@ -4610,6 +4721,7 @@ static void rk_mpp_scheduler_work(struct work_struct *work)
 		const struct rk_mpp_backend_ops *ops = job->hw->match->ops;
 		int ret;
 
+		rk_mpp_count_dispatched_core(job);
 		if (READ_ONCE(job->canceled))
 			ret = -ECANCELED;
 		else if (!ops || !ops->submit)
@@ -4977,6 +5089,7 @@ static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
 	writel(job->rkvdec_ccu_cfg_done,
 	       ccu_regs + RK_MPP_RKVDEC_CCU_CFG_DONE_BASE);
 	job->rkvdec_ccu_started = true;
+	rk_mpp_count_started_core(job);
 	mutex_unlock(&ccu->run_lock);
 
 	return 0;
@@ -5744,6 +5857,7 @@ static int rk_mpp_rkvenc2_submit(struct rk_mpp_job *job)
 	rk_mpp_hw_schedule_timeout(hw);
 	wmb();
 	writel(start_value, hw->regs[0] + RK_MPP_RKVENC_START_BASE);
+	rk_mpp_count_started_core(job);
 	mutex_unlock(&hw->run_lock);
 
 	return 0;
@@ -6018,6 +6132,7 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 	else
 		writel(start_value | RK_MPP_RKVDEC_START_EN,
 		       hw->regs[0] + RK_MPP_RKVDEC_START_BASE);
+	rk_mpp_count_started_core(job);
 	mutex_unlock(&hw->run_lock);
 
 	return 0;
@@ -6830,6 +6945,25 @@ static const struct file_operations rk_mpp_fops = {
 	.llseek		= noop_llseek,
 };
 
+static void
+rk_mpp_debugfs_create_core_counts(const char *prefix,
+				  atomic_t rkvenc_counters[RK_MPP_CORE_COUNTER_COUNT],
+				  atomic_t rkvdec_counters[RK_MPP_CORE_COUNTER_COUNT])
+{
+	char name[48];
+
+	for (u32 i = 0; i < RK_MPP_CORE_COUNTER_COUNT; i++) {
+		snprintf(name, sizeof(name), "%s_rkvenc_core%u_count",
+			 prefix, i);
+		debugfs_create_atomic_t(name, 0444, rk_mpp_srv.debugfs_root,
+					&rkvenc_counters[i]);
+		snprintf(name, sizeof(name), "%s_rkvdec_core%u_count",
+			 prefix, i);
+		debugfs_create_atomic_t(name, 0444, rk_mpp_srv.debugfs_root,
+					&rkvdec_counters[i]);
+	}
+}
+
 static void rk_mpp_hw_pm_disable(void *data)
 {
 	struct device *dev = data;
@@ -7181,6 +7315,24 @@ static int __init rk_mpp_init(void)
 	debugfs_create_atomic_t("submitted_job_count", 0444,
 				rk_mpp_srv.debugfs_root,
 				&rk_mpp_srv.submitted_job_count);
+	debugfs_create_atomic_t("scheduled_job_count", 0444,
+				rk_mpp_srv.debugfs_root,
+				&rk_mpp_srv.scheduled_job_count);
+	rk_mpp_debugfs_create_core_counts("scheduled",
+					  rk_mpp_srv.scheduled_rkvenc_core_count,
+					  rk_mpp_srv.scheduled_rkvdec_core_count);
+	debugfs_create_atomic_t("dispatched_job_count", 0444,
+				rk_mpp_srv.debugfs_root,
+				&rk_mpp_srv.dispatched_job_count);
+	rk_mpp_debugfs_create_core_counts("dispatched",
+					  rk_mpp_srv.dispatched_rkvenc_core_count,
+					  rk_mpp_srv.dispatched_rkvdec_core_count);
+	debugfs_create_atomic_t("started_job_count", 0444,
+				rk_mpp_srv.debugfs_root,
+				&rk_mpp_srv.started_job_count);
+	rk_mpp_debugfs_create_core_counts("started",
+					  rk_mpp_srv.started_rkvenc_core_count,
+					  rk_mpp_srv.started_rkvdec_core_count);
 	debugfs_create_atomic_t("queued_job_count", 0444,
 				rk_mpp_srv.debugfs_root,
 				&rk_mpp_srv.queued_job_count);
