@@ -10065,8 +10065,35 @@ static void rk_rga2_librga_y4_dither_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, dst_info & RK_RGA2_DST_DITHER_DOWN_EN);
 
 	job.cmd_ready = false;
+	memset(cmd, 0, sizeof(cmd));
 	task.full_csc.flag = RK_RGA_FULL_CSC_ENABLE;
-	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), -EOPNOTSUPP);
+	task.yuv2rgb_mode = 3 << 2;
+	task.alpha_rop_flag = RK_RGA2_ALPHA_FLAG_ENABLE |
+			      RK_RGA2_ALPHA_FLAG_DST_DITHER_DOWN;
+
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	dst_info = cmd[RK_RGA2_DST_INFO_OFFSET / 4];
+	KUNIT_EXPECT_TRUE(test, dst_info & RK_RGA2_DST_FULL_CSC_EN);
+	KUNIT_EXPECT_EQ(test, dst_info & RK_RGA2_DST_CSC_MODE,
+			FIELD_PREP(RK_RGA2_DST_CSC_MODE, 3));
+	KUNIT_EXPECT_TRUE(test, dst_info & RK_RGA2_DST_DITHER_DOWN_EN);
+	KUNIT_EXPECT_FALSE(test, dst_info & RK_RGA2_DST_Y4_EN);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_Y4MAP_LUT0_OFFSET / 4],
+			0x76543210U);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_Y4MAP_LUT1_OFFSET / 4],
+			0xfedcba98U);
+
+	job.cmd_ready = false;
+	memset(cmd, 0, sizeof(cmd));
+	task.dst.format = RK_RGA_FORMAT_Y4;
+
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	dst_info = cmd[RK_RGA2_DST_INFO_OFFSET / 4];
+	KUNIT_EXPECT_TRUE(test, dst_info & RK_RGA2_DST_FULL_CSC_EN);
+	KUNIT_EXPECT_TRUE(test, dst_info & RK_RGA2_DST_Y4_EN);
+	KUNIT_EXPECT_TRUE(test, dst_info & RK_RGA2_DST_DITHER_DOWN_EN);
 }
 
 static void rk_rga2_librga_full_csc_emit_kunit(struct kunit *test)
@@ -12296,8 +12323,9 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 		if (!rk_rga2_dither_flags_allowed(task))
 			return -EOPNOTSUPP;
 		if (task->PD_mode || task->feature.global_alpha_en ||
-		    task->rop_code || task->alpha_rop_mode ||
-		    task->full_csc.flag)
+		    task->rop_code || task->alpha_rop_mode)
+			return -EOPNOTSUPP;
+		if (task->full_csc.flag & ~RK_RGA_FULL_CSC_ENABLE)
 			return -EOPNOTSUPP;
 		if (task->dither_mode > 1)
 			return -EOPNOTSUPP;
