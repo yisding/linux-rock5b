@@ -1516,6 +1516,23 @@ static int rk_rga_layout_size(size_t pixels, size_t multiplier,
 	return 0;
 }
 
+static int rk_rga_bpp_layout_size(const struct rga_img_info_t *img,
+				  u8 shift, size_t *size)
+{
+	size_t stride;
+
+	stride = ALIGN((u32)img->vir_w >> shift, 4);
+	if (!stride)
+		return -EINVAL;
+	if (check_mul_overflow(stride, (size_t)img->vir_h, size))
+		return -EOVERFLOW;
+
+	if (!*size)
+		return -EINVAL;
+
+	return 0;
+}
+
 static int rk_rga_fbc_strides(const struct rga_img_info_t *img,
 			      u32 *header_stride, u32 *payload_stride)
 {
@@ -1746,6 +1763,8 @@ static int rk_rga_img_layout(const struct rga_img_info_t *img,
 		ret = 0;
 		break;
 	case RK_RGA_FORMAT_BPP8:
+		ret = rk_rga_bpp_layout_size(img, 0, &layout->yrgb_size);
+		break;
 	case RK_RGA_FORMAT_YCBCR_400:
 	case RK_RGA_FORMAT_A8:
 	case RK_RGA_FORMAT_Y8:
@@ -1753,17 +1772,17 @@ static int rk_rga_img_layout(const struct rga_img_info_t *img,
 		ret = 0;
 		break;
 	case RK_RGA_FORMAT_BPP4:
+		ret = rk_rga_bpp_layout_size(img, 1, &layout->yrgb_size);
+		break;
 	case RK_RGA_FORMAT_Y4:
 		layout->yrgb_size = pixels >> 1;
 		ret = 0;
 		break;
 	case RK_RGA_FORMAT_BPP2:
-		layout->yrgb_size = pixels >> 2;
-		ret = 0;
+		ret = rk_rga_bpp_layout_size(img, 2, &layout->yrgb_size);
 		break;
 	case RK_RGA_FORMAT_BPP1:
-		layout->yrgb_size = pixels >> 3;
-		ret = 0;
+		ret = rk_rga_bpp_layout_size(img, 3, &layout->yrgb_size);
 		break;
 	default:
 		return -EINVAL;
@@ -6498,9 +6517,29 @@ static void rk_rga2_palette_emit_kunit(struct kunit *test)
 
 	memset(cmd, 0, sizeof(cmd));
 	job.cmd_ready = false;
+	task.src.format = RK_RGA_FORMAT_BPP4;
 	task.palette_mode = 2;
-	KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_palette(&job),
-			-EOPNOTSUPP);
+	task.endian_mode = 0;
+	task.src.x_offset = 6;
+	task.src.y_offset = 7;
+	stride = ALIGN((u32)task.src.vir_w >> 1, 4);
+	expected_src_info = FIELD_PREP(RK_RGA2_SRC_FORMAT, 0xe);
+
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_palette(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_BASE0_OFFSET / 4],
+			lower_32_bits(task.src.yrgb_addr +
+				      (u64)task.src.y_offset * stride +
+				      (task.src.x_offset >> 1)));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_INFO_OFFSET / 4],
+			expected_src_info);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_VIR_INFO_OFFSET / 4],
+			stride >> 2);
+
+	memset(cmd, 0, sizeof(cmd));
+	job.cmd_ready = false;
+	task.palette_mode = 1;
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_palette(&job), -EOPNOTSUPP);
 	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
 }
 
@@ -6540,6 +6579,20 @@ static void rk_rga2_update_palette_emit_kunit(struct kunit *test)
 
 	memset(cmd, 0, sizeof(cmd));
 	job.cmd_ready = false;
+	task.palette_mode = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_update_palette(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_MASK_BASE_OFFSET / 4],
+			lower_32_bits(task.pat.yrgb_addr));
+
+	memset(cmd, 0, sizeof(cmd));
+	job.cmd_ready = false;
+	task.palette_mode = 4;
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_update_palette(&job),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+
+	task.palette_mode = 3;
 	task.pat.act_w = 8;
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_update_palette(&job),
 			-EOPNOTSUPP);
@@ -8104,6 +8157,13 @@ static void rk_rga_import_buffer_size_kunit(struct kunit *test)
 	size = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_import_buffer_size(&buffer, &size), 0);
 	KUNIT_EXPECT_EQ(test, size, (size_t)(64 * 32 * 3 / 2));
+
+	buffer.memory_parm.width = 6;
+	buffer.memory_parm.height = 5;
+	buffer.memory_parm.format = RK_RGA_FORMAT_BPP4;
+	size = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_import_buffer_size(&buffer, &size), 0);
+	KUNIT_EXPECT_EQ(test, size, (size_t)(ALIGN(6U >> 1, 4) * 5));
 
 	buffer.type = RGA_PHYSICAL_ADDRESS;
 	buffer.memory_parm.size = 4096;
@@ -11876,16 +11936,42 @@ static int rk_rga2_validate_color_fill(const struct rga_req *task,
 
 static int rk_rga2_palette_source_mode(const struct rga_req *task)
 {
-	if (task->palette_mode != 3)
-		return -EOPNOTSUPP;
+	u8 expected;
 
 	switch (task->src.format) {
+	case RK_RGA_FORMAT_BPP1:
+		expected = 0;
+		break;
+	case RK_RGA_FORMAT_BPP2:
+		expected = 1;
+		break;
+	case RK_RGA_FORMAT_BPP4:
+		expected = 2;
+		break;
 	case RK_RGA_FORMAT_BPP8:
 	case RK_RGA_FORMAT_YCBCR_400:
-		return 0;
+		expected = 3;
+		break;
 	default:
 		return -EOPNOTSUPP;
 	}
+
+	if (task->palette_mode != expected)
+		return -EOPNOTSUPP;
+
+	return 0;
+}
+
+static int rk_rga2_palette_shift(const struct rga_req *task, u8 *shift)
+{
+	int ret;
+
+	ret = rk_rga2_palette_source_mode(task);
+	if (ret)
+		return ret;
+
+	*shift = 3 - task->palette_mode;
+	return 0;
 }
 
 static bool rk_rga2_palette_dst_format(u32 format)
@@ -11979,7 +12065,7 @@ static int rk_rga2_validate_update_palette(const struct rga_req *task)
 {
 	if (task->render_mode != RK_RGA_RENDER_UPDATE_PALETTE)
 		return -EOPNOTSUPP;
-	if (task->palette_mode != 3)
+	if (task->palette_mode > 3)
 		return -EOPNOTSUPP;
 	if (task->fading.g != 0xff)
 		return -EOPNOTSUPP;
@@ -13333,12 +13419,17 @@ static u32 rk_rga2_pack_nn_quantize(__s16 r, __s16 g, __s16 b)
 static int rk_rga2_palette_src_stride(const struct rga_req *task,
 				      u32 *stride)
 {
+	u8 shift;
 	u32 bytes;
+	int ret;
 
-	if (task->palette_mode != 3)
-		return -EOPNOTSUPP;
-	bytes = task->src.vir_w;
+	ret = rk_rga2_palette_shift(task, &shift);
+	if (ret)
+		return ret;
+	bytes = (u32)task->src.vir_w >> shift;
 	*stride = ALIGN(bytes, 4);
+	if (!*stride)
+		return -EINVAL;
 
 	return 0;
 }
@@ -13366,7 +13457,9 @@ static int rk_rga2_emit_color_palette(struct rk_rga_job *job)
 	if (check_mul_overflow((u32)task->src.y_offset, src_stride,
 			       &src_offset))
 		return -EOVERFLOW;
-	if (check_add_overflow(src_offset, (u32)task->src.x_offset,
+	if (check_add_overflow(src_offset,
+			       (u32)task->src.x_offset >>
+			       (3 - task->palette_mode),
 			       &src_offset))
 		return -EOVERFLOW;
 	if (check_add_overflow(task->src.yrgb_addr, (__u64)src_offset,
