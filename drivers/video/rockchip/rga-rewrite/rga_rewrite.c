@@ -4958,6 +4958,8 @@ rk_rga_find_best_hw_for_job(struct list_head *hw_list, struct rk_rga_job *job,
 			    u32 type_mask, u32 rr_start);
 static void rk_rga_hw_enqueue_job_locked(struct rk_rga_hw *hw,
 					 struct rk_rga_job *job);
+static int rk_rga_job_queue_on_hw(struct rk_rga_job *job, struct rk_rga_hw *hw,
+				  bool take_ref);
 static struct rk_rga_hw *
 rk_rga_iommu_find_fault_hw(struct list_head *fault_hws,
 			   struct iommu_domain *domain,
@@ -6903,6 +6905,43 @@ static void rk_rga_hw_abort_queued_jobs_kunit(struct kunit *test)
 	rk_rga_job_put(job1);
 	dma_fence_put(fence0);
 	dma_fence_put(fence1);
+}
+
+static void rk_rga_queue_on_removing_hw_kunit(struct kunit *test)
+{
+	struct rk_rga_hw hw = { };
+	struct rk_rga_job *job;
+	struct dma_fence *fence;
+
+	spin_lock_init(&hw.job_lock);
+	INIT_LIST_HEAD(&hw.job_queue);
+	refcount_set(&hw.refs, 2);
+	hw.removing = true;
+
+	job = kzalloc_obj(*job, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+	rk_rga_job_init(job);
+	job->hw = NULL;
+
+	fence = rk_rga_kunit_alloc_fence();
+	KUNIT_ASSERT_NOT_NULL(test, fence);
+	dma_fence_get(fence);
+	job->release_fence = fence;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_queue_on_hw(job, &hw, true),
+			-ENODEV);
+	KUNIT_EXPECT_TRUE(test, list_empty(&hw.job_queue));
+	KUNIT_EXPECT_EQ(test, hw.queued_jobs, 0U);
+	KUNIT_EXPECT_FALSE(test, job->queued);
+	KUNIT_EXPECT_TRUE(test, job->done);
+	KUNIT_EXPECT_EQ(test, job->result, -ENODEV);
+	KUNIT_EXPECT_PTR_EQ(test, job->hw, NULL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&job->refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&hw.refs), 1);
+	KUNIT_EXPECT_EQ(test, dma_fence_get_status(fence), -ENODEV);
+
+	rk_rga_job_put(job);
+	dma_fence_put(fence);
 }
 
 static void rk_rga_mixed_task_hw_type_kunit(struct kunit *test)
@@ -9835,6 +9874,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_job_free_release_fence_kunit),
 	KUNIT_CASE(rk_rga_release_fence_fd_state_kunit),
 	KUNIT_CASE(rk_rga_hw_abort_queued_jobs_kunit),
+	KUNIT_CASE(rk_rga_queue_on_removing_hw_kunit),
 	KUNIT_CASE(rk_rga_mixed_task_hw_type_kunit),
 	KUNIT_CASE(rk_rga_bitblt_hw_type_mask_kunit),
 	KUNIT_CASE(rk_rga_find_best_hw_for_job_kunit),
@@ -12903,7 +12943,6 @@ queued:
 static int rk_rga_job_queue_ref(struct rk_rga_job *job, bool take_ref)
 {
 	struct rk_rga_hw *hw;
-	unsigned long flags;
 	int ret;
 
 	hw = rk_rga_hw_get_for_job(job, &ret);
@@ -12915,6 +12954,14 @@ static int rk_rga_job_queue_ref(struct rk_rga_job *job, bool take_ref)
 			rk_rga_job_put(job);
 		return ret;
 	}
+
+	return rk_rga_job_queue_on_hw(job, hw, take_ref);
+}
+
+static int rk_rga_job_queue_on_hw(struct rk_rga_job *job, struct rk_rga_hw *hw,
+				  bool take_ref)
+{
+	unsigned long flags;
 
 	job->hw = hw;
 	if (take_ref)
