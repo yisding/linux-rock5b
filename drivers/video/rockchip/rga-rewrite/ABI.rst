@@ -186,8 +186,9 @@ Implemented
   RGB-destination composition, including ffmpeg
   ``overlay_rkrga=format=<rgb>`` pipelines, current ``librga``
   ``rga_alpha_3channel_demo``/``imcomposite()`` RGB SRC_OVER requests,
-  no-pattern ``librga`` A+B->B updates for matching semiplanar YUV
-  source/destination formats, and the
+  no-pattern ``librga`` A+B->B updates for same-depth semiplanar YUV
+  source/destination formats, including UV-order and 4:2:0/4:2:2
+  conversions, and the
   default ffmpeg/RKMPP overlay path where an 8-bit or matching semiplanar
   10-bit YUV main/foreground image and RGB/RGBA pattern write a YUV destination,
   including AFBC16x16 output when requested, through the per-window CSC policy
@@ -197,8 +198,7 @@ Implemented
   ``librga`` Porter-Duff modes SRC, DST, SRC_OVER, DST_OVER, SRC_IN, DST_IN,
   SRC_OUT, DST_OUT, SRC_ATOP, DST_ATOP, XOR, and CLEAR are accepted; other
   unlisted blend modes remain unsupported.  Mixed-depth 8/10-bit
-  YUV-destination alpha, converted no-pattern YUV A+B->B, and compressed
-  in-place write-back remain unsupported.
+  YUV-destination alpha and compressed in-place write-back remain unsupported.
 * RGA3 normal/inverted-selector RGB color-key for the current ``librga``
   ``imcolorkey`` destination-update path.  The rewrite accepts the two-image
   raster RGB request shape emitted by ``librga``, routes it through the RGA3
@@ -380,7 +380,8 @@ Implemented
   RGA3 ``librga`` AFBC16x16 copy profile selection and FBCD/FBCE command
   emission including RGB-family/compact-10-bit read/writeback and source
   active-offset handling, RGA3 tile8x8 profile selection and stride emission, RGA3
-  pattern-backed 8-bit ``librga`` alpha-YUV overlay and AFBC writeback emission,
+  pattern-backed 8-bit ``librga`` alpha-YUV overlay, same-depth no-pattern
+  semiplanar YUV alpha conversion, and AFBC writeback emission,
   ``librga`` global-alpha register emission, RGA3 ``librga`` three-channel
   RGB alpha-composite routing/emission, current ``librga`` Porter-Duff blend-mode factor mapping
   including CLEAR emission, 10-bit YUV alpha-overlay and AFBC writeback emission, and
@@ -396,8 +397,8 @@ Recognized But Unsupported
 * RGA2 hardware command generation outside the solid color fill, raster bitblit,
   and color-palette profiles above, including full-CSC outside raster bitblit.
 * RGA3 pattern outside the supported alpha-overlay profile, color-key outside
-  the RGB ``imcolorkey`` profile, converted no-pattern or mixed-depth
-  8/10-bit YUV-destination alpha, per-channel rotation,
+  the RGB ``imcolorkey`` profile, mixed-depth 8/10-bit YUV-destination alpha,
+  per-channel rotation,
   RFBC/AFBC32x8, tile outside simple bitblits, physical-address channels, and
   non-bitblit operation modes.
 Unsupported submit profiles return ``-EOPNOTSUPP`` after copying, validating,
