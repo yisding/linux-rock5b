@@ -4994,6 +4994,10 @@ static long rk_rga_ioctl_get_version(unsigned long arg);
 static long rk_rga_ioctl_get_rga2_version(unsigned long arg);
 static long rk_rga_ioctl_get_hw_versions(unsigned long arg);
 static long rk_rga_ioctl_get_driver_version(unsigned long arg);
+static long rk_rga_ioctl_request_create(unsigned long arg,
+					struct rk_rga_session *session);
+static long rk_rga_ioctl_request_cancel(unsigned long arg,
+					struct rk_rga_session *session);
 
 static void __user *rk_rga_kunit_user_buffer(struct kunit *test, size_t size)
 {
@@ -5996,6 +6000,53 @@ static void rk_rga_request_ioctl_ret_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_request_ioctl_ret(0), 0);
 	KUNIT_EXPECT_EQ(test, rk_rga_request_ioctl_ret(-EINVAL), -EFAULT);
 	KUNIT_EXPECT_EQ(test, rk_rga_request_ioctl_ret(-ENOMEM), -EFAULT);
+}
+
+static void rk_rga_request_create_cancel_ioctl_kunit(struct kunit *test)
+{
+	struct rk_rga_session session = {};
+	struct rk_rga_request *request;
+	void __user *user;
+	unsigned long uncopied;
+	__u32 value = 0x55;
+	__u32 id = 0;
+
+	user = rk_rga_kunit_user_buffer(test, sizeof(value));
+	KUNIT_ASSERT_NOT_NULL(test, user);
+	uncopied = copy_to_user(user, &value, sizeof(value));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+
+	mutex_init(&session.lock);
+	idr_init(&session.requests);
+
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_ioctl_request_create((unsigned long)user,
+						    &session),
+			0L);
+	uncopied = copy_from_user(&id, user, sizeof(id));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+	KUNIT_EXPECT_NE(test, id, 0U);
+	request = idr_find(&session.requests, id);
+	KUNIT_ASSERT_NOT_NULL(test, request);
+	KUNIT_EXPECT_EQ(test, request->flags, 0x55U);
+
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_ioctl_request_cancel((unsigned long)user,
+						    &session),
+			0L);
+	KUNIT_EXPECT_PTR_EQ(test, idr_find(&session.requests, id), NULL);
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_ioctl_request_cancel((unsigned long)user,
+						    &session),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_ioctl_request_create(TASK_SIZE, &session),
+			-EFAULT);
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_ioctl_request_cancel(TASK_SIZE, &session),
+			-EFAULT);
+
+	idr_destroy(&session.requests);
 }
 
 static void rk_rga_version_queries_kunit(struct kunit *test)
@@ -8900,6 +8951,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga2_update_palette_emit_kunit),
 	KUNIT_CASE(rk_rga_request_check_kunit),
 	KUNIT_CASE(rk_rga_request_ioctl_ret_kunit),
+	KUNIT_CASE(rk_rga_request_create_cancel_ioctl_kunit),
 	KUNIT_CASE(rk_rga_version_queries_kunit),
 	KUNIT_CASE(rk_rga_request_remove_free_kunit),
 	KUNIT_CASE(rk_rga_import_buffer_size_kunit),
