@@ -199,14 +199,15 @@ Implemented
   unlisted blend modes remain unsupported.  Mixed-depth 8/10-bit
   YUV-destination alpha, converted no-pattern YUV A+B->B, and compressed
   in-place write-back remain unsupported.
-* RGA3 normal-mode RGB color-key for the current ``librga`` ``imcolorkey``
-  destination-update path.  The rewrite accepts the two-image raster RGB
-  request shape emitted by ``librga``, routes it through the RGA3 overlap
-  A+B->B topology, converts the 8-bit key min/max fields into the BSP RGA3
-  overlap-key layout, and keeps the destination as the background image.
-  Inverted color-key, pattern color-key, FBC/YUV/10-bit color-key, and
-  hand-built color-key requests outside the normal ``librga`` alpha/zero-key
-  mode remain unsupported.
+* RGA3 normal/inverted-selector RGB color-key for the current ``librga``
+  ``imcolorkey`` destination-update path.  The rewrite accepts the two-image
+  raster RGB request shape emitted by ``librga``, routes it through the RGA3
+  overlap A+B->B topology, converts the 8-bit key min/max fields into the BSP
+  RGA3 overlap-key layout, and keeps the destination as the background image.
+  Like the BSP RGA3 register builder, the normal and inverted userspace
+  selectors program the same overlap top-key command stream.  Pattern
+  color-key, FBC/YUV/10-bit color-key, and hand-built color-key requests
+  outside the normal ``librga`` alpha/zero-key mode remain unsupported.
 * RGA2 RGBA-family color-key for the current ``librga``
   ``rga_alpha_colorkey_demo``/``imcolorkey`` forced-core profile.  The rewrite
   accepts separate raster alpha-carrying RGB source/destination images encoded
@@ -395,7 +396,7 @@ Recognized But Unsupported
 * RGA2 hardware command generation outside the solid color fill, raster bitblit,
   and color-palette profiles above, including full-CSC outside raster bitblit.
 * RGA3 pattern outside the supported alpha-overlay profile, color-key outside
-  the normal RGB ``imcolorkey`` profile, converted no-pattern or mixed-depth
+  the RGB ``imcolorkey`` profile, converted no-pattern or mixed-depth
   8/10-bit YUV-destination alpha, per-channel rotation,
   RFBC/AFBC32x8, tile outside simple bitblits, physical-address channels, and
   non-bitblit operation modes.
