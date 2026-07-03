@@ -4335,9 +4335,13 @@ static int rk_rga2_fill_format_info(u32 format,
 	case RK_RGA_FORMAT_ARGB_4444:
 	case RK_RGA_FORMAT_ABGR_4444:
 	case RK_RGA_FORMAT_YVYU_422:
+	case RK_RGA_FORMAT_YVYU_420:
 	case RK_RGA_FORMAT_VYUY_422:
+	case RK_RGA_FORMAT_VYUY_420:
 	case RK_RGA_FORMAT_YUYV_422:
+	case RK_RGA_FORMAT_YUYV_420:
 	case RK_RGA_FORMAT_UYVY_422:
+	case RK_RGA_FORMAT_UYVY_420:
 	case RK_RGA_FORMAT_YCBCR_422_SP:
 	case RK_RGA_FORMAT_YCRCB_422_SP:
 	case RK_RGA_FORMAT_YCBCR_422_P:
@@ -5943,8 +5947,55 @@ static void rk_rga2_fill_packed_yuv_emit_kunit(struct kunit *test)
 	job.cmd_ready = false;
 	task.dst.format = RK_RGA_FORMAT_YUYV_420;
 
-	KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_fill(&job), -EOPNOTSUPP);
-	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_fill(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	expected_dst_info = FIELD_PREP(RK_RGA2_DST_FORMAT, 0xf) |
+			    RK_RGA2_DST_UV_SWAP |
+			    FIELD_PREP(RK_RGA2_DST_CSC_MODE, 2);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_INFO_OFFSET / 4],
+			expected_dst_info);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_BASE0_OFFSET / 4],
+			expected_base);
+
+	memset(cmd, 0, sizeof(cmd));
+	job.cmd_ready = false;
+	task.dst.format = RK_RGA_FORMAT_YVYU_420;
+
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_fill(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	expected_dst_info = FIELD_PREP(RK_RGA2_DST_FORMAT, 0xf) |
+			    FIELD_PREP(RK_RGA2_DST_CSC_MODE, 2);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_INFO_OFFSET / 4],
+			expected_dst_info);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_BASE0_OFFSET / 4],
+			expected_base);
+
+	memset(cmd, 0, sizeof(cmd));
+	job.cmd_ready = false;
+	task.dst.format = RK_RGA_FORMAT_VYUY_420;
+
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_fill(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	expected_dst_info = FIELD_PREP(RK_RGA2_DST_FORMAT, 0xd) |
+			    FIELD_PREP(RK_RGA2_DST_CSC_MODE, 2);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_INFO_OFFSET / 4],
+			expected_dst_info);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_BASE0_OFFSET / 4],
+			expected_base);
+
+	memset(cmd, 0, sizeof(cmd));
+	job.cmd_ready = false;
+	task.dst.format = RK_RGA_FORMAT_UYVY_420;
+
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_fill(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	expected_dst_info = FIELD_PREP(RK_RGA2_DST_FORMAT, 0xd) |
+			    RK_RGA2_DST_UV_SWAP |
+			    FIELD_PREP(RK_RGA2_DST_CSC_MODE, 2);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_INFO_OFFSET / 4],
+			expected_dst_info);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_BASE0_OFFSET / 4],
+			expected_base);
 }
 
 static void rk_rga2_fill_multitask_hw_type_kunit(struct kunit *test)
