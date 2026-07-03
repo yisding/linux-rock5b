@@ -450,6 +450,7 @@
 #define RGA_GET_RESULT			0x501a
 #define RGA_GET_VERSION			0x501b
 #define RGA_CACHE_FLUSH			0x501c
+#define RGA2_FLUSH			0x6019
 #define RGA2_GET_RESULT		0x601a
 #define RGA2_GET_VERSION		0x601b
 #define RGA_IMPORT_DMA			0x601d
@@ -910,6 +911,7 @@ static_assert(RGA_FLUSH == 0x5019);
 static_assert(RGA_GET_RESULT == 0x501a);
 static_assert(RGA_GET_VERSION == 0x501b);
 static_assert(RGA_CACHE_FLUSH == 0x501c);
+static_assert(RGA2_FLUSH == 0x6019);
 static_assert(RGA2_GET_RESULT == 0x601a);
 static_assert(RGA2_GET_VERSION == 0x601b);
 static_assert(RGA_IMPORT_DMA == 0x601d);
@@ -12543,6 +12545,7 @@ static long rk_rga_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return rk_rga_ioctl_blit(arg, session, cmd);
 	case RGA_CACHE_FLUSH:
 	case RGA_FLUSH:
+	case RGA2_FLUSH:
 	case RGA_GET_RESULT:
 	case RGA2_GET_RESULT:
 		return 0;
