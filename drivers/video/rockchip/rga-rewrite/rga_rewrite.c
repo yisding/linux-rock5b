@@ -1179,6 +1179,8 @@ struct rk_rga_service {
 	atomic_t started_core_count[RK_RGA_CORE_COUNTER_COUNT];
 	atomic64_t hw_total_ns;
 	atomic64_t hw_max_ns;
+	atomic64_t hw_total_core_ns[RK_RGA_CORE_COUNTER_COUNT];
+	atomic64_t hw_max_core_ns[RK_RGA_CORE_COUNTER_COUNT];
 	atomic_t cmd_alloc_count;
 	atomic_t power_cycle_count;
 	atomic_t irq_count;
@@ -1279,15 +1281,38 @@ static void rk_rga_debugfs_create_atomic64(const char *name, atomic64_t *value)
 			    &rk_rga_debugfs_atomic64_fops);
 }
 
+static void rk_rga_count_core_ns(atomic64_t counters[RK_RGA_CORE_COUNTER_COUNT],
+				 const struct rk_rga_hw *hw, u64 value,
+				 bool max)
+{
+	int index;
+
+	if (!hw)
+		return;
+
+	index = rk_rga_core_counter_index(hw->core_mask);
+	if (index < 0)
+		return;
+
+	if (max)
+		rk_rga_atomic64_max(&counters[index], value);
+	else
+		atomic64_add(value, &counters[index]);
+}
+
 static void rk_rga_job_note_hw_done(struct rk_rga_job *job)
 {
+	u64 elapsed;
 	u64 start = job->hw_start_ns;
 
 	if (!start)
 		return;
 
-	job->hw_elapsed_ns += ktime_get_ns() - start;
+	elapsed = ktime_get_ns() - start;
+	job->hw_elapsed_ns += elapsed;
 	job->hw_start_ns = 0;
+	rk_rga_count_core_ns(rk_rga.hw_total_core_ns, job->hw, elapsed, false);
+	rk_rga_count_core_ns(rk_rga.hw_max_core_ns, job->hw, elapsed, true);
 }
 
 static void rk_rga_job_record_hw_stats(struct rk_rga_job *job)
@@ -16616,6 +16641,25 @@ rk_rga_debugfs_create_core_counts(const char *prefix,
 	}
 }
 
+static void
+rk_rga_debugfs_create_core_times(const char *prefix,
+				 atomic64_t counters[RK_RGA_CORE_COUNTER_COUNT])
+{
+	static const char * const core_names[RK_RGA_CORE_COUNTER_COUNT] = {
+		"rga3_core0",
+		"rga3_core1",
+		"rga2_core0",
+		"rga2_core1",
+	};
+	char name[48];
+
+	for (u32 i = 0; i < ARRAY_SIZE(core_names); i++) {
+		snprintf(name, sizeof(name), "%s_%s", prefix,
+			 core_names[i]);
+		rk_rga_debugfs_create_atomic64(name, &counters[i]);
+	}
+}
+
 static int __init rk_rga_init(void)
 {
 	int ret;
@@ -16674,6 +16718,10 @@ static int __init rk_rga_init(void)
 					  rk_rga.started_core_count);
 	rk_rga_debugfs_create_atomic64("hw_total_ns", &rk_rga.hw_total_ns);
 	rk_rga_debugfs_create_atomic64("hw_max_ns", &rk_rga.hw_max_ns);
+	rk_rga_debugfs_create_core_times("hw_total_ns",
+					 rk_rga.hw_total_core_ns);
+	rk_rga_debugfs_create_core_times("hw_max_ns",
+					 rk_rga.hw_max_core_ns);
 	debugfs_create_atomic_t("cmd_alloc_count", 0444, rk_rga.debugfs_root,
 				&rk_rga.cmd_alloc_count);
 	debugfs_create_atomic_t("power_cycle_count", 0444,
