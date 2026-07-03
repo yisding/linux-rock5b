@@ -2307,6 +2307,9 @@ static void rk_mpp_rkvenc2_dchs_release(struct rk_mpp_job *job);
 static int rk_mpp_switch_session(struct rk_mpp_session **session,
 				 struct fd *held_fd,
 				 const struct rk_mpp_msg_v1 *msg);
+static int rk_mpp_process_request(struct rk_mpp_session *session,
+				  struct mpp_request *req,
+				  struct rk_mpp_batch_state *batch);
 
 static void __user *rk_mpp_kunit_user_payload(struct kunit *test,
 					      const void *src, size_t size)
@@ -2508,6 +2511,49 @@ static void rk_mpp_store_codec_info_kunit(struct kunit *test)
 			session.codec_info[RK_MPP_DEC_INFO_BUTT].flag, 0U);
 	KUNIT_EXPECT_EQ(test,
 			session.codec_info[RK_MPP_DEC_INFO_BUTT].val, 0ULL);
+}
+
+static void rk_mpp_init_trans_table_kunit(struct kunit *test)
+{
+	u16 entries[] = { 7, 1024, U16_MAX };
+	struct rk_mpp_service srv = {};
+	struct rk_mpp_session session = {
+		.srv = &srv,
+		.trans_count = 9,
+	};
+	struct mpp_request req = {
+		.cmd = MPP_CMD_INIT_TRANS_TABLE,
+		.size = sizeof(entries),
+	};
+	int ret;
+
+	memset(session.trans_table, 0xa5, sizeof(session.trans_table));
+	req.data = rk_mpp_kunit_user_payload(test, entries, sizeof(entries));
+	KUNIT_ASSERT_NOT_NULL(test, req.data);
+
+	ret = rk_mpp_process_request(&session, &req, NULL);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, session.trans_count, (u32)ARRAY_SIZE(entries));
+	KUNIT_EXPECT_EQ(test, session.trans_table[0], entries[0]);
+	KUNIT_EXPECT_EQ(test, session.trans_table[1], entries[1]);
+	KUNIT_EXPECT_EQ(test, session.trans_table[2], entries[2]);
+
+	req.size = sizeof(session.trans_table) + 1;
+	session.trans_count = 3;
+	KUNIT_EXPECT_EQ(test, rk_mpp_process_request(&session, &req, NULL),
+			-ENOMEM);
+	KUNIT_EXPECT_EQ(test, session.trans_count, 3U);
+
+	req.size = sizeof(u16);
+	req.data = (void __user *)TASK_SIZE;
+	KUNIT_EXPECT_EQ(test, rk_mpp_process_request(&session, &req, NULL),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, session.trans_count, 3U);
+
+	req.size = 0;
+	req.data = NULL;
+	KUNIT_EXPECT_EQ(test, rk_mpp_process_request(&session, &req, NULL), 0);
+	KUNIT_EXPECT_EQ(test, session.trans_count, 0U);
 }
 
 static void rk_mpp_request_check_reg_span_kunit(struct kunit *test)
@@ -3999,6 +4045,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_msg_v1_to_request_kunit),
 	KUNIT_CASE(rk_mpp_cmd_copies_payload_kunit),
 	KUNIT_CASE(rk_mpp_store_codec_info_kunit),
+	KUNIT_CASE(rk_mpp_init_trans_table_kunit),
 	KUNIT_CASE(rk_mpp_request_check_reg_span_kunit),
 	KUNIT_CASE(rk_mpp_request_check_rkvdec_perf_span_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_timeout_threshold_kunit),
