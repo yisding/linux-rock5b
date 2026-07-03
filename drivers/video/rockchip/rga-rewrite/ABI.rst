@@ -181,7 +181,8 @@ Implemented
   including current ``librga`` ``imrotate()``, ``imflip()``, and combined
   rotate-plus-mirror RGB blits; unknown main rotate selector values fall back
   to no-op rotation like the BSP RGA2/RGA3 register builders while preserving
-  rejection of per-channel rotate fields.
+  rejection of source/destination per-channel rotate fields and pattern-channel
+  rotate fields on pattern-blend requests.
   BSP's RGA3 policy restriction for source YUV422 90/270-degree rotation is
   preserved so those jobs fall back to an eligible RGA2 core unless the request
   forced an RGA3-only core mask.  Per-channel rotate flags remain unsupported.
