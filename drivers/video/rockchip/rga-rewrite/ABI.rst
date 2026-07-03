@@ -168,7 +168,11 @@ Implemented
   legacy ``c_RkRgaBlit()`` conversions: malloc-backed RGB-family input to
   dma-buf NV12 for encoder preprocessing, MPP-frame NV12/NV21-style dma-buf
   input to RGB-family output with optional rotation, and planar I420/YV12-style
-  fallback through RGA2 when RGA3 cannot accept the format.
+  fallback through RGA2 when RGA3 cannot accept the format.  The KUnit matrix
+  pins the userspace-visible GStreamer set for BGR16/RGB/BGR/RGBA/BGRA/RGBx/
+  BGRx to NV12, NV16/NV61 to NV12, NV12/NV21/NV16/NV61 plus compact 10-bit
+  NV12/NV16 decoder output to RGB-family formats, and planar I420/YV12
+  round-trips through the RGA2 fallback.
   Explicit interpolation selectors from current ``librga`` resize calls are
   accepted on native RGA3 bitblits; like the BSP RGA3 register builder, the
   rewrite programs only the RGA3 scale direction and factor fields.
