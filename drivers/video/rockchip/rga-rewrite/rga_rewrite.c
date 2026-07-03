@@ -175,6 +175,8 @@
 
 #define RK_RGA2_OSD_CTRL0_OFFSET		0x020
 #define RK_RGA2_OSD_CTRL1_OFFSET		0x024
+#define RK_RGA2_OSD_COLOR0_OFFSET		0x028
+#define RK_RGA2_OSD_COLOR1_OFFSET		0x02c
 #define RK_RGA2_OSD_LAST_FLAGS0_OFFSET		0x030
 #define RK_RGA2_OSD_LAST_FLAGS1_OFFSET		0x034
 #define RK_RGA2_OSD_INVERSION_CAL0_OFFSET	0x060
@@ -5061,7 +5063,7 @@ static int rk_rga2_validate_osd_info(const struct rga_osd_info *osd)
 	if (!osd->enable)
 		return -EOPNOTSUPP;
 	if (mode->mode > 3 || mode->direction_mode > 1 ||
-	    mode->width_mode != 0 || mode->color_mode != 0 ||
+	    mode->width_mode != 0 || mode->color_mode > 1 ||
 	    mode->invert_flags_mode > 1 || mode->default_color_sel > 1 ||
 	    mode->invert_enable > 7 || mode->invert_mode > 1)
 		return -EOPNOTSUPP;
@@ -6470,6 +6472,25 @@ static void rk_rga2_osd_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_OSD_LAST_FLAGS1_OFFSET / 4],
 			0x01020304U);
 
+	memset(cmd, 0, sizeof(cmd));
+	job.cmd_ready = false;
+	task.osd_info.mode_ctrl.color_mode = 1;
+	task.osd_info.bpp2_info.color0.value = 0xff336699;
+	task.osd_info.bpp2_info.color1.value = 0x80123456;
+	expected_ctrl1 |= FIELD_PREP(RK_RGA2_OSD_CTRL1_COLOR_MODE, 1);
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_OSD_CTRL1_OFFSET / 4],
+			expected_ctrl1);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_OSD_COLOR0_OFFSET / 4],
+			0x336699U);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_OSD_COLOR1_OFFSET / 4],
+			0x123456U);
+
+	task.osd_info.mode_ctrl.color_mode = 0;
 	memset(cmd, 0, sizeof(cmd));
 	job.cmd_ready = false;
 	task.pat.format = RK_RGA_FORMAT_RGB_565;
@@ -13880,6 +13901,14 @@ static int rk_rga2_emit_osd(struct rk_rga_job *job,
 			 task->osd_info.last_flags0);
 	rk_rga_cmd_write(job, RK_RGA2_OSD_LAST_FLAGS1_OFFSET,
 			 task->osd_info.last_flags1);
+
+	if (mode->color_mode) {
+		u32 color0 = task->osd_info.bpp2_info.color0.value & 0xffffff;
+		u32 color1 = task->osd_info.bpp2_info.color1.value & 0xffffff;
+
+		rk_rga_cmd_write(job, RK_RGA2_OSD_COLOR0_OFFSET, color0);
+		rk_rga_cmd_write(job, RK_RGA2_OSD_COLOR1_OFFSET, color1);
+	}
 
 	return 0;
 }
