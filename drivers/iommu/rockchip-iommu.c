@@ -21,6 +21,7 @@
 #include <linux/init.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
+#include <linux/overflow.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
@@ -789,10 +790,10 @@ done:
 
 static size_t rk_iommu_unmap_iova(struct rk_iommu_domain *rk_domain,
 				  u32 *pte_addr, dma_addr_t pte_dma,
-				  size_t size)
+				  size_t size, unsigned int pte_limit)
 {
 	unsigned int pte_count;
-	unsigned int pte_total = size / SPAGE_SIZE;
+	unsigned int pte_total = min_t(unsigned int, size / SPAGE_SIZE, pte_limit);
 
 	assert_spin_locked(&rk_domain->dt_lock);
 
@@ -811,10 +812,11 @@ static size_t rk_iommu_unmap_iova(struct rk_iommu_domain *rk_domain,
 
 static int rk_iommu_map_iova(struct rk_iommu_domain *rk_domain, u32 *pte_addr,
 			     dma_addr_t pte_dma, dma_addr_t iova,
-			     phys_addr_t paddr, size_t size, int prot)
+			     phys_addr_t paddr, size_t size, int prot,
+			     unsigned int pte_limit, size_t *mapped)
 {
 	unsigned int pte_count;
-	unsigned int pte_total = size / SPAGE_SIZE;
+	unsigned int pte_total = min_t(unsigned int, size / SPAGE_SIZE, pte_limit);
 	phys_addr_t page_phys;
 
 	assert_spin_locked(&rk_domain->dt_lock);
@@ -831,6 +833,7 @@ static int rk_iommu_map_iova(struct rk_iommu_domain *rk_domain, u32 *pte_addr,
 	}
 
 	rk_table_flush(rk_domain, pte_dma, pte_total);
+	*mapped = pte_total * SPAGE_SIZE;
 
 	/*
 	 * Zap the first and last iova to evict from iotlb any previously
@@ -838,13 +841,13 @@ static int rk_iommu_map_iova(struct rk_iommu_domain *rk_domain, u32 *pte_addr,
 	 * We only zap the first and last iova, since only they could have
 	 * dte or pte shared with an existing mapping.
 	 */
-	rk_iommu_zap_iova_first_last(rk_domain, iova, size);
+	rk_iommu_zap_iova_first_last(rk_domain, iova, *mapped);
 
 	return 0;
 unwind:
 	/* Unmap the range of iovas that we just mapped */
 	rk_iommu_unmap_iova(rk_domain, pte_addr, pte_dma,
-			    pte_count * SPAGE_SIZE);
+			    pte_count * SPAGE_SIZE, pte_limit);
 
 	iova += pte_count * SPAGE_SIZE;
 	page_phys = rk_ops->pt_address(pte_addr[pte_count]);
@@ -861,18 +864,21 @@ static int rk_iommu_map(struct iommu_domain *domain, unsigned long _iova,
 	struct rk_iommu_domain *rk_domain = to_rk_domain(domain);
 	unsigned long flags;
 	dma_addr_t pte_dma, iova = (dma_addr_t)_iova;
+	size_t total_size;
 	u32 *page_table, *pte_addr;
 	u32 dte_index, pte_index;
 	int ret;
 
+	if (check_mul_overflow(size, count, &total_size))
+		return -EINVAL;
+
 	spin_lock_irqsave(&rk_domain->dt_lock, flags);
 
 	/*
-	 * pgsize_bitmap specifies iova sizes that fit in one page table
-	 * (1024 4-KiB pages = 4 MiB).
-	 * So, size will always be 4096 <= size <= 4194304.
-	 * Since iommu_map() guarantees that both iova and size will be
-	 * aligned, we will always only be mapping from a single dte here.
+	 * pgsize_bitmap keeps each individual page size within one Rockchip
+	 * page table, but count may describe a run crossing this DTE. Map only
+	 * to the current page-table boundary and report partial progress so the
+	 * IOMMU core can continue at the next DTE.
 	 */
 	page_table = rk_dte_get_page_table(rk_domain, iova);
 	if (IS_ERR(page_table)) {
@@ -886,11 +892,10 @@ static int rk_iommu_map(struct iommu_domain *domain, unsigned long _iova,
 
 	pte_dma = rk_ops->pt_address(dte_index) + pte_index * sizeof(u32);
 	ret = rk_iommu_map_iova(rk_domain, pte_addr, pte_dma, iova,
-				paddr, size, prot);
+				paddr, total_size, prot,
+				NUM_PT_ENTRIES - pte_index, mapped);
 
 	spin_unlock_irqrestore(&rk_domain->dt_lock, flags);
-	if (!ret)
-		*mapped = size;
 
 	return ret;
 }
@@ -901,19 +906,22 @@ static size_t rk_iommu_unmap(struct iommu_domain *domain, unsigned long _iova,
 	struct rk_iommu_domain *rk_domain = to_rk_domain(domain);
 	unsigned long flags;
 	dma_addr_t pte_dma, iova = (dma_addr_t)_iova;
+	size_t total_size;
 	phys_addr_t pt_phys;
 	u32 dte;
 	u32 *pte_addr;
 	size_t unmap_size;
 
+	if (check_mul_overflow(size, count, &total_size))
+		return 0;
+
 	spin_lock_irqsave(&rk_domain->dt_lock, flags);
 
 	/*
-	 * pgsize_bitmap specifies iova sizes that fit in one page table
-	 * (1024 4-KiB pages = 4 MiB).
-	 * So, size will always be 4096 <= size <= 4194304.
-	 * Since iommu_unmap() guarantees that both iova and size will be
-	 * aligned, we will always only be unmapping from a single dte here.
+	 * pgsize_bitmap keeps each individual page size within one Rockchip
+	 * page table, but count may describe a run crossing this DTE. Unmap
+	 * only to the current page-table boundary and report partial progress
+	 * so the IOMMU core can continue at the next DTE.
 	 */
 	dte = rk_domain->dt[rk_iova_dte_index(iova)];
 	/* Just return 0 if iova is unmapped */
@@ -925,7 +933,9 @@ static size_t rk_iommu_unmap(struct iommu_domain *domain, unsigned long _iova,
 	pt_phys = rk_ops->pt_address(dte);
 	pte_addr = (u32 *)phys_to_virt(pt_phys) + rk_iova_pte_index(iova);
 	pte_dma = pt_phys + rk_iova_pte_index(iova) * sizeof(u32);
-	unmap_size = rk_iommu_unmap_iova(rk_domain, pte_addr, pte_dma, size);
+	unmap_size = rk_iommu_unmap_iova(rk_domain, pte_addr, pte_dma,
+					 total_size,
+					 NUM_PT_ENTRIES - rk_iova_pte_index(iova));
 
 	spin_unlock_irqrestore(&rk_domain->dt_lock, flags);
 
