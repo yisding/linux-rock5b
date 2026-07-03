@@ -317,8 +317,8 @@ Implemented
   RGA3 no-blend bitblit path and preserves each task's destination offset.
   The RGA3 no-blend emitted command includes overlap field and
   alpha/default-global-alpha controls.
-* Legacy ``RGA_CACHE_FLUSH``, ``RGA_FLUSH``, ``RGA_GET_RESULT``, and
-  ``RGA2_GET_RESULT`` as BSP-compatible no-ops.
+* Legacy ``RGA_CACHE_FLUSH``, ``RGA_FLUSH``, ``RGA2_FLUSH``,
+  ``RGA_GET_RESULT``, and ``RGA2_GET_RESULT`` as BSP-compatible no-ops.
 * Optional ``ROCKCHIP_RGA_REWRITE_KUNIT_TEST`` coverage for rewrite-local ABI
   normalization helpers, including the RGA2 ``rotate_mode``/``sina``/``cosa``
   decoder, transformed destination-corner selection, color-fill core-mask
