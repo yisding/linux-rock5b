@@ -50,6 +50,7 @@
 #include <linux/uaccess.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
+#include <soc/rockchip/rockchip_iommu.h>
 
 #ifndef kzalloc_obj
 #define kzalloc_obj(obj, flags)	kzalloc(sizeof(obj), flags)
@@ -15665,8 +15666,11 @@ static void rk_rga_iommu_register_fault_handler(struct rk_rga_hw *hw)
 	list_add_tail(&hw->fault_node, &rk_rga.fault_hws);
 	spin_unlock_irqrestore(&rk_rga.fault_lock, flags);
 
-	iommu_set_fault_handler(hw->iommu_domain,
-				rk_rga_iommu_fault_handler, &rk_rga);
+	if (rockchip_iommu_set_fault_handler(hw->dev,
+					     rk_rga_iommu_fault_handler,
+					     &rk_rga))
+		iommu_set_fault_handler(hw->iommu_domain,
+					rk_rga_iommu_fault_handler, &rk_rga);
 }
 
 static void rk_rga_iommu_unregister_fault_handler(struct rk_rga_hw *hw)
@@ -15689,7 +15693,7 @@ static void rk_rga_iommu_unregister_fault_handler(struct rk_rga_hw *hw)
 	}
 	spin_unlock_irqrestore(&rk_rga.fault_lock, flags);
 
-	if (clear)
+	if (clear && rockchip_iommu_set_fault_handler(hw->dev, NULL, NULL))
 		iommu_set_fault_handler(hw->iommu_domain, NULL, NULL);
 }
 
