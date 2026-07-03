@@ -155,6 +155,11 @@ Implemented
   20/50/100 ms timeout-threshold register values that the BSP selects from
   retained decoder width/height/bitdepth codec info when those task register
   words are present in the submitted image.
+* RK3588 RKVDEC2 CCU mode selection from the coordinator node's
+  ``rockchip,ccu-mode`` property.  Missing or invalid values fall back to the
+  BSP default SOFT mode.  SOFT mode programs the BSP CCU coordination registers
+  and starts the selected decoder core directly; HARD mode is opt-in and uses
+  the linked-table CCU path below.
 * RK3588 VDPU383/RKVDEC2 hard-CCU link-table capability data, backing
   allocation, table materialization, and readback copying.  Decoder cores with
   a ``link`` MMIO window and ``rockchip,ccu`` phandle validate the BSP VDPU383
@@ -234,8 +239,9 @@ Implemented
   claiming, hard-CCU table-status readback,
   hard-CCU idle/add-mode descriptor values, hard-CCU all-core work-mask
   selection, fixed-RCB link-latch programming, decoder RCB min-width gating,
-  CCU coordinator removal cleanup for queued and active dependent-core jobs,
-  MPP core-counter and per-core timing routing, IOMMU fault target matching,
+  RKVDEC2 ccu-mode normalization and SOFT-CCU register programming, CCU
+  coordinator removal cleanup for queued and active dependent-core jobs, MPP
+  core-counter and per-core timing routing, IOMMU fault target matching,
   ``INIT_TRANS_TABLE`` ``u16`` storage and boundary behavior,
   ``RELEASE_FD`` import-cache sweeping across all DMA-device mappings for one
   fd while preserving other fd imports,
@@ -271,8 +277,8 @@ Outside This Slice
 Findings
 --------
 
-* **RKVDEC2 multi-core CCU mode mismatch: rewrite is HARD-CCU only, but the
-  RK3588 device tree selects SOFT CCU.**  The vendor RKVDEC2 driver supports two
+* **RKVDEC2 multi-core CCU mode mismatch is resolved at the code level; board
+  validation is still required.**  The vendor RKVDEC2 driver supports two
   multi-core coordination modes chosen by the ``rockchip,ccu-mode`` device-tree
   property: SOFT CCU (``= 1``, software-scheduled; the driver writes each task's
   registers directly to the core MMIO and reaps completion in a software IRQ
@@ -283,33 +289,21 @@ Findings
   The shipped RK3588 device tree requests SOFT CCU
   (``rk3588-base.dtsi`` ``rkvdec_ccu`` node: ``/* 1: soft ccu  2: hw ccu */``
   ``rockchip,ccu-mode = <1>``; ``rk3588-rock-5b.dtsi`` enables that node without
-  overriding the mode), matching the vendor driver's own SOFT default.
+  overriding the mode), matching the vendor driver's own SOFT default.  The
+  rewrite now reads that property from the CCU/coordinator device and normalizes
+  missing or invalid values to SOFT, so the Rock 5B DT no longer forces the
+  rewrite down the HARD-CCU linked-list path.
 
-  The rewrite implements only the HARD-CCU linked-list path
-  (``rk_mpp_rkvdec2_reserve_link_table`` / ``_fill_ccu_descriptor`` /
-  ``_prepare_ccu_descriptor`` / ``_start_ccu_job``), has no SOFT-CCU equivalent,
-  and never reads ``rockchip,ccu-mode``.  Its link table is provisioned whenever
-  a ``ccu_node`` and the ``"link"`` reg window are present
-  (``rk_mpp_rkvdec2_setup_link``), both of which are true on the rock-5b DT
-  (``vdec0`` ``reg-names = "regs", "link"``, ``rockchip,ccu = <&rkvdec_ccu>``).
-  Consequently, on the real board DT the rewrite would drive the cores in HARD
-  CCU even though the BSP-validated configuration is SOFT.  This is a behavioral
-  divergence, not the ``-EOPNOTSUPP`` degrade-to-per-core fallback (that path is
-  reached only when the ``"link"`` MMIO is absent, which it is not here).
+  In SOFT mode, the rewrite prepares the same CCU task register words, programs
+  the software CCU coordination registers, and starts the selected core directly.
+  In HARD mode, it keeps the VDPU383/RKVDEC2 link-table allocation,
+  materialization, coordinator running-list, add-mode, readback, timeout, and
+  recovery machinery as an explicit opt-in path.  KUnit covers ccu-mode
+  normalization, SOFT-CCU register programming, and the HARD-CCU descriptor and
+  ownership helpers, but these are logic-level tests: they do not drive MMIO,
+  DMA, the real CCU register block, or real decoder interrupts.
 
-  Test confidence is asymmetric.  The HARD-CCU path has ~16 KUnit cases
-  (``_fill_link_table``, ``_link_table_ownership``, ``_link_table_ccu_ref``,
-  ``_ccu_running_list``, ``_ccu_job_done``, ``_ccu_power_transfer``,
-  ``_release_power_transfer``, ``_ccu_relink_unfinished``,
-  ``_ccu_collect_unfinished``, ``_ccu_descriptor``, ``_ccu_descriptor_core_mask``,
-  ``_fixed_rcb_link``, ``_hw_abort_ccu_dependents``, and the link
-  info/irq-decode/timeout helpers), but they are logic-level only: they build
-  descriptors in ``kunit_kcalloc`` buffers with fake IOVAs and assert on link
-  table byte layout and job-list/ownership/power state machines.  No test drives
-  MMIO, the CCU register block, or DMA, and SOFT CCU has no coverage because it
-  is unimplemented.
-
-  Resolution requires RK3588 hardware bring-up and one of: (a) read
-  ``rockchip,ccu-mode`` and implement a SOFT-CCU path to match the BSP, or
-  (b) demonstrate HARD CCU is correct on this silicon and consciously document
-  the deviation from the BSP device tree.
+  Remaining evidence required for release is RK3588 hardware validation of the
+  default SOFT path under normal decode, multi-stream scheduling, timeout/reset,
+  runtime suspend, and IOMMU-fault recovery, plus opt-in HARD-CCU validation if
+  that mode is ever enabled by a board DT.
