@@ -1093,6 +1093,7 @@ struct rk_rga_service {
 	struct list_head fault_hws;
 	struct rga_hw_versions_t hw_versions;
 	u32 hw_count;
+	u32 core_select_seq;
 	u64 fence_context;
 	u32 fence_seqno;
 	spinlock_t fence_lock;
@@ -1144,6 +1145,18 @@ static void rk_rga_count_core(atomic_t counters[RK_RGA_CORE_COUNTER_COUNT],
 
 	if (index >= 0)
 		atomic_inc(&counters[index]);
+}
+
+static u32 rk_rga_core_distance(u32 core_mask, u32 start)
+{
+	int index = rk_rga_core_counter_index(core_mask);
+
+	if (index < 0)
+		return U32_MAX;
+
+	return (index + RK_RGA_CORE_COUNTER_COUNT -
+		(start % RK_RGA_CORE_COUNTER_COUNT)) %
+	       RK_RGA_CORE_COUNTER_COUNT;
 }
 
 static void rk_rga_of_node_put(void *data)
@@ -4878,7 +4891,7 @@ static int rk_rga_import_one(struct rk_rga_session *session,
 			     struct rga_external_buffer *buffer);
 static struct rk_rga_hw *
 rk_rga_find_best_hw_for_job(struct list_head *hw_list, struct rk_rga_job *job,
-			    u32 type_mask);
+			    u32 type_mask, u32 rr_start);
 static void rk_rga_hw_enqueue_job_locked(struct rk_rga_hw *hw,
 					 struct rk_rga_job *job);
 static struct rk_rga_hw *
@@ -6864,6 +6877,7 @@ static void rk_rga_find_best_hw_for_job_kunit(struct kunit *test)
 		.type = RK_RGA_HW_RGA2,
 		.core_mask = BIT(2),
 	};
+	struct rk_rga_hw *rga2_other;
 	LIST_HEAD(hw_list);
 
 	spin_lock_init(&busy.job_lock);
@@ -6874,22 +6888,30 @@ static void rk_rga_find_best_hw_for_job_kunit(struct kunit *test)
 	list_add_tail(&rga2_idle.node, &hw_list);
 	tasks = kunit_kcalloc(test, 2, sizeof(*tasks), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, tasks);
+	rga2_other = kunit_kzalloc(test, sizeof(*rga2_other), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, rga2_other);
+	rga2_other->type = RK_RGA_HW_RGA2;
+	rga2_other->core_mask = BIT(3);
+	spin_lock_init(&rga2_other->job_lock);
 
 	KUNIT_EXPECT_PTR_EQ(test,
 			    rk_rga_find_best_hw_for_job(&hw_list, &job,
-							RK_RGA_HW_TYPE_MASK_RGA3),
+							RK_RGA_HW_TYPE_MASK_RGA3,
+							0),
 			    &idle);
 
 	task.core = BIT(0);
 	KUNIT_EXPECT_PTR_EQ(test,
 			    rk_rga_find_best_hw_for_job(&hw_list, &job,
-							RK_RGA_HW_TYPE_MASK_ALL),
+							RK_RGA_HW_TYPE_MASK_ALL,
+							0),
 			    &busy);
 
 	task.core = BIT(1);
 	KUNIT_EXPECT_PTR_EQ(test,
 			    rk_rga_find_best_hw_for_job(&hw_list, &job,
-							RK_RGA_HW_TYPE_MASK_ALL),
+							RK_RGA_HW_TYPE_MASK_ALL,
+							0),
 			    &idle);
 
 	task.core = 0;
@@ -6897,30 +6919,35 @@ static void rk_rga_find_best_hw_for_job_kunit(struct kunit *test)
 	idle.queued_jobs = 3;
 	KUNIT_EXPECT_PTR_EQ(test,
 			    rk_rga_find_best_hw_for_job(&hw_list, &job,
-							RK_RGA_HW_TYPE_MASK_RGA3),
+							RK_RGA_HW_TYPE_MASK_RGA3,
+							0),
 			    &busy);
 	KUNIT_EXPECT_PTR_EQ(test,
 			    rk_rga_find_best_hw_for_job(&hw_list, &job,
-							RK_RGA_HW_TYPE_MASK_ALL),
+							RK_RGA_HW_TYPE_MASK_ALL,
+							0),
 			    &rga2_idle);
 
 	task.core = BIT(3);
 	KUNIT_EXPECT_PTR_EQ(test,
 			    rk_rga_find_best_hw_for_job(&hw_list, &job,
-							RK_RGA_HW_TYPE_MASK_ALL),
+							RK_RGA_HW_TYPE_MASK_ALL,
+							0),
 			    NULL);
 
 	task.core = BIT(2) | BIT(3);
 	KUNIT_EXPECT_PTR_EQ(test,
 			    rk_rga_find_best_hw_for_job(&hw_list, &job,
-							RK_RGA_HW_TYPE_MASK_ALL),
+							RK_RGA_HW_TYPE_MASK_ALL,
+							0),
 			    &rga2_idle);
 
 	task.core = BIT(0);
 	busy.removing = true;
 	KUNIT_EXPECT_PTR_EQ(test,
 			    rk_rga_find_best_hw_for_job(&hw_list, &job,
-							RK_RGA_HW_TYPE_MASK_ALL),
+							RK_RGA_HW_TYPE_MASK_ALL,
+							0),
 			    NULL);
 
 	tasks[0] = task;
@@ -6933,8 +6960,47 @@ static void rk_rga_find_best_hw_for_job_kunit(struct kunit *test)
 	job.current_task = 1;
 	KUNIT_EXPECT_PTR_EQ(test,
 			    rk_rga_find_best_hw_for_job(&hw_list, &job,
-							RK_RGA_HW_TYPE_MASK_ALL),
+							RK_RGA_HW_TYPE_MASK_ALL,
+							0),
 			    &idle);
+
+	job.tasks = &task;
+	job.task_count = 1;
+	job.current_task = 0;
+	task.core = 0;
+	idle.active_job = NULL;
+	idle.queued_jobs = 0;
+	busy.active_job = NULL;
+	busy.queued_jobs = 0;
+	busy.removing = false;
+	KUNIT_EXPECT_PTR_EQ(test,
+			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+							RK_RGA_HW_TYPE_MASK_RGA3,
+							0),
+			    &busy);
+	KUNIT_EXPECT_PTR_EQ(test,
+			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+							RK_RGA_HW_TYPE_MASK_RGA3,
+							1),
+			    &idle);
+	KUNIT_EXPECT_PTR_EQ(test,
+			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+							RK_RGA_HW_TYPE_MASK_ALL,
+							2),
+			    &busy);
+
+	task.core = BIT(2) | BIT(3);
+	list_add_tail(&rga2_other->node, &hw_list);
+	KUNIT_EXPECT_PTR_EQ(test,
+			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+							RK_RGA_HW_TYPE_MASK_RGA2,
+							2),
+			    &rga2_idle);
+	KUNIT_EXPECT_PTR_EQ(test,
+			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+							RK_RGA_HW_TYPE_MASK_RGA2,
+							3),
+			    rga2_other);
 }
 
 static void rk_rga_core_counter_kunit(struct kunit *test)
@@ -11900,9 +11966,21 @@ static u32 rk_rga_hw_load(struct rk_rga_hw *hw)
 	return load;
 }
 
+static bool rk_rga_hw_tie_better(const struct rk_rga_hw *best,
+				 const struct rk_rga_hw *hw, u32 rr_start)
+{
+	if (!best)
+		return true;
+	if (hw->type != best->type)
+		return false;
+
+	return rk_rga_core_distance(hw->core_mask, rr_start) <
+	       rk_rga_core_distance(best->core_mask, rr_start);
+}
+
 static struct rk_rga_hw *
 rk_rga_find_best_hw_for_job(struct list_head *hw_list, struct rk_rga_job *job,
-			    u32 type_mask)
+			    u32 type_mask, u32 rr_start)
 {
 	struct rk_rga_hw *best = NULL;
 	struct rk_rga_hw *hw;
@@ -11920,13 +11998,16 @@ rk_rga_find_best_hw_for_job(struct list_head *hw_list, struct rk_rga_job *job,
 			continue;
 
 		load = rk_rga_hw_load(hw);
-		if (best && load >= best_load)
-			continue;
+		if (best) {
+			if (load > best_load)
+				continue;
+			if (load == best_load &&
+			    !rk_rga_hw_tie_better(best, hw, rr_start))
+				continue;
+		}
 
 		best = hw;
 		best_load = load;
-		if (!load)
-			break;
 	}
 
 	return best;
@@ -12130,7 +12211,8 @@ static struct rk_rga_hw *rk_rga_hw_get_for_job(struct rk_rga_job *job,
 	}
 
 	mutex_lock(&rk_rga.hw_lock);
-	hw = rk_rga_find_best_hw_for_job(&rk_rga.hw_list, job, type_mask);
+	hw = rk_rga_find_best_hw_for_job(&rk_rga.hw_list, job, type_mask,
+					 rk_rga.core_select_seq++);
 	if (hw) {
 		refcount_inc(&hw->refs);
 		mutex_unlock(&rk_rga.hw_lock);
