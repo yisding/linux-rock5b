@@ -289,6 +289,7 @@ Implemented
   accepted for the BSP RGA2P RGB-family source-format subset and use the same
   source-only FBCIN path.
   Pattern/alpha blend outside the alpha-bitmap and color-key subsets below,
+  Y4/Y8 full-CSC dither output outside the current RGB-to-YUV ``librga`` path,
   color-key outside the RGBA ``imcolorkey`` profile above, ROP outside the
   ``imrop`` subset below, tile, YUV AFBC32x8, AFBC32x8 destination, RFBC
   destination, overlapping
@@ -418,7 +419,7 @@ Implemented
   RGA2 ``librga`` full-CSC RGB-to-YUV dispatch/emission,
   RGA2 ``librga`` gray256 RGB-to-Y400 color-conversion dispatch/emission,
   RGA2 ``librga`` Y400 UV-downsampling resize dispatch/emission,
-  RGA2 ``librga`` Y4/Y8 dither-output dispatch/emission and full-CSC rejection,
+  RGA2 ``librga`` Y4/Y8 compact/full-CSC dither-output dispatch/emission,
   RGA3 normal/inverted RGB color-key dispatch/emission and invalid-selector
   rejection,
   RGA3 ``librga`` DRM-fourcc ABGR8888-to-RGBA normal raster copy emission,
