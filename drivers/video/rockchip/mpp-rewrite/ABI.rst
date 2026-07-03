@@ -207,7 +207,8 @@ Implemented
 * Optional ``ROCKCHIP_MPP_REWRITE_KUNIT_TEST`` coverage for rewrite-local ABI
   parser helpers, including command range classification, command group
   boundary queries, fixed-width V1/``mpp_bat_msg`` ABI layout, V1-to-native
-  request conversion, payload-copy classification, register-span overflow
+  request conversion, payload-copy classification, ``SEND_CODEC_INFO`` storage
+  and trailing-byte tolerance, register-span overflow
   checks, BSP VDPU383 link IRQ decoding, link-table
   layout/materialization/readback/ownership/relinking, CCU-reference lifetime,
   hard-CCU running-list table-chain relinking/scanning/active matching and
@@ -218,8 +219,8 @@ Implemented
   preservation and IOMMU refresh accounting, cross-core CCU completion
   claiming, hard-CCU table-status readback,
   hard-CCU idle/add-mode descriptor values, hard-CCU all-core work-mask
-  selection, fixed-RCB link-latch
-  programming, MPP core-counter routing, IOMMU fault target matching,
+  selection, fixed-RCB link-latch programming, decoder RCB min-width gating,
+  MPP core-counter routing, IOMMU fault target matching,
   procfs support-command table coverage,
   RKVENC2 DCHS tx/rx id remapping and release, independent-core DCHS id
   capacity, ``POLL_HW_IRQ``
