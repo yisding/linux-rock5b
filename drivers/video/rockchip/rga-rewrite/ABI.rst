@@ -102,7 +102,9 @@ Implemented
   jobs ahead of lower-priority queued work and aging displaced queued jobs,
   with priorities clamped to the BSP 0..6 range.
   Hardware removal stops new dispatch, completes queued and active jobs with
-  ``-ENODEV``, and signals any exported async release fence with that result.
+  ``-ENODEV``, signals any exported async release fence with that result, and
+  when the last RGA core disappears also completes async jobs still blocked on
+  unsignaled acquire fences with ``-ENODEV``.
 * Backend-aware core selection for prepared jobs.  The scheduler checks the
   same supported-operation profile used by command generation, selects the
   least-loaded compatible RGA core for the current hardware-backed profile,
@@ -396,6 +398,7 @@ Implemented
   acquire-fence fd ownership merging, acquire-fence pending/success/error
   status propagation, async acquire-callback error completion,
   queued hardware-removal abort completion and release-fence signaling,
+  last-hardware pending-acquire abort completion and release-fence signaling,
   selected-core removal race completion and release-fence signaling,
   ffmpeg-facing RGA2 RFBC64x4 8/10-bit 4:2:0/4:2:2 and RGB-family AFBC32x8
   source profile selection and FBCIN command emission, IOMMU fault target matching,
