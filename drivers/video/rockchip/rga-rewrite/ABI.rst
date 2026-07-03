@@ -343,10 +343,11 @@ Implemented
   RGBA-family raster OSD image in SRC1, ``DST_OVER`` alpha controls, normal
   fixed-width OSD blocks, and the auto-invert/flag fields copied from
   ``im_osd_t``.  It programs SRC1 address/stride, the RGA2 bitblt-mode and OSD
-  mode bits, BSP-compatible OSD control/flag/calibration registers, and the
+  mode bits, BSP-compatible OSD control/flag/calibration registers, optional
+  external normal/invert colors from ``IM_OSD_COLOR_EXTERNAL``, and the
   OSD-specific alpha premultiplication policy.  Scaled/rotated/converted, YUV,
-  FBC/tile, RGBA2BPP/external-color, non-fixed-width, non-``DST_OVER``,
-  ROP/color-key, mosaic, gauss, and mixed-feature OSD variants remain
+  FBC/tile, RGBA2BPP, non-fixed-width, non-``DST_OVER``, ROP/color-key,
+  mosaic, gauss, and mixed-feature OSD variants remain
   unsupported.
 * RGA2 color palette for the current ``librga`` ``impalette`` sample path.
   The rewrite accepts the BSP two-command sequence emitted by userspace: first
@@ -421,8 +422,9 @@ Implemented
   RGA2 ``librga`` gray256 RGB-to-Y400 color-conversion dispatch/emission,
   RGA2 ``librga`` Y400 UV-downsampling resize dispatch/emission,
   RGA2 ``librga`` Y4/Y8 compact/full-CSC dither-output dispatch/emission,
-  RGA3 normal/inverted RGB color-key dispatch/emission and invalid-selector
-  rejection,
+  RGA2 OSD external-color dispatch/emission,
+  RGA3 normal/inverted RGB color-key dispatch/emission and
+  invalid-selector rejection,
   RGA3 ``librga`` DRM-fourcc ABGR8888-to-RGBA normal raster copy emission,
   RGA3 ``librga`` copy-splice multi-task destination-offset emission,
   RGA3 multi-task command-buffer rebuild between alpha and plain copy tasks,
