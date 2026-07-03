@@ -153,9 +153,9 @@ Implemented
   to WR; non-overlapping same-buffer, same-format, no-scale raster mirror copies
   use the BSP-compatible overlap route with source on WIN1, destination/background
   on WIN0, WR on the destination, and the destination rectangle carried in
-  ``OVLP_OFF``.  This covers the current ``librga`` ``immakeBorder()`` reflect
-  top/bottom source-to-destination tasks and reflect/wrap same-destination
-  side-edge tasks, plus the current ``librga`` DRM-fourcc
+  ``OVLP_OFF``.  This covers the current ``librga`` ``immakeBorder()``
+  reflect/wrap top/bottom source-to-destination tasks and reflect/wrap
+  same-destination side-edge tasks, plus the current ``librga`` DRM-fourcc
   ``rga_copy_drm_fourcc_demo`` ``DRM_FORMAT_ABGR8888``/modifier-zero path after
   userspace maps it to ``RK_FORMAT_RGBA_8888``.  The path requires imported dma-buf backed
   source/destination images, rejects color-key and unsupported pattern
@@ -428,7 +428,7 @@ Implemented
   RGA3 ``librga`` RGB translate and ffmpeg overlay-preprocess destination-offset emission,
   RGA3 ``librga`` RGB rotate, flip/mirror, and combined rotate/mirror
   emission, RGA3 ``librga`` centered RGB rotate destination-offset emission,
-  RGA3 ``librga`` ``immakeBorder()`` reflect top/bottom command emission,
+  RGA3 ``librga`` ``immakeBorder()`` reflect/wrap top/bottom command emission,
   RGA3 ``librga`` AFBC16x16 copy profile selection and FBCD/FBCE command
   emission including RGB-family/compact-10-bit read/writeback, ffmpeg
   AFBC-to-AFBC filter copies, and source active-offset handling, RGA3 tile8x8
