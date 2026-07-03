@@ -33,7 +33,9 @@ Implemented
 * Minimal ``/proc/mpp_service/supports-cmd`` and
   ``/proc/mpp_service/support_cmd`` discovery markers so current
   ``mpp-rockchip`` enables command probing.  These procfs files are read-only
-  compatibility markers, not BSP debug/control ABI.
+  compatibility markers, not BSP debug/control ABI.  The marker contents use
+  the BSP-style labelled hexadecimal command table and include the current
+  RK3588 command boundaries used by userspace capability probing.
 * ``MPP_CMD_INIT_CLIENT_TYPE`` for detected classes.
 * ``MPP_CMD_INIT_DRIVER_DATA`` as a validated no-op.
 * ``MPP_CMD_INIT_TRANS_TABLE`` storage using the BSP-compatible ``u16`` table
@@ -218,6 +220,7 @@ Implemented
   hard-CCU idle/add-mode descriptor values, hard-CCU all-core work-mask
   selection, fixed-RCB link-latch
   programming, MPP core-counter routing, IOMMU fault target matching,
+  procfs support-command table coverage,
   RKVENC2 DCHS tx/rx id remapping and release, independent-core DCHS id
   capacity, ``POLL_HW_IRQ``
   flexible-buffer sizing, RKVENC2 slice-mode detection and slice FIFO

@@ -42,6 +42,7 @@
 #include <linux/scatterlist.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
@@ -972,6 +973,41 @@ static __u32 rk_mpp_get_cmd_butt(__u32 cmd)
 	}
 }
 
+struct rk_mpp_support_cmd {
+	const char *name;
+	__u32 cmd;
+};
+
+static const struct rk_mpp_support_cmd rk_mpp_support_cmds[] = {
+	{ "QUERY_HW_SUPPORT:", MPP_CMD_QUERY_HW_SUPPORT },
+	{ "QUERY_HW_ID:", MPP_CMD_QUERY_HW_ID },
+	{ "QUERY_CMD_SUPPORT:", MPP_CMD_QUERY_CMD_SUPPORT },
+	{ "QUERY_BUTT:", MPP_CMD_QUERY_BUTT },
+	{ NULL, 0 },
+	{ "INIT_CLIENT_TYPE:", MPP_CMD_INIT_CLIENT_TYPE },
+	{ "INIT_DRIVER_DATA:", MPP_CMD_INIT_DRIVER_DATA },
+	{ "INIT_TRANS_TABLE:", MPP_CMD_INIT_TRANS_TABLE },
+	{ "INIT_BUTT:", MPP_CMD_INIT_BUTT },
+	{ NULL, 0 },
+	{ "SET_REG_WRITE:", MPP_CMD_SET_REG_WRITE },
+	{ "SET_REG_READ:", MPP_CMD_SET_REG_READ },
+	{ "SET_REG_ADDR_OFFSET:", MPP_CMD_SET_REG_ADDR_OFFSET },
+	{ "SET_RCB_INFO:", MPP_CMD_SET_RCB_INFO },
+	{ "SET_SESSION_FD:", MPP_CMD_SET_SESSION_FD },
+	{ "SEND_BUTT:", MPP_CMD_SEND_BUTT },
+	{ NULL, 0 },
+	{ "POLL_HW_FINISH:", MPP_CMD_POLL_HW_FINISH },
+	{ "POLL_HW_IRQ:", MPP_CMD_POLL_HW_IRQ },
+	{ "POLL_BUTT:", MPP_CMD_POLL_BUTT },
+	{ NULL, 0 },
+	{ "RESET_SESSION:", MPP_CMD_RESET_SESSION },
+	{ "TRANS_FD_TO_IOVA:", MPP_CMD_TRANS_FD_TO_IOVA },
+	{ "RELEASE_FD:", MPP_CMD_RELEASE_FD },
+	{ "SEND_CODEC_INFO:", MPP_CMD_SEND_CODEC_INFO },
+	{ "SET_ERR_REF_HACK:", MPP_CMD_SET_ERR_REF_HACK },
+	{ "CONTROL_BUTT:", MPP_CMD_CONTROL_BUTT },
+};
+
 static void rk_mpp_msg_v1_to_request(const struct rk_mpp_msg_v1 *msg,
 				     struct mpp_request *req)
 {
@@ -984,28 +1020,17 @@ static void rk_mpp_msg_v1_to_request(const struct rk_mpp_msg_v1 *msg,
 
 static int rk_mpp_support_cmd_show(struct seq_file *s, void *unused)
 {
-	seq_puts(s, "QUERY_HW_SUPPORT\n");
-	seq_puts(s, "QUERY_HW_ID\n");
-	seq_puts(s, "QUERY_CMD_SUPPORT\n");
-	seq_puts(s, "QUERY_BUTT\n");
-	seq_puts(s, "INIT_CLIENT_TYPE\n");
-	seq_puts(s, "INIT_DRIVER_DATA\n");
-	seq_puts(s, "INIT_TRANS_TABLE\n");
-	seq_puts(s, "INIT_BUTT\n");
-	seq_puts(s, "SET_REG_WRITE\n");
-	seq_puts(s, "SET_REG_READ\n");
-	seq_puts(s, "SET_REG_ADDR_OFFSET\n");
-	seq_puts(s, "SET_RCB_INFO\n");
-	seq_puts(s, "SEND_BUTT\n");
-	seq_puts(s, "POLL_HW_FINISH\n");
-	seq_puts(s, "POLL_HW_IRQ\n");
-	seq_puts(s, "POLL_BUTT\n");
-	seq_puts(s, "RESET_SESSION\n");
-	seq_puts(s, "TRANS_FD_TO_IOVA\n");
-	seq_puts(s, "RELEASE_FD\n");
-	seq_puts(s, "SEND_CODEC_INFO\n");
-	seq_puts(s, "SET_ERR_REF_HACK\n");
-	seq_puts(s, "CONTROL_BUTT\n");
+	__u32 i;
+
+	seq_puts(s, "------------- SUPPORT CMD -------------\n");
+	for (i = 0; i < ARRAY_SIZE(rk_mpp_support_cmds); i++) {
+		const struct rk_mpp_support_cmd *cmd = &rk_mpp_support_cmds[i];
+
+		if (!cmd->name)
+			seq_puts(s, "----\n");
+		else
+			seq_printf(s, "%-22s0x%08x\n", cmd->name, cmd->cmd);
+	}
 
 	return 0;
 }
@@ -2309,6 +2334,34 @@ static void rk_mpp_get_cmd_butt_kunit(struct kunit *test)
 			(__u32)MPP_CMD_CONTROL_BUTT);
 	KUNIT_EXPECT_EQ(test, rk_mpp_get_cmd_butt(MPP_CMD_QUERY_HW_SUPPORT),
 			(__u32)0);
+}
+
+static void rk_mpp_support_cmds_kunit(struct kunit *test)
+{
+#define RK_MPP_EXPECT_SUPPORT_CMD(_idx, _name, _cmd) do {		\
+		KUNIT_EXPECT_EQ(test, strcmp(rk_mpp_support_cmds[_idx].name, \
+					     _name), 0);		\
+		KUNIT_EXPECT_EQ(test, rk_mpp_support_cmds[_idx].cmd,	\
+				(__u32)(_cmd));				\
+	} while (0)
+
+	KUNIT_EXPECT_EQ(test, ARRAY_SIZE(rk_mpp_support_cmds), (size_t)27);
+	RK_MPP_EXPECT_SUPPORT_CMD(0, "QUERY_HW_SUPPORT:",
+				  MPP_CMD_QUERY_HW_SUPPORT);
+	RK_MPP_EXPECT_SUPPORT_CMD(2, "QUERY_CMD_SUPPORT:",
+				  MPP_CMD_QUERY_CMD_SUPPORT);
+	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_support_cmds[4].name, NULL);
+	RK_MPP_EXPECT_SUPPORT_CMD(6, "INIT_DRIVER_DATA:",
+				  MPP_CMD_INIT_DRIVER_DATA);
+	RK_MPP_EXPECT_SUPPORT_CMD(13, "SET_RCB_INFO:", MPP_CMD_SET_RCB_INFO);
+	RK_MPP_EXPECT_SUPPORT_CMD(14, "SET_SESSION_FD:",
+				  MPP_CMD_SET_SESSION_FD);
+	RK_MPP_EXPECT_SUPPORT_CMD(18, "POLL_HW_IRQ:", MPP_CMD_POLL_HW_IRQ);
+	RK_MPP_EXPECT_SUPPORT_CMD(25, "SET_ERR_REF_HACK:",
+				  MPP_CMD_SET_ERR_REF_HACK);
+	RK_MPP_EXPECT_SUPPORT_CMD(26, "CONTROL_BUTT:", MPP_CMD_CONTROL_BUTT);
+
+#undef RK_MPP_EXPECT_SUPPORT_CMD
 }
 
 static void rk_mpp_abi_layout_kunit(struct kunit *test)
@@ -3771,6 +3824,7 @@ static void rk_mpp_batch_session_switch_split_kunit(struct kunit *test)
 static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_check_cmd_v1_kunit),
 	KUNIT_CASE(rk_mpp_get_cmd_butt_kunit),
+	KUNIT_CASE(rk_mpp_support_cmds_kunit),
 	KUNIT_CASE(rk_mpp_abi_layout_kunit),
 	KUNIT_CASE(rk_mpp_msg_v1_to_request_kunit),
 	KUNIT_CASE(rk_mpp_cmd_copies_payload_kunit),
