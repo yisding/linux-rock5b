@@ -101,8 +101,10 @@ Implemented
   BSP-compatible ``rga_req.core`` scheduler masks are honored for supported
   profiles: RGA3 core bits ``0x1``/``0x2`` select RGA3 cores and RGA2 bits
   ``0x4``/``0x8`` select RGA2 cores.  Unsupported profiles requested on a
-  forced core still fail with the normal validation error.  Imported images are
-  rebound to the selected core's DMA device at dispatch time, so direct
+  forced core still fail with the normal validation error, and a mask that
+  selects only an absent hardware core is not silently rerouted to another
+  present core.  Imported images are rebound to the selected core's DMA device
+  at dispatch time, so direct
   ``wrapbuffer_fd()`` submissions can target a non-default RGA core.  Minimal
   debugfs counters report scheduled, dispatched, and hardware-started work per
   public core-mask bit so RK3588 board validation can confirm load balancing
