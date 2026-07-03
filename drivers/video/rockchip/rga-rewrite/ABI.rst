@@ -333,6 +333,7 @@ Implemented
   version-query strings and positive success returns, mixed RGA2/RGA3 multi-task
   classification with per-task core-mask forcing, request-id removal on terminal
   submit, request create/cancel ioctl id allocation, usercopy, and miss handling,
+  release-buffer ioctl handle removal and malformed-pool returns,
   ``librga`` virtual-address import sizing and physical
   import rejection, RGA2 fill RGB/YUV destination-offset emission,
   YUV-fill chroma-alignment rejection, multi-fill task acceptance, and
