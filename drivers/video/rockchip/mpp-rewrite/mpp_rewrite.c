@@ -26,6 +26,7 @@
 #include <linux/io.h>
 #include <linux/jiffies.h>
 #include <linux/kfifo.h>
+#include <linux/ktime.h>
 #include <linux/list.h>
 #include <linux/math.h>
 #include <linux/miscdevice.h>
@@ -278,6 +279,8 @@ struct rk_mpp_service {
 	atomic_t started_job_count;
 	atomic_t started_rkvenc_core_count[RK_MPP_CORE_COUNTER_COUNT];
 	atomic_t started_rkvdec_core_count[RK_MPP_CORE_COUNTER_COUNT];
+	atomic64_t hw_total_ns;
+	atomic64_t hw_max_ns;
 	atomic_t queued_job_count;
 	atomic_t timeout_count;
 	atomic_t iommu_fault_count;
@@ -387,6 +390,8 @@ struct rk_mpp_job {
 	bool rkvenc_slice_mode;
 	bool rkvenc_slice_done;
 	bool rkvenc_slice_overflow;
+	u64 hw_start_ns;
+	u64 hw_elapsed_ns;
 	spinlock_t rkvenc_slice_lock;
 	DECLARE_KFIFO(rkvenc_slice_fifo, u32, RK_MPP_RKVENC_MAX_SLICE_FIFO);
 	struct mpp_request poll_req;
@@ -470,6 +475,57 @@ rk_mpp_count_core(atomic_t rkvenc_counters[RK_MPP_CORE_COUNTER_COUNT],
 		atomic_inc(&rkvdec_counters[index]);
 }
 
+static void rk_mpp_atomic64_max(atomic64_t *counter, u64 value)
+{
+	s64 old = atomic64_read(counter);
+
+	while ((u64)old < value) {
+		s64 prev = atomic64_cmpxchg(counter, old, value);
+
+		if (prev == old)
+			break;
+		old = prev;
+	}
+}
+
+static int rk_mpp_debugfs_atomic64_get(void *data, u64 *val)
+{
+	*val = atomic64_read(data);
+	return 0;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(rk_mpp_debugfs_atomic64_fops,
+			 rk_mpp_debugfs_atomic64_get, NULL, "%llu\n");
+
+static void rk_mpp_debugfs_create_atomic64(const char *name, atomic64_t *value)
+{
+	debugfs_create_file(name, 0444, rk_mpp_srv.debugfs_root, value,
+			    &rk_mpp_debugfs_atomic64_fops);
+}
+
+static void rk_mpp_job_note_hw_done(struct rk_mpp_job *job)
+{
+	u64 start = job->hw_start_ns;
+
+	if (!start)
+		return;
+
+	job->hw_elapsed_ns += ktime_get_ns() - start;
+	job->hw_start_ns = 0;
+}
+
+static void rk_mpp_job_record_hw_stats(struct rk_mpp_job *job)
+{
+	u64 elapsed = job->hw_elapsed_ns;
+
+	if (!elapsed)
+		return;
+
+	atomic64_add(elapsed, &job->session->srv->hw_total_ns);
+	rk_mpp_atomic64_max(&job->session->srv->hw_max_ns, elapsed);
+	job->hw_elapsed_ns = 0;
+}
+
 static void rk_mpp_count_scheduled_core(struct rk_mpp_job *job)
 {
 	struct rk_mpp_service *srv = job->session->srv;
@@ -492,6 +548,8 @@ static void rk_mpp_count_started_core(struct rk_mpp_job *job)
 {
 	struct rk_mpp_service *srv = job->session->srv;
 
+	rk_mpp_job_note_hw_done(job);
+	job->hw_start_ns = ktime_get_ns();
 	atomic_inc(&srv->started_job_count);
 	rk_mpp_count_core(srv->started_rkvenc_core_count,
 			  srv->started_rkvdec_core_count, job->hw);
@@ -5572,6 +5630,8 @@ static void rk_mpp_job_complete(struct rk_mpp_job *job, int result)
 {
 	struct rk_mpp_session *session = job->session;
 
+	rk_mpp_job_note_hw_done(job);
+	rk_mpp_job_record_hw_stats(job);
 	mutex_lock(&session->lock);
 	job->result = result;
 	job->state = RK_MPP_JOB_DONE;
@@ -8334,6 +8394,8 @@ static int __init rk_mpp_init(void)
 	rk_mpp_debugfs_create_core_counts("started",
 					  rk_mpp_srv.started_rkvenc_core_count,
 					  rk_mpp_srv.started_rkvdec_core_count);
+	rk_mpp_debugfs_create_atomic64("hw_total_ns", &rk_mpp_srv.hw_total_ns);
+	rk_mpp_debugfs_create_atomic64("hw_max_ns", &rk_mpp_srv.hw_max_ns);
 	debugfs_create_atomic_t("queued_job_count", 0444,
 				rk_mpp_srv.debugfs_root,
 				&rk_mpp_srv.queued_job_count);
