@@ -8637,8 +8637,13 @@ static void rk_rga3_librga_blend_modes_kunit(struct kunit *test)
 			RK_RGA_ALPHA_BLEND_XOR,
 			RK_RGA3_ALPHA_OPPOSITE_INVERSE,
 			RK_RGA3_ALPHA_OPPOSITE_INVERSE,
+		}, {
+			RK_RGA_ALPHA_BLEND_CLEAR,
+			RK_RGA3_ALPHA_ZERO,
+			RK_RGA3_ALPHA_ZERO,
 		},
 	};
+	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
 	struct rga_req task =
 		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
 					  RK_RGA_FORMAT_RGBA_8888);
@@ -8646,6 +8651,8 @@ static void rk_rga3_librga_blend_modes_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
 	};
 	enum rk_rga_hw_type type;
 	u32 top_factor;
@@ -8678,12 +8685,37 @@ static void rk_rga3_librga_blend_modes_kunit(struct kunit *test)
 				modes[i].bottom_factor);
 		KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 		KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+
+		memset(cmd, 0, sizeof(cmd));
+		job.cmd_ready = false;
+		KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+		KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+		KUNIT_EXPECT_EQ(test,
+				cmd[RK_RGA3_OVLP_TOP_CTRL_OFFSET / 4] &
+				RK_RGA3_ALPHA_FACTOR,
+				FIELD_PREP(RK_RGA3_ALPHA_FACTOR,
+					   modes[i].top_factor));
+		KUNIT_EXPECT_EQ(test,
+				cmd[RK_RGA3_OVLP_BOT_CTRL_OFFSET / 4] &
+				RK_RGA3_ALPHA_FACTOR,
+				FIELD_PREP(RK_RGA3_ALPHA_FACTOR,
+					   modes[i].bottom_factor));
+		KUNIT_EXPECT_EQ(test,
+				cmd[RK_RGA3_OVLP_TOP_ALPHA_OFFSET / 4] &
+				RK_RGA3_ALPHA_FACTOR,
+				FIELD_PREP(RK_RGA3_ALPHA_FACTOR,
+					   modes[i].top_factor));
+		KUNIT_EXPECT_EQ(test,
+				cmd[RK_RGA3_OVLP_BOT_ALPHA_OFFSET / 4] &
+				RK_RGA3_ALPHA_FACTOR,
+				FIELD_PREP(RK_RGA3_ALPHA_FACTOR,
+					   modes[i].bottom_factor));
 	}
 
 	type = 0;
 	top_factor = U32_MAX;
 	bottom_factor = U32_MAX;
-	task.PD_mode = RK_RGA_ALPHA_BLEND_CLEAR;
+	task.PD_mode = RK_RGA_ALPHA_BLEND_CLEAR + 1;
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), -EOPNOTSUPP);
 	KUNIT_EXPECT_EQ(test,
@@ -11114,6 +11146,10 @@ static int rk_rga3_alpha_factors(u8 pd_mode, u32 *top_factor,
 	case RK_RGA_ALPHA_BLEND_XOR:
 		*top_factor = RK_RGA3_ALPHA_OPPOSITE_INVERSE;
 		*bottom_factor = RK_RGA3_ALPHA_OPPOSITE_INVERSE;
+		return 0;
+	case RK_RGA_ALPHA_BLEND_CLEAR:
+		*top_factor = RK_RGA3_ALPHA_ZERO;
+		*bottom_factor = RK_RGA3_ALPHA_ZERO;
 		return 0;
 	default:
 		return -EOPNOTSUPP;
