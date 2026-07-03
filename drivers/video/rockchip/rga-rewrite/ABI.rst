@@ -8,6 +8,8 @@ Implemented
 -----------
 
 * Legacy ``RGA_GET_VERSION`` and ``RGA2_GET_VERSION`` query paths.
+  ``RGA2_GET_VERSION`` intentionally returns a positive success value after
+  copying the version string, matching the BSP/librga observable contract.
 * Modern ``RGA_IOC_GET_HW_VERSION`` and ``RGA_IOC_GET_DRVIER_VERSION``.
   Hardware version queries report the RK3588-compatible RGA2E
   ``3.2.63318`` and RGA3 ``3.0.76831`` tuples used by current ``librga``
