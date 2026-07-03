@@ -8476,6 +8476,30 @@ static void rk_rga3_tile8x8_profile_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_UV_VIR_STRIDE_OFFSET / 4],
 			src_tile_uv_stride);
 
+	memset(cmd, 0, sizeof(cmd));
+	task.dst.rd_mode = RK_RGA_TILE_MODE;
+	job.cmd_ready = false;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+
+	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
+	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WIN0_RD_MODE,
+			FIELD_PREP(RK_RGA3_WIN0_RD_MODE, 2));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_VIR_STRIDE_OFFSET / 4],
+			src_tile_stride);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_UV_VIR_STRIDE_OFFSET / 4],
+			src_tile_uv_stride);
+	ctrl = cmd[RK_RGA3_WR_CTRL_OFFSET / 4];
+	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WR_MODE,
+			FIELD_PREP(RK_RGA3_WR_MODE, 2));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4],
+			dst_tile_stride);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_PL_VIR_STRIDE_OFFSET / 4],
+			dst_tile_uv_stride);
+
 	task.dst.format = RK_RGA_FORMAT_RGBA_8888;
 	task.dst.rd_mode = RK_RGA_TILE_MODE;
 	type = 0;
