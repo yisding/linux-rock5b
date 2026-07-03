@@ -6391,9 +6391,15 @@ static void rk_rga2_osd_emit_kunit(struct kunit *test)
 			     FIELD_PREP(RK_RGA2_OSD_CTRL0_FIX_WIDTH, 47);
 	u32 expected_ctrl1 = FIELD_PREP(RK_RGA2_OSD_CTRL1_FLAGS_MODE, 1) |
 			     FIELD_PREP(RK_RGA2_OSD_CTRL1_INVERT_MODE, 1) |
-			     FIELD_PREP(RK_RGA2_OSD_CTRL1_THRESH, 40);
+			     FIELD_PREP(RK_RGA2_OSD_CTRL1_DEFAULT_COLOR, 1) |
+			     FIELD_PREP(RK_RGA2_OSD_CTRL1_THRESH, 40) |
+			     FIELD_PREP(RK_RGA2_OSD_CTRL1_INVERT_Y, 1) |
+			     FIELD_PREP(RK_RGA2_OSD_CTRL1_INVERT_C, 1);
 	u32 expected_dst_vir_info = (1280U * 4 / 4) |
 				    ((64U * 4 / 4) << 16);
+	u32 expected_cal0 = (211U << 24) | (17U << 16) |
+			    (201U << 8) | 9U;
+	u32 expected_cal1 = (231U << 8) | 23U;
 
 	bg.x_offset = 100;
 	bg.y_offset = 100;
@@ -6419,9 +6425,18 @@ static void rk_rga2_osd_emit_kunit(struct kunit *test)
 	task.osd_info.mode_ctrl.block_num = 6;
 	task.osd_info.mode_ctrl.invert_flags_mode = 1;
 	task.osd_info.mode_ctrl.flags_index = 1;
+	task.osd_info.mode_ctrl.default_color_sel = 1;
+	task.osd_info.mode_ctrl.invert_enable = 0x6;
 	task.osd_info.mode_ctrl.invert_mode = 1;
 	task.osd_info.mode_ctrl.invert_thresh = 40;
+	task.osd_info.cal_factor.yg_min = 9;
+	task.osd_info.cal_factor.yg_max = 201;
+	task.osd_info.cal_factor.crb_min = 17;
+	task.osd_info.cal_factor.crb_max = 211;
+	task.osd_info.cal_factor.alpha_min = 23;
+	task.osd_info.cal_factor.alpha_max = 231;
 	task.osd_info.last_flags0 = 0x2a;
+	task.osd_info.last_flags1 = 0x01020304;
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
@@ -6446,10 +6461,14 @@ static void rk_rga2_osd_emit_kunit(struct kunit *test)
 			expected_ctrl0);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_OSD_CTRL1_OFFSET / 4],
 			expected_ctrl1);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_OSD_INVERSION_CAL0_OFFSET / 4],
+			expected_cal0);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_OSD_INVERSION_CAL1_OFFSET / 4],
+			expected_cal1);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_OSD_LAST_FLAGS0_OFFSET / 4],
 			0x2aU);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_OSD_LAST_FLAGS1_OFFSET / 4],
-			0U);
+			0x01020304U);
 
 	memset(cmd, 0, sizeof(cmd));
 	job.cmd_ready = false;
