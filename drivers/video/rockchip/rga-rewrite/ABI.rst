@@ -360,6 +360,8 @@ Implemented
   mixed RGA2/RGA3 multi-task
   classification with per-task core-mask forcing, request-id removal on terminal
   submit, request create/cancel ioctl id allocation, usercopy, and miss handling,
+  legacy ``RGA_BLIT_ASYNC`` acquire-fence ioctls that copy a release-fence fd
+  back through ``rga_req.out_fence_fd`` before deferred dispatch,
   modern request-submit async acquire-fence ioctls that return a release-fence
   fd before deferred dispatch and signal it with the eventual backend result,
   import-buffer ioctl physical-address rejection and malformed-pool returns,
