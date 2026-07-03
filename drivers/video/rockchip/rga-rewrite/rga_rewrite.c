@@ -6499,6 +6499,18 @@ static void rk_rga_find_best_hw_for_job_kunit(struct kunit *test)
 							RK_RGA_HW_TYPE_MASK_ALL),
 			    &rga2_idle);
 
+	task.core = BIT(3);
+	KUNIT_EXPECT_PTR_EQ(test,
+			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+							RK_RGA_HW_TYPE_MASK_ALL),
+			    NULL);
+
+	task.core = BIT(2) | BIT(3);
+	KUNIT_EXPECT_PTR_EQ(test,
+			    rk_rga_find_best_hw_for_job(&hw_list, &job,
+							RK_RGA_HW_TYPE_MASK_ALL),
+			    &rga2_idle);
+
 	task.core = BIT(0);
 	busy.removing = true;
 	KUNIT_EXPECT_PTR_EQ(test,
