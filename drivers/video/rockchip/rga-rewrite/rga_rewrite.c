@@ -6699,6 +6699,122 @@ static void rk_rga_request_reconfig_fences_kunit(struct kunit *test)
 	dma_fence_put(new_fence);
 }
 
+static void rk_rga_request_reconfig_gauss_kunit(struct kunit *test)
+{
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_RGBA_8888);
+	u32 coeffs[3] = { 1, 2, 3 };
+	u32 expected_old =
+		FIELD_PREP(RK_RGA2_GAUSS_COE0, 1) |
+		FIELD_PREP(RK_RGA2_GAUSS_COE1, 2) |
+		FIELD_PREP(RK_RGA2_GAUSS_COE2, 3);
+	u32 expected_new =
+		FIELD_PREP(RK_RGA2_GAUSS_COE0, 4) |
+		FIELD_PREP(RK_RGA2_GAUSS_COE1, 5) |
+		FIELD_PREP(RK_RGA2_GAUSS_COE2, 6);
+	struct rga_user_request user = {
+		.task_num = 1,
+		.id = 11,
+	};
+	struct rk_rga_session session = {};
+	struct rk_rga_request *request;
+	struct rk_rga_import *src_import;
+	struct rk_rga_import *dst_import;
+	struct rk_rga_job *job = NULL;
+	void __user *task_user;
+	void __user *coeff_user;
+	unsigned long uncopied;
+	int ret;
+
+	task_user = rk_rga_kunit_user_buffer(test, sizeof(task));
+	coeff_user = rk_rga_kunit_user_buffer(test, sizeof(coeffs));
+	KUNIT_ASSERT_NOT_NULL(test, task_user);
+	KUNIT_ASSERT_NOT_NULL(test, coeff_user);
+
+	task.handle_flag = 1;
+	task.src.yrgb_addr = 41;
+	task.src.uv_addr = 0;
+	task.src.v_addr = 0;
+	task.dst.yrgb_addr = 42;
+	task.dst.uv_addr = 0;
+	task.dst.v_addr = 0;
+	task.feature.global_alpha_en = true;
+	task.fg_global_alpha = 0xfe;
+	task.gauss_config.size = 3;
+	task.gauss_config.coe_ptr = (uintptr_t)coeff_user;
+	user.task_ptr = (uintptr_t)task_user;
+
+	uncopied = copy_to_user(task_user, &task, sizeof(task));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+	uncopied = copy_to_user(coeff_user, coeffs, sizeof(coeffs));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+
+	mutex_init(&session.lock);
+	idr_init(&session.requests);
+	idr_init(&session.imports);
+
+	request = kzalloc_obj(*request, GFP_KERNEL);
+	src_import = rk_rga_kunit_import(test);
+	dst_import = rk_rga_kunit_import(test);
+	KUNIT_ASSERT_NOT_NULL(test, request);
+	KUNIT_ASSERT_NOT_NULL(test, src_import);
+	KUNIT_ASSERT_NOT_NULL(test, dst_import);
+	src_import->iova = 0x10000000;
+	src_import->size = (size_t)1920 * 1080 * 4;
+	dst_import->iova = 0x20000000;
+	dst_import->size = (size_t)1280 * 720 * 4;
+
+	KUNIT_ASSERT_EQ(test,
+			idr_alloc(&session.requests, request, 11, 12,
+				  GFP_KERNEL),
+			11);
+	KUNIT_ASSERT_EQ(test,
+			idr_alloc(&session.imports, src_import, 41, 42,
+				  GFP_KERNEL),
+			41);
+	KUNIT_ASSERT_EQ(test,
+			idr_alloc(&session.imports, dst_import, 42, 43,
+				  GFP_KERNEL),
+			42);
+
+	ret = rk_rga_request_config(&session, &user, NULL);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_ASSERT_NOT_NULL(test, request->gauss_coeffs);
+	KUNIT_EXPECT_EQ(test, request->gauss_coeffs[0], expected_old);
+
+	coeffs[0] = 4;
+	coeffs[1] = 5;
+	coeffs[2] = 6;
+	uncopied = copy_to_user(coeff_user, coeffs, sizeof(coeffs));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+
+	ret = rk_rga_request_config(&session, &user, NULL);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_ASSERT_NOT_NULL(test, request->gauss_coeffs);
+	KUNIT_EXPECT_EQ(test, request->gauss_coeffs[0], expected_new);
+
+	ret = rk_rga_job_clone_request_locked(request, &job);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+	KUNIT_ASSERT_NOT_NULL(test, job->gauss_coeffs);
+	KUNIT_EXPECT_PTR_NE(test, job->gauss_coeffs, request->gauss_coeffs);
+	KUNIT_EXPECT_EQ(test, job->gauss_coeffs[0], expected_new);
+	rk_rga_job_put(job);
+
+	KUNIT_EXPECT_TRUE(test, rk_rga_request_remove_free(&session, 11));
+	KUNIT_EXPECT_EQ(test, refcount_read(&src_import->refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&dst_import->refs), 1);
+	KUNIT_EXPECT_PTR_EQ(test, idr_remove(&session.imports, 41),
+			    src_import);
+	KUNIT_EXPECT_PTR_EQ(test, idr_remove(&session.imports, 42),
+			    dst_import);
+	rk_rga_import_put(src_import);
+	rk_rga_import_put(dst_import);
+	idr_destroy(&session.requests);
+	idr_destroy(&session.imports);
+}
+
 static void rk_rga_legacy_blit_async_acquire_kunit(struct kunit *test)
 {
 	struct rga_req task =
@@ -10627,6 +10743,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_request_config_handles_kunit),
 	KUNIT_CASE(rk_rga_request_reconfig_resources_kunit),
 	KUNIT_CASE(rk_rga_request_reconfig_fences_kunit),
+	KUNIT_CASE(rk_rga_request_reconfig_gauss_kunit),
 	KUNIT_CASE(rk_rga_legacy_blit_async_acquire_kunit),
 	KUNIT_CASE(rk_rga_request_submit_async_acquire_kunit),
 	KUNIT_CASE(rk_rga_version_queries_kunit),
