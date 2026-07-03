@@ -367,6 +367,7 @@ Implemented
   emission,
   acquire-fence fd ownership merging, acquire-fence pending/success/error
   status propagation, async acquire-callback error completion,
+  queued hardware-removal abort completion and release-fence signaling,
   ffmpeg-facing RGA2 RFBC64x4 8/10-bit 4:2:0/4:2:2 and RGB-family AFBC32x8
   source profile selection and FBCIN command emission, IOMMU fault target matching,
   post-reset IOMMU refresh accounting, scheduler priority enqueue/aging,
