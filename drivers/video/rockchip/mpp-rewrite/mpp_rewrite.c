@@ -417,6 +417,7 @@ static bool rk_mpp_hw_take_active_if(struct rk_mpp_hw *hw,
 				     u32 *irq_status);
 static void rk_mpp_hw_timeout_work(struct work_struct *work);
 static void rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu);
+static void rk_mpp_hw_abort_ccu_dependents(struct rk_mpp_hw *ccu);
 static void
 rk_mpp_hw_abort_ccu_active_dependents(struct rk_mpp_hw *ccu,
 				      struct rk_mpp_hw *skip, int result);
@@ -426,6 +427,7 @@ static bool rk_mpp_job_rkvenc_slice_done(struct rk_mpp_job *job);
 static void rk_mpp_job_push_rkvenc_slice(struct rk_mpp_job *job, u32 value);
 static int rk_mpp_job_pop_rkvenc_slice(struct rk_mpp_job *job, u32 *value);
 static int rk_mpp_job_apply_rcb_info(struct rk_mpp_job *job);
+static void rk_mpp_scheduler_work(struct work_struct *work);
 static void rk_mpp_session_abort_jobs(struct rk_mpp_session *session);
 static int rk_mpp_session_poll_job(struct rk_mpp_session *session, u32 flags);
 static int rk_mpp_process_request(struct rk_mpp_session *session,
@@ -3557,6 +3559,175 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv.iommu_refresh_count), 1);
 }
 
+static void rk_mpp_kunit_device_release(struct device *dev)
+{
+}
+
+static void rk_mpp_hw_abort_ccu_dependents_kunit(struct kunit *test)
+{
+	struct device_node *ccu_node;
+	struct rk_mpp_session *session;
+	struct device *ccu_dev;
+	struct device *core0_dev;
+	struct device *core1_dev;
+	struct rk_mpp_hw *ccu;
+	struct rk_mpp_hw *core0;
+	struct rk_mpp_hw *core1;
+	struct rk_mpp_job *queued;
+	struct rk_mpp_job *active;
+
+	ccu_node = kunit_kzalloc(test, sizeof(*ccu_node), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ccu_node);
+	session = kunit_kzalloc(test, sizeof(*session), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, session);
+	ccu_dev = kunit_kzalloc(test, sizeof(*ccu_dev), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ccu_dev);
+	core0_dev = kunit_kzalloc(test, sizeof(*core0_dev), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, core0_dev);
+	core1_dev = kunit_kzalloc(test, sizeof(*core1_dev), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, core1_dev);
+	queued = kunit_kzalloc(test, sizeof(*queued), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, queued);
+	active = kunit_kzalloc(test, sizeof(*active), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, active);
+	ccu = kunit_kzalloc(test, sizeof(*ccu), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ccu);
+	core0 = kunit_kzalloc(test, sizeof(*core0), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, core0);
+	core1 = kunit_kzalloc(test, sizeof(*core1), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, core1);
+
+	device_initialize(ccu_dev);
+	ccu_dev->of_node = ccu_node;
+	ccu_dev->release = rk_mpp_kunit_device_release;
+	device_initialize(core0_dev);
+	core0_dev->release = rk_mpp_kunit_device_release;
+	device_initialize(core1_dev);
+	core1_dev->release = rk_mpp_kunit_device_release;
+	pm_runtime_set_active(core1_dev);
+	pm_runtime_enable(core1_dev);
+	pm_runtime_get_noresume(core1_dev);
+
+	mutex_init(&rk_mpp_srv.hw_lock);
+	mutex_init(&rk_mpp_srv.sched_lock);
+	spin_lock_init(&rk_mpp_srv.rkvenc_dchs_lock);
+	INIT_LIST_HEAD(&rk_mpp_srv.hw_list);
+	INIT_LIST_HEAD(&rk_mpp_srv.queued_jobs);
+	INIT_WORK(&rk_mpp_srv.sched_work, rk_mpp_scheduler_work);
+	atomic_set(&rk_mpp_srv.queued_job_count, 1);
+
+	session->srv = &rk_mpp_srv;
+	session->active_job_count = 2;
+	mutex_init(&session->lock);
+	INIT_LIST_HEAD(&session->imports);
+	INIT_LIST_HEAD(&session->active_jobs);
+	init_waitqueue_head(&session->wait);
+	refcount_set(&session->refs, 1);
+
+	ccu->dev = ccu_dev;
+	refcount_set(&ccu->refs, 1);
+	init_completion(&ccu->released);
+	mutex_init(&ccu->run_lock);
+	spin_lock_init(&ccu->lock);
+	INIT_LIST_HEAD(&ccu->link);
+	INIT_LIST_HEAD(&ccu->rkvdec_ccu_jobs);
+	INIT_LIST_HEAD(&ccu->rkvdec_link_jobs);
+	INIT_DELAYED_WORK(&ccu->timeout_work, rk_mpp_hw_timeout_work);
+
+	core0->dev = core0_dev;
+	core0->ccu_node = ccu_node;
+	core0->online = true;
+	refcount_set(&core0->refs, 2);
+	init_completion(&core0->released);
+	mutex_init(&core0->run_lock);
+	spin_lock_init(&core0->lock);
+	INIT_LIST_HEAD(&core0->link);
+	INIT_LIST_HEAD(&core0->rkvdec_ccu_jobs);
+	INIT_LIST_HEAD(&core0->rkvdec_link_jobs);
+	INIT_DELAYED_WORK(&core0->timeout_work, rk_mpp_hw_timeout_work);
+
+	core1->dev = core1_dev;
+	core1->ccu_node = ccu_node;
+	core1->online = true;
+	refcount_set(&core1->refs, 2);
+	init_completion(&core1->released);
+	mutex_init(&core1->run_lock);
+	spin_lock_init(&core1->lock);
+	INIT_LIST_HEAD(&core1->link);
+	INIT_LIST_HEAD(&core1->rkvdec_ccu_jobs);
+	INIT_LIST_HEAD(&core1->rkvdec_link_jobs);
+	INIT_DELAYED_WORK(&core1->timeout_work, rk_mpp_hw_timeout_work);
+
+	list_add_tail(&core0->link, &rk_mpp_srv.hw_list);
+	list_add_tail(&core1->link, &rk_mpp_srv.hw_list);
+
+	queued->session = session;
+	queued->hw = core0;
+	queued->state = RK_MPP_JOB_ACTIVE;
+	queued->result = -EINPROGRESS;
+	refcount_set(&queued->refs, 2);
+	INIT_LIST_HEAD(&queued->link);
+	INIT_LIST_HEAD(&queued->session_link);
+	INIT_LIST_HEAD(&queued->sched_link);
+	INIT_LIST_HEAD(&queued->rkvdec_ccu_node);
+	INIT_LIST_HEAD(&queued->rkvdec_link_node);
+	list_add_tail(&queued->session_link, &session->active_jobs);
+	list_add_tail(&queued->sched_link, &rk_mpp_srv.queued_jobs);
+	atomic_set(&core0->queued_job_count, 1);
+
+	active->session = session;
+	active->hw = core1;
+	active->state = RK_MPP_JOB_ACTIVE;
+	active->result = -EINPROGRESS;
+	refcount_set(&active->refs, 2);
+	INIT_LIST_HEAD(&active->link);
+	INIT_LIST_HEAD(&active->session_link);
+	INIT_LIST_HEAD(&active->sched_link);
+	INIT_LIST_HEAD(&active->rkvdec_ccu_node);
+	INIT_LIST_HEAD(&active->rkvdec_link_node);
+	list_add_tail(&active->session_link, &session->active_jobs);
+	core1->active_job = active;
+
+	rk_mpp_hw_abort_ccu_dependents(ccu);
+	flush_work(&rk_mpp_srv.sched_work);
+
+	KUNIT_EXPECT_TRUE(test, list_empty(&rk_mpp_srv.queued_jobs));
+	KUNIT_EXPECT_EQ(test, atomic_read(&rk_mpp_srv.queued_job_count), 0);
+	KUNIT_EXPECT_TRUE(test, list_empty(&queued->sched_link));
+	KUNIT_EXPECT_FALSE(test, list_empty(&queued->session_link));
+	KUNIT_EXPECT_EQ(test, queued->state,
+			(enum rk_mpp_job_state)RK_MPP_JOB_DONE);
+	KUNIT_EXPECT_EQ(test, queued->result, -ENODEV);
+	KUNIT_EXPECT_PTR_EQ(test, queued->hw, NULL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&queued->refs), 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&core0->queued_job_count), 0);
+	KUNIT_EXPECT_EQ(test, refcount_read(&core0->refs), 1);
+
+	KUNIT_EXPECT_PTR_EQ(test, core1->active_job, NULL);
+	KUNIT_EXPECT_TRUE(test, list_empty(&active->sched_link));
+	KUNIT_EXPECT_FALSE(test, list_empty(&active->session_link));
+	KUNIT_EXPECT_EQ(test, active->state,
+			(enum rk_mpp_job_state)RK_MPP_JOB_DONE);
+	KUNIT_EXPECT_EQ(test, active->result, -ENODEV);
+	KUNIT_EXPECT_PTR_EQ(test, active->hw, NULL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&active->refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&core1->refs), 1);
+	KUNIT_EXPECT_EQ(test, session->active_job_count, 2U);
+
+	list_del_init(&queued->session_link);
+	list_del_init(&active->session_link);
+	list_del_init(&core0->link);
+	list_del_init(&core1->link);
+	INIT_LIST_HEAD(&rk_mpp_srv.hw_list);
+	INIT_LIST_HEAD(&rk_mpp_srv.queued_jobs);
+	atomic_set(&rk_mpp_srv.queued_job_count, 0);
+
+	pm_runtime_disable(core1_dev);
+	put_device(core1_dev);
+	put_device(core0_dev);
+	put_device(ccu_dev);
+}
+
 static void rk_mpp_core_counter_kunit(struct kunit *test)
 {
 	atomic_t rkvenc[RK_MPP_CORE_COUNTER_COUNT];
@@ -4552,6 +4723,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_rkvdec2_fixed_rcb_link_kunit),
 	KUNIT_CASE(rk_mpp_hw_take_active_if_kunit),
 	KUNIT_CASE(rk_mpp_hw_prepare_active_retry_kunit),
+	KUNIT_CASE(rk_mpp_hw_abort_ccu_dependents_kunit),
 	KUNIT_CASE(rk_mpp_core_counter_kunit),
 	KUNIT_CASE(rk_mpp_hw_select_rotation_kunit),
 	KUNIT_CASE(rk_mpp_iommu_fault_match_kunit),
