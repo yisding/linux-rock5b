@@ -9217,10 +9217,15 @@ static void rk_rga_find_best_hw_for_job_kunit(struct kunit *test)
 static void rk_rga_core_counter_kunit(struct kunit *test)
 {
 	atomic_t counters[RK_RGA_CORE_COUNTER_COUNT];
+	atomic64_t total_ns[RK_RGA_CORE_COUNTER_COUNT];
+	atomic64_t max_ns[RK_RGA_CORE_COUNTER_COUNT];
 	struct rk_rga_hw hw = { .core_mask = BIT(1) };
 
-	for (u32 i = 0; i < ARRAY_SIZE(counters); i++)
+	for (u32 i = 0; i < ARRAY_SIZE(counters); i++) {
 		atomic_set(&counters[i], 0);
+		atomic64_set(&total_ns[i], 0);
+		atomic64_set(&max_ns[i], 0);
+	}
 
 	KUNIT_EXPECT_EQ(test, rk_rga_core_counter_index(BIT(0)), 0);
 	KUNIT_EXPECT_EQ(test, rk_rga_core_counter_index(BIT(1)), 1);
@@ -9232,14 +9237,23 @@ static void rk_rga_core_counter_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_core_counter_index(BIT(4)), -EINVAL);
 
 	rk_rga_count_core(counters, &hw);
+	rk_rga_count_core_ns(total_ns, &hw, 100, false);
+	rk_rga_count_core_ns(max_ns, &hw, 7, true);
+	rk_rga_count_core_ns(max_ns, &hw, 3, true);
 	KUNIT_EXPECT_EQ(test, atomic_read(&counters[0]), 0);
 	KUNIT_EXPECT_EQ(test, atomic_read(&counters[1]), 1);
 	KUNIT_EXPECT_EQ(test, atomic_read(&counters[2]), 0);
 	KUNIT_EXPECT_EQ(test, atomic_read(&counters[3]), 0);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&total_ns[1]), 100LL);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&max_ns[1]), 7LL);
 
 	hw.core_mask = BIT(4);
 	rk_rga_count_core(counters, &hw);
+	rk_rga_count_core_ns(total_ns, &hw, 1000, false);
+	rk_rga_count_core_ns(max_ns, &hw, 1000, true);
 	KUNIT_EXPECT_EQ(test, atomic_read(&counters[1]), 1);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&total_ns[1]), 100LL);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&max_ns[1]), 7LL);
 }
 
 static void rk_rga_priority_enqueue_kunit(struct kunit *test)
