@@ -10836,6 +10836,34 @@ static void rk_rga3_librga_rgb_composite_emit_kunit(struct kunit *test)
 			expected_bottom_alpha);
 }
 
+static void rk_rga3_pattern_rotate_reject_kunit(struct kunit *test)
+{
+	struct rk_rga3_bitblt_profile profile;
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_RGBA_8888);
+
+	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
+				    1280, 720);
+	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_RGBA_8888,
+				    1280, 720);
+	task.pat = rk_rga_kunit_img(0x30000000, RK_RGA_FORMAT_RGBA_8888,
+				    1280, 720);
+	task.bsfilter_flag = 1;
+	task.alpha_rop_flag = BIT(0) | BIT(3) | BIT(4) | BIT(9);
+	task.PD_mode = RK_RGA_ALPHA_BLEND_SRC_OVER;
+	task.feature.global_alpha_en = true;
+	task.fg_global_alpha = 0xff;
+	task.bg_global_alpha = 0xff;
+	task.yuv2rgb_mode = 0;
+
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile), 0);
+
+	task.pat.rotate_mode = 1;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile),
+			-EOPNOTSUPP);
+}
+
 static void rk_rga3_librga_blend_modes_kunit(struct kunit *test)
 {
 	static const struct {
@@ -11575,6 +11603,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga3_librga_slt_alpha_emit_kunit),
 	KUNIT_CASE(rk_rga3_librga_global_alpha_emit_kunit),
 	KUNIT_CASE(rk_rga3_librga_rgb_composite_emit_kunit),
+	KUNIT_CASE(rk_rga3_pattern_rotate_reject_kunit),
 	KUNIT_CASE(rk_rga3_librga_blend_modes_kunit),
 	KUNIT_CASE(rk_rga3_alpha_yuv10_overlay_emit_kunit),
 	KUNIT_CASE(rk_rga3_colorkey_emit_kunit),
@@ -12024,6 +12053,8 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 	profile->color_key = rk_rga3_task_uses_color_key(task);
 	profile->overlap_copy = false;
 	if (profile->pattern_blend && !profile->alpha_blend)
+		return -EOPNOTSUPP;
+	if (profile->pattern_blend && task->pat.rotate_mode)
 		return -EOPNOTSUPP;
 
 	ret = rk_rga3_rotate_flags(task, &profile->rotate_flags);
