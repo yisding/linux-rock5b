@@ -26,6 +26,7 @@
 #include <linux/iommu.h>
 #include <linux/interrupt.h>
 #include <linux/jiffies.h>
+#include <linux/ktime.h>
 #if IS_ENABLED(CONFIG_ROCKCHIP_RGA_REWRITE_KUNIT_TEST)
 #include <linux/mman.h>
 #include <kunit/test.h>
@@ -1089,6 +1090,8 @@ struct rk_rga_job {
 	u32 hw_status;
 	u32 cmd_status;
 	u32 work_cycle;
+	u64 hw_start_ns;
+	u64 hw_elapsed_ns;
 	__u32 sync_mode;
 	u8 priority;
 	int release_fence_fd;
@@ -1174,6 +1177,8 @@ struct rk_rga_service {
 	atomic_t dispatched_core_count[RK_RGA_CORE_COUNTER_COUNT];
 	atomic_t started_job_count;
 	atomic_t started_core_count[RK_RGA_CORE_COUNTER_COUNT];
+	atomic64_t hw_total_ns;
+	atomic64_t hw_max_ns;
 	atomic_t cmd_alloc_count;
 	atomic_t power_cycle_count;
 	atomic_t irq_count;
@@ -1244,6 +1249,57 @@ static void rk_rga_count_core(atomic_t counters[RK_RGA_CORE_COUNTER_COUNT],
 
 	if (index >= 0)
 		atomic_inc(&counters[index]);
+}
+
+static void rk_rga_atomic64_max(atomic64_t *counter, u64 value)
+{
+	s64 old = atomic64_read(counter);
+
+	while ((u64)old < value) {
+		s64 prev = atomic64_cmpxchg(counter, old, value);
+
+		if (prev == old)
+			break;
+		old = prev;
+	}
+}
+
+static int rk_rga_debugfs_atomic64_get(void *data, u64 *val)
+{
+	*val = atomic64_read(data);
+	return 0;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(rk_rga_debugfs_atomic64_fops,
+			 rk_rga_debugfs_atomic64_get, NULL, "%llu\n");
+
+static void rk_rga_debugfs_create_atomic64(const char *name, atomic64_t *value)
+{
+	debugfs_create_file(name, 0444, rk_rga.debugfs_root, value,
+			    &rk_rga_debugfs_atomic64_fops);
+}
+
+static void rk_rga_job_note_hw_done(struct rk_rga_job *job)
+{
+	u64 start = job->hw_start_ns;
+
+	if (!start)
+		return;
+
+	job->hw_elapsed_ns += ktime_get_ns() - start;
+	job->hw_start_ns = 0;
+}
+
+static void rk_rga_job_record_hw_stats(struct rk_rga_job *job)
+{
+	u64 elapsed = job->hw_elapsed_ns;
+
+	if (!elapsed)
+		return;
+
+	atomic64_add(elapsed, &rk_rga.hw_total_ns);
+	rk_rga_atomic64_max(&rk_rga.hw_max_ns, elapsed);
+	job->hw_elapsed_ns = 0;
 }
 
 static u32 rk_rga_core_distance(u32 core_mask, u32 start)
@@ -3159,6 +3215,8 @@ static void rk_rga_job_complete(struct rk_rga_job *job, int result)
 {
 	struct rk_rga_hw *hw = job->hw;
 
+	rk_rga_job_note_hw_done(job);
+	rk_rga_job_record_hw_stats(job);
 	rk_rga_job_sync_userptr_for_cpu(job);
 	job->result = result;
 	job->done = true;
@@ -3415,6 +3473,7 @@ static void rk_rga_hw_start(struct rk_rga_hw *hw, struct rk_rga_job *job)
 {
 	job->irq_result = 0;
 	job->irq_seen = false;
+	job->hw_start_ns = ktime_get_ns();
 
 	if (hw->type == RK_RGA_HW_RGA3)
 		rk_rga3_start_hw(hw, job);
@@ -15014,6 +15073,7 @@ static irqreturn_t rk_rga_irq_thread(int irq, void *data)
 
 	cancel_delayed_work(&hw->timeout_work);
 	result = job->irq_result;
+	rk_rga_job_note_hw_done(job);
 	rk_rga_hw_power_off(hw);
 
 	if (rk_rga_job_advance_task(job, result)) {
@@ -15084,6 +15144,7 @@ static void rk_rga_hw_timeout_work(struct work_struct *work)
 		atomic_inc(&rk_rga.timeout_count);
 	}
 
+	rk_rga_job_note_hw_done(job);
 	rk_rga_hw_reset_for_recovery(hw);
 	rk_rga_hw_power_off(hw);
 	rk_rga_job_complete_queued(job, result);
@@ -15350,6 +15411,7 @@ static void rk_rga_hw_abort_jobs(struct rk_rga_hw *hw, int result)
 	spin_unlock_irqrestore(&hw->job_lock, flags);
 
 	if (active) {
+		rk_rga_job_note_hw_done(active);
 		rk_rga_hw_reset_for_recovery(hw);
 		rk_rga_hw_power_off(hw);
 	}
@@ -15395,6 +15457,7 @@ static bool rk_rga_hw_abort_session_jobs(struct rk_rga_hw *hw,
 
 	if (active) {
 		cancel_delayed_work(&hw->timeout_work);
+		rk_rga_job_note_hw_done(active);
 		rk_rga_hw_reset_for_recovery(hw);
 		rk_rga_hw_power_off(hw);
 	}
@@ -16609,6 +16672,8 @@ static int __init rk_rga_init(void)
 				&rk_rga.started_job_count);
 	rk_rga_debugfs_create_core_counts("started",
 					  rk_rga.started_core_count);
+	rk_rga_debugfs_create_atomic64("hw_total_ns", &rk_rga.hw_total_ns);
+	rk_rga_debugfs_create_atomic64("hw_max_ns", &rk_rga.hw_max_ns);
 	debugfs_create_atomic_t("cmd_alloc_count", 0444, rk_rga.debugfs_root,
 				&rk_rga.cmd_alloc_count);
 	debugfs_create_atomic_t("power_cycle_count", 0444,
