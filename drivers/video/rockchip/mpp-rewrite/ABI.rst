@@ -26,6 +26,10 @@ Implemented
   are consumed as no-op markers.
 * RK3588 BSP-style RKVENC2/RKVDEC2 platform-device binding with devm-managed
   MMIO, IRQ, clock, and reset discovery.
+  Device-tree ``rockchip,normal-rates`` entries that match the clock list are
+  applied through the public clock framework before hardware clocks are enabled,
+  preserving the BSP-visible fixed-rate performance setup without depending on
+  private devfreq or Rockchip OPP internals.
 * ``MPP_CMD_QUERY_HW_SUPPORT`` from bound RK3588 MPP hardware cores.
 * ``MPP_CMD_QUERY_HW_ID`` returns the register-0 hardware id captured from the
   first bound RK3588 RKVENC2/RKVDEC2 core whose referenced CCU coordinator is
