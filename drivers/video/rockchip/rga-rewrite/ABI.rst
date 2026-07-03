@@ -161,6 +161,11 @@ Implemented
   source/destination images, rejects color-key and unsupported pattern
   operations, and supports the 8-bit RGB/YUV plus semiplanar 10-bit YUV formats
   exposed by common ``librga`` and ``ffmpeg-rockchip`` blit/scale/convert users.
+  This also covers the current JeffyCN ``gstreamer-rockchip`` MPP plugin's
+  legacy ``c_RkRgaBlit()`` conversions: RGB-family input to NV12 for encoder
+  preprocessing, MPP-frame NV12/NV21-style dma-buf input to RGB-family output
+  with optional rotation, and planar I420/YV12-style fallback through RGA2 when
+  RGA3 cannot accept the format.
   Explicit interpolation selectors from current ``librga`` resize calls are
   accepted on native RGA3 bitblits; like the BSP RGA3 register builder, the
   rewrite programs only the RGA3 scale direction and factor fields.
@@ -441,6 +446,9 @@ Implemented
   RGA3 ``librga`` RGB translate and ffmpeg overlay-preprocess destination-offset emission,
   RGA3 ``librga`` RGB rotate, flip/mirror, and combined rotate/mirror
   emission, RGA3 ``librga`` centered RGB rotate destination-offset emission,
+  JeffyCN ``gstreamer-rockchip`` legacy ``c_RkRgaBlit()`` RGB-to-NV12,
+  rotated NV12-to-RGB, and planar-I420 RGA2 fallback profile selection and
+  command emission,
   RGA3 ``librga`` ``immakeBorder()`` reflect/wrap top/bottom command emission,
   RGA3 ``librga`` ``immakeBorder()`` reflect/wrap left/right side-edge command
   emission, RGA3 ``librga`` AFBC16x16 copy profile selection and FBCD/FBCE command
