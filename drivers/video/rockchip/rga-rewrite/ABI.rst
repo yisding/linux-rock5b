@@ -242,7 +242,8 @@ Implemented
   dma-buf mappings for that core when the imported handle was originally mapped
   elsewhere, and emits a minimal raster fill command for RGB-family
   destinations plus the 8-bit planar/semiplanar YUV destinations current
-  ``librga`` documents for color fill.  Destination rectangle offsets are
+  ``librga`` documents for color fill, including packed YUV422 destination
+  formats.  Destination rectangle offsets are
   applied through the RGA2 destination address helper, including chroma-plane
   offsets and alignment checks for YUV fill.  YUV fill requires the
   RGB-to-YUV mode bits emitted by ``librga``.  This is deliberately an RGA2
@@ -251,7 +252,7 @@ Implemented
   ``-EOPNOTSUPP``.  ``imfillTaskArray()`` and ``imrectangleTask()``/array
   jobs are covered as serial multi-task RGA2 fill batches under one request
   completion/fence.  Pattern fill, alpha/ROP/color-key, rotation, tile/FBC,
-  10-bit, and packed-YUV fill variants remain unsupported.
+  10-bit, and packed-YUV420 fill variants remain unsupported.
 * RGA2 raster bitblit for the common upstream-consumer fallback formats that
   RGA3 does not cover: planar YUV420/YUV422, YCbCr400/gray, NV24/NV42-style
   YUV444 semiplanar, compact 10-bit semiplanar source, RGB555-family, and
@@ -387,7 +388,9 @@ Implemented
   release-buffer ioctl handle removal and malformed-pool returns,
   ``librga`` virtual-address import sizing and physical import rejection,
   RGA2 fill RGB/YUV destination-offset emission,
-  YUV-fill chroma-alignment rejection, multi-fill task acceptance, and
+  packed YUV422 fill destination format/offset emission,
+  YUV-fill chroma-alignment rejection, packed-YUV420 fill rejection,
+  multi-fill task acceptance, and
   ``librga`` rectangle-task serial fill command emission, compact 10-bit RGA2
   source dispatch/emission including the no-scale force-tile mode, RGA2
   in-place RGB mosaic dispatch/emission, RGA2 RGB ROP dispatch/emission, RGA2
