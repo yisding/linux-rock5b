@@ -327,9 +327,10 @@ Implemented
 * Optional ``ROCKCHIP_RGA_REWRITE_KUNIT_TEST`` coverage for rewrite-local ABI
   normalization helpers, including the RGA2 ``rotate_mode``/``sina``/``cosa``
   decoder, transformed destination-corner selection, color-fill core-mask
-  dispatch, BSP request task-count limits and return codes, mixed RGA2/RGA3
-  multi-task classification with per-task core-mask forcing, request-id removal
-  on terminal submit, ``librga`` virtual-address import sizing and physical
+  dispatch, BSP request task-count limits and return codes, legacy/modern
+  version-query strings and positive success returns, mixed RGA2/RGA3 multi-task
+  classification with per-task core-mask forcing, request-id removal on terminal
+  submit, ``librga`` virtual-address import sizing and physical
   import rejection, RGA2 fill RGB/YUV destination-offset emission,
   YUV-fill chroma-alignment rejection, multi-fill task acceptance, and
   ``librga`` rectangle-task serial fill command emission, compact 10-bit RGA2
