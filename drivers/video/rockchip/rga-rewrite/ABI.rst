@@ -251,8 +251,10 @@ Implemented
   ``RGA_COLOR_FILL``, so requests forced to RGA3 core bits fail with
   ``-EOPNOTSUPP``.  ``imfillTaskArray()`` and ``imrectangleTask()``/array
   jobs are covered as serial multi-task RGA2 fill batches under one request
-  completion/fence.  Pattern fill, alpha/ROP/color-key, rotation, tile/FBC,
-  10-bit, and packed-YUV420 fill variants remain unsupported.
+  completion/fence.  Packed-YUV420 destination fill variants use the same RGA2
+  write-only destination format path as packed-YUV422.  Pattern fill,
+  alpha/ROP/color-key, rotation, tile/FBC, and 10-bit fill variants remain
+  unsupported.
 * RGA2 ``IM_PRE_INTR`` line-interrupt programming for already-supported RGA2
   profiles.  The rewrite accepts current ``librga`` ``improcess`` requests that
   set ``pre_intr_info``, programs the BSP read-line threshold, write-line
@@ -402,7 +404,7 @@ Implemented
   ``librga`` virtual-address import sizing and physical import rejection,
   RGA2 fill RGB/YUV destination-offset emission,
   packed YUV422 fill destination format/offset emission,
-  YUV-fill chroma-alignment rejection, packed-YUV420 fill rejection,
+  YUV-fill chroma-alignment rejection, packed-YUV420 fill emission,
   multi-fill task acceptance, and
   ``librga`` rectangle-task serial fill command emission, compact 10-bit RGA2
   source dispatch/emission including the no-scale force-tile mode, RGA2
