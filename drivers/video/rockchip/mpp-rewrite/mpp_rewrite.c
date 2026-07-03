@@ -47,6 +47,7 @@
 #include <linux/uaccess.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
+#include <soc/rockchip/rockchip_iommu.h>
 #include <uapi/linux/rk-mpp.h>
 
 #if IS_ENABLED(CONFIG_ROCKCHIP_MPP_REWRITE_KUNIT_TEST)
@@ -6989,8 +6990,10 @@ static void rk_mpp_iommu_register_fault_handler(struct rk_mpp_hw *hw)
 	list_add_tail(&hw->fault_link, &srv->fault_hws);
 	spin_unlock_irqrestore(&srv->fault_lock, flags);
 
-	iommu_set_fault_handler(hw->iommu_domain,
-				rk_mpp_iommu_fault_handler, srv);
+	if (rockchip_iommu_set_fault_handler(hw->dev,
+					     rk_mpp_iommu_fault_handler, srv))
+		iommu_set_fault_handler(hw->iommu_domain,
+					rk_mpp_iommu_fault_handler, srv);
 }
 
 static void rk_mpp_iommu_unregister_fault_handler(struct rk_mpp_hw *hw)
@@ -7014,7 +7017,7 @@ static void rk_mpp_iommu_unregister_fault_handler(struct rk_mpp_hw *hw)
 	}
 	spin_unlock_irqrestore(&srv->fault_lock, flags);
 
-	if (clear)
+	if (clear && rockchip_iommu_set_fault_handler(hw->dev, NULL, NULL))
 		iommu_set_fault_handler(hw->iommu_domain, NULL, NULL);
 }
 
