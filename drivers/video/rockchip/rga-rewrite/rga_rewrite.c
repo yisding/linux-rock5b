@@ -9159,6 +9159,7 @@ static void rk_rga3_dst_offset_emit_kunit(struct kunit *test)
 	};
 	u32 uv_stride_bytes;
 	u32 y_stride_bytes;
+	u32 afbc_header_size;
 
 	task.dst.act_w = 640;
 	task.dst.act_h = 360;
@@ -9249,6 +9250,37 @@ static void rk_rga3_dst_offset_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_U_BASE_OFFSET / 4],
 			lower_32_bits(task.dst.uv_addr +
 				      4 * uv_stride_bytes + 64));
+
+	memset(cmd, 0, sizeof(cmd));
+	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					 RK_RGA_FORMAT_RGBA_8888);
+	task.dst.rd_mode = RK_RGA_FBC_MODE;
+	task.dst.x_offset = 32;
+	task.dst.y_offset = 16;
+	job.cmd_ready = false;
+	type = 0;
+
+	afbc_header_size = ((ALIGN((u32)task.dst.vir_w, 16) >> 2) *
+			    ALIGN((u32)task.dst.vir_h, 16)) >> 2;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
+			RK_RGA3_WIN0_RD_MODE,
+			FIELD_PREP(RK_RGA3_WIN0_RD_MODE, 1));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4] &
+			RK_RGA3_WIN0_RD_MODE, 0U);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_CTRL_OFFSET / 4] &
+			RK_RGA3_WR_MODE,
+			FIELD_PREP(RK_RGA3_WR_MODE, 1));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_OFF_OFFSET / 4],
+			32U | (16U << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_Y_BASE_OFFSET / 4],
+			lower_32_bits(task.dst.yrgb_addr));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_U_BASE_OFFSET / 4],
+			lower_32_bits(task.dst.uv_addr + afbc_header_size));
 }
 
 static void rk_rga3_ffmpeg_p210_emit_kunit(struct kunit *test)
@@ -9877,9 +9909,6 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 		if (task->src.yrgb_addr == task->dst.yrgb_addr)
 			return -EOPNOTSUPP;
 	}
-	if (profile->dst_mode == 1 &&
-	    (task->dst.x_offset || task->dst.y_offset))
-		return -EOPNOTSUPP;
 	if (profile->dst_mode == 2 &&
 	    (task->dst.x_offset || task->dst.y_offset))
 		return -EOPNOTSUPP;
@@ -9928,8 +9957,10 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 	    (profile->src_mode || profile->dst_mode ||
 	     !profile->src_fmt.rgb || !profile->dst_fmt.rgb))
 		return -EOPNOTSUPP;
-	profile->overlap_copy = task->src.yrgb_addr == task->dst.yrgb_addr &&
-				!profile->alpha_blend;
+	profile->overlap_copy = !profile->alpha_blend &&
+				(task->src.yrgb_addr == task->dst.yrgb_addr ||
+				 (profile->dst_mode == 1 &&
+				  (task->dst.x_offset || task->dst.y_offset)));
 	if (!profile->alpha_blend)
 		return 0;
 

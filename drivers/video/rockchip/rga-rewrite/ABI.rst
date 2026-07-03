@@ -155,7 +155,9 @@ Implemented
   source crop-top offsets carried as active-window y-offsets; tile8x8 is
   accepted through ``RGA_TILE_MODE`` for the BSP RGA3 semiplanar YUV
   tile-format subset in simple raster-to-tile, tile-to-raster, and
-  tile-to-tile bitblits.
+  tile-to-tile bitblits.  AFBC destination offsets use the same overlap-offset
+  programming as the BSP, preserving the base FBCE addresses for no-blend and
+  alpha writeback paths.
   RFBC, AFBC32x8, packed-YUV FBC, compressed in-place alpha write-back,
   overlapping in-place blits, tile alpha/pattern/color-key, and in-place
   scaling/conversion/rotation remain unsupported.  Main request
@@ -395,8 +397,8 @@ Recognized But Unsupported
 * RGA3 pattern outside the supported alpha-overlay profile, color-key outside
   the normal RGB ``imcolorkey`` profile, converted no-pattern or mixed-depth
   8/10-bit YUV-destination alpha, per-channel rotation,
-  RFBC/AFBC32x8, tile outside simple bitblits, AFBC destination offsets,
-  physical-address channels, and non-bitblit operation modes.
+  RFBC/AFBC32x8, tile outside simple bitblits, physical-address channels, and
+  non-bitblit operation modes.
 Unsupported submit profiles return ``-EOPNOTSUPP`` after copying, validating,
 preparing, queuing, dispatching, resolving imported buffers, allocating an owned
 command buffer, and power-sequencing an owned job to the backend boundary.
