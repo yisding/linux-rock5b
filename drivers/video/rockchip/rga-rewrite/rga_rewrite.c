@@ -4764,6 +4764,7 @@ static int rk_rga2_select_dst_addresses(const struct rga_img_info_t *dst,
 					__u64 *v_addr);
 static int rk_rga_job_hw_type(struct rk_rga_job *job,
 			      enum rk_rga_hw_type *type);
+static int rk_rga_job_emit_cmd(struct rk_rga_hw *hw, struct rk_rga_job *job);
 static int rk_rga2_emit_simple_bitblt(struct rk_rga_job *job);
 static int rk_rga2_emit_color_fill(struct rk_rga_job *job);
 static int rk_rga2_emit_color_palette(struct rk_rga_job *job);
@@ -6661,6 +6662,54 @@ static void rk_rga3_librga_copy_splice_task_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4],
 			2560U);
 	KUNIT_EXPECT_FALSE(test, rk_rga_job_advance_task(&job, 0));
+}
+
+static void rk_rga3_multitask_emit_clears_stale_regs_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
+	struct rk_rga_hw hw = {
+		.type = RK_RGA_HW_RGA3,
+	};
+	struct rga_req tasks[] = {
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_RGBA_8888),
+		rk_rga_librga_splice_task(0x40000000, 0),
+	};
+	struct rk_rga_job job = {
+		.tasks = tasks,
+		.task_count = ARRAY_SIZE(tasks),
+		.import_count = 3,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+
+	tasks[0].src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
+					1280, 720);
+	tasks[0].dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_RGBA_8888,
+					1280, 720);
+	tasks[0].pat = rk_rga_kunit_img(0x30000000, RK_RGA_FORMAT_RGBA_8888,
+					1280, 720);
+	tasks[0].bsfilter_flag = 1;
+	tasks[0].alpha_rop_flag = BIT(0) | BIT(3) | BIT(4) | BIT(9);
+	tasks[0].PD_mode = RK_RGA_ALPHA_BLEND_SRC_OVER;
+	tasks[0].feature.global_alpha_en = true;
+	tasks[0].fg_global_alpha = 0xff;
+	tasks[0].bg_global_alpha = 0xff;
+	tasks[0].yuv2rgb_mode = 0;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_emit_cmd(&hw, &job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_NE(test, cmd[RK_RGA3_OVLP_TOP_CTRL_OFFSET / 4], 0U);
+	KUNIT_EXPECT_NE(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4], 0U);
+
+	KUNIT_EXPECT_TRUE(test, rk_rga_job_advance_task(&job, 0));
+	job.cmd_ready = true;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_emit_cmd(&hw, &job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_TOP_CTRL_OFFSET / 4], 0U);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4], 0U);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_Y_BASE_OFFSET / 4],
+			lower_32_bits(0x40000000));
 }
 
 static void rk_rga3_librga_translate_emit_kunit(struct kunit *test)
@@ -8672,6 +8721,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga3_librga_resize_interp_emit_kunit),
 	KUNIT_CASE(rk_rga3_librga_drm_abgr_copy_emit_kunit),
 	KUNIT_CASE(rk_rga3_librga_copy_splice_task_kunit),
+	KUNIT_CASE(rk_rga3_multitask_emit_clears_stale_regs_kunit),
 	KUNIT_CASE(rk_rga3_librga_translate_emit_kunit),
 	KUNIT_CASE(rk_rga3_librga_rotate_emit_kunit),
 	KUNIT_CASE(rk_rga3_librga_rotate_flip_emit_kunit),
