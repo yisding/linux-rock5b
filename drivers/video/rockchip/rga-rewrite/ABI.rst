@@ -274,8 +274,12 @@ Implemented
   ``librga`` UV-downsampling helper that wraps NV16/NV12 Y and UV regions as
   tall ``YCbCr_400`` images is covered by the RGA2 gray/Y400 resize path,
   including the UV-region source and destination y-offsets.  Forced RGA2 core
-  requests also accept the non-overlapping same-buffer, same-format, no-scale
-  raster mirror copies emitted by current ``librga`` for ``immakeBorder()``
+  requests also cover the current ``librga`` RGB-to-Y4/Y8 dither output path
+  for same-size, unrotated compact-CSC bitblits, including BSP-compatible
+  Y4/Y8 destination format bits, dither mode, and Y4 map LUT command
+  registers.  The same RGA2 path accepts the non-overlapping same-buffer,
+  same-format, no-scale raster mirror copies emitted by current ``librga`` for
+  ``immakeBorder()``
   reflect/wrap left and right edge tasks.  RFBC64x4 source images emitted by
   ``ffmpeg-rockchip`` for Rockchip RFBC DRM frames are accepted for the BSP RGA2P
   YUV source-format subset, including the current 8-bit YUV420, compact 10-bit
@@ -289,8 +293,8 @@ Implemented
   ``imrop`` subset below, tile, YUV AFBC32x8, AFBC32x8 destination, RFBC
   destination, overlapping
   in-place blits, in-place scaling/conversion/rotation, incompact 10-bit input,
-  10-bit output, OSD, pre-intr, and gauss/NN-quantize variants outside the
-  subsets below remain unsupported.
+  10-bit output, Y4/Y8 full-CSC output, OSD, pre-intr, and gauss/NN-quantize
+  variants outside the subsets below remain unsupported.
 * RGA2 in-place RGB mosaic for the current ``librga`` ``immosaic`` single-image
   path.  The rewrite accepts same-buffer, same-rectangle raster RGB bitblit
   requests with ``mosaic_info.enable`` and BSP mosaic modes ``0..4``.
@@ -412,6 +416,7 @@ Implemented
   RGA2 ``librga`` full-CSC RGB-to-YUV dispatch/emission,
   RGA2 ``librga`` gray256 RGB-to-Y400 color-conversion dispatch/emission,
   RGA2 ``librga`` Y400 UV-downsampling resize dispatch/emission,
+  RGA2 ``librga`` Y4/Y8 dither-output dispatch/emission and full-CSC rejection,
   RGA3 normal/inverted RGB color-key dispatch/emission and invalid-selector
   rejection,
   RGA3 ``librga`` DRM-fourcc ABGR8888-to-RGBA normal raster copy emission,
