@@ -75,6 +75,13 @@ Implemented
   status that the submit path returns.  If userspace drops a pending async job
   before completion, cleanup signals the release fence with ``-EFAULT`` like
   the BSP request teardown path.
+* File-close ownership for submitted jobs.  The open file session tracks every
+  submitted sync/async job until completion.  ``release()`` marks the session
+  closing, rejects newly tracked jobs, cancels unsignaled acquire-fence
+  callbacks for jobs that have not reached hardware yet, completes those jobs
+  and their release fences with ``-EFAULT``, then waits for any already queued
+  or active jobs to leave the normal IRQ/timeout completion path before
+  dropping configured requests and imported buffers.
 * Async pending-acquire handling for modern submit and legacy blit paths.  If
   an async job is blocked by an unsignaled acquire fence, the ioctl exports the
   release-fence fd, arms ``dma_fence`` callbacks, queues dispatch work when the
@@ -365,6 +372,7 @@ Implemented
   request-config ioctl staging with kernel-owned acquire-fd close and no
   release-fence export,
   request cancel and file-close cleanup of configured imports/fences,
+  file-close cleanup of async jobs pending on acquire fences,
   request create/cancel ioctl id allocation, usercopy, and miss handling,
   legacy ``RGA_BLIT_ASYNC`` acquire-fence ioctls that copy a release-fence fd
   back through ``rga_req.out_fence_fd`` before deferred dispatch,
