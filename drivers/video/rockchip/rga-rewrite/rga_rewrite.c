@@ -85,6 +85,10 @@
 #define RK_RGA2_INT_SCL_ERROR_INTR		BIT(17)
 #define RK_RGA2_INT_LINE_WR_CLEAR		BIT(16)
 #define RK_RGA2_INT_LINE_RD_CLEAR		BIT(15)
+#define RK_RGA2_INT_LINE_WR_EN			BIT(14)
+#define RK_RGA2_INT_LINE_RD_EN			BIT(13)
+#define RK_RGA2_INT_WRITE_CNT_FLAG		BIT(12)
+#define RK_RGA2_INT_READ_CNT_FLAG		BIT(11)
 #define RK_RGA2_INT_ALL_CMD_DONE_INT_EN		BIT(10)
 #define RK_RGA2_INT_MMU_INT_EN			BIT(9)
 #define RK_RGA2_INT_ERROR_INT_EN		BIT(8)
@@ -101,6 +105,8 @@
 #define RK_RGA2_INT_ERROR_MASK \
 	(RK_RGA2_INT_MMU_INT_FLAG | RK_RGA2_INT_ERROR_INT_FLAG | \
 	 RK_RGA2_INT_SCL_ERROR_INTR | RK_RGA2_INT_FBCIN_DEC_ERROR)
+#define RK_RGA2_INT_LINE_MASK \
+	(RK_RGA2_INT_READ_CNT_FLAG | RK_RGA2_INT_WRITE_CNT_FLAG)
 #define RK_RGA2_INT_CLEAR_MASK \
 	(RK_RGA2_INT_MMU_INT_CLEAR | RK_RGA2_INT_ERROR_INT_CLEAR | \
 	 RK_RGA2_INT_SCL_ERROR_CLEAR | RK_RGA2_INT_FBCIN_DEC_ERROR_CLEAR | \
@@ -113,6 +119,12 @@
 	 RK_RGA2_INT_ALL_CMD_DONE_INT_EN)
 #define RK_RGA2_STATUS2_RPP_ERROR		BIT(2)
 #define RK_RGA2_STATUS2_BUS_ERROR		BIT(1)
+#define RK_RGA2_READ_LINE_CNT			0x030
+#define RK_RGA2_WRITE_LINE_CNT			0x034
+#define RK_RGA2_SYS_CTRL_HOLD_MODE_EN		BIT(9)
+#define RK_RGA2_LINE_RD_THRESHOLD		GENMASK(12, 0)
+#define RK_RGA2_LINE_WR_START			GENMASK(12, 0)
+#define RK_RGA2_LINE_WR_STEP			GENMASK(28, 16)
 
 #define RK_RGA2_MODE_CTRL_OFFSET		0x000
 #define RK_RGA2_SRC_INFO_OFFSET		0x004
@@ -792,6 +804,40 @@ struct rga_pre_intr_info {
 	__u32 write_start;
 	__u32 write_step;
 };
+
+static u32 rk_rga2_pre_intr_read_line(const struct rga_pre_intr_info *intr)
+{
+	if (!intr->enable || !intr->read_intr_en)
+		return 0;
+
+	return FIELD_PREP(RK_RGA2_LINE_RD_THRESHOLD, intr->read_threshold);
+}
+
+static u32 rk_rga2_pre_intr_write_line(const struct rga_pre_intr_info *intr)
+{
+	if (!intr->enable || !intr->write_intr_en)
+		return 0;
+
+	return FIELD_PREP(RK_RGA2_LINE_WR_START, intr->write_start) |
+	       FIELD_PREP(RK_RGA2_LINE_WR_STEP, intr->write_step);
+}
+
+static u32 rk_rga2_pre_intr_int_enable(const struct rga_pre_intr_info *intr)
+{
+	if (!intr->enable)
+		return 0;
+
+	return FIELD_PREP(RK_RGA2_INT_LINE_RD_EN, intr->read_intr_en) |
+	       FIELD_PREP(RK_RGA2_INT_LINE_WR_EN, intr->write_intr_en);
+}
+
+static u32 rk_rga2_pre_intr_sys_ctrl(const struct rga_pre_intr_info *intr)
+{
+	if (!intr->enable || !intr->read_hold_en)
+		return 0;
+
+	return RK_RGA2_SYS_CTRL_HOLD_MODE_EN;
+}
 
 struct rga_img_info_t {
 	__u64 yrgb_addr;
@@ -3327,14 +3373,28 @@ static void rk_rga_hw_reset_for_recovery(struct rk_rga_hw *hw)
 
 static void rk_rga2_start_hw(struct rk_rga_hw *hw, struct rk_rga_job *job)
 {
+	const struct rga_pre_intr_info *intr =
+		&job->tasks[job->current_task].pre_intr_info;
 	u32 sys_ctrl = RK_RGA2_SYS_CTRL_AUTO_CKG |
 		       RK_RGA2_SYS_CTRL_AUTO_RST |
 		       RK_RGA2_SYS_CTRL_CMD_MODE;
+	u32 int_enable = RK_RGA2_INT_ENABLE_MASK |
+			 rk_rga2_pre_intr_int_enable(intr);
 
 	rk_rga2_clear_irq(hw);
 	rk_rga2_write_full_csc(hw, &job->tasks[job->current_task]);
+	if (intr->enable) {
+		u32 read_line = rk_rga2_pre_intr_read_line(intr);
+		u32 write_line = rk_rga2_pre_intr_write_line(intr);
+
+		if (intr->read_intr_en)
+			rk_rga_write(hw, read_line, RK_RGA2_READ_LINE_CNT);
+		if (intr->write_intr_en)
+			rk_rga_write(hw, write_line, RK_RGA2_WRITE_LINE_CNT);
+		sys_ctrl |= rk_rga2_pre_intr_sys_ctrl(intr);
+	}
 	rk_rga_write(hw, rk_rga_read(hw, RK_RGA2_INT) |
-		     RK_RGA2_INT_ENABLE_MASK, RK_RGA2_INT);
+		     int_enable, RK_RGA2_INT);
 	rk_rga_write(hw, lower_32_bits(job->cmd_dma), RK_RGA2_CMD_BASE);
 	rk_rga_write(hw, sys_ctrl, RK_RGA2_SYS_CTRL);
 	rk_rga_write(hw, rk_rga_read(hw, RK_RGA2_CMD_CTRL) |
@@ -3416,8 +3476,13 @@ static irqreturn_t rk_rga_hw_irq_status(struct rk_rga_hw *hw,
 		rk_rga2_read_irq_status(hw, job);
 		done = job->intr_status & RK_RGA2_INT_DONE_MASK;
 		error = job->intr_status & RK_RGA2_INT_ERROR_MASK;
-		if (!done && !error)
+		if (!done && !error) {
+			if (job->intr_status & RK_RGA2_INT_LINE_MASK) {
+				rk_rga2_clear_irq(hw);
+				return IRQ_HANDLED;
+			}
 			return IRQ_NONE;
+		}
 		job->irq_result = error ? rk_rga2_irq_result(job) : 0;
 		job->irq_seen = true;
 		rk_rga2_clear_irq(hw);
@@ -3440,7 +3505,8 @@ static irqreturn_t rk_rga_hw_clear_spurious_irq(struct rk_rga_hw *hw)
 		rk_rga3_clear_irq(hw);
 	} else {
 		intr = rk_rga_read(hw, RK_RGA2_INT);
-		if (!(intr & (RK_RGA2_INT_DONE_MASK | RK_RGA2_INT_ERROR_MASK)))
+		if (!(intr & (RK_RGA2_INT_DONE_MASK | RK_RGA2_INT_ERROR_MASK |
+			      RK_RGA2_INT_LINE_MASK)))
 			return IRQ_NONE;
 		rk_rga2_clear_irq(hw);
 	}
@@ -4865,7 +4931,7 @@ static int rk_rga2_validate_rop(const struct rga_req *task)
 	if (task->yuv2rgb_mode || task->full_csc.flag)
 		return -EOPNOTSUPP;
 	if (task->mosaic_info.enable || task->osd_info.enable ||
-	    task->pre_intr_info.enable || task->gauss_config.size)
+	    task->gauss_config.size)
 		return -EOPNOTSUPP;
 
 	return rk_rga2_rop_ctrl(task->rop_code, &rop_ctrl);
@@ -4893,7 +4959,7 @@ static int rk_rga2_validate_color_key(const struct rga_req *task)
 		return -EOPNOTSUPP;
 	if (task->rop_code || task->rgba5551_alpha.flags ||
 	    task->mosaic_info.enable || task->osd_info.enable ||
-	    task->pre_intr_info.enable || task->gauss_config.size)
+	    task->gauss_config.size)
 		return -EOPNOTSUPP;
 	if ((task->src.rd_mode && task->src.rd_mode != RK_RGA_RASTER_MODE) ||
 	    (task->dst.rd_mode && task->dst.rd_mode != RK_RGA_RASTER_MODE))
@@ -4942,7 +5008,7 @@ static int rk_rga2_validate_quantize(const struct rga_req *task)
 	if (task->yuv2rgb_mode || task->full_csc.flag)
 		return -EOPNOTSUPP;
 	if (task->mosaic_info.enable || task->osd_info.enable ||
-	    task->pre_intr_info.enable || task->gauss_config.size)
+	    task->gauss_config.size)
 		return -EOPNOTSUPP;
 	if (rk_rga2_validate_quantize_value(task->gr_color.gr_x_r, true) ||
 	    rk_rga2_validate_quantize_value(task->gr_color.gr_x_g, true) ||
@@ -5003,7 +5069,7 @@ static int rk_rga2_validate_alpha_bitmap(const struct rga_req *task)
 	if (task->yuv2rgb_mode || task->full_csc.flag)
 		return -EOPNOTSUPP;
 	if (task->mosaic_info.enable || task->osd_info.enable ||
-	    task->pre_intr_info.enable || task->gauss_config.size)
+	    task->gauss_config.size)
 		return -EOPNOTSUPP;
 	if (!rk_rga2_alpha_bitmap_format(task->pat.format))
 		return -EOPNOTSUPP;
@@ -5110,8 +5176,7 @@ static int rk_rga2_validate_osd(const struct rga_req *task)
 		return -EOPNOTSUPP;
 	if (task->yuv2rgb_mode || task->full_csc.flag)
 		return -EOPNOTSUPP;
-	if (task->mosaic_info.enable || task->pre_intr_info.enable ||
-	    task->gauss_config.size)
+	if (task->mosaic_info.enable || task->gauss_config.size)
 		return -EOPNOTSUPP;
 	if (!rk_rga2_osd_in_place_allowed(task))
 		return -EOPNOTSUPP;
@@ -5152,8 +5217,7 @@ static int rk_rga2_validate_gauss(const struct rga_req *task)
 		return -EOPNOTSUPP;
 	if (task->yuv2rgb_mode || task->full_csc.flag)
 		return -EOPNOTSUPP;
-	if (task->mosaic_info.enable || task->osd_info.enable ||
-	    task->pre_intr_info.enable)
+	if (task->mosaic_info.enable || task->osd_info.enable)
 		return -EOPNOTSUPP;
 
 	return 0;
@@ -5606,6 +5670,62 @@ static void rk_rga2_fill_dst_offset_emit_kunit(struct kunit *test)
 			(((u32)task.dst.act_h - 1) << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_FG_COLOR_OFFSET / 4],
 			task.fg_color);
+}
+
+static void rk_rga2_pre_intr_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA2_CMD_REG_COUNT] = { };
+	struct rga_req task = rk_rga_fill_task(BIT(2));
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 1,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+	struct rga_pre_intr_info intr = {
+		.enable = 1,
+		.read_intr_en = 1,
+		.write_intr_en = 1,
+		.read_hold_en = 1,
+		.read_threshold = 0x0345,
+		.write_start = 0x1234,
+		.write_step = 0x1456,
+	};
+
+	KUNIT_EXPECT_EQ(test, rk_rga2_pre_intr_read_line(&intr),
+			FIELD_PREP(RK_RGA2_LINE_RD_THRESHOLD,
+				   intr.read_threshold));
+	KUNIT_EXPECT_EQ(test, rk_rga2_pre_intr_write_line(&intr),
+			FIELD_PREP(RK_RGA2_LINE_WR_START,
+				   intr.write_start) |
+			FIELD_PREP(RK_RGA2_LINE_WR_STEP, intr.write_step));
+	KUNIT_EXPECT_EQ(test, rk_rga2_pre_intr_int_enable(&intr),
+			RK_RGA2_INT_LINE_RD_EN | RK_RGA2_INT_LINE_WR_EN);
+	KUNIT_EXPECT_EQ(test, rk_rga2_pre_intr_sys_ctrl(&intr),
+			RK_RGA2_SYS_CTRL_HOLD_MODE_EN);
+
+	intr.enable = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga2_pre_intr_read_line(&intr), 0U);
+	KUNIT_EXPECT_EQ(test, rk_rga2_pre_intr_write_line(&intr), 0U);
+	KUNIT_EXPECT_EQ(test, rk_rga2_pre_intr_int_enable(&intr), 0U);
+	KUNIT_EXPECT_EQ(test, rk_rga2_pre_intr_sys_ctrl(&intr), 0U);
+
+	intr.enable = 1;
+	task.pre_intr_info = intr;
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_fill(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+
+	memset(cmd, 0, sizeof(cmd));
+	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					 RK_RGA_FORMAT_RGBA_8888);
+	task.core = BIT(2);
+	task.pre_intr_info = intr;
+	job.tasks = &task;
+	job.import_count = 2;
+	job.cmd_ready = false;
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
 }
 
 static void rk_rga2_fill_yuv_emit_kunit(struct kunit *test)
@@ -11935,6 +12055,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga2_dst_corner_kunit),
 	KUNIT_CASE(rk_rga_fill_hw_type_kunit),
 	KUNIT_CASE(rk_rga2_fill_dst_offset_emit_kunit),
+	KUNIT_CASE(rk_rga2_pre_intr_kunit),
 	KUNIT_CASE(rk_rga2_fill_yuv_emit_kunit),
 	KUNIT_CASE(rk_rga2_fill_packed_yuv_emit_kunit),
 	KUNIT_CASE(rk_rga2_fill_multitask_hw_type_kunit),
@@ -12075,8 +12196,7 @@ static int rk_rga2_validate_color_fill(const struct rga_req *task,
 	    task->rotate_mode || task->sina || task->cosa)
 		return -EOPNOTSUPP;
 	if (task->full_csc.flag || task->mosaic_info.enable ||
-	    task->osd_info.enable || task->pre_intr_info.enable ||
-	    task->gauss_config.size)
+	    task->osd_info.enable || task->gauss_config.size)
 		return -EOPNOTSUPP;
 	if (task->dst.rd_mode && task->dst.rd_mode != RK_RGA_RASTER_MODE)
 		return -EOPNOTSUPP;
@@ -12186,7 +12306,7 @@ static int rk_rga2_validate_color_palette(const struct rga_req *task,
 	if (task->yuv2rgb_mode || task->full_csc.flag)
 		return -EOPNOTSUPP;
 	if (task->mosaic_info.enable || task->osd_info.enable ||
-	    task->pre_intr_info.enable || task->gauss_config.size)
+	    task->gauss_config.size)
 		return -EOPNOTSUPP;
 	if (task->src.act_w != task->dst.act_w ||
 	    task->src.act_h != task->dst.act_h)
@@ -12361,8 +12481,6 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 	ret = rk_rga2_decode_transform(task, &profile->transform);
 	if (ret)
 		return ret;
-	if (task->pre_intr_info.enable)
-		return -EOPNOTSUPP;
 	ret = rk_rga2_validate_full_csc(task);
 	if (ret)
 		return ret;

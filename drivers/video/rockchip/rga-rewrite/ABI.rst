@@ -253,6 +253,13 @@ Implemented
   jobs are covered as serial multi-task RGA2 fill batches under one request
   completion/fence.  Pattern fill, alpha/ROP/color-key, rotation, tile/FBC,
   10-bit, and packed-YUV420 fill variants remain unsupported.
+* RGA2 ``IM_PRE_INTR`` line-interrupt programming for already-supported RGA2
+  profiles.  The rewrite accepts current ``librga`` ``improcess`` requests that
+  set ``pre_intr_info``, programs the BSP read-line threshold, write-line
+  start/step, and read-hold mode fields, enables the RGA2 line read/write
+  interrupt bits, and clears line-only interrupts without treating them as job
+  completion.  RGA3 pre-intr remains unsupported because the checked BSP RGA3
+  register path exposes no matching pre-intr programming sequence.
 * RGA2 raster bitblit for the common upstream-consumer fallback formats that
   RGA3 does not cover: planar YUV420/YUV422, YCbCr400/gray, NV24/NV42-style
   YUV444 semiplanar, compact 10-bit semiplanar source, RGB555-family, and
@@ -294,7 +301,7 @@ Implemented
   ``imrop`` subset below, tile, YUV AFBC32x8, AFBC32x8 destination, RFBC
   destination, overlapping
   in-place blits, in-place scaling/conversion/rotation, incompact 10-bit input,
-  10-bit output, Y4/Y8 full-CSC output, OSD, pre-intr, and gauss/NN-quantize
+  10-bit output, Y4/Y8 full-CSC output, OSD, and gauss/NN-quantize
   variants outside the subsets below remain unsupported.
 * RGA2 in-place RGB mosaic for the current ``librga`` ``immosaic`` single-image
   path.  The rewrite accepts same-buffer, same-rectangle raster RGB bitblit
@@ -422,7 +429,8 @@ Implemented
   RGA2 ``librga`` gray256 RGB-to-Y400 color-conversion dispatch/emission,
   RGA2 ``librga`` Y400 UV-downsampling resize dispatch/emission,
   RGA2 ``librga`` Y4/Y8 compact/full-CSC dither-output dispatch/emission,
-  RGA2 OSD external-color dispatch/emission,
+  RGA2 OSD external-color dispatch/emission, RGA2 pre-intr register packing
+  and acceptance on supported fill/bitblit profiles,
   RGA3 normal/inverted RGB color-key dispatch/emission and
   invalid-selector rejection,
   RGA3 ``librga`` DRM-fourcc ABGR8888-to-RGBA normal raster copy emission,
