@@ -204,6 +204,15 @@ Implemented
   Inverted color-key, pattern color-key, FBC/YUV/10-bit color-key, and
   hand-built color-key requests outside the normal ``librga`` alpha/zero-key
   mode remain unsupported.
+* RGA2 RGBA-family color-key for the current ``librga``
+  ``rga_alpha_colorkey_demo``/``imcolorkey`` forced-core profile.  The rewrite
+  accepts separate raster alpha-carrying RGB source/destination images encoded
+  with the normal ``librga`` alpha/zero-key flags, PD SRC blend mode, and
+  ``src_trans_mode`` values ``0x1e`` (normal) or ``0x1f`` (inverted).  It
+  programs the BSP RGA2 source-transparency bits, key min/max registers, and
+  non-premultiplied per-pixel alpha controls.  Pattern color-key, YUV/FBC/tile,
+  non-alpha source/destination formats, and other hand-built source-transparency
+  requests remain unsupported.
 * RGA2 solid color fill for the common ``librga`` ``imfill`` destination-only
   path.  The rewrite selects an RGA2-class RK3588 core, creates job-owned
   dma-buf mappings for that core when the imported handle was originally mapped
@@ -247,9 +256,9 @@ Implemented
   YUV source-format subset, including the current 8-bit YUV420, compact 10-bit
   YUV420, and compact 10-bit YUV422 source profiles, and programmed through the
   RGA2 FBCIN register aliases while keeping the destination raster.
-  Pattern/alpha blend outside
-  the alpha-bitmap subset below, color-key, ROP outside the ``imrop`` subset
-  below, tile, AFBC32x8, RFBC destination, overlapping
+  Pattern/alpha blend outside the alpha-bitmap and color-key subsets below,
+  color-key outside the RGBA ``imcolorkey`` profile above, ROP outside the
+  ``imrop`` subset below, tile, AFBC32x8, RFBC destination, overlapping
   in-place blits, in-place scaling/conversion/rotation, incompact 10-bit input,
   10-bit output, OSD, pre-intr, and gauss/NN-quantize variants outside the
   subsets below remain unsupported.

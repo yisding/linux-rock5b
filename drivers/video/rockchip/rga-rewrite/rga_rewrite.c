@@ -207,6 +207,8 @@
 #define RK_RGA2_SRC_MIR_MODE			GENMASK(13, 12)
 #define RK_RGA2_SRC_HSCL_MODE			GENMASK(15, 14)
 #define RK_RGA2_SRC_VSCL_MODE			GENMASK(17, 16)
+#define RK_RGA2_SRC_TRANS_MODE			BIT(18)
+#define RK_RGA2_SRC_TRANS_ENABLE		GENMASK(22, 19)
 #define RK_RGA2_SRC_SCL_FILTER			GENMASK(25, 24)
 #define RK_RGA2_SRC_VSP_MODE_SEL		BIT(26)
 #define RK_RGA2_SRC_YUV10_EN			BIT(27)
@@ -237,6 +239,25 @@
 #define RK_RGA2_ALPHA_DST_GLOBAL		GENMASK(19, 12)
 #define RK_RGA2_ALPHA_ROP_ENDIAN		BIT(20)
 
+#define RK_RGA2_ALPHA_CTRL1_DST_COLOR_M0	BIT(0)
+#define RK_RGA2_ALPHA_CTRL1_SRC_COLOR_M0	BIT(1)
+#define RK_RGA2_ALPHA_CTRL1_DST_FACTOR_M0	GENMASK(4, 2)
+#define RK_RGA2_ALPHA_CTRL1_SRC_FACTOR_M0	GENMASK(7, 5)
+#define RK_RGA2_ALPHA_CTRL1_DST_ALPHA_CAL_M0	BIT(8)
+#define RK_RGA2_ALPHA_CTRL1_SRC_ALPHA_CAL_M0	BIT(9)
+#define RK_RGA2_ALPHA_CTRL1_DST_BLEND_M0	GENMASK(11, 10)
+#define RK_RGA2_ALPHA_CTRL1_SRC_BLEND_M0	GENMASK(13, 12)
+#define RK_RGA2_ALPHA_CTRL1_DST_ALPHA_M0	BIT(14)
+#define RK_RGA2_ALPHA_CTRL1_SRC_ALPHA_M0	BIT(15)
+#define RK_RGA2_ALPHA_CTRL1_DST_FACTOR_M1	GENMASK(18, 16)
+#define RK_RGA2_ALPHA_CTRL1_SRC_FACTOR_M1	GENMASK(21, 19)
+#define RK_RGA2_ALPHA_CTRL1_DST_ALPHA_CAL_M1	BIT(22)
+#define RK_RGA2_ALPHA_CTRL1_SRC_ALPHA_CAL_M1	BIT(23)
+#define RK_RGA2_ALPHA_CTRL1_DST_BLEND_M1	GENMASK(25, 24)
+#define RK_RGA2_ALPHA_CTRL1_SRC_BLEND_M1	GENMASK(27, 26)
+#define RK_RGA2_ALPHA_CTRL1_DST_ALPHA_M1	BIT(28)
+#define RK_RGA2_ALPHA_CTRL1_SRC_ALPHA_M1	BIT(29)
+
 #define RK_RGA2_GAUSS_COE0			GENMASK(5, 0)
 #define RK_RGA2_GAUSS_COE1			GENMASK(13, 8)
 #define RK_RGA2_GAUSS_COE2			GENMASK(23, 16)
@@ -249,7 +270,9 @@
 #define RK_RGA2_ALPHA_FLAG_REAL_COLOR		BIT(9)
 
 #define RK_RGA2_ALPHA_STRAIGHT			0
+#define RK_RGA2_ALPHA_GLOBAL			0
 #define RK_RGA2_ALPHA_PER_PIXEL		1
+#define RK_RGA2_ALPHA_ZERO			0
 #define RK_RGA2_ALPHA_ONE			1
 #define RK_RGA2_ALPHA_OPPOSITE_INVERSE		3
 #define RK_RGA2_ALPHA_PRE_MULTIPLIED		0
@@ -3235,6 +3258,7 @@ struct rk_rga2_format_info {
 	bool yuv;
 	bool yuv400;
 	bool yuv10;
+	bool alpha;
 	bool packed_yuv420;
 	bool packed_yuv422;
 	bool planar_420;
@@ -3256,6 +3280,7 @@ struct rk_rga2_bitblt_profile {
 	struct rk_rga2_format_info dst_fmt;
 	struct rk_rga2_transform transform;
 	bool alpha_bitmap;
+	bool color_key;
 	bool osd;
 };
 
@@ -3336,6 +3361,27 @@ static bool rk_rga_format_is_alpha(u32 format)
 	case RK_RGA_FORMAT_BGRA_8888:
 	case RK_RGA_FORMAT_ARGB_8888:
 	case RK_RGA_FORMAT_ABGR_8888:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool rk_rga2_format_is_alpha(u32 format)
+{
+	switch (format) {
+	case RK_RGA_FORMAT_RGBA_8888:
+	case RK_RGA_FORMAT_BGRA_8888:
+	case RK_RGA_FORMAT_ARGB_8888:
+	case RK_RGA_FORMAT_ABGR_8888:
+	case RK_RGA_FORMAT_RGBA_5551:
+	case RK_RGA_FORMAT_BGRA_5551:
+	case RK_RGA_FORMAT_ARGB_5551:
+	case RK_RGA_FORMAT_ABGR_5551:
+	case RK_RGA_FORMAT_RGBA_4444:
+	case RK_RGA_FORMAT_BGRA_4444:
+	case RK_RGA_FORMAT_ARGB_4444:
+	case RK_RGA_FORMAT_ABGR_4444:
 		return true;
 	default:
 		return false;
@@ -3536,6 +3582,7 @@ static int rk_rga2_format_info(u32 format, bool write,
 	info->x_div = 1;
 	info->y_div = 1;
 	info->yuv = rk_rga_format_is_yuv(format);
+	info->alpha = rk_rga2_format_is_alpha(format);
 
 	switch (format) {
 	case RK_RGA_FORMAT_RGBA_8888:
@@ -4399,6 +4446,11 @@ static bool rk_rga2_task_uses_rop(const struct rga_req *task)
 	       task->alpha_rop_mode;
 }
 
+static bool rk_rga2_task_uses_color_key(const struct rga_req *task)
+{
+	return task->color_key_min || task->color_key_max;
+}
+
 static bool rk_rga2_task_uses_quantize(const struct rga_req *task)
 {
 	return task->alpha_rop_flag & BIT(8);
@@ -4503,6 +4555,37 @@ static int rk_rga2_validate_rop(const struct rga_req *task)
 		return -EOPNOTSUPP;
 
 	return rk_rga2_rop_ctrl(task->rop_code, &rop_ctrl);
+}
+
+static int rk_rga2_validate_color_key(const struct rga_req *task)
+{
+	u16 supported_flags = RK_RGA2_ALPHA_FLAG_ENABLE |
+			      RK_RGA2_ALPHA_FLAG_PD_ENABLE |
+			      RK_RGA2_ALPHA_FLAG_CAL_MODE |
+			      RK_RGA2_ALPHA_FLAG_REAL_COLOR;
+
+	if (!rk_rga2_task_uses_color_key(task))
+		return 0;
+	if (task->alpha_rop_flag != supported_flags)
+		return -EOPNOTSUPP;
+	if (task->alpha_rop_mode != 0x11)
+		return -EOPNOTSUPP;
+	if (task->PD_mode != RK_RGA_ALPHA_BLEND_SRC)
+		return -EOPNOTSUPP;
+	if (task->src_trans_mode != 0x1e && task->src_trans_mode != 0x1f)
+		return -EOPNOTSUPP;
+	if (task->feature.global_alpha_en &&
+	    (task->fg_global_alpha != 0xff || task->bg_global_alpha != 0xff))
+		return -EOPNOTSUPP;
+	if (task->rop_code || task->rgba5551_alpha.flags ||
+	    task->mosaic_info.enable || task->osd_info.enable ||
+	    task->pre_intr_info.enable || task->gauss_config.size)
+		return -EOPNOTSUPP;
+	if ((task->src.rd_mode && task->src.rd_mode != RK_RGA_RASTER_MODE) ||
+	    (task->dst.rd_mode && task->dst.rd_mode != RK_RGA_RASTER_MODE))
+		return -EOPNOTSUPP;
+
+	return 0;
 }
 
 static bool rk_rga2_task_uses_gauss(const struct rga_req *task)
@@ -5555,6 +5638,111 @@ static void rk_rga2_rop_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
 			-EOPNOTSUPP);
 	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+}
+
+static void rk_rga2_colorkey_emit_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA2_CMD_REG_COUNT] = { };
+	enum rk_rga_hw_type type = 0;
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_BGRA_8888);
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 2,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+	u32 src_info;
+	u32 expected_trans;
+	u32 expected_ctrl1;
+
+	task.core = BIT(2);
+	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
+				    320, 240);
+	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_BGRA_8888,
+				    320, 240);
+	task.yuv2rgb_mode = 0;
+	task.alpha_rop_flag = RK_RGA2_ALPHA_FLAG_ENABLE |
+			      RK_RGA2_ALPHA_FLAG_PD_ENABLE |
+			      RK_RGA2_ALPHA_FLAG_CAL_MODE |
+			      RK_RGA2_ALPHA_FLAG_REAL_COLOR;
+	task.alpha_rop_mode = 0x11;
+	task.PD_mode = RK_RGA_ALPHA_BLEND_SRC;
+	task.feature.global_alpha_en = true;
+	task.fg_global_alpha = 0xff;
+	task.bg_global_alpha = 0xff;
+	task.src_trans_mode = 0x1e;
+	task.color_key_min = 0x00112233;
+	task.color_key_max = 0x00445566;
+	expected_ctrl1 =
+		FIELD_PREP(RK_RGA2_ALPHA_CTRL1_DST_COLOR_M0,
+			   RK_RGA2_ALPHA_NO_PRE_MULTIPLIED) |
+		FIELD_PREP(RK_RGA2_ALPHA_CTRL1_SRC_COLOR_M0,
+			   RK_RGA2_ALPHA_NO_PRE_MULTIPLIED) |
+		FIELD_PREP(RK_RGA2_ALPHA_CTRL1_SRC_FACTOR_M0,
+			   RK_RGA2_ALPHA_ONE) |
+		FIELD_PREP(RK_RGA2_ALPHA_CTRL1_DST_BLEND_M0,
+			   RK_RGA2_ALPHA_PER_PIXEL) |
+		FIELD_PREP(RK_RGA2_ALPHA_CTRL1_SRC_BLEND_M0,
+			   RK_RGA2_ALPHA_PER_PIXEL) |
+		FIELD_PREP(RK_RGA2_ALPHA_CTRL1_SRC_FACTOR_M1,
+			   RK_RGA2_ALPHA_ONE) |
+		FIELD_PREP(RK_RGA2_ALPHA_CTRL1_DST_BLEND_M1,
+			   RK_RGA2_ALPHA_PER_PIXEL) |
+		FIELD_PREP(RK_RGA2_ALPHA_CTRL1_SRC_BLEND_M1,
+			   RK_RGA2_ALPHA_PER_PIXEL);
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+
+	src_info = cmd[RK_RGA2_SRC_INFO_OFFSET / 4];
+	expected_trans =
+		FIELD_PREP(RK_RGA2_SRC_TRANS_MODE, task.src_trans_mode) |
+		FIELD_PREP(RK_RGA2_SRC_TRANS_ENABLE,
+			   task.src_trans_mode >> 1);
+	KUNIT_EXPECT_EQ(test, src_info & (RK_RGA2_SRC_TRANS_MODE |
+					 RK_RGA2_SRC_TRANS_ENABLE),
+			expected_trans);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_TR_COLOR0_OFFSET / 4],
+			task.color_key_min);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_TR_COLOR1_OFFSET / 4],
+			task.color_key_max);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_ALPHA_CTRL0_OFFSET / 4],
+			RK_RGA2_ALPHA_ROP_0 |
+			FIELD_PREP(RK_RGA2_ALPHA_ROP_MODE, 1));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_ALPHA_CTRL1_OFFSET / 4],
+			expected_ctrl1);
+
+	memset(cmd, 0, sizeof(cmd));
+	job.cmd_ready = false;
+	task.src_trans_mode = 0x1f;
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	src_info = cmd[RK_RGA2_SRC_INFO_OFFSET / 4];
+	expected_trans =
+		FIELD_PREP(RK_RGA2_SRC_TRANS_MODE, task.src_trans_mode) |
+		FIELD_PREP(RK_RGA2_SRC_TRANS_ENABLE,
+			   task.src_trans_mode >> 1);
+	KUNIT_EXPECT_EQ(test, src_info & (RK_RGA2_SRC_TRANS_MODE |
+					 RK_RGA2_SRC_TRANS_ENABLE),
+			expected_trans);
+
+	memset(cmd, 0, sizeof(cmd));
+	job.cmd_ready = false;
+	task.src_trans_mode = 0x1d;
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+
+	task.src_trans_mode = 0x1e;
+	task.src.format = RK_RGA_FORMAT_RGB_888;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
 }
 
 static void rk_rga2_gauss_emit_kunit(struct kunit *test)
@@ -9140,6 +9328,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga2_mosaic_emit_kunit),
 	KUNIT_CASE(rk_rga2_mosaic_task_array_emit_kunit),
 	KUNIT_CASE(rk_rga2_rop_emit_kunit),
+	KUNIT_CASE(rk_rga2_colorkey_emit_kunit),
 	KUNIT_CASE(rk_rga2_gauss_emit_kunit),
 	KUNIT_CASE(rk_rga2_quantize_emit_kunit),
 	KUNIT_CASE(rk_rga2_alpha_bitmap_emit_kunit),
@@ -9437,19 +9626,20 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 {
 	struct rga_img_info_t dst;
 	bool uses_alpha_bitmap = rk_rga2_task_uses_alpha_bitmap(task);
-	bool uses_rop = rk_rga2_task_uses_rop(task);
+	bool uses_color_key = rk_rga2_task_uses_color_key(task);
+	bool uses_rop = !uses_color_key && rk_rga2_task_uses_rop(task);
 	bool uses_quantize = rk_rga2_task_uses_quantize(task);
 	bool uses_gauss = rk_rga2_task_uses_gauss(task);
 	bool uses_osd = rk_rga2_task_uses_osd(task);
 	int ret;
 
 	profile->alpha_bitmap = false;
+	profile->color_key = false;
 	profile->osd = false;
 
 	if (task->render_mode != RK_RGA_RENDER_BITBLT)
 		return -EOPNOTSUPP;
-	if (task->rop_mask_addr || task->LUT_addr ||
-	    task->color_key_min || task->color_key_max)
+	if (task->rop_mask_addr || task->LUT_addr)
 		return -EOPNOTSUPP;
 	if (task->bsfilter_flag && !uses_alpha_bitmap && !uses_osd)
 		return -EOPNOTSUPP;
@@ -9465,6 +9655,9 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 	} else if (uses_osd) {
 		if (!rk_rga2_osd_in_place_allowed(task))
 			return -EOPNOTSUPP;
+	} else if (uses_color_key) {
+		if (!rk_rga_in_place_bitblt_allowed(task))
+			return -EOPNOTSUPP;
 	} else if (uses_rop) {
 		if (!rk_rga2_rop_bitblt_allowed(task))
 			return -EOPNOTSUPP;
@@ -9477,6 +9670,10 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 			return ret;
 	} else if (uses_quantize) {
 		ret = rk_rga2_validate_quantize(task);
+		if (ret)
+			return ret;
+	} else if (uses_color_key) {
+		ret = rk_rga2_validate_color_key(task);
 		if (ret)
 			return ret;
 	} else if (uses_rop) {
@@ -9530,6 +9727,7 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 		profile->alpha_bitmap = uses_alpha_bitmap;
 		profile->osd = uses_osd;
 	}
+	profile->color_key = uses_color_key;
 	if (profile->src_fmt.yuv10 &&
 	    !rk_rga_img_yuv10_compact(&task->src))
 		return -EOPNOTSUPP;
@@ -9570,6 +9768,12 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 		return -EOPNOTSUPP;
 	if (uses_quantize &&
 	    (profile->src_fmt.yuv || profile->src_fmt.yuv400 ||
+	     profile->src_fmt.yuv10 || profile->dst_fmt.yuv ||
+	     profile->dst_fmt.yuv400 || profile->dst_fmt.yuv10))
+		return -EOPNOTSUPP;
+	if (uses_color_key &&
+	    (!profile->src_fmt.alpha || !profile->dst_fmt.alpha ||
+	     profile->src_fmt.yuv || profile->src_fmt.yuv400 ||
 	     profile->src_fmt.yuv10 || profile->dst_fmt.yuv ||
 	     profile->dst_fmt.yuv400 || profile->dst_fmt.yuv10))
 		return -EOPNOTSUPP;
@@ -10470,6 +10674,11 @@ static int rk_rga2_emit_src(struct rk_rga_job *job,
 	if (src_fmt->yuv10)
 		src_info |= RK_RGA2_SRC_YUV10_EN |
 			    RK_RGA2_SRC_YUV10_ROUND_EN;
+	if (rk_rga2_task_uses_color_key(task))
+		src_info |= FIELD_PREP(RK_RGA2_SRC_TRANS_MODE,
+				       task->src_trans_mode) |
+			    FIELD_PREP(RK_RGA2_SRC_TRANS_ENABLE,
+				       task->src_trans_mode >> 1);
 
 	if (src_rkfbc) {
 		ret = rk_rga2_rkfbc_format(task->src.format, &fbc_format);
@@ -10518,8 +10727,12 @@ static int rk_rga2_emit_src(struct rk_rga_job *job,
 	rk_rga_cmd_write(job, RK_RGA2_SRC_Y_FACTOR_OFFSET, y_factor);
 	rk_rga_cmd_write(job, RK_RGA2_SRC_BG_COLOR_OFFSET, 0);
 	rk_rga_cmd_write(job, RK_RGA2_SRC_FG_COLOR_OFFSET, 0);
-	rk_rga_cmd_write(job, RK_RGA2_SRC_TR_COLOR0_OFFSET, 0);
-	rk_rga_cmd_write(job, RK_RGA2_SRC_TR_COLOR1_OFFSET, 0);
+	rk_rga_cmd_write(job, RK_RGA2_SRC_TR_COLOR0_OFFSET,
+			 rk_rga2_task_uses_color_key(task) ?
+			 task->color_key_min : 0);
+	rk_rga_cmd_write(job, RK_RGA2_SRC_TR_COLOR1_OFFSET,
+			 rk_rga2_task_uses_color_key(task) ?
+			 task->color_key_max : 0);
 
 	return 0;
 }
@@ -10776,6 +10989,44 @@ static u32 rk_rga2_osd_alpha_ctrl1(void)
 	return color_ctrl | (alpha_ctrl << 16);
 }
 
+static u32
+rk_rga2_color_key_alpha_ctrl1(const struct rk_rga2_bitblt_profile *profile)
+{
+	u32 src_blend = profile->src_fmt.alpha ? RK_RGA2_ALPHA_PER_PIXEL :
+			RK_RGA2_ALPHA_GLOBAL;
+	u32 dst_blend = profile->dst_fmt.alpha ? RK_RGA2_ALPHA_PER_PIXEL :
+			RK_RGA2_ALPHA_GLOBAL;
+
+	return FIELD_PREP(RK_RGA2_ALPHA_CTRL1_DST_COLOR_M0,
+			  RK_RGA2_ALPHA_NO_PRE_MULTIPLIED) |
+	       FIELD_PREP(RK_RGA2_ALPHA_CTRL1_SRC_COLOR_M0,
+			  RK_RGA2_ALPHA_NO_PRE_MULTIPLIED) |
+	       FIELD_PREP(RK_RGA2_ALPHA_CTRL1_DST_FACTOR_M0,
+			  RK_RGA2_ALPHA_ZERO) |
+	       FIELD_PREP(RK_RGA2_ALPHA_CTRL1_SRC_FACTOR_M0,
+			  RK_RGA2_ALPHA_ONE) |
+	       FIELD_PREP(RK_RGA2_ALPHA_CTRL1_DST_ALPHA_CAL_M0, 0) |
+	       FIELD_PREP(RK_RGA2_ALPHA_CTRL1_SRC_ALPHA_CAL_M0, 0) |
+	       FIELD_PREP(RK_RGA2_ALPHA_CTRL1_DST_BLEND_M0, dst_blend) |
+	       FIELD_PREP(RK_RGA2_ALPHA_CTRL1_SRC_BLEND_M0, src_blend) |
+	       FIELD_PREP(RK_RGA2_ALPHA_CTRL1_DST_ALPHA_M0,
+			  RK_RGA2_ALPHA_STRAIGHT) |
+	       FIELD_PREP(RK_RGA2_ALPHA_CTRL1_SRC_ALPHA_M0,
+			  RK_RGA2_ALPHA_STRAIGHT) |
+	       FIELD_PREP(RK_RGA2_ALPHA_CTRL1_DST_FACTOR_M1,
+			  RK_RGA2_ALPHA_ZERO) |
+	       FIELD_PREP(RK_RGA2_ALPHA_CTRL1_SRC_FACTOR_M1,
+			  RK_RGA2_ALPHA_ONE) |
+	       FIELD_PREP(RK_RGA2_ALPHA_CTRL1_DST_ALPHA_CAL_M1, 0) |
+	       FIELD_PREP(RK_RGA2_ALPHA_CTRL1_SRC_ALPHA_CAL_M1, 0) |
+	       FIELD_PREP(RK_RGA2_ALPHA_CTRL1_DST_BLEND_M1, dst_blend) |
+	       FIELD_PREP(RK_RGA2_ALPHA_CTRL1_SRC_BLEND_M1, src_blend) |
+	       FIELD_PREP(RK_RGA2_ALPHA_CTRL1_DST_ALPHA_M1,
+			  RK_RGA2_ALPHA_STRAIGHT) |
+	       FIELD_PREP(RK_RGA2_ALPHA_CTRL1_SRC_ALPHA_M1,
+			  RK_RGA2_ALPHA_STRAIGHT);
+}
+
 static int rk_rga2_emit_src1_base(struct rk_rga_job *job,
 				  const struct rga_img_info_t *img,
 				  const struct rk_rga2_format_info *fmt)
@@ -10800,6 +11051,21 @@ static int rk_rga2_emit_src1_base(struct rk_rga_job *job,
 			 lower_32_bits(y_addr));
 
 	return 0;
+}
+
+static void
+rk_rga2_emit_color_key(struct rk_rga_job *job, const struct rga_req *task,
+		       const struct rk_rga2_bitblt_profile *profile)
+{
+	rk_rga_cmd_write(job, RK_RGA2_ALPHA_CTRL0_OFFSET,
+			 FIELD_PREP(RK_RGA2_ALPHA_ROP_0,
+				    task->alpha_rop_flag) |
+			 FIELD_PREP(RK_RGA2_ALPHA_ROP_SEL,
+				    task->alpha_rop_flag >> 1) |
+			 FIELD_PREP(RK_RGA2_ALPHA_ROP_MODE,
+				    task->alpha_rop_mode));
+	rk_rga_cmd_write(job, RK_RGA2_ALPHA_CTRL1_OFFSET,
+			 rk_rga2_color_key_alpha_ctrl1(profile));
 }
 
 static int rk_rga2_emit_alpha_bitmap(struct rk_rga_job *job,
@@ -10943,6 +11209,8 @@ static int rk_rga2_emit_simple_bitblt(struct rk_rga_job *job)
 		ret = rk_rga2_emit_osd(job, task, &profile.pat_fmt);
 		if (ret)
 			return ret;
+	} else if (profile.color_key) {
+		rk_rga2_emit_color_key(job, task, &profile);
 	} else if (rk_rga2_task_uses_rop(task)) {
 		ret = rk_rga2_rop_ctrl(task->rop_code, &rop_ctrl);
 		if (ret)
