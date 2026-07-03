@@ -6699,6 +6699,117 @@ static void rk_rga_request_reconfig_fences_kunit(struct kunit *test)
 	dma_fence_put(new_fence);
 }
 
+static void rk_rga_request_config_ioctl_acquire_kunit(struct kunit *test)
+{
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_RGBA_8888);
+	struct rga_user_request user = {
+		.task_num = 1,
+		.id = 12,
+		.sync_mode = RGA_BLIT_ASYNC,
+		.release_fence_fd = 0x12345678,
+	};
+	struct rk_rga_session session = {};
+	struct rk_rga_request *request;
+	struct rk_rga_import *src_import;
+	struct rk_rga_import *dst_import;
+	struct dma_fence *acquire_fence;
+	struct dma_fence *fd_fence;
+	void __user *task_user;
+	void __user *request_user;
+	unsigned long uncopied;
+	int acquire_fd;
+	long ret;
+
+	task_user = rk_rga_kunit_user_buffer(test, sizeof(task));
+	request_user = rk_rga_kunit_user_buffer(test, sizeof(user));
+	KUNIT_ASSERT_NOT_NULL(test, task_user);
+	KUNIT_ASSERT_NOT_NULL(test, request_user);
+
+	acquire_fence = rk_rga_kunit_alloc_fence();
+	KUNIT_ASSERT_NOT_NULL(test, acquire_fence);
+	acquire_fd = rk_rga_kunit_install_fence_fd(acquire_fence);
+	KUNIT_ASSERT_GE(test, acquire_fd, 0);
+
+	task.handle_flag = 1;
+	task.src.yrgb_addr = 51;
+	task.src.uv_addr = 0;
+	task.src.v_addr = 0;
+	task.dst.yrgb_addr = 52;
+	task.dst.uv_addr = 0;
+	task.dst.v_addr = 0;
+	user.task_ptr = (uintptr_t)task_user;
+	user.acquire_fence_fd = acquire_fd;
+
+	uncopied = copy_to_user(task_user, &task, sizeof(task));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+	uncopied = copy_to_user(request_user, &user, sizeof(user));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+
+	mutex_init(&session.lock);
+	idr_init(&session.requests);
+	idr_init(&session.imports);
+
+	request = kzalloc_obj(*request, GFP_KERNEL);
+	src_import = rk_rga_kunit_import(test);
+	dst_import = rk_rga_kunit_import(test);
+	KUNIT_ASSERT_NOT_NULL(test, request);
+	KUNIT_ASSERT_NOT_NULL(test, src_import);
+	KUNIT_ASSERT_NOT_NULL(test, dst_import);
+	src_import->iova = 0x10000000;
+	src_import->size = (size_t)1920 * 1080 * 4;
+	dst_import->iova = 0x20000000;
+	dst_import->size = (size_t)1280 * 720 * 4;
+
+	KUNIT_ASSERT_EQ(test,
+			idr_alloc(&session.requests, request, 12, 13,
+				  GFP_KERNEL),
+			12);
+	KUNIT_ASSERT_EQ(test,
+			idr_alloc(&session.imports, src_import, 51, 52,
+				  GFP_KERNEL),
+			51);
+	KUNIT_ASSERT_EQ(test,
+			idr_alloc(&session.imports, dst_import, 52, 53,
+				  GFP_KERNEL),
+			52);
+
+	ret = rk_rga_ioctl_request_submit((unsigned long)request_user,
+					  &session, false);
+	KUNIT_ASSERT_EQ(test, ret, 0L);
+	KUNIT_EXPECT_PTR_EQ(test, idr_find(&session.requests, 12), request);
+	KUNIT_EXPECT_TRUE(test, request->configured);
+	KUNIT_EXPECT_EQ(test, request->release_fence_fd, -1);
+	KUNIT_EXPECT_EQ(test, request->acquire_fence_count, 1U);
+	KUNIT_EXPECT_PTR_EQ(test, request->acquire_fences[0], acquire_fence);
+	KUNIT_EXPECT_EQ(test, refcount_read(&src_import->refs), 2);
+	KUNIT_EXPECT_EQ(test, refcount_read(&dst_import->refs), 2);
+
+	uncopied = copy_from_user(&user, request_user, sizeof(user));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+	KUNIT_EXPECT_EQ(test, user.release_fence_fd, 0x12345678U);
+
+	fd_fence = sync_file_get_fence(acquire_fd);
+	KUNIT_EXPECT_PTR_EQ(test, fd_fence, NULL);
+	if (fd_fence)
+		dma_fence_put(fd_fence);
+
+	KUNIT_EXPECT_TRUE(test, rk_rga_request_remove_free(&session, 12));
+	KUNIT_EXPECT_EQ(test, kref_read(&acquire_fence->refcount), 1U);
+	KUNIT_EXPECT_EQ(test, refcount_read(&src_import->refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&dst_import->refs), 1);
+	KUNIT_EXPECT_PTR_EQ(test, idr_remove(&session.imports, 51),
+			    src_import);
+	KUNIT_EXPECT_PTR_EQ(test, idr_remove(&session.imports, 52),
+			    dst_import);
+	rk_rga_import_put(src_import);
+	rk_rga_import_put(dst_import);
+	dma_fence_put(acquire_fence);
+	idr_destroy(&session.requests);
+	idr_destroy(&session.imports);
+}
+
 static void rk_rga_request_reconfig_gauss_kunit(struct kunit *test)
 {
 	struct rga_req task =
@@ -10743,6 +10854,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_request_config_handles_kunit),
 	KUNIT_CASE(rk_rga_request_reconfig_resources_kunit),
 	KUNIT_CASE(rk_rga_request_reconfig_fences_kunit),
+	KUNIT_CASE(rk_rga_request_config_ioctl_acquire_kunit),
 	KUNIT_CASE(rk_rga_request_reconfig_gauss_kunit),
 	KUNIT_CASE(rk_rga_legacy_blit_async_acquire_kunit),
 	KUNIT_CASE(rk_rga_request_submit_async_acquire_kunit),
