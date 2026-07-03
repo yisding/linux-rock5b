@@ -4998,6 +4998,8 @@ static long rk_rga_ioctl_request_create(unsigned long arg,
 					struct rk_rga_session *session);
 static long rk_rga_ioctl_request_cancel(unsigned long arg,
 					struct rk_rga_session *session);
+static long rk_rga_ioctl_import_buffer(unsigned long arg,
+				       struct rk_rga_session *session);
 static long rk_rga_ioctl_release_buffer(unsigned long arg,
 					struct rk_rga_session *session);
 
@@ -6194,6 +6196,75 @@ static void rk_rga_import_buffer_size_kunit(struct kunit *test)
 	buffer.type = RGA_PHYSICAL_ADDRESS;
 	buffer.memory_parm.size = 4096;
 	KUNIT_EXPECT_EQ(test, rk_rga_import_one(NULL, &buffer), -EOPNOTSUPP);
+}
+
+static void rk_rga_import_buffer_ioctl_errors_kunit(struct kunit *test)
+{
+	struct rga_external_buffer buffer = {
+		.type = RGA_PHYSICAL_ADDRESS,
+		.memory = 0x100000,
+		.memory_parm = {
+			.size = 4096,
+		},
+	};
+	struct rga_buffer_pool pool = {
+		.size = 1,
+	};
+	struct rk_rga_session session = {};
+	void __user *pool_user;
+	void __user *buffer_user;
+	unsigned long uncopied;
+
+	pool_user = rk_rga_kunit_user_buffer(test, sizeof(pool));
+	buffer_user = rk_rga_kunit_user_buffer(test, sizeof(buffer));
+	KUNIT_ASSERT_NOT_NULL(test, pool_user);
+	KUNIT_ASSERT_NOT_NULL(test, buffer_user);
+
+	pool.buffers_ptr = (uintptr_t)buffer_user;
+	uncopied = copy_to_user(pool_user, &pool, sizeof(pool));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+	uncopied = copy_to_user(buffer_user, &buffer, sizeof(buffer));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+
+	mutex_init(&session.lock);
+	idr_init(&session.imports);
+
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_ioctl_import_buffer((unsigned long)pool_user,
+						   &session),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_PTR_EQ(test, idr_find(&session.imports, 1), NULL);
+
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_ioctl_import_buffer(TASK_SIZE, &session),
+			-EFAULT);
+
+	pool.size = RGA_BUFFER_POOL_SIZE_MAX + 1;
+	uncopied = copy_to_user(pool_user, &pool, sizeof(pool));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_ioctl_import_buffer((unsigned long)pool_user,
+						   &session),
+			-EFBIG);
+
+	pool.size = 1;
+	pool.buffers_ptr = 0;
+	uncopied = copy_to_user(pool_user, &pool, sizeof(pool));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_ioctl_import_buffer((unsigned long)pool_user,
+						   &session),
+			-EFAULT);
+
+	pool.buffers_ptr = TASK_SIZE;
+	uncopied = copy_to_user(pool_user, &pool, sizeof(pool));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_ioctl_import_buffer((unsigned long)pool_user,
+						   &session),
+			-EFAULT);
+
+	idr_destroy(&session.imports);
 }
 
 static struct rk_rga_import *rk_rga_kunit_import(struct kunit *test)
@@ -9049,6 +9120,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_version_queries_kunit),
 	KUNIT_CASE(rk_rga_request_remove_free_kunit),
 	KUNIT_CASE(rk_rga_import_buffer_size_kunit),
+	KUNIT_CASE(rk_rga_import_buffer_ioctl_errors_kunit),
 	KUNIT_CASE(rk_rga_release_buffer_ioctl_kunit),
 	KUNIT_CASE(rk_rga_acquire_fd_ownership_kunit),
 	KUNIT_CASE(rk_rga_acquire_fence_status_kunit),
