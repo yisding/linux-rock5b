@@ -4198,6 +4198,7 @@ static int rk_rga3_validate_alpha_blend(const struct rga_req *task)
 	case RK_RGA_ALPHA_BLEND_SRC_ATOP:
 	case RK_RGA_ALPHA_BLEND_DST_ATOP:
 	case RK_RGA_ALPHA_BLEND_XOR:
+	case RK_RGA_ALPHA_BLEND_CLEAR:
 		return 0;
 	default:
 		return -EOPNOTSUPP;
