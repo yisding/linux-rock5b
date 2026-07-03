@@ -4266,6 +4266,41 @@ static void rk_mpp_release_fd_all_devices_kunit(struct kunit *test)
 	list_del_init(&fd1_dev0->link);
 }
 
+static void rk_mpp_session_poll_nonblock_pending_kunit(struct kunit *test)
+{
+	struct rk_mpp_session session = {
+		.active_job_count = 1,
+	};
+	struct rk_mpp_job *job;
+
+	mutex_init(&session.lock);
+	INIT_LIST_HEAD(&session.active_jobs);
+	init_waitqueue_head(&session.wait);
+
+	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+
+	job->session = &session;
+	job->state = RK_MPP_JOB_ACTIVE;
+	job->result = -EINPROGRESS;
+	refcount_set(&job->refs, 1);
+	INIT_LIST_HEAD(&job->session_link);
+	list_add_tail(&job->session_link, &session.active_jobs);
+
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_session_poll_job(&session,
+						MPP_FLAGS_POLL_NON_BLOCK),
+			-EAGAIN);
+	KUNIT_EXPECT_FALSE(test, list_empty(&session.active_jobs));
+	KUNIT_EXPECT_EQ(test, session.active_job_count, 1U);
+	KUNIT_EXPECT_EQ(test, job->state,
+			(enum rk_mpp_job_state)RK_MPP_JOB_ACTIVE);
+	KUNIT_EXPECT_EQ(test, job->result, -EINPROGRESS);
+	KUNIT_EXPECT_EQ(test, refcount_read(&job->refs), 1);
+
+	list_del_init(&job->session_link);
+}
+
 static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 {
 	struct rk_mpp_service srv = {};
@@ -4385,6 +4420,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_switch_session_status_kunit),
 	KUNIT_CASE(rk_mpp_batch_session_switch_split_kunit),
 	KUNIT_CASE(rk_mpp_release_fd_all_devices_kunit),
+	KUNIT_CASE(rk_mpp_session_poll_nonblock_pending_kunit),
 	KUNIT_CASE(rk_mpp_session_abort_jobs_kunit),
 	{}
 };
