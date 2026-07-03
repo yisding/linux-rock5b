@@ -75,11 +75,12 @@ Implemented
 * Prepared register jobs select and hold a counted reference to an online
   RK3588 hardware core whose ``rockchip,ccu`` phandle, when present, resolves
   to a bound online CCU coordinator.  Kernel-translated jobs choose the
-  least-loaded matching core and prefer an idle core; jobs flagged
-  ``MPP_FLAGS_REG_FD_NO_TRANS`` stay on the default matching core so explicit
-  ``TRANS_FD_TO_IOVA`` results remain device-consistent.  Core removal unlists
-  the device and waits for prepared job references to drain before devm-managed
-  resources are released.
+  least-loaded matching core, prefer an idle core, and rotate equal-load
+  automatic selections by core id so sequential submit streams do not stick to
+  the first bound core.  Jobs flagged ``MPP_FLAGS_REG_FD_NO_TRANS`` stay on the
+  default matching core so explicit ``TRANS_FD_TO_IOVA`` results remain
+  device-consistent.  Core removal unlists the device and waits for prepared
+  job references to drain before devm-managed resources are released.
 * CCU coordinator removal makes dependent cores unavailable for new prepared
   jobs and completes already queued or active dependent-core jobs with
   ``-ENODEV``.
