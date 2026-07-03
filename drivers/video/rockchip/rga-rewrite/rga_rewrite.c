@@ -6406,6 +6406,23 @@ static void rk_rga_version_queries_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, driver_version.revision, 11U);
 	KUNIT_EXPECT_STREQ(test, driver_version.str, DRIVER_VERSION);
 
+	strscpy(rga2_version, "unchanged", sizeof(rga2_version));
+	uncopied = copy_to_user(rga2_user, rga2_version,
+				sizeof(rga2_version));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+
+	list_del_init(&rga2.node);
+	rk_rga_refresh_hw_versions();
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_ioctl_get_rga2_version((unsigned long)rga2_user),
+			-EFAULT);
+	memset(rga2_version, 0, sizeof(rga2_version));
+	uncopied = copy_from_user(rga2_version, rga2_user,
+				  sizeof(rga2_version));
+	KUNIT_EXPECT_EQ(test, uncopied, 0UL);
+	KUNIT_EXPECT_STREQ(test, rga2_version, "unchanged");
+
+	list_del_init(&rga3.node);
 	INIT_LIST_HEAD(&rk_rga.hw_list);
 	rk_rga_refresh_hw_versions();
 }
