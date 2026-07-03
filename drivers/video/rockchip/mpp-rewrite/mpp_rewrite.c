@@ -4787,6 +4787,72 @@ static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 			-EIO);
 }
 
+static void rk_mpp_session_abort_hw_active_kunit(struct kunit *test)
+{
+	struct rk_mpp_service srv = {};
+	struct rk_mpp_session *session;
+	struct device *dev;
+	struct rk_mpp_hw hw = {};
+	struct rk_mpp_job *active;
+
+	session = kunit_kzalloc(test, sizeof(*session), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, session);
+	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dev);
+	active = kzalloc(sizeof(*active), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, active);
+
+	device_initialize(dev);
+	dev->release = rk_mpp_kunit_device_release;
+	pm_runtime_set_active(dev);
+	pm_runtime_enable(dev);
+	pm_runtime_get_noresume(dev);
+
+	mutex_init(&srv.sched_lock);
+	INIT_LIST_HEAD(&srv.queued_jobs);
+
+	session->srv = &srv;
+	session->active_job_count = 1;
+	mutex_init(&session->lock);
+	INIT_LIST_HEAD(&session->imports);
+	INIT_LIST_HEAD(&session->active_jobs);
+	init_waitqueue_head(&session->wait);
+	refcount_set(&session->refs, 2);
+
+	hw.dev = dev;
+	refcount_set(&hw.refs, 1);
+	init_completion(&hw.released);
+	spin_lock_init(&hw.lock);
+	mutex_init(&hw.run_lock);
+	INIT_LIST_HEAD(&hw.rkvdec_ccu_jobs);
+	INIT_LIST_HEAD(&hw.rkvdec_link_jobs);
+	INIT_DELAYED_WORK(&hw.timeout_work, rk_mpp_hw_timeout_work);
+
+	active->session = session;
+	active->hw = &hw;
+	active->state = RK_MPP_JOB_ACTIVE;
+	active->result = -EINPROGRESS;
+	refcount_set(&active->refs, 2);
+	INIT_LIST_HEAD(&active->link);
+	INIT_LIST_HEAD(&active->session_link);
+	INIT_LIST_HEAD(&active->sched_link);
+	INIT_LIST_HEAD(&active->rkvdec_ccu_node);
+	INIT_LIST_HEAD(&active->rkvdec_link_node);
+	list_add_tail(&active->session_link, &session->active_jobs);
+	hw.active_job = active;
+
+	rk_mpp_session_abort_jobs(session);
+
+	KUNIT_EXPECT_TRUE(test, list_empty(&session->active_jobs));
+	KUNIT_EXPECT_EQ(test, session->active_job_count, 0U);
+	KUNIT_EXPECT_PTR_EQ(test, hw.active_job, NULL);
+	KUNIT_EXPECT_TRUE(test, completion_done(&hw.released));
+	KUNIT_EXPECT_EQ(test, refcount_read(&session->refs), 1);
+
+	pm_runtime_disable(dev);
+	put_device(dev);
+}
+
 static void rk_mpp_reset_session_public_cleanup_kunit(struct kunit *test)
 {
 	struct rk_mpp_service srv = {};
@@ -4975,6 +5041,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_release_fd_all_devices_kunit),
 	KUNIT_CASE(rk_mpp_session_poll_nonblock_pending_kunit),
 	KUNIT_CASE(rk_mpp_session_abort_jobs_kunit),
+	KUNIT_CASE(rk_mpp_session_abort_hw_active_kunit),
 	KUNIT_CASE(rk_mpp_reset_session_public_cleanup_kunit),
 	KUNIT_CASE(rk_mpp_file_release_public_cleanup_kunit),
 	{}
