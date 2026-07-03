@@ -428,6 +428,10 @@ static int rk_mpp_job_pop_rkvenc_slice(struct rk_mpp_job *job, u32 *value);
 static int rk_mpp_job_apply_rcb_info(struct rk_mpp_job *job);
 static void rk_mpp_session_abort_jobs(struct rk_mpp_session *session);
 static int rk_mpp_session_poll_job(struct rk_mpp_session *session, u32 flags);
+static int rk_mpp_process_request(struct rk_mpp_session *session,
+				  struct mpp_request *req,
+				  struct rk_mpp_batch_state *batch);
+static int rk_mpp_release(struct inode *inode, struct file *filp);
 static struct rk_mpp_hw *
 rk_mpp_iommu_find_fault_hw(struct list_head *fault_hws,
 			   struct iommu_domain *domain,
@@ -4378,6 +4382,147 @@ static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 			-EIO);
 }
 
+static void rk_mpp_reset_session_public_cleanup_kunit(struct kunit *test)
+{
+	struct rk_mpp_service srv = {};
+	struct rk_mpp_session session = {
+		.srv = &srv,
+		.initialized = true,
+		.active_job_count = 2,
+	};
+	struct rk_mpp_batch_state batch = {};
+	struct mpp_request req = {
+		.cmd = MPP_CMD_RESET_SESSION,
+	};
+	struct rk_mpp_import *import;
+	struct rk_mpp_hw hw = {};
+	struct rk_mpp_job *queued;
+	struct rk_mpp_job *active;
+
+	mutex_init(&srv.sched_lock);
+	INIT_LIST_HEAD(&srv.queued_jobs);
+	mutex_init(&session.lock);
+	INIT_LIST_HEAD(&session.imports);
+	INIT_LIST_HEAD(&session.active_jobs);
+	init_waitqueue_head(&session.wait);
+	INIT_LIST_HEAD(&batch.jobs);
+	spin_lock_init(&hw.lock);
+	mutex_init(&hw.run_lock);
+	INIT_DELAYED_WORK(&hw.timeout_work, rk_mpp_hw_timeout_work);
+
+	import = kzalloc_obj(*import, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, import);
+	import->fd = 7;
+	refcount_set(&import->refs, 2);
+	INIT_LIST_HEAD(&import->link);
+	list_add_tail(&import->link, &session.imports);
+
+	queued = kunit_kzalloc(test, sizeof(*queued), GFP_KERNEL);
+	active = kunit_kzalloc(test, sizeof(*active), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, queued);
+	KUNIT_ASSERT_NOT_NULL(test, active);
+
+	queued->session = &session;
+	queued->hw = &hw;
+	queued->state = RK_MPP_JOB_ACTIVE;
+	queued->result = -EINPROGRESS;
+	refcount_set(&queued->refs, 3);
+	INIT_LIST_HEAD(&queued->link);
+	INIT_LIST_HEAD(&queued->session_link);
+	INIT_LIST_HEAD(&queued->sched_link);
+	INIT_LIST_HEAD(&queued->rkvdec_ccu_node);
+	INIT_LIST_HEAD(&queued->rkvdec_link_node);
+	list_add_tail(&queued->session_link, &session.active_jobs);
+	list_add_tail(&queued->sched_link, &srv.queued_jobs);
+	atomic_set(&hw.queued_job_count, 1);
+	atomic_set(&srv.queued_job_count, 1);
+
+	active->session = &session;
+	active->state = RK_MPP_JOB_ACTIVE;
+	active->result = -EINPROGRESS;
+	refcount_set(&active->refs, 2);
+	INIT_LIST_HEAD(&active->link);
+	INIT_LIST_HEAD(&active->session_link);
+	INIT_LIST_HEAD(&active->sched_link);
+	INIT_LIST_HEAD(&active->rkvdec_ccu_node);
+	INIT_LIST_HEAD(&active->rkvdec_link_node);
+	list_add_tail(&active->session_link, &session.active_jobs);
+
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_process_request(&session, &req, &batch),
+			0);
+	KUNIT_EXPECT_TRUE(test, list_empty(&session.imports));
+	KUNIT_EXPECT_EQ(test, refcount_read(&import->refs), 1);
+	KUNIT_EXPECT_TRUE(test, list_empty(&session.active_jobs));
+	KUNIT_EXPECT_EQ(test, session.active_job_count, 0U);
+	KUNIT_EXPECT_TRUE(test, list_empty(&srv.queued_jobs));
+	KUNIT_EXPECT_TRUE(test, list_empty(&queued->session_link));
+	KUNIT_EXPECT_TRUE(test, list_empty(&queued->sched_link));
+	KUNIT_EXPECT_TRUE(test, list_empty(&active->session_link));
+	KUNIT_EXPECT_EQ(test, queued->result, -ECANCELED);
+	KUNIT_EXPECT_EQ(test, active->result, -ECANCELED);
+	KUNIT_EXPECT_EQ(test, refcount_read(&queued->refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&active->refs), 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&hw.queued_job_count), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&srv.queued_job_count), 0);
+
+	rk_mpp_import_put(import);
+}
+
+static void rk_mpp_file_release_public_cleanup_kunit(struct kunit *test)
+{
+	struct rk_mpp_service srv = {};
+	struct rk_mpp_session *session;
+	struct rk_mpp_import *import;
+	struct rk_mpp_job *active;
+	struct file file = {};
+
+	mutex_init(&srv.sched_lock);
+	INIT_LIST_HEAD(&srv.queued_jobs);
+
+	session = kzalloc_obj(*session, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, session);
+	session->srv = &srv;
+	session->active_job_count = 1;
+	mutex_init(&session->lock);
+	INIT_LIST_HEAD(&session->imports);
+	INIT_LIST_HEAD(&session->active_jobs);
+	init_waitqueue_head(&session->wait);
+	refcount_set(&session->refs, 1);
+	file.private_data = session;
+
+	import = kzalloc_obj(*import, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, import);
+	import->fd = 8;
+	refcount_set(&import->refs, 2);
+	INIT_LIST_HEAD(&import->link);
+	list_add_tail(&import->link, &session->imports);
+
+	active = kunit_kzalloc(test, sizeof(*active), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, active);
+	active->session = session;
+	active->state = RK_MPP_JOB_ACTIVE;
+	active->result = -EINPROGRESS;
+	refcount_set(&active->refs, 2);
+	INIT_LIST_HEAD(&active->link);
+	INIT_LIST_HEAD(&active->session_link);
+	INIT_LIST_HEAD(&active->sched_link);
+	INIT_LIST_HEAD(&active->rkvdec_ccu_node);
+	INIT_LIST_HEAD(&active->rkvdec_link_node);
+	list_add_tail(&active->session_link, &session->active_jobs);
+
+	KUNIT_EXPECT_EQ(test, rk_mpp_release(NULL, &file), 0);
+	KUNIT_EXPECT_PTR_EQ(test, file.private_data, NULL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&import->refs), 1);
+	KUNIT_EXPECT_TRUE(test, list_empty(&active->session_link));
+	KUNIT_EXPECT_EQ(test, active->result, -ECANCELED);
+	KUNIT_EXPECT_EQ(test, active->state,
+			(enum rk_mpp_job_state)RK_MPP_JOB_DONE);
+	KUNIT_EXPECT_EQ(test, refcount_read(&active->refs), 1);
+
+	rk_mpp_import_put(import);
+}
+
 static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_check_cmd_v1_kunit),
 	KUNIT_CASE(rk_mpp_get_cmd_butt_kunit),
@@ -4422,6 +4567,8 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_release_fd_all_devices_kunit),
 	KUNIT_CASE(rk_mpp_session_poll_nonblock_pending_kunit),
 	KUNIT_CASE(rk_mpp_session_abort_jobs_kunit),
+	KUNIT_CASE(rk_mpp_reset_session_public_cleanup_kunit),
+	KUNIT_CASE(rk_mpp_file_release_public_cleanup_kunit),
 	{}
 };
 

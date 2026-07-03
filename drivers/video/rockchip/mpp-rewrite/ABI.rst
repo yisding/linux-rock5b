@@ -238,7 +238,8 @@ Implemented
   flexible-buffer sizing, RKVENC2 slice-mode detection and slice FIFO
   overflow/final-slice reporting, ``POLL_HW_FINISH`` nonblocking pending-job
   ``-EAGAIN`` without consuming the active job, and ``SET_SESSION_FD``
-  invalid-fd status, done-marker handling, and batch job splitting.
+  invalid-fd status, done-marker handling, batch job splitting, and public
+  ``RESET_SESSION``/file-close cleanup of imports plus queued/active jobs.
 
 Recognized But Unsupported
 --------------------------
