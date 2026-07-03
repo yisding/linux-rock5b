@@ -79,7 +79,10 @@ Implemented
   automatic selections by core id so sequential submit streams do not stick to
   the first bound core.  Jobs flagged ``MPP_FLAGS_REG_FD_NO_TRANS`` stay on the
   default matching core so explicit ``TRANS_FD_TO_IOVA`` results remain
-  device-consistent.  Core removal unlists the device and waits for prepared
+  device-consistent.  KUnit coverage checks CCU coordinator teardown completing
+  queued and active jobs on dependent decoder cores with ``-ENODEV`` while
+  dropping scheduler and hardware ownership.  Core removal unlists the device
+  and waits for prepared
   job references to drain before devm-managed resources are released.
 * CCU coordinator removal makes dependent cores unavailable for new prepared
   jobs and completes already queued or active dependent-core jobs with
@@ -227,6 +230,7 @@ Implemented
   claiming, hard-CCU table-status readback,
   hard-CCU idle/add-mode descriptor values, hard-CCU all-core work-mask
   selection, fixed-RCB link-latch programming, decoder RCB min-width gating,
+  CCU coordinator removal cleanup for queued and active dependent-core jobs,
   MPP core-counter routing, IOMMU fault target matching,
   ``INIT_TRANS_TABLE`` ``u16`` storage and boundary behavior,
   ``RELEASE_FD`` import-cache sweeping across all DMA-device mappings for one
