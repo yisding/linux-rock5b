@@ -347,6 +347,7 @@ Implemented
   RGA3 normal RGB color-key dispatch/emission and inverted-mode rejection,
   RGA3 ``librga`` DRM-fourcc ABGR8888-to-RGBA normal raster copy emission,
   RGA3 ``librga`` copy-splice multi-task destination-offset emission,
+  RGA3 multi-task command-buffer rebuild between alpha and plain copy tasks,
   RGA3 ``librga`` RGB translate and ffmpeg overlay-preprocess destination-offset emission,
   RGA3 ``librga`` RGB rotate, flip/mirror, and combined rotate/mirror
   emission, RGA3 ``librga`` centered RGB rotate destination-offset emission,
