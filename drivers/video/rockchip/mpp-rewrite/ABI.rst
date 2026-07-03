@@ -88,7 +88,11 @@ Implemented
   path.  A rewrite-local dispatcher feeds queued jobs to idle selected cores,
   preserves the existing session poll ordering, keeps BSP-style submit-time
   validation for invalid register/readback/start descriptors, and reports
-  backend start failures through the normal completion path.
+  backend start failures through the normal completion path.  Minimal debugfs
+  counters report scheduled, dispatched, and hardware-started work per
+  RKVENC2/RKVDEC2 core id so RK3588 board validation can confirm multicore
+  load balancing, DCHS routing, and decoder CCU distribution without carrying
+  the BSP debugger ABI.
 * RK3588 RKVENC2 DCHS dual-core hand-shake setup for queued multicore encoder
   jobs.  The rewrite mirrors the BSP-visible policy of always enabling TX,
   allocating per-active-core TX ids, linking RX to a same-session producer
@@ -213,8 +217,9 @@ Implemented
   claiming, hard-CCU table-status readback,
   hard-CCU idle/add-mode descriptor values, hard-CCU all-core work-mask
   selection, fixed-RCB link-latch
-  programming, IOMMU fault target matching, RKVENC2 DCHS tx/rx id remapping
-  and release, independent-core DCHS id capacity, ``POLL_HW_IRQ``
+  programming, MPP core-counter routing, IOMMU fault target matching,
+  RKVENC2 DCHS tx/rx id remapping and release, independent-core DCHS id
+  capacity, ``POLL_HW_IRQ``
   flexible-buffer sizing, RKVENC2 slice-mode detection and slice FIFO
   overflow/final-slice reporting, and ``SET_SESSION_FD`` batch job splitting.
 
