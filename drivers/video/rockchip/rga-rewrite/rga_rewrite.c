@@ -9076,6 +9076,52 @@ static void rk_rga3_alpha_yuv10_overlay_emit_kunit(struct kunit *test)
 			RK_RGA3_OVLP_FIELD | RK_RGA3_OVLP_TOP_ALPHA_EN);
 
 	memset(cmd, 0, sizeof(cmd));
+	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_YCBCR_420_SP,
+				    1280, 720);
+	job.cmd_ready = false;
+	type = 0;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
+			  RK_RGA3_WIN0_R2Y_EN);
+	KUNIT_EXPECT_FALSE(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4] &
+			   RK_RGA3_WIN0_YUV10_COMPACT);
+	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WR_CTRL_OFFSET / 4] &
+			  RK_RGA3_WR_YUV10_COMPACT);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_CTRL_OFFSET / 4],
+			FIELD_PREP(RK_RGA3_OVLP_MODE, 0) |
+			RK_RGA3_OVLP_FIELD | RK_RGA3_OVLP_TOP_ALPHA_EN);
+
+	memset(cmd, 0, sizeof(cmd));
+	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_YCBCR_420_SP_10B,
+				    1280, 720);
+	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_YCBCR_420_SP,
+				    1280, 720);
+	job.cmd_ready = false;
+	type = 0;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
+			  RK_RGA3_WIN0_R2Y_EN);
+	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4] &
+			  RK_RGA3_WIN0_YUV10_COMPACT);
+	KUNIT_EXPECT_FALSE(test, cmd[RK_RGA3_WR_CTRL_OFFSET / 4] &
+			   RK_RGA3_WR_YUV10_COMPACT);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_CTRL_OFFSET / 4],
+			FIELD_PREP(RK_RGA3_OVLP_MODE, 0) |
+			RK_RGA3_OVLP_FIELD | RK_RGA3_OVLP_TOP_ALPHA_EN);
+
+	memset(cmd, 0, sizeof(cmd));
+	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_YCBCR_420_SP_10B,
+				    1280, 720);
+	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_YCBCR_420_SP_10B,
+				    1280, 720);
 	task.dst.rd_mode = RK_RGA_FBC_MODE;
 	job.cmd_ready = false;
 	type = 0;
@@ -9129,9 +9175,35 @@ static void rk_rga3_alpha_yuv10_overlay_emit_kunit(struct kunit *test)
 	job.cmd_ready = false;
 	type = 0;
 
-	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
-			-EOPNOTSUPP);
-	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
+			  RK_RGA3_WIN0_YUV10_COMPACT);
+	KUNIT_EXPECT_FALSE(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4] &
+			   RK_RGA3_WIN0_YUV10_COMPACT);
+	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WR_CTRL_OFFSET / 4] &
+			  RK_RGA3_WR_YUV10_COMPACT);
+
+	memset(cmd, 0, sizeof(cmd));
+	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_YCBCR_420_SP_10B,
+				    1280, 720);
+	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_YCBCR_420_SP,
+				    1280, 720);
+	job.cmd_ready = false;
+	type = 0;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_FALSE(test, cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
+			   RK_RGA3_WIN0_YUV10_COMPACT);
+	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4] &
+			  RK_RGA3_WIN0_YUV10_COMPACT);
+	KUNIT_EXPECT_FALSE(test, cmd[RK_RGA3_WR_CTRL_OFFSET / 4] &
+			   RK_RGA3_WR_YUV10_COMPACT);
 }
 
 static void rk_rga3_colorkey_emit_kunit(struct kunit *test)
@@ -10089,22 +10161,19 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 	/*
 	 * Keep the alpha subset to the formats emitted by librga/ffmpeg:
 	 * RGB/RGBA pattern over an RGB destination, the default RKMPP overlay
-	 * path where RGB/RGBA pattern data converts into an 8-bit or matching
-	 * 10-bit YUV write domain, and librga no-pattern A+B->B updates where
-	 * foreground/background/writeback are the same semiplanar YUV format.
+	 * path where RGB/RGBA pattern data converts into a YUV write domain,
+	 * and librga no-pattern A+B->B updates where foreground/background/
+	 * writeback are semiplanar YUV formats.
 	 */
 	if (profile->pattern_blend) {
 		if (!profile->bg_fmt.rgb)
 			return -EOPNOTSUPP;
 		if (!profile->dst_fmt.rgb &&
-		    !(profile->dst_fmt.yuv && profile->src_fmt.yuv &&
-		      ((!profile->dst_fmt.yuv10 && !profile->src_fmt.yuv10) ||
-		       profile->dst_fmt.yuv10 == profile->src_fmt.yuv10)))
+		    !(profile->dst_fmt.yuv && profile->src_fmt.yuv))
 			return -EOPNOTSUPP;
 	} else if (profile->dst_fmt.yuv) {
 		if (!profile->src_fmt.yuv || !profile->src_fmt.yuv_sp ||
-		    !profile->dst_fmt.yuv_sp ||
-		    profile->src_fmt.yuv10 != profile->dst_fmt.yuv10)
+		    !profile->dst_fmt.yuv_sp)
 			return -EOPNOTSUPP;
 	} else if (!profile->bg_fmt.rgb) {
 		return -EOPNOTSUPP;
