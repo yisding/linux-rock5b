@@ -2023,6 +2023,31 @@ static bool rk_rga_direct_img_uses_mmu(const struct rga_req *task,
 	return flags & (RK_RGA_MMU_SRC1 | RK_RGA_MMU_ELSE);
 }
 
+enum rk_rga_direct_img_mem_type {
+	RK_RGA_DIRECT_IMG_INVALID,
+	RK_RGA_DIRECT_IMG_DMABUF,
+	RK_RGA_DIRECT_IMG_USERPTR,
+	RK_RGA_DIRECT_IMG_UNSUPPORTED_PHYS,
+};
+
+static enum rk_rga_direct_img_mem_type
+rk_rga_classify_direct_img(const struct rga_req *task,
+			   const struct rga_img_info_t *img)
+{
+	if (!rk_rga_direct_img_uses_mmu(task, img)) {
+		if (!img->yrgb_addr && !img->uv_addr && !img->v_addr)
+			return RK_RGA_DIRECT_IMG_INVALID;
+		return RK_RGA_DIRECT_IMG_UNSUPPORTED_PHYS;
+	}
+
+	if (img->yrgb_addr && img->yrgb_addr <= INT_MAX)
+		return RK_RGA_DIRECT_IMG_DMABUF;
+	if (img->yrgb_addr || img->uv_addr)
+		return RK_RGA_DIRECT_IMG_USERPTR;
+
+	return RK_RGA_DIRECT_IMG_INVALID;
+}
+
 static int rk_rga_resolve_direct_img(struct rga_req *task,
 				     struct rga_img_info_t *img,
 				     struct rk_rga_import **imports,
@@ -2033,27 +2058,29 @@ static int rk_rga_resolve_direct_img(struct rga_req *task,
 	struct rk_rga_import *import;
 	int ret;
 
-	if (!rk_rga_direct_img_uses_mmu(task, img)) {
-		if (!img->yrgb_addr && !img->uv_addr && !img->v_addr)
-			return required ? -EINVAL : 0;
+	switch (rk_rga_classify_direct_img(task, img)) {
+	case RK_RGA_DIRECT_IMG_INVALID:
+		return required ? -EINVAL : 0;
+	case RK_RGA_DIRECT_IMG_UNSUPPORTED_PHYS:
 		return -EOPNOTSUPP;
+	case RK_RGA_DIRECT_IMG_DMABUF:
+		buffer.type = RGA_DMA_BUFFER;
+		buffer.memory = img->yrgb_addr;
+		break;
+	case RK_RGA_DIRECT_IMG_USERPTR:
+		buffer.type = RGA_VIRTUAL_ADDRESS;
+		buffer.memory = img->yrgb_addr ? img->yrgb_addr : img->uv_addr;
+		break;
 	}
 
 	buffer.memory_parm.width = img->vir_w;
 	buffer.memory_parm.height = img->vir_h;
 	buffer.memory_parm.format = img->format;
 
-	if (img->yrgb_addr && img->yrgb_addr <= INT_MAX) {
-		buffer.type = RGA_DMA_BUFFER;
-		buffer.memory = img->yrgb_addr;
+	if (buffer.type == RGA_DMA_BUFFER)
 		ret = rk_rga_import_dmabuf(&buffer, &import);
-	} else {
-		buffer.type = RGA_VIRTUAL_ADDRESS;
-		buffer.memory = img->yrgb_addr ? img->yrgb_addr : img->uv_addr;
-		if (!buffer.memory)
-			return required ? -EINVAL : 0;
+	else
 		ret = rk_rga_import_userptr(&buffer, &import);
-	}
 	if (ret)
 		return ret;
 
@@ -7093,6 +7120,49 @@ static void rk_rga_request_config_handles_kunit(struct kunit *test)
 	rk_rga_import_put(dst_import);
 	idr_destroy(&session.requests);
 	idr_destroy(&session.imports);
+}
+
+static void rk_rga_direct_img_mem_type_kunit(struct kunit *test)
+{
+	struct rga_req task = {};
+
+	task.src.yrgb_addr = 5;
+	KUNIT_EXPECT_EQ(test, rk_rga_classify_direct_img(&task, &task.src),
+			RK_RGA_DIRECT_IMG_UNSUPPORTED_PHYS);
+
+	task.mmu_info.mmu_flag = RK_RGA_MMU_SRC0;
+	KUNIT_EXPECT_EQ(test, rk_rga_classify_direct_img(&task, &task.src),
+			RK_RGA_DIRECT_IMG_DMABUF);
+
+	task.src.yrgb_addr = 0;
+	task.src.uv_addr = 0x1000;
+	KUNIT_EXPECT_EQ(test, rk_rga_classify_direct_img(&task, &task.src),
+			RK_RGA_DIRECT_IMG_USERPTR);
+
+	task.src.yrgb_addr = (u64)INT_MAX + 1;
+	task.src.uv_addr = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_classify_direct_img(&task, &task.src),
+			RK_RGA_DIRECT_IMG_USERPTR);
+
+	task.src.yrgb_addr = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_classify_direct_img(&task, &task.src),
+			RK_RGA_DIRECT_IMG_INVALID);
+
+	task.mmu_info.mmu_flag = RK_RGA_MMU_DST;
+	task.dst.yrgb_addr = 7;
+	KUNIT_EXPECT_EQ(test, rk_rga_classify_direct_img(&task, &task.dst),
+			RK_RGA_DIRECT_IMG_DMABUF);
+
+	task.mmu_info.mmu_flag = RK_RGA_MMU_SRC1;
+	task.pat.yrgb_addr = 9;
+	KUNIT_EXPECT_EQ(test, rk_rga_classify_direct_img(&task, &task.pat),
+			RK_RGA_DIRECT_IMG_DMABUF);
+
+	task.mmu_info.mmu_flag = RK_RGA_MMU_ELSE;
+	task.pat.yrgb_addr = 0;
+	task.pat.uv_addr = 0x2000;
+	KUNIT_EXPECT_EQ(test, rk_rga_classify_direct_img(&task, &task.pat),
+			RK_RGA_DIRECT_IMG_USERPTR);
 }
 
 static void rk_rga_request_reconfig_resources_kunit(struct kunit *test)
@@ -12507,6 +12577,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_request_ioctl_ret_kunit),
 	KUNIT_CASE(rk_rga_request_create_cancel_ioctl_kunit),
 	KUNIT_CASE(rk_rga_request_config_handles_kunit),
+	KUNIT_CASE(rk_rga_direct_img_mem_type_kunit),
 	KUNIT_CASE(rk_rga_request_reconfig_resources_kunit),
 	KUNIT_CASE(rk_rga_request_reconfig_fences_kunit),
 	KUNIT_CASE(rk_rga_request_config_ioctl_acquire_kunit),
