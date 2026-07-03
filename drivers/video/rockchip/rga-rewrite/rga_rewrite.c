@@ -12527,6 +12527,7 @@ static long rk_rga_ioctl_get_rga2_version(unsigned long arg)
 	if (copy_to_user((void __user *)arg, version.str, sizeof(version.str)))
 		return -EFAULT;
 
+	/* BSP/librga compatibility: success is reported as a positive result. */
 	return true;
 }
 
