@@ -1225,7 +1225,7 @@
 };
 
 &usb_host0_xhci {
-	dr_mode = "peripheral";
+	dr_mode = "otg";
 	phy-names = "usb2-phy";
 	phys = <&usb2phy0_otg>;
 	maximum-speed = "high-speed";
@@ -1245,6 +1245,7 @@
 };
 
 &usb2phy0_otg {
+	phy-supply = <&otg_switch>;
 	status = "okay";
 };
 
