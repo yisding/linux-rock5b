@@ -229,6 +229,8 @@ Implemented
   selection, fixed-RCB link-latch programming, decoder RCB min-width gating,
   MPP core-counter routing, IOMMU fault target matching,
   ``INIT_TRANS_TABLE`` ``u16`` storage and boundary behavior,
+  ``RELEASE_FD`` import-cache sweeping across all DMA-device mappings for one
+  fd while preserving other fd imports,
   ``SET_REG_ADDR_OFFSET`` tuple staging/apply behavior and cap handling,
   procfs support-command table coverage,
   RKVENC2 DCHS tx/rx id remapping and release, independent-core DCHS id
