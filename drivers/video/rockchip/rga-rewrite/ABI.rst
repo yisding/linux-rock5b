@@ -93,8 +93,9 @@ Implemented
   ``-ENODEV``, and signals any exported async release fence with that result.
 * Backend-aware core selection for prepared jobs.  The scheduler checks the
   same supported-operation profile used by command generation, selects the
-  least-loaded compatible RGA core for the current hardware-backed profile, and
-  requires that core to match the device that owns the job's dma-buf mappings.
+  least-loaded compatible RGA core for the current hardware-backed profile,
+  rotates same-class equal-load ties across public core bits, and requires that
+  core to match the device that owns the job's dma-buf mappings.
   Common bitblits that are accepted by both RGA3 and RGA2 participate in the
   same load-based choice so the RK3588 RGA2 core can take work when the RGA3
   cores are busier, matching the forward-port optional-core policy.
@@ -107,8 +108,9 @@ Implemented
   at dispatch time, so direct
   ``wrapbuffer_fd()`` submissions can target a non-default RGA core.  Minimal
   debugfs counters report scheduled, dispatched, and hardware-started work per
-  public core-mask bit so RK3588 board validation can confirm load balancing
-  and forced-core routing without carrying the BSP debugger ABI.
+  public core-mask bit so RK3588 board validation can confirm load balancing,
+  equal-load tie rotation, and forced-core routing without carrying the BSP
+  debugger ABI.
 * Runtime PM and clock-bulk sequencing around the backend dispatch boundary.
   Each dispatched job resumes the selected RGA core, enables discovered clocks,
   enters the backend, then disables clocks and drops runtime PM.
