@@ -8646,6 +8646,39 @@ static void rk_rga3_librga_alpha_yuv_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_CTRL_OFFSET / 4],
 			FIELD_PREP(RK_RGA3_OVLP_MODE, 0) |
 			RK_RGA3_OVLP_FIELD | RK_RGA3_OVLP_TOP_ALPHA_EN);
+
+	memset(cmd, 0, sizeof(cmd));
+	task.src = rk_rga_kunit_img(0x10000000,
+				    RK_RGA_FORMAT_YCRCB_420_SP,
+				    1280, 720);
+	task.dst = rk_rga_kunit_img(0x20000000,
+				    RK_RGA_FORMAT_YCBCR_422_SP,
+				    1280, 720);
+	memset(&task.pat, 0, sizeof(task.pat));
+	task.bsfilter_flag = 0;
+	task.core = BIT(0);
+	job.import_count = 2;
+	job.cmd_ready = false;
+	type = 0;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_CTRL_OFFSET / 4],
+			FIELD_PREP(RK_RGA3_OVLP_MODE, 1) |
+			RK_RGA3_OVLP_FIELD | RK_RGA3_OVLP_TOP_ALPHA_EN);
+	KUNIT_EXPECT_FALSE(test, cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
+			   (RK_RGA3_WIN0_R2Y_EN | RK_RGA3_WIN0_Y2R_EN));
+	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4] &
+			  RK_RGA3_WIN0_PIX_SWAP);
+	KUNIT_EXPECT_FALSE(test, cmd[RK_RGA3_WR_CTRL_OFFSET / 4] &
+			   RK_RGA3_WR_PIX_SWAP);
+
+	task.src.format = RK_RGA_FORMAT_YCRCB_420_SP_10B;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
 }
 
 static void rk_rga3_librga_global_alpha_emit_kunit(struct kunit *test)
@@ -9998,7 +10031,7 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 	} else if (profile->dst_fmt.yuv) {
 		if (!profile->src_fmt.yuv || !profile->src_fmt.yuv_sp ||
 		    !profile->dst_fmt.yuv_sp ||
-		    task->src.format != task->dst.format)
+		    profile->src_fmt.yuv10 != profile->dst_fmt.yuv10)
 			return -EOPNOTSUPP;
 	} else if (!profile->bg_fmt.rgb) {
 		return -EOPNOTSUPP;
