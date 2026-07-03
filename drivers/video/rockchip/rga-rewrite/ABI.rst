@@ -404,7 +404,8 @@ Implemented
   multi-rectangle ``librga`` mosaic-task serial emission,
   RGB gauss coefficient lifetime and command emission, RGA2 RGB NN quantize
   dispatch/emission, RGA2 RGB alpha-bitmap SRC1/alpha emission, RGA2 OSD
-  SRC1/alpha/control emission, RGA2 palette update and color-palette command
+  SRC1/alpha/control/external-flag/invert-calibration emission, RGA2 palette
+  update and color-palette command
   emission,
   acquire-fence fd ownership merging, acquire-fence pending/success/error
   status propagation, async acquire-callback error completion,
