@@ -371,7 +371,8 @@ Implemented
   RGA2 ``librga`` full-CSC RGB-to-YUV dispatch/emission,
   RGA2 ``librga`` gray256 RGB-to-Y400 color-conversion dispatch/emission,
   RGA2 ``librga`` Y400 UV-downsampling resize dispatch/emission,
-  RGA3 normal RGB color-key dispatch/emission and inverted-mode rejection,
+  RGA3 normal/inverted RGB color-key dispatch/emission and invalid-selector
+  rejection,
   RGA3 ``librga`` DRM-fourcc ABGR8888-to-RGBA normal raster copy emission,
   RGA3 ``librga`` copy-splice multi-task destination-offset emission,
   RGA3 multi-task command-buffer rebuild between alpha and plain copy tasks,
