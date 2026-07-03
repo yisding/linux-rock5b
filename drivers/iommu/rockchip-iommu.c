@@ -27,6 +27,7 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string_choices.h>
+#include <soc/rockchip/rockchip_iommu.h>
 
 #include "iommu-pages.h"
 
@@ -117,6 +118,9 @@ struct rk_iommu {
 	struct clk_bulk_data *clocks;
 	int num_clocks;
 	bool reset_disabled;
+	spinlock_t fault_lock;
+	iommu_fault_handler_t fault_handler;
+	void *fault_handler_token;
 	struct iommu_device iommu;
 	struct list_head node; /* entry in rk_iommu_domain.iommus */
 	struct iommu_domain *domain; /* domain to which iommu is attached */
@@ -129,6 +133,9 @@ struct rk_iommudata {
 
 static const struct rk_iommu_ops *rk_ops;
 static struct iommu_domain rk_identity_domain;
+
+static bool rk_iommu_call_fault_handler(struct rk_iommu *iommu,
+					dma_addr_t iova, int flags);
 
 static inline void rk_table_flush(struct rk_iommu_domain *dom, dma_addr_t dma,
 				  unsigned int count)
@@ -633,11 +640,11 @@ static irqreturn_t rk_iommu_irq(int irq, void *dev_id)
 			 * Ignore the return code, though, since we always zap cache
 			 * and clear the page fault anyway.
 			 */
-			if (iommu->domain != &rk_identity_domain)
+			if (iommu->domain == &rk_identity_domain)
+				dev_err(iommu->dev, "Page fault while iommu not attached to domain?\n");
+			else if (!rk_iommu_call_fault_handler(iommu, iova, flags))
 				report_iommu_fault(iommu->domain, iommu->dev, iova,
 						   flags);
-			else
-				dev_err(iommu->dev, "Page fault while iommu not attached to domain?\n");
 
 			rk_iommu_base_command(iommu->bases[i], RK_MMU_CMD_ZAP_CACHE);
 			rk_iommu_base_command(iommu->bases[i], RK_MMU_CMD_PAGE_FAULT_DONE);
@@ -952,6 +959,44 @@ static struct rk_iommu *rk_iommu_from_dev(struct device *dev)
 	return data ? data->iommu : NULL;
 }
 
+static bool rk_iommu_call_fault_handler(struct rk_iommu *iommu,
+					dma_addr_t iova, int flags)
+{
+	iommu_fault_handler_t handler;
+	unsigned long irq_flags;
+	void *token;
+
+	spin_lock_irqsave(&iommu->fault_lock, irq_flags);
+	handler = iommu->fault_handler;
+	token = iommu->fault_handler_token;
+	spin_unlock_irqrestore(&iommu->fault_lock, irq_flags);
+
+	if (!handler || iommu->domain == &rk_identity_domain)
+		return false;
+
+	handler(iommu->domain, iommu->dev, iova, flags, token);
+
+	return true;
+}
+
+int rockchip_iommu_set_fault_handler(struct device *dev,
+				     iommu_fault_handler_t handler, void *token)
+{
+	struct rk_iommu *iommu = rk_iommu_from_dev(dev);
+	unsigned long flags;
+
+	if (!iommu)
+		return -ENODEV;
+
+	spin_lock_irqsave(&iommu->fault_lock, flags);
+	iommu->fault_handler = handler;
+	iommu->fault_handler_token = token;
+	spin_unlock_irqrestore(&iommu->fault_lock, flags);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(rockchip_iommu_set_fault_handler);
+
 /* Must be called with iommu powered on and attached */
 static void rk_iommu_disable(struct rk_iommu *iommu)
 {
@@ -1261,6 +1306,7 @@ static int rk_iommu_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, iommu);
 	iommu->dev = dev;
+	spin_lock_init(&iommu->fault_lock);
 	iommu->num_mmu = 0;
 
 	ops = of_device_get_match_data(dev);
