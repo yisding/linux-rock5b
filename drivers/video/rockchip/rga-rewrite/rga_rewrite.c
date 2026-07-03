@@ -5160,6 +5160,8 @@ static long rk_rga_ioctl_get_version(unsigned long arg);
 static long rk_rga_ioctl_get_rga2_version(unsigned long arg);
 static long rk_rga_ioctl_get_hw_versions(unsigned long arg);
 static long rk_rga_ioctl_get_driver_version(unsigned long arg);
+static long rk_rga_ioctl_blit(unsigned long arg, struct rk_rga_session *session,
+			      __u32 sync_mode);
 static long rk_rga_ioctl_request_create(unsigned long arg,
 					struct rk_rga_session *session);
 static long rk_rga_ioctl_request_cancel(unsigned long arg,
@@ -6449,6 +6451,118 @@ static void rk_rga_request_config_handles_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, rk_rga_request_remove_free(&session, 7));
 	KUNIT_EXPECT_EQ(test, refcount_read(&src_import->refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&dst_import->refs), 1);
+	KUNIT_EXPECT_PTR_EQ(test, idr_remove(&session.imports, 11),
+			    src_import);
+	KUNIT_EXPECT_PTR_EQ(test, idr_remove(&session.imports, 12),
+			    dst_import);
+	rk_rga_import_put(src_import);
+	rk_rga_import_put(dst_import);
+	idr_destroy(&session.requests);
+	idr_destroy(&session.imports);
+}
+
+static void rk_rga_legacy_blit_async_acquire_kunit(struct kunit *test)
+{
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_RGBA_8888);
+	struct rk_rga_session session = {};
+	struct rk_rga_import *src_import;
+	struct rk_rga_import *dst_import;
+	struct dma_fence *acquire_fence;
+	struct dma_fence *release_fence;
+	struct dma_fence *fd_fence;
+	void __user *task_user;
+	unsigned long uncopied;
+	int acquire_fd;
+	int release_fd;
+	long ret;
+
+	task_user = rk_rga_kunit_user_buffer(test, sizeof(task));
+	KUNIT_ASSERT_NOT_NULL(test, task_user);
+
+	acquire_fence = rk_rga_kunit_alloc_fence();
+	KUNIT_ASSERT_NOT_NULL(test, acquire_fence);
+	acquire_fd = rk_rga_kunit_install_fence_fd(acquire_fence);
+	KUNIT_ASSERT_GE(test, acquire_fd, 0);
+
+	task.handle_flag = 1;
+	task.feature.user_close_fence = 1;
+	task.in_fence_fd = acquire_fd;
+	task.src.yrgb_addr = 11;
+	task.src.uv_addr = 0;
+	task.src.v_addr = 0;
+	task.dst.yrgb_addr = 12;
+	task.dst.uv_addr = 0;
+	task.dst.v_addr = 0;
+	task.out_fence_fd = -1;
+
+	uncopied = copy_to_user(task_user, &task, sizeof(task));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+
+	mutex_init(&session.lock);
+	idr_init(&session.imports);
+	idr_init(&session.requests);
+	src_import = rk_rga_kunit_import(test);
+	dst_import = rk_rga_kunit_import(test);
+	KUNIT_ASSERT_NOT_NULL(test, src_import);
+	KUNIT_ASSERT_NOT_NULL(test, dst_import);
+	src_import->iova = 0x10000000;
+	src_import->size = (size_t)1920 * 1080 * 4;
+	dst_import->iova = 0x20000000;
+	dst_import->size = (size_t)1280 * 720 * 4;
+
+	KUNIT_ASSERT_EQ(test,
+			idr_alloc(&session.imports, src_import, 11, 12,
+				  GFP_KERNEL),
+			11);
+	KUNIT_ASSERT_EQ(test,
+			idr_alloc(&session.imports, dst_import, 12, 13,
+				  GFP_KERNEL),
+			12);
+
+	mutex_init(&rk_rga.hw_lock);
+	INIT_LIST_HEAD(&rk_rga.hw_list);
+	spin_lock_init(&rk_rga.fence_lock);
+	rk_rga.fence_context = dma_fence_context_alloc(1);
+	rk_rga.fence_seqno = 0;
+
+	ret = rk_rga_ioctl_blit((unsigned long)task_user, &session,
+				RGA_BLIT_ASYNC);
+	KUNIT_ASSERT_EQ(test, ret, 0L);
+	KUNIT_EXPECT_EQ(test, refcount_read(&src_import->refs), 2);
+	KUNIT_EXPECT_EQ(test, refcount_read(&dst_import->refs), 2);
+
+	uncopied = copy_from_user(&task, task_user, sizeof(task));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+	KUNIT_EXPECT_EQ(test, task.handle_flag & 1, 0U);
+	KUNIT_EXPECT_EQ(test, task.src.yrgb_addr, src_import->iova);
+	KUNIT_EXPECT_EQ(test, task.dst.yrgb_addr, dst_import->iova);
+	release_fd = task.out_fence_fd;
+	KUNIT_ASSERT_GE(test, release_fd, 0);
+
+	fd_fence = sync_file_get_fence(acquire_fd);
+	KUNIT_ASSERT_NOT_NULL(test, fd_fence);
+	KUNIT_EXPECT_PTR_EQ(test, fd_fence, acquire_fence);
+	dma_fence_put(fd_fence);
+
+	release_fence = sync_file_get_fence(release_fd);
+	KUNIT_ASSERT_NOT_NULL(test, release_fence);
+	KUNIT_EXPECT_EQ(test, dma_fence_get_status(release_fence), 0);
+
+	rk_rga_fence_signal(acquire_fence, 0);
+	KUNIT_EXPECT_GT(test,
+			dma_fence_wait_timeout(release_fence, false,
+					       msecs_to_jiffies(1000)),
+			0L);
+	KUNIT_EXPECT_EQ(test, dma_fence_get_status(release_fence), -ENODEV);
+	KUNIT_EXPECT_EQ(test, refcount_read(&src_import->refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&dst_import->refs), 1);
+
+	close_fd(release_fd);
+	dma_fence_put(release_fence);
+	close_fd(acquire_fd);
+	dma_fence_put(acquire_fence);
 	KUNIT_EXPECT_PTR_EQ(test, idr_remove(&session.imports, 11),
 			    src_import);
 	KUNIT_EXPECT_PTR_EQ(test, idr_remove(&session.imports, 12),
@@ -10221,6 +10335,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_request_ioctl_ret_kunit),
 	KUNIT_CASE(rk_rga_request_create_cancel_ioctl_kunit),
 	KUNIT_CASE(rk_rga_request_config_handles_kunit),
+	KUNIT_CASE(rk_rga_legacy_blit_async_acquire_kunit),
 	KUNIT_CASE(rk_rga_request_submit_async_acquire_kunit),
 	KUNIT_CASE(rk_rga_version_queries_kunit),
 	KUNIT_CASE(rk_rga_request_remove_free_kunit),
