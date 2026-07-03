@@ -76,8 +76,11 @@
 #define RK_MPP_RKVDEC_LINK_ADD_CFG_NUM	1
 #define RK_MPP_RKVDEC_LINK_IRQ_RAW	BIT(9)
 #define RK_MPP_RKVDEC_LINK_IP_TIMEOUT	0x007fffff
+#define RK_MPP_RKVDEC_LINK_CORE_WORK_MODE	BIT(16)
 #define RK_MPP_RKVDEC_LINK_CCU_WORK_MODE	BIT(17)
 #define RK_MPP_RKVDEC_LINK_FIX_RCB	BIT(20)
+#define RK_MPP_RKVDEC_CCU_MODE_SOFT	1
+#define RK_MPP_RKVDEC_CCU_MODE_HARD	2
 #define RK_MPP_WORK_TIMEOUT_MS		500
 #define RK_MPP_CODEC_INFO_MAX		11
 #define RK_MPP_ENC_INFO_BUTT		RK_MPP_CODEC_INFO_MAX
@@ -229,6 +232,7 @@ struct rk_mpp_hw {
 	u32 taskqueue_node;
 	u32 task_capacity;
 	u32 core_mask;
+	u32 rkvdec_ccu_mode;
 	u32 irq_status;
 	u32 hw_id;
 	void *rcb_vaddr;
@@ -706,6 +710,8 @@ struct rk_mpp_rkvenc_poll_slice_cfg {
 #define RK_MPP_RKVDEC_CCU_CFG_DONE		BIT(0)
 #define RK_MPP_RKVDEC_CCU_WORK_BASE		0x0018
 #define RK_MPP_RKVDEC_CCU_WORK_EN		BIT(0)
+#define RK_MPP_RKVDEC_CCU_WORK_MODE_BASE	0x0040
+#define RK_MPP_RKVDEC_CCU_WORK_MODE		BIT(0)
 #define RK_MPP_RKVDEC_CCU_CORE_WORK_BASE	0x0044
 #define RK_MPP_RKVDEC_CCU_CORE_STA_BASE		0x0048
 
@@ -839,6 +845,32 @@ static const struct rk_mpp_trans_table rk_mpp_rkvenc_osd_tables[] = {
 		.count = ARRAY_SIZE(rk_mpp_rkvenc_osd_regs),
 	},
 };
+
+static bool rk_mpp_rkvdec2_ccu_mode_valid(u32 mode)
+{
+	return mode == RK_MPP_RKVDEC_CCU_MODE_SOFT ||
+	       mode == RK_MPP_RKVDEC_CCU_MODE_HARD;
+}
+
+static u32 rk_mpp_rkvdec2_normalize_ccu_mode(u32 mode)
+{
+	if (rk_mpp_rkvdec2_ccu_mode_valid(mode))
+		return mode;
+
+	return RK_MPP_RKVDEC_CCU_MODE_SOFT;
+}
+
+static bool rk_mpp_rkvdec2_soft_ccu_enabled(const struct rk_mpp_hw *hw)
+{
+	return hw && hw->ccu_node &&
+	       hw->rkvdec_ccu_mode == RK_MPP_RKVDEC_CCU_MODE_SOFT;
+}
+
+static bool rk_mpp_rkvdec2_hard_ccu_enabled(const struct rk_mpp_hw *hw)
+{
+	return hw && hw->ccu_node &&
+	       hw->rkvdec_ccu_mode == RK_MPP_RKVDEC_CCU_MODE_HARD;
+}
 
 static void rk_mpp_session_get(struct rk_mpp_session *session)
 {
@@ -2302,7 +2334,7 @@ static int rk_mpp_rkvdec2_reserve_link_table(struct rk_mpp_job *job)
 		return -EOPNOTSUPP;
 	if (job->rkvdec_link_active)
 		return 0;
-	if (hw->ccu_node && !job->rkvdec_ccu) {
+	if (rk_mpp_rkvdec2_hard_ccu_enabled(hw) && !job->rkvdec_ccu) {
 		job->rkvdec_ccu =
 			rk_mpp_hw_get_ccu_for_core(job->session->srv, hw);
 		if (!job->rkvdec_ccu)
@@ -2433,6 +2465,7 @@ static bool rk_mpp_hw_prepare_active_retry(struct rk_mpp_hw *hw,
 static void rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw,
 				    struct rk_mpp_job *job);
 static bool rk_mpp_job_rkvdec_rcb_enabled(struct rk_mpp_job *job);
+static int rk_mpp_rkvdec2_program_soft_ccu(struct rk_mpp_job *job);
 static void rk_mpp_rkvenc2_dchs_patch(struct rk_mpp_job *job);
 static void rk_mpp_rkvenc2_dchs_release(struct rk_mpp_job *job);
 static int rk_mpp_switch_session(struct rk_mpp_session **session,
@@ -2827,6 +2860,88 @@ static void rk_mpp_rkvdec2_ccu_timeout_threshold_kunit(struct kunit *test)
 			(u32)RK_MPP_RKVDEC_CCU_TIMEOUT_100MS);
 	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_ccu_timeout_threshold(1280, 720, 10),
 			(u32)RK_MPP_RKVDEC_CCU_TIMEOUT_20MS);
+}
+
+static void rk_mpp_rkvdec2_ccu_mode_kunit(struct kunit *test)
+{
+	struct rk_mpp_hw hw = {};
+	struct device_node *ccu_node = (struct device_node *)test;
+
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_normalize_ccu_mode(0),
+			(u32)RK_MPP_RKVDEC_CCU_MODE_SOFT);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_rkvdec2_normalize_ccu_mode(RK_MPP_RKVDEC_CCU_MODE_SOFT),
+			(u32)RK_MPP_RKVDEC_CCU_MODE_SOFT);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_rkvdec2_normalize_ccu_mode(RK_MPP_RKVDEC_CCU_MODE_HARD),
+			(u32)RK_MPP_RKVDEC_CCU_MODE_HARD);
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_normalize_ccu_mode(3),
+			(u32)RK_MPP_RKVDEC_CCU_MODE_SOFT);
+
+	KUNIT_EXPECT_FALSE(test, rk_mpp_rkvdec2_soft_ccu_enabled(&hw));
+	KUNIT_EXPECT_FALSE(test, rk_mpp_rkvdec2_hard_ccu_enabled(&hw));
+
+	hw.ccu_node = ccu_node;
+	hw.rkvdec_ccu_mode = RK_MPP_RKVDEC_CCU_MODE_SOFT;
+	KUNIT_EXPECT_TRUE(test, rk_mpp_rkvdec2_soft_ccu_enabled(&hw));
+	KUNIT_EXPECT_FALSE(test, rk_mpp_rkvdec2_hard_ccu_enabled(&hw));
+
+	hw.rkvdec_ccu_mode = RK_MPP_RKVDEC_CCU_MODE_HARD;
+	KUNIT_EXPECT_FALSE(test, rk_mpp_rkvdec2_soft_ccu_enabled(&hw));
+	KUNIT_EXPECT_TRUE(test, rk_mpp_rkvdec2_hard_ccu_enabled(&hw));
+}
+
+static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
+{
+	const struct rk_mpp_rkvdec2_link_info *info =
+		&rk_mpp_rkvdec2_vdpu383_link_info;
+	struct rk_mpp_hw hw = {
+		.core_mask = 0x00030000,
+	};
+	struct rk_mpp_hw ccu = {};
+	struct rk_mpp_job job = {
+		.hw = &hw,
+		.rkvdec_ccu = &ccu,
+	};
+	u32 *ccu_regs;
+	u32 *link;
+
+	link = kunit_kcalloc(test, 0x60 / sizeof(*link), sizeof(*link),
+			     GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, link);
+	ccu_regs = kunit_kcalloc(test,
+				 (RK_MPP_RKVDEC_CCU_CORE_STA_BASE +
+				  sizeof(*ccu_regs)) / sizeof(*ccu_regs),
+				 sizeof(*ccu_regs), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ccu_regs);
+
+	hw.regs[RK_MPP_RKVDEC_LINK_REGION] = (void __iomem *)link;
+	hw.reg_size[RK_MPP_RKVDEC_LINK_REGION] = 0x60;
+	ccu.regs[0] = (void __iomem *)ccu_regs;
+	ccu.reg_size[0] = RK_MPP_RKVDEC_CCU_CORE_STA_BASE + sizeof(*ccu_regs);
+
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_program_soft_ccu(&job), 0);
+	KUNIT_EXPECT_EQ(test,
+			link[info->irq_base / sizeof(*link)] &
+			(RK_MPP_RKVDEC_LINK_CORE_WORK_MODE |
+			 RK_MPP_RKVDEC_LINK_CCU_WORK_MODE),
+			(u32)(RK_MPP_RKVDEC_LINK_CORE_WORK_MODE |
+			      RK_MPP_RKVDEC_LINK_CCU_WORK_MODE));
+	KUNIT_EXPECT_EQ(test,
+			ccu_regs[RK_MPP_RKVDEC_CCU_WORK_BASE / sizeof(*ccu_regs)],
+			(u32)RK_MPP_RKVDEC_CCU_WORK_EN);
+	KUNIT_EXPECT_EQ(test,
+			ccu_regs[RK_MPP_RKVDEC_CCU_WORK_MODE_BASE / sizeof(*ccu_regs)],
+			(u32)RK_MPP_RKVDEC_CCU_WORK_MODE);
+	KUNIT_EXPECT_EQ(test,
+			ccu_regs[RK_MPP_RKVDEC_CCU_CORE_WORK_BASE / sizeof(*ccu_regs)],
+			hw.core_mask);
+	KUNIT_EXPECT_EQ(test,
+			ccu_regs[RK_MPP_RKVDEC_CCU_CORE_STA_BASE / sizeof(*ccu_regs)],
+			hw.core_mask);
+
+	hw.core_mask = 0;
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_program_soft_ccu(&job), -EINVAL);
 }
 
 static void rk_mpp_rkvdec2_link_info_kunit(struct kunit *test)
@@ -4826,6 +4941,8 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_request_check_reg_span_kunit),
 	KUNIT_CASE(rk_mpp_request_check_rkvdec_perf_span_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_timeout_threshold_kunit),
+	KUNIT_CASE(rk_mpp_rkvdec2_ccu_mode_kunit),
+	KUNIT_CASE(rk_mpp_rkvdec2_soft_ccu_program_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_link_info_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_link_irq_decode_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_fill_link_table_kunit),
@@ -5844,6 +5961,90 @@ static bool rk_mpp_rkvdec2_ccu_regs_ready(struct rk_mpp_hw *ccu)
 					 sizeof(u32)) &&
 	       rk_mpp_hw_reg_range_valid(ccu, 0, RK_MPP_RKVDEC_CCU_CORE_STA_BASE,
 					 sizeof(u32));
+}
+
+static bool rk_mpp_rkvdec2_soft_ccu_regs_ready(struct rk_mpp_hw *ccu)
+{
+	return ccu &&
+	       rk_mpp_hw_reg_range_valid(ccu, 0, RK_MPP_RKVDEC_CCU_WORK_BASE,
+					 sizeof(u32)) &&
+	       rk_mpp_hw_reg_range_valid(ccu, 0, RK_MPP_RKVDEC_CCU_WORK_MODE_BASE,
+					 sizeof(u32)) &&
+	       rk_mpp_hw_reg_range_valid(ccu, 0, RK_MPP_RKVDEC_CCU_CORE_WORK_BASE,
+					 sizeof(u32)) &&
+	       rk_mpp_hw_reg_range_valid(ccu, 0, RK_MPP_RKVDEC_CCU_CORE_STA_BASE,
+					 sizeof(u32));
+}
+
+static int rk_mpp_rkvdec2_program_soft_ccu(struct rk_mpp_job *job)
+{
+	const struct rk_mpp_rkvdec2_link_info *link_info =
+		&rk_mpp_rkvdec2_vdpu383_link_info;
+	struct rk_mpp_hw *hw = job->hw;
+	struct rk_mpp_hw *ccu = job->rkvdec_ccu;
+	void __iomem *ccu_regs;
+	u32 irq_val;
+
+	if (!hw || !ccu || !rk_mpp_rkvdec2_soft_ccu_regs_ready(ccu))
+		return -EOPNOTSUPP;
+	if (!hw->core_mask)
+		return -EINVAL;
+
+	if (rk_mpp_rkvdec2_link_regs_ready(hw, link_info)) {
+		void __iomem *link = hw->regs[RK_MPP_RKVDEC_LINK_REGION];
+
+		irq_val = readl_relaxed(link + link_info->irq_base);
+		irq_val |= RK_MPP_RKVDEC_LINK_CORE_WORK_MODE |
+			   RK_MPP_RKVDEC_LINK_CCU_WORK_MODE;
+		writel_relaxed(irq_val, link + link_info->irq_base);
+	}
+
+	ccu_regs = ccu->regs[0];
+	writel_relaxed(RK_MPP_RKVDEC_CCU_WORK_EN,
+		       ccu_regs + RK_MPP_RKVDEC_CCU_WORK_BASE);
+	writel_relaxed(RK_MPP_RKVDEC_CCU_WORK_MODE,
+		       ccu_regs + RK_MPP_RKVDEC_CCU_WORK_MODE_BASE);
+	writel_relaxed(hw->core_mask,
+		       ccu_regs + RK_MPP_RKVDEC_CCU_CORE_WORK_BASE);
+	writel_relaxed(hw->core_mask,
+		       ccu_regs + RK_MPP_RKVDEC_CCU_CORE_STA_BASE);
+
+	return 0;
+}
+
+static int rk_mpp_rkvdec2_prepare_soft_ccu(struct rk_mpp_job *job)
+{
+	struct rk_mpp_hw *hw = job->hw;
+	struct rk_mpp_hw *ccu;
+	int ret;
+
+	if (!rk_mpp_rkvdec2_soft_ccu_enabled(hw))
+		return 0;
+
+	if (!job->rkvdec_ccu) {
+		job->rkvdec_ccu =
+			rk_mpp_hw_get_ccu_for_core(job->session->srv, hw);
+		if (!job->rkvdec_ccu)
+			return -ENODEV;
+	}
+	ccu = job->rkvdec_ccu;
+	if (!rk_mpp_rkvdec2_soft_ccu_regs_ready(ccu))
+		return -EOPNOTSUPP;
+
+	if (!job->rkvdec_ccu_powered) {
+		ret = rk_mpp_hw_power_on(ccu);
+		if (ret)
+			return ret;
+		job->rkvdec_ccu_powered = true;
+	}
+	if (!READ_ONCE(ccu->online))
+		return -ENODEV;
+
+	mutex_lock(&ccu->run_lock);
+	ret = rk_mpp_rkvdec2_program_soft_ccu(job);
+	mutex_unlock(&ccu->run_lock);
+
+	return ret;
 }
 
 static u32 rk_mpp_rkvdec2_ccu_core_mask(struct rk_mpp_service *srv,
@@ -7171,7 +7372,9 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 		goto err_power_off;
 	}
 
-	link_start = rk_mpp_rkvdec2_link_regs_ready(hw, link_info);
+	link_start = rk_mpp_rkvdec2_hard_ccu_enabled(hw) &&
+		     hw->rkvdec_link_vaddr &&
+		     rk_mpp_rkvdec2_link_regs_ready(hw, link_info);
 
 	if (rk_mpp_hw_reg_range_valid(hw, 0, RK_MPP_RKVDEC_MAX_READS_BASE,
 				      sizeof(u32)))
@@ -7200,7 +7403,8 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 		writel_relaxed(1, hw->regs[0] + RK_MPP_RKVDEC_CLR_CACHE2_BASE);
 
 	rk_mpp_rkvdec2_prepare_ccu_regs(job);
-	rk_mpp_rkvdec2_stage_link_table(job);
+	if (rk_mpp_rkvdec2_hard_ccu_enabled(hw))
+		rk_mpp_rkvdec2_stage_link_table(job);
 
 	ret = rk_mpp_job_write_regs(job, RK_MPP_RKVDEC_START_BASE,
 				    &start_value, &start_seen);
@@ -7225,6 +7429,10 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 		mutex_unlock(&hw->run_lock);
 		return 0;
 	}
+
+	ret = rk_mpp_rkvdec2_prepare_soft_ccu(job);
+	if (ret)
+		goto err_power_off;
 
 	rk_mpp_hw_schedule_timeout(hw);
 	if (link_start) {
@@ -8180,6 +8388,26 @@ static int rk_mpp_hw_alloc_rcb(struct rk_mpp_hw *hw)
 	return 0;
 }
 
+static void rk_mpp_hw_read_rkvdec_ccu_mode(struct rk_mpp_hw *hw)
+{
+	struct device *dev = hw->dev;
+	u32 mode = RK_MPP_RKVDEC_CCU_MODE_SOFT;
+	u32 requested;
+
+	if (hw->match->type != RK_MPP_DEVICE_RKVDEC || !hw->ccu_node)
+		return;
+
+	requested = mode;
+	if (of_property_read_u32(hw->ccu_node, "rockchip,ccu-mode", &requested))
+		requested = mode;
+
+	mode = rk_mpp_rkvdec2_normalize_ccu_mode(requested);
+	if (mode != requested)
+		dev_warn(dev, "invalid rkvdec ccu-mode %u; using soft mode\n",
+			 requested);
+	hw->rkvdec_ccu_mode = mode;
+}
+
 static int rk_mpp_hw_alloc_rkvdec_link(struct rk_mpp_hw *hw)
 {
 	const struct rk_mpp_rkvdec2_link_info *info =
@@ -8189,7 +8417,8 @@ static int rk_mpp_hw_alloc_rkvdec_link(struct rk_mpp_hw *hw)
 	size_t node_size;
 	size_t size;
 
-	if (hw->match->type != RK_MPP_DEVICE_RKVDEC || !hw->ccu_node)
+	if (hw->match->type != RK_MPP_DEVICE_RKVDEC ||
+	    !rk_mpp_rkvdec2_hard_ccu_enabled(hw))
 		return 0;
 
 	if (!rk_mpp_rkvdec2_link_regs_ready(hw, info)) {
@@ -8279,6 +8508,7 @@ static int rk_mpp_hw_probe(struct platform_device *pdev)
 		if (ret)
 			return ret;
 	}
+	rk_mpp_hw_read_rkvdec_ccu_mode(hw);
 
 	of_property_read_u32(dev->of_node, "rockchip,taskqueue-node",
 			     &hw->taskqueue_node);
@@ -8374,10 +8604,12 @@ static int rk_mpp_hw_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, hw);
 
-	dev_info(dev, "bound %s core %d hw_id %#x irq %d regs %d clocks %d%s\n",
+	dev_info(dev, "bound %s core %d hw_id %#x irq %d regs %d clocks %d%s%s\n",
 		 match->name, hw->core_id, hw->hw_id, hw->irq,
 		 hw->num_regs, hw->num_clks,
-		 hw->ccu_node ? " ccu-gated" : "");
+		 hw->ccu_node ? " ccu-gated" : "",
+		 rk_mpp_rkvdec2_soft_ccu_enabled(hw) ? " soft-ccu" :
+		 rk_mpp_rkvdec2_hard_ccu_enabled(hw) ? " hard-ccu" : "");
 
 	return 0;
 }
