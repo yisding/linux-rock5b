@@ -154,7 +154,8 @@ Implemented
   RGB-family and compact 10-bit YUV input/output, plus ffmpeg/RKMPP AFBC
   source crop-top offsets carried as active-window y-offsets; tile8x8 is
   accepted through ``RGA_TILE_MODE`` for the BSP RGA3 semiplanar YUV
-  tile-format subset in simple raster-to-tile and tile-to-raster bitblits.
+  tile-format subset in simple raster-to-tile, tile-to-raster, and
+  tile-to-tile bitblits.
   RFBC, AFBC32x8, packed-YUV FBC, compressed in-place alpha write-back,
   overlapping in-place blits, tile alpha/pattern/color-key, and in-place
   scaling/conversion/rotation remain unsupported.  Main request
@@ -361,6 +362,7 @@ Implemented
   profile selection and FBCIN command emission, IOMMU fault target matching,
   post-reset IOMMU refresh accounting, scheduler priority enqueue/aging,
   scheduler core-counter mapping,
+  RGA3 tile8x8 raster/tile round-trip and tile-to-tile command emission,
   RGA2 ``librga`` full-CSC RGB-to-YUV dispatch/emission,
   RGA2 ``librga`` gray256 RGB-to-Y400 color-conversion dispatch/emission,
   RGA2 ``librga`` Y400 UV-downsampling resize dispatch/emission,
