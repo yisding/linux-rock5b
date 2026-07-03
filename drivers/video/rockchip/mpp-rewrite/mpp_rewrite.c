@@ -4201,6 +4201,71 @@ static void rk_mpp_batch_session_switch_split_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&session1.refs), 1);
 }
 
+static void rk_mpp_release_fd_all_devices_kunit(struct kunit *test)
+{
+	struct rk_mpp_session session = {};
+	struct device *dev0;
+	struct device *dev1;
+	struct rk_mpp_import *fd0_dev0;
+	struct rk_mpp_import *fd0_dev1;
+	struct rk_mpp_import *fd1_dev0;
+	struct rk_mpp_import *iter;
+	unsigned int remaining = 0;
+
+	mutex_init(&session.lock);
+	INIT_LIST_HEAD(&session.imports);
+
+	dev0 = kunit_kzalloc(test, sizeof(*dev0), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dev0);
+	dev1 = kunit_kzalloc(test, sizeof(*dev1), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dev1);
+
+	fd0_dev0 = kunit_kzalloc(test, sizeof(*fd0_dev0), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, fd0_dev0);
+	fd0_dev0->fd = 7;
+	fd0_dev0->dev = dev0;
+	refcount_set(&fd0_dev0->refs, 2);
+	INIT_LIST_HEAD(&fd0_dev0->link);
+	list_add_tail(&fd0_dev0->link, &session.imports);
+
+	fd0_dev1 = kunit_kzalloc(test, sizeof(*fd0_dev1), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, fd0_dev1);
+	fd0_dev1->fd = 7;
+	fd0_dev1->dev = dev1;
+	refcount_set(&fd0_dev1->refs, 2);
+	INIT_LIST_HEAD(&fd0_dev1->link);
+	list_add_tail(&fd0_dev1->link, &session.imports);
+
+	fd1_dev0 = kunit_kzalloc(test, sizeof(*fd1_dev0), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, fd1_dev0);
+	fd1_dev0->fd = 8;
+	fd1_dev0->dev = dev0;
+	refcount_set(&fd1_dev0->refs, 2);
+	INIT_LIST_HEAD(&fd1_dev0->link);
+	list_add_tail(&fd1_dev0->link, &session.imports);
+
+	KUNIT_EXPECT_EQ(test, rk_mpp_release_fd(&session, 7), 0);
+	KUNIT_EXPECT_TRUE(test, list_empty(&fd0_dev0->link));
+	KUNIT_EXPECT_TRUE(test, list_empty(&fd0_dev1->link));
+	KUNIT_EXPECT_FALSE(test, list_empty(&fd1_dev0->link));
+	KUNIT_EXPECT_EQ(test, refcount_read(&fd0_dev0->refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&fd0_dev1->refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&fd1_dev0->refs), 2);
+
+	list_for_each_entry(iter, &session.imports, link) {
+		remaining++;
+		KUNIT_EXPECT_EQ(test, iter->fd, 8);
+		KUNIT_EXPECT_PTR_EQ(test, iter->dev, dev0);
+	}
+	KUNIT_EXPECT_EQ(test, remaining, 1U);
+
+	KUNIT_EXPECT_EQ(test, rk_mpp_release_fd(&session, 7), -EINVAL);
+	KUNIT_EXPECT_EQ(test, rk_mpp_release_fd(&session, 99), -EINVAL);
+	KUNIT_EXPECT_FALSE(test, list_empty(&fd1_dev0->link));
+
+	list_del_init(&fd1_dev0->link);
+}
+
 static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 {
 	struct rk_mpp_service srv = {};
@@ -4319,6 +4384,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_rkvdec_rcb_width_gate_kunit),
 	KUNIT_CASE(rk_mpp_switch_session_status_kunit),
 	KUNIT_CASE(rk_mpp_batch_session_switch_split_kunit),
+	KUNIT_CASE(rk_mpp_release_fd_all_devices_kunit),
 	KUNIT_CASE(rk_mpp_session_abort_jobs_kunit),
 	{}
 };
