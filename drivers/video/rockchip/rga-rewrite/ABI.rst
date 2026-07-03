@@ -423,7 +423,7 @@ Implemented
   ffmpeg-facing RGA2 RFBC64x4 8/10-bit 4:2:0/4:2:2 and RGB-family AFBC32x8
   source profile selection and FBCIN command emission, IOMMU fault target matching,
   post-reset IOMMU refresh accounting, scheduler priority enqueue/aging,
-  scheduler core-counter mapping,
+  scheduler core-counter and per-core timing mapping,
   RGA3 tile8x8 raster/tile round-trip and tile-to-tile command emission,
   RGA2 ``librga`` full-CSC RGB-to-YUV dispatch/emission,
   RGA2 ``librga`` gray256 RGB-to-Y400 color-conversion dispatch/emission,
