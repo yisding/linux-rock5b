@@ -236,8 +236,9 @@ Implemented
   RKVENC2 DCHS tx/rx id remapping and release, independent-core DCHS id
   capacity, ``POLL_HW_IRQ``
   flexible-buffer sizing, RKVENC2 slice-mode detection and slice FIFO
-  overflow/final-slice reporting, and ``SET_SESSION_FD`` invalid-fd status,
-  done-marker handling, and batch job splitting.
+  overflow/final-slice reporting, ``POLL_HW_FINISH`` nonblocking pending-job
+  ``-EAGAIN`` without consuming the active job, and ``SET_SESSION_FD``
+  invalid-fd status, done-marker handling, and batch job splitting.
 
 Recognized But Unsupported
 --------------------------
