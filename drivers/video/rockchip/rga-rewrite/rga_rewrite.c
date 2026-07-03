@@ -27,6 +27,7 @@
 #include <linux/interrupt.h>
 #include <linux/jiffies.h>
 #if IS_ENABLED(CONFIG_ROCKCHIP_RGA_REWRITE_KUNIT_TEST)
+#include <linux/mman.h>
 #include <kunit/test.h>
 #endif
 #include <linux/list.h>
@@ -4989,6 +4990,26 @@ static struct rga_req rk_rga_fill_task(u32 core)
 
 static DEFINE_SPINLOCK(rk_rga_kunit_fence_lock);
 
+static long rk_rga_ioctl_get_version(unsigned long arg);
+static long rk_rga_ioctl_get_rga2_version(unsigned long arg);
+static long rk_rga_ioctl_get_hw_versions(unsigned long arg);
+static long rk_rga_ioctl_get_driver_version(unsigned long arg);
+
+static void __user *rk_rga_kunit_user_buffer(struct kunit *test, size_t size)
+{
+	unsigned long useraddr;
+
+	useraddr = kunit_vm_mmap(test, NULL, 0, PAGE_ALIGN(size ? size : 1),
+				 PROT_READ | PROT_WRITE,
+				 MAP_ANONYMOUS | MAP_PRIVATE, 0);
+	if (!useraddr || useraddr >= TASK_SIZE) {
+		KUNIT_FAIL(test, "failed to allocate userspace buffer");
+		return NULL;
+	}
+
+	return (void __user *)useraddr;
+}
+
 static struct dma_fence *rk_rga_kunit_alloc_fence(void)
 {
 	struct dma_fence *fence;
@@ -5975,6 +5996,97 @@ static void rk_rga_request_ioctl_ret_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_request_ioctl_ret(0), 0);
 	KUNIT_EXPECT_EQ(test, rk_rga_request_ioctl_ret(-EINVAL), -EFAULT);
 	KUNIT_EXPECT_EQ(test, rk_rga_request_ioctl_ret(-ENOMEM), -EFAULT);
+}
+
+static void rk_rga_version_queries_kunit(struct kunit *test)
+{
+	const struct rk_rga_hw_match rga3_match = {
+		.type = RK_RGA_HW_RGA3,
+		.name = "rga3",
+		.version_major = 3,
+		.version_minor = 0,
+		.version_revision = 0x76831,
+	};
+	const struct rk_rga_hw_match rga2_match = {
+		.type = RK_RGA_HW_RGA2,
+		.name = "rga2",
+		.version_major = 3,
+		.version_minor = 2,
+		.version_revision = 0x63318,
+	};
+	struct rk_rga_hw rga3 = {
+		.type = RK_RGA_HW_RGA3,
+		.match = &rga3_match,
+	};
+	struct rk_rga_hw rga2 = {
+		.type = RK_RGA_HW_RGA2,
+		.match = &rga2_match,
+	};
+	struct rga_hw_versions_t hw_versions = {};
+	struct rga_version_t driver_version = {};
+	char legacy_version[RGA_VERSION_SIZE] = {};
+	char rga2_version[RGA_VERSION_SIZE] = {};
+	void __user *legacy_user;
+	void __user *rga2_user;
+	void __user *hw_user;
+	void __user *driver_user;
+	unsigned long uncopied;
+
+	legacy_user = rk_rga_kunit_user_buffer(test, sizeof(legacy_version));
+	rga2_user = rk_rga_kunit_user_buffer(test, sizeof(rga2_version));
+	hw_user = rk_rga_kunit_user_buffer(test, sizeof(hw_versions));
+	driver_user = rk_rga_kunit_user_buffer(test, sizeof(driver_version));
+	KUNIT_ASSERT_NOT_NULL(test, legacy_user);
+	KUNIT_ASSERT_NOT_NULL(test, rga2_user);
+	KUNIT_ASSERT_NOT_NULL(test, hw_user);
+	KUNIT_ASSERT_NOT_NULL(test, driver_user);
+
+	mutex_init(&rk_rga.hw_lock);
+	INIT_LIST_HEAD(&rk_rga.hw_list);
+	INIT_LIST_HEAD(&rga3.node);
+	INIT_LIST_HEAD(&rga2.node);
+	list_add_tail(&rga3.node, &rk_rga.hw_list);
+	list_add_tail(&rga2.node, &rk_rga.hw_list);
+	rk_rga_refresh_hw_versions();
+
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_ioctl_get_version((unsigned long)legacy_user),
+			0L);
+	uncopied = copy_from_user(legacy_version, legacy_user,
+				  sizeof(legacy_version));
+	KUNIT_EXPECT_EQ(test, uncopied, 0UL);
+	KUNIT_EXPECT_STREQ(test, legacy_version, "3.00");
+
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_ioctl_get_rga2_version((unsigned long)rga2_user),
+			1L);
+	uncopied = copy_from_user(rga2_version, rga2_user,
+				  sizeof(rga2_version));
+	KUNIT_EXPECT_EQ(test, uncopied, 0UL);
+	KUNIT_EXPECT_STREQ(test, rga2_version, "3.2.63318");
+
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_ioctl_get_hw_versions((unsigned long)hw_user),
+			1L);
+	uncopied = copy_from_user(&hw_versions, hw_user, sizeof(hw_versions));
+	KUNIT_EXPECT_EQ(test, uncopied, 0UL);
+	KUNIT_EXPECT_EQ(test, hw_versions.size, 2U);
+	KUNIT_EXPECT_STREQ(test, hw_versions.version[0].str, "3.0.76831");
+	KUNIT_EXPECT_STREQ(test, hw_versions.version[1].str, "3.2.63318");
+
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_ioctl_get_driver_version((unsigned long)driver_user),
+			1L);
+	uncopied = copy_from_user(&driver_version, driver_user,
+				  sizeof(driver_version));
+	KUNIT_EXPECT_EQ(test, uncopied, 0UL);
+	KUNIT_EXPECT_EQ(test, driver_version.major, 1U);
+	KUNIT_EXPECT_EQ(test, driver_version.minor, 3U);
+	KUNIT_EXPECT_EQ(test, driver_version.revision, 11U);
+	KUNIT_EXPECT_STREQ(test, driver_version.str, DRIVER_VERSION);
+
+	INIT_LIST_HEAD(&rk_rga.hw_list);
+	rk_rga_refresh_hw_versions();
 }
 
 static void rk_rga_request_remove_free_kunit(struct kunit *test)
@@ -8776,6 +8888,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga2_update_palette_emit_kunit),
 	KUNIT_CASE(rk_rga_request_check_kunit),
 	KUNIT_CASE(rk_rga_request_ioctl_ret_kunit),
+	KUNIT_CASE(rk_rga_version_queries_kunit),
 	KUNIT_CASE(rk_rga_request_remove_free_kunit),
 	KUNIT_CASE(rk_rga_import_buffer_size_kunit),
 	KUNIT_CASE(rk_rga_acquire_fd_ownership_kunit),
