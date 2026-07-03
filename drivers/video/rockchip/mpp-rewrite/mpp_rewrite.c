@@ -2310,6 +2310,9 @@ static int rk_mpp_switch_session(struct rk_mpp_session **session,
 static int rk_mpp_process_request(struct rk_mpp_session *session,
 				  struct mpp_request *req,
 				  struct rk_mpp_batch_state *batch);
+static int rk_mpp_job_store_reg_offsets(struct rk_mpp_job *job,
+					const struct rk_mpp_job_req *job_req);
+static int rk_mpp_job_apply_reg_offsets(struct rk_mpp_job *job);
 
 static void __user *rk_mpp_kunit_user_payload(struct kunit *test,
 					      const void *src, size_t size)
@@ -2554,6 +2557,62 @@ static void rk_mpp_init_trans_table_kunit(struct kunit *test)
 	req.data = NULL;
 	KUNIT_EXPECT_EQ(test, rk_mpp_process_request(&session, &req, NULL), 0);
 	KUNIT_EXPECT_EQ(test, session.trans_count, 0U);
+}
+
+static void rk_mpp_reg_offsets_kunit(struct kunit *test)
+{
+	struct rk_mpp_reg_offset offsets[] = {
+		{ .index = 1, .offset = 4 },
+		{ .index = 1, .offset = 8 },
+		{ .index = 3, .offset = 0x20 },
+	};
+	struct rk_mpp_job *job;
+	struct rk_mpp_job_req job_req = {
+		.req = {
+			.cmd = MPP_CMD_SET_REG_ADDR_OFFSET,
+			.size = sizeof(offsets),
+		},
+		.payload = offsets,
+	};
+
+	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_store_reg_offsets(job, &job_req), 0);
+	KUNIT_EXPECT_EQ(test, job->reg_image.offset_count,
+			(u32)ARRAY_SIZE(offsets));
+	KUNIT_EXPECT_EQ(test, job->reg_image.offsets[0].index, 1U);
+	KUNIT_EXPECT_EQ(test, job->reg_image.offsets[0].offset, 4U);
+	KUNIT_EXPECT_EQ(test, job->reg_image.offsets[2].index, 3U);
+	KUNIT_EXPECT_EQ(test, job->reg_image.offsets[2].offset, 0x20U);
+
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_reg_offsets(job), 0);
+	KUNIT_ASSERT_NOT_NULL(test, job->reg_image.regs);
+	KUNIT_EXPECT_TRUE(test, job->reg_image.reg_words >= 4);
+	KUNIT_EXPECT_EQ(test, job->reg_image.regs[1], 12U);
+	KUNIT_EXPECT_EQ(test, job->reg_image.regs[3], 0x20U);
+	kfree(job->reg_image.regs);
+	memset(job, 0, sizeof(*job));
+
+	job_req.req.size = 0;
+	job_req.payload = NULL;
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_store_reg_offsets(job, &job_req), 0);
+	KUNIT_EXPECT_EQ(test, job->reg_image.offset_count, 0U);
+
+	job_req.req.size = sizeof(offsets) - 1;
+	job_req.payload = offsets;
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_store_reg_offsets(job, &job_req),
+			-EINVAL);
+
+	job_req.req.size = sizeof(offsets[0]);
+	job_req.payload = NULL;
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_store_reg_offsets(job, &job_req),
+			-EINVAL);
+
+	job->reg_image.offset_count = RK_MPP_MAX_REG_TRANS_NUM;
+	job_req.payload = offsets;
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_store_reg_offsets(job, &job_req),
+			-EINVAL);
 }
 
 static void rk_mpp_request_check_reg_span_kunit(struct kunit *test)
@@ -4046,6 +4105,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_cmd_copies_payload_kunit),
 	KUNIT_CASE(rk_mpp_store_codec_info_kunit),
 	KUNIT_CASE(rk_mpp_init_trans_table_kunit),
+	KUNIT_CASE(rk_mpp_reg_offsets_kunit),
 	KUNIT_CASE(rk_mpp_request_check_reg_span_kunit),
 	KUNIT_CASE(rk_mpp_request_check_rkvdec_perf_span_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_timeout_threshold_kunit),
