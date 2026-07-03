@@ -216,6 +216,7 @@ struct rk_mpp_hw {
 	void __iomem *regs[RK_MPP_MAX_HW_REGS];
 	resource_size_t reg_size[RK_MPP_MAX_HW_REGS];
 	struct clk_bulk_data *clks;
+	u32 *normal_rates;
 	struct reset_control *resets;
 	struct delayed_work timeout_work;
 	struct mutex run_lock; /* serializes start, abort, timeout, and completion */
@@ -5744,6 +5745,61 @@ static u32 rk_mpp_rkvdec2_ccu_core_mask(struct rk_mpp_service *srv,
 	return mask;
 }
 
+static int rk_mpp_hw_read_clk_rates(struct rk_mpp_hw *hw)
+{
+	struct device *dev = hw->dev;
+	int count;
+	int ret;
+
+	if (!hw->num_clks)
+		return 0;
+
+	count = device_property_count_u32(dev, "rockchip,normal-rates");
+	if (count == -EINVAL || count == -ENODATA)
+		return 0;
+	if (count < 0)
+		return count;
+	if (!count)
+		return 0;
+
+	if (count != hw->num_clks) {
+		dev_warn(dev, "ignoring %d normal clock rates for %d clocks\n",
+			 count, hw->num_clks);
+		return 0;
+	}
+
+	hw->normal_rates = devm_kcalloc(dev, count, sizeof(*hw->normal_rates),
+					GFP_KERNEL);
+	if (!hw->normal_rates)
+		return -ENOMEM;
+
+	ret = device_property_read_u32_array(dev, "rockchip,normal-rates",
+					     hw->normal_rates, count);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+static void rk_mpp_hw_apply_clk_rates(struct rk_mpp_hw *hw)
+{
+	int i;
+
+	for (i = 0; hw->normal_rates && i < hw->num_clks; i++) {
+		u32 rate = hw->normal_rates[i];
+		int ret;
+
+		if (!rate)
+			continue;
+
+		ret = clk_set_rate(hw->clks[i].clk, rate);
+		if (ret)
+			dev_warn_ratelimited(hw->dev,
+					     "failed to set %s to %u Hz: %d\n",
+					     hw->clks[i].id ?: "clock", rate, ret);
+	}
+}
+
 static int rk_mpp_hw_power_on(struct rk_mpp_hw *hw)
 {
 	int ret;
@@ -5751,6 +5807,8 @@ static int rk_mpp_hw_power_on(struct rk_mpp_hw *hw)
 	ret = pm_runtime_resume_and_get(hw->dev);
 	if (ret < 0)
 		return ret;
+
+	rk_mpp_hw_apply_clk_rates(hw);
 
 	ret = reset_control_deassert(hw->resets);
 	if (ret)
@@ -8124,6 +8182,10 @@ static int rk_mpp_hw_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return ret;
 	hw->num_clks = ret;
+
+	ret = rk_mpp_hw_read_clk_rates(hw);
+	if (ret)
+		return ret;
 
 	hw->resets = devm_reset_control_array_get_optional_exclusive(dev);
 	if (IS_ERR(hw->resets))
