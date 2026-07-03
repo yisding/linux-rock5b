@@ -357,8 +357,8 @@ Implemented
   decoder, transformed destination-corner selection, color-fill core-mask
   dispatch, BSP request task-count limits and return codes, legacy/modern
   version-query strings, positive success returns, and absent-RGA2 failure,
-  mixed RGA2/RGA3 multi-task
-  classification with per-task core-mask forcing, request-id removal on terminal
+  mixed RGA2/RGA3 multi-task classification with per-task core-mask forcing and
+  RGA3-to-RGA2 core handoff/requeue selection, request-id removal on terminal
   submit, request create/cancel ioctl id allocation, usercopy, and miss handling,
   legacy ``RGA_BLIT_ASYNC`` acquire-fence ioctls that copy a release-fence fd
   back through ``rga_req.out_fence_fd`` before deferred dispatch,
