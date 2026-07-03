@@ -21,7 +21,9 @@ Implemented
   ``/dev/mpp_service`` file descriptors.  Switching sessions closes the
   current staged job and starts a distinct job for subsequent register/poll
   messages, including when a later batch entry switches back to an earlier
-  session.
+  session.  Invalid descriptors are reported in the batch entry's
+  ``mpp_bat_msg.ret`` field as ``-EBADF``, and ``MPP_BAT_MSG_DONE`` entries
+  are consumed as no-op markers.
 * RK3588 BSP-style RKVENC2/RKVDEC2 platform-device binding with devm-managed
   MMIO, IRQ, clock, and reset discovery.
 * ``MPP_CMD_QUERY_HW_SUPPORT`` from bound RK3588 MPP hardware cores.
@@ -225,7 +227,8 @@ Implemented
   RKVENC2 DCHS tx/rx id remapping and release, independent-core DCHS id
   capacity, ``POLL_HW_IRQ``
   flexible-buffer sizing, RKVENC2 slice-mode detection and slice FIFO
-  overflow/final-slice reporting, and ``SET_SESSION_FD`` batch job splitting.
+  overflow/final-slice reporting, and ``SET_SESSION_FD`` invalid-fd status,
+  done-marker handling, and batch job splitting.
 
 Recognized But Unsupported
 --------------------------

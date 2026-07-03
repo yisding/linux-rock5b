@@ -2304,6 +2304,9 @@ static void rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw,
 static bool rk_mpp_job_rkvdec_rcb_enabled(struct rk_mpp_job *job);
 static void rk_mpp_rkvenc2_dchs_patch(struct rk_mpp_job *job);
 static void rk_mpp_rkvenc2_dchs_release(struct rk_mpp_job *job);
+static int rk_mpp_switch_session(struct rk_mpp_session **session,
+				 struct fd *held_fd,
+				 const struct rk_mpp_msg_v1 *msg);
 
 static void __user *rk_mpp_kunit_user_payload(struct kunit *test,
 					      const void *src, size_t size)
@@ -3887,6 +3890,54 @@ static void rk_mpp_rkvdec_rcb_width_gate_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, rk_mpp_job_rkvdec_rcb_enabled(&job));
 }
 
+static void rk_mpp_switch_session_status_kunit(struct kunit *test)
+{
+	struct rk_mpp_session session = {};
+	struct rk_mpp_session *active = &session;
+	struct fd held_fd = {};
+	struct mpp_bat_msg bat = {
+		.fd = U32_MAX,
+		.ret = 1234,
+	};
+	struct mpp_bat_msg out = {};
+	struct rk_mpp_msg_v1 msg = {};
+	void __user *user;
+	unsigned long uncopied;
+
+	user = rk_mpp_kunit_user_payload(test, &bat, sizeof(bat));
+	KUNIT_ASSERT_NOT_NULL(test, user);
+	msg.data_ptr = (uintptr_t)user;
+	msg.size = sizeof(bat);
+
+	KUNIT_EXPECT_EQ(test, rk_mpp_switch_session(&active, &held_fd, &msg),
+			0);
+	KUNIT_EXPECT_PTR_EQ(test, active, &session);
+	KUNIT_EXPECT_PTR_EQ(test, fd_file(held_fd), NULL);
+	uncopied = copy_from_user(&out, user, sizeof(out));
+	KUNIT_EXPECT_EQ(test, uncopied, 0UL);
+	KUNIT_EXPECT_EQ(test, out.ret, -EBADF);
+	KUNIT_EXPECT_EQ(test, out.fd, U32_MAX);
+	KUNIT_EXPECT_EQ(test, out.flag, 0ULL);
+
+	bat.flag = MPP_BAT_MSG_DONE;
+	bat.fd = U32_MAX;
+	bat.ret = 77;
+	out = (struct mpp_bat_msg){};
+	user = rk_mpp_kunit_user_payload(test, &bat, sizeof(bat));
+	KUNIT_ASSERT_NOT_NULL(test, user);
+	msg.data_ptr = (uintptr_t)user;
+
+	KUNIT_EXPECT_EQ(test, rk_mpp_switch_session(&active, &held_fd, &msg),
+			0);
+	KUNIT_EXPECT_PTR_EQ(test, active, &session);
+	KUNIT_EXPECT_PTR_EQ(test, fd_file(held_fd), NULL);
+	uncopied = copy_from_user(&out, user, sizeof(out));
+	KUNIT_EXPECT_EQ(test, uncopied, 0UL);
+	KUNIT_EXPECT_EQ(test, out.ret, 77);
+	KUNIT_EXPECT_EQ(test, out.fd, U32_MAX);
+	KUNIT_EXPECT_EQ(test, out.flag, (__u64)MPP_BAT_MSG_DONE);
+}
+
 static void rk_mpp_batch_session_switch_split_kunit(struct kunit *test)
 {
 	struct rk_mpp_session session0 = {};
@@ -3976,6 +4027,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_rkvenc2_dchs_independent_cores_kunit),
 	KUNIT_CASE(rk_mpp_rcb_invalid_index_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec_rcb_width_gate_kunit),
+	KUNIT_CASE(rk_mpp_switch_session_status_kunit),
 	KUNIT_CASE(rk_mpp_batch_session_switch_split_kunit),
 	{}
 };
