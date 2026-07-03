@@ -9184,6 +9184,9 @@ static void rk_rga3_colorkey_emit_kunit(struct kunit *test)
 	memset(cmd, 0, sizeof(cmd));
 	job.cmd_ready = false;
 	task.src_trans_mode = 0x1f;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
 	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_CTRL_OFFSET / 4],
@@ -9192,6 +9195,10 @@ static void rk_rga3_colorkey_emit_kunit(struct kunit *test)
 			expected_min);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_TOP_KEY_MAX_OFFSET / 4],
 			expected_max);
+
+	task.src_trans_mode = 0x1d;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), -EOPNOTSUPP);
 }
 
 static void rk_rga3_alpha_rotate_emit_kunit(struct kunit *test)
