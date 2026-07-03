@@ -235,7 +235,7 @@ Implemented
   hard-CCU idle/add-mode descriptor values, hard-CCU all-core work-mask
   selection, fixed-RCB link-latch programming, decoder RCB min-width gating,
   CCU coordinator removal cleanup for queued and active dependent-core jobs,
-  MPP core-counter routing, IOMMU fault target matching,
+  MPP core-counter and per-core timing routing, IOMMU fault target matching,
   ``INIT_TRANS_TABLE`` ``u16`` storage and boundary behavior,
   ``RELEASE_FD`` import-cache sweeping across all DMA-device mappings for one
   fd while preserving other fd imports,
