@@ -1007,7 +1007,9 @@ struct rk_rga_acquire_fd {
 
 struct rk_rga_job {
 	struct list_head node;
+	struct list_head session_node;
 	struct rk_rga_hw *hw;
+	struct rk_rga_session *session;
 	struct work_struct acquire_work;
 	refcount_t refs;
 	struct rga_req *tasks;
@@ -1039,6 +1041,7 @@ struct rk_rga_job {
 	int irq_result;
 	int result;
 	bool queued;
+	bool session_linked;
 	bool cmd_ready;
 	bool irq_seen;
 	bool done;
@@ -1081,8 +1084,12 @@ struct rk_rga_hw {
 
 struct rk_rga_session {
 	struct mutex lock;
+	spinlock_t job_lock;
+	wait_queue_head_t job_wait;
 	struct idr imports;
 	struct idr requests;
+	struct list_head jobs;
+	bool closing;
 };
 
 struct rk_rga_service {
@@ -1124,6 +1131,16 @@ struct rk_rga_service {
 static struct rk_rga_service rk_rga;
 
 static int rk_rga_release(struct inode *inode, struct file *file);
+
+static void rk_rga_session_init(struct rk_rga_session *session)
+{
+	mutex_init(&session->lock);
+	spin_lock_init(&session->job_lock);
+	init_waitqueue_head(&session->job_wait);
+	idr_init(&session->imports);
+	idr_init(&session->requests);
+	INIT_LIST_HEAD(&session->jobs);
+}
 
 static int rk_rga_core_counter_index(u32 core_mask)
 {
@@ -2223,6 +2240,23 @@ static void rk_rga_job_clear_mappings(struct rk_rga_job *job)
 	job->mapping_count = 0;
 }
 
+static void rk_rga_job_cancel_acquire_callbacks(struct rk_rga_job *job)
+{
+	if (!job->acquire_waiters)
+		return;
+
+	for (u32 i = 0; i < job->acquire_fence_count; i++) {
+		struct rk_rga_fence_waiter *waiter = &job->acquire_waiters[i];
+
+		if (!waiter->job)
+			continue;
+
+		dma_fence_remove_callback(job->acquire_fences[i],
+					  &waiter->cb);
+		waiter->job = NULL;
+	}
+}
+
 static size_t rk_rga_cmd_size(struct rk_rga_hw *hw)
 {
 	if (hw->type == RK_RGA_HW_RGA3)
@@ -2473,6 +2507,7 @@ static void rk_rga_job_free(struct rk_rga_job *job)
 				    RK_RGA_RELEASE_FENCE_ABORT_ERR);
 		dma_fence_put(job->release_fence);
 	}
+	rk_rga_job_cancel_acquire_callbacks(job);
 	rk_rga_job_free_cmd(job);
 	rk_rga_job_clear_mappings(job);
 	rk_rga_put_import_array(job->imports, job->import_count);
@@ -2492,6 +2527,53 @@ static void rk_rga_job_put(struct rk_rga_job *job)
 {
 	if (refcount_dec_and_test(&job->refs))
 		rk_rga_job_free(job);
+}
+
+static int rk_rga_session_track_job(struct rk_rga_session *session,
+				    struct rk_rga_job *job)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	rk_rga_job_get(job);
+	spin_lock_irqsave(&session->job_lock, flags);
+	if (session->closing) {
+		ret = -ESHUTDOWN;
+	} else {
+		job->session = session;
+		job->session_linked = true;
+		list_add_tail(&job->session_node, &session->jobs);
+	}
+	spin_unlock_irqrestore(&session->job_lock, flags);
+
+	if (ret)
+		rk_rga_job_put(job);
+
+	return ret;
+}
+
+static void rk_rga_job_unlink_session(struct rk_rga_job *job)
+{
+	struct rk_rga_session *session = job->session;
+	unsigned long flags;
+	bool linked = false;
+
+	if (!session)
+		return;
+
+	spin_lock_irqsave(&session->job_lock, flags);
+	if (job->session_linked) {
+		list_del_init(&job->session_node);
+		job->session_linked = false;
+		job->session = NULL;
+		linked = true;
+	}
+	spin_unlock_irqrestore(&session->job_lock, flags);
+
+	if (linked) {
+		wake_up_all(&session->job_wait);
+		rk_rga_job_put(job);
+	}
 }
 
 static void rk_rga_job_forget_release_fence_fd(struct rk_rga_job *job, int fd)
@@ -2516,6 +2598,7 @@ static void rk_rga_job_acquire_work(struct work_struct *work);
 static void rk_rga_job_init(struct rk_rga_job *job)
 {
 	INIT_LIST_HEAD(&job->node);
+	INIT_LIST_HEAD(&job->session_node);
 	INIT_WORK(&job->acquire_work, rk_rga_job_acquire_work);
 	refcount_set(&job->refs, 1);
 	init_waitqueue_head(&job->wait);
@@ -2837,6 +2920,48 @@ static void rk_rga_job_queue_acquire_work(struct rk_rga_job *job)
 		queue_work(system_highpri_wq, &job->acquire_work);
 }
 
+static bool rk_rga_job_is_pending_acquire(struct rk_rga_job *job)
+{
+	return job->acquire_waiters && !job->queued && !job->hw &&
+	       !job->done && !READ_ONCE(job->result);
+}
+
+static void rk_rga_job_abort_pending_acquire(struct rk_rga_job *job,
+					     int result)
+{
+	rk_rga_job_cancel_acquire_callbacks(job);
+	rk_rga_job_set_acquire_result(job, result);
+	rk_rga_job_queue_acquire_work(job);
+}
+
+static void rk_rga_session_abort_pending_acquire_jobs(
+	struct rk_rga_session *session, int result)
+{
+	for (;;) {
+		struct rk_rga_job *job = NULL;
+		unsigned long flags;
+		bool found = false;
+
+		spin_lock_irqsave(&session->job_lock, flags);
+		list_for_each_entry(job, &session->jobs, session_node) {
+			if (rk_rga_job_is_pending_acquire(job)) {
+				rk_rga_job_get(job);
+				found = true;
+				break;
+			}
+		}
+		if (!found)
+			job = NULL;
+		spin_unlock_irqrestore(&session->job_lock, flags);
+
+		if (!job)
+			return;
+
+		rk_rga_job_abort_pending_acquire(job, result);
+		rk_rga_job_put(job);
+	}
+}
+
 static void rk_rga_job_acquire_cb(struct dma_fence *fence,
 				  struct dma_fence_cb *cb)
 {
@@ -2844,6 +2969,9 @@ static void rk_rga_job_acquire_cb(struct dma_fence *fence,
 		container_of(cb, struct rk_rga_fence_waiter, cb);
 	struct rk_rga_job *job = waiter->job;
 	int status;
+
+	if (!job)
+		return;
 
 	status = dma_fence_get_status(fence);
 	if (status < 0)
@@ -2932,6 +3060,7 @@ static void rk_rga_job_complete(struct rk_rga_job *job, int result)
 	atomic_inc(&rk_rga.completed_job_count);
 	if (hw)
 		rk_rga_hw_put(hw);
+	rk_rga_job_unlink_session(job);
 }
 
 static void rk_rga_job_complete_queued(struct rk_rga_job *job, int result)
@@ -6971,9 +7100,7 @@ static void rk_rga_release_configured_request_kunit(struct kunit *test)
 
 	session = kzalloc_obj(*session, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, session);
-	mutex_init(&session->lock);
-	idr_init(&session->requests);
-	idr_init(&session->imports);
+	rk_rga_session_init(session);
 	file.private_data = session;
 
 	request = kzalloc_obj(*request, GFP_KERNEL);
@@ -7036,6 +7163,108 @@ static void rk_rga_release_configured_request_kunit(struct kunit *test)
 	rk_rga_import_put(dst_import);
 	close_fd(acquire_fd);
 	dma_fence_put(acquire_fence);
+}
+
+static void rk_rga_release_pending_acquire_job_kunit(struct kunit *test)
+{
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_RGBA_8888);
+	struct rk_rga_session *session;
+	struct rk_rga_import *src_import;
+	struct rk_rga_import *dst_import;
+	struct dma_fence *acquire_fence;
+	struct dma_fence *release_fence;
+	struct file file = {};
+	void __user *task_user;
+	unsigned long uncopied;
+	int acquire_fd;
+	int release_fd;
+	long ret;
+
+	task_user = rk_rga_kunit_user_buffer(test, sizeof(task));
+	KUNIT_ASSERT_NOT_NULL(test, task_user);
+
+	acquire_fence = rk_rga_kunit_alloc_fence();
+	KUNIT_ASSERT_NOT_NULL(test, acquire_fence);
+	acquire_fd = rk_rga_kunit_install_fence_fd(acquire_fence);
+	KUNIT_ASSERT_GE(test, acquire_fd, 0);
+
+	session = kzalloc_obj(*session, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, session);
+	rk_rga_session_init(session);
+	file.private_data = session;
+
+	src_import = rk_rga_kunit_import(test);
+	dst_import = rk_rga_kunit_import(test);
+	KUNIT_ASSERT_NOT_NULL(test, src_import);
+	KUNIT_ASSERT_NOT_NULL(test, dst_import);
+	refcount_inc(&src_import->refs);
+	refcount_inc(&dst_import->refs);
+	src_import->iova = 0x10000000;
+	src_import->size = (size_t)1920 * 1080 * 4;
+	dst_import->iova = 0x20000000;
+	dst_import->size = (size_t)1280 * 720 * 4;
+
+	KUNIT_ASSERT_EQ(test,
+			idr_alloc(&session->imports, src_import, 81, 82,
+				  GFP_KERNEL),
+			81);
+	KUNIT_ASSERT_EQ(test,
+			idr_alloc(&session->imports, dst_import, 82, 83,
+				  GFP_KERNEL),
+			82);
+
+	mutex_init(&rk_rga.hw_lock);
+	INIT_LIST_HEAD(&rk_rga.hw_list);
+	spin_lock_init(&rk_rga.fence_lock);
+	rk_rga.fence_context = dma_fence_context_alloc(1);
+	rk_rga.fence_seqno = 0;
+
+	task.handle_flag = 1;
+	task.feature.user_close_fence = 1;
+	task.in_fence_fd = acquire_fd;
+	task.src.yrgb_addr = 81;
+	task.src.uv_addr = 0;
+	task.src.v_addr = 0;
+	task.dst.yrgb_addr = 82;
+	task.dst.uv_addr = 0;
+	task.dst.v_addr = 0;
+	task.out_fence_fd = -1;
+
+	uncopied = copy_to_user(task_user, &task, sizeof(task));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+
+	ret = rk_rga_ioctl_blit((unsigned long)task_user, session,
+				RGA_BLIT_ASYNC);
+	KUNIT_ASSERT_EQ(test, ret, 0L);
+	KUNIT_EXPECT_EQ(test, refcount_read(&src_import->refs), 3);
+	KUNIT_EXPECT_EQ(test, refcount_read(&dst_import->refs), 3);
+
+	uncopied = copy_from_user(&task, task_user, sizeof(task));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+	release_fd = task.out_fence_fd;
+	KUNIT_ASSERT_GE(test, release_fd, 0);
+
+	release_fence = sync_file_get_fence(release_fd);
+	KUNIT_ASSERT_NOT_NULL(test, release_fence);
+	KUNIT_EXPECT_EQ(test, dma_fence_get_status(release_fence), 0);
+
+	KUNIT_EXPECT_EQ(test, rk_rga_release(NULL, &file), 0);
+	KUNIT_EXPECT_PTR_EQ(test, file.private_data, NULL);
+	KUNIT_EXPECT_EQ(test, dma_fence_get_status(release_fence), -EFAULT);
+	KUNIT_EXPECT_EQ(test, refcount_read(&src_import->refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&dst_import->refs), 1);
+
+	rk_rga_fence_signal(acquire_fence, 0);
+	KUNIT_EXPECT_EQ(test, dma_fence_get_status(release_fence), -EFAULT);
+
+	close_fd(release_fd);
+	dma_fence_put(release_fence);
+	close_fd(acquire_fd);
+	dma_fence_put(acquire_fence);
+	rk_rga_import_put(src_import);
+	rk_rga_import_put(dst_import);
 }
 
 static void rk_rga_request_reconfig_gauss_kunit(struct kunit *test)
@@ -7193,9 +7422,7 @@ static void rk_rga_legacy_blit_async_acquire_kunit(struct kunit *test)
 	uncopied = copy_to_user(task_user, &task, sizeof(task));
 	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
 
-	mutex_init(&session.lock);
-	idr_init(&session.imports);
-	idr_init(&session.requests);
+	rk_rga_session_init(&session);
 	src_import = rk_rga_kunit_import(test);
 	dst_import = rk_rga_kunit_import(test);
 	KUNIT_ASSERT_NOT_NULL(test, src_import);
@@ -7316,9 +7543,7 @@ static void rk_rga_request_submit_async_acquire_kunit(struct kunit *test)
 	uncopied = copy_to_user(request_user, &user, sizeof(user));
 	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
 
-	mutex_init(&session.lock);
-	idr_init(&session.requests);
-	idr_init(&session.imports);
+	rk_rga_session_init(&session);
 	request = kzalloc_obj(*request, GFP_KERNEL);
 	src_import = rk_rga_kunit_import(test);
 	dst_import = rk_rga_kunit_import(test);
@@ -11085,6 +11310,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_request_config_ioctl_acquire_kunit),
 	KUNIT_CASE(rk_rga_request_cancel_configured_ioctl_kunit),
 	KUNIT_CASE(rk_rga_release_configured_request_kunit),
+	KUNIT_CASE(rk_rga_release_pending_acquire_job_kunit),
 	KUNIT_CASE(rk_rga_request_reconfig_gauss_kunit),
 	KUNIT_CASE(rk_rga_legacy_blit_async_acquire_kunit),
 	KUNIT_CASE(rk_rga_request_submit_async_acquire_kunit),
@@ -14282,7 +14508,8 @@ static void rk_rga_job_acquire_work(struct work_struct *work)
 	rk_rga_job_put(job);
 }
 
-static int rk_rga_job_submit(struct rk_rga_job *job, int *release_fence_fd,
+static int rk_rga_job_submit(struct rk_rga_session *session,
+			     struct rk_rga_job *job, int *release_fence_fd,
 			     bool *deferred)
 {
 	bool acquire_pending = false;
@@ -14294,6 +14521,10 @@ static int rk_rga_job_submit(struct rk_rga_job *job, int *release_fence_fd,
 		*deferred = false;
 
 	ret = rk_rga_job_prepare_release_fence(job);
+	if (ret)
+		return ret;
+
+	ret = rk_rga_session_track_job(session, job);
 	if (ret)
 		return ret;
 
@@ -14890,7 +15121,7 @@ static long rk_rga_ioctl_request_submit(unsigned long arg,
 		return rk_rga_request_ioctl_ret(ret);
 
 	if (run) {
-		ret = rk_rga_job_submit(job, &release_fence_fd, NULL);
+		ret = rk_rga_job_submit(session, job, &release_fence_fd, NULL);
 		if (ret) {
 			ret = rk_rga_request_ioctl_ret(ret);
 		} else if (user.sync_mode == RGA_BLIT_ASYNC) {
@@ -15072,7 +15303,7 @@ static long rk_rga_ioctl_blit(unsigned long arg, struct rk_rga_session *session,
 		return ret;
 	}
 
-	ret = rk_rga_job_submit(job, &release_fence_fd, NULL);
+	ret = rk_rga_job_submit(session, job, &release_fence_fd, NULL);
 	if (!ret && sync_mode == RGA_BLIT_ASYNC) {
 		if (release_fence_fd < 0) {
 			ret = -EIO;
@@ -15291,12 +15522,22 @@ static int rk_rga_open(struct inode *inode, struct file *file)
 	if (!session)
 		return -ENOMEM;
 
-	mutex_init(&session->lock);
-	idr_init(&session->imports);
-	idr_init(&session->requests);
+	rk_rga_session_init(session);
 	file->private_data = session;
 
 	return nonseekable_open(inode, file);
+}
+
+static bool rk_rga_session_jobs_empty(struct rk_rga_session *session)
+{
+	unsigned long flags;
+	bool empty;
+
+	spin_lock_irqsave(&session->job_lock, flags);
+	empty = list_empty(&session->jobs);
+	spin_unlock_irqrestore(&session->job_lock, flags);
+
+	return empty;
 }
 
 static int rk_rga_release(struct inode *inode, struct file *file)
@@ -15304,10 +15545,18 @@ static int rk_rga_release(struct inode *inode, struct file *file)
 	struct rk_rga_session *session = file->private_data;
 	struct rk_rga_import *import;
 	struct rk_rga_request *request;
+	unsigned long flags;
 	int id;
 
 	if (!session)
 		return 0;
+
+	spin_lock_irqsave(&session->job_lock, flags);
+	session->closing = true;
+	spin_unlock_irqrestore(&session->job_lock, flags);
+
+	rk_rga_session_abort_pending_acquire_jobs(session, -EFAULT);
+	wait_event(session->job_wait, rk_rga_session_jobs_empty(session));
 
 	idr_for_each_entry(&session->imports, import, id)
 		rk_rga_import_put(import);
