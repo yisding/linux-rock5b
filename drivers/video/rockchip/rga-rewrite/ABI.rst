@@ -261,10 +261,14 @@ Implemented
   ``ffmpeg-rockchip`` for Rockchip RFBC DRM frames are accepted for the BSP RGA2P
   YUV source-format subset, including the current 8-bit YUV420, compact 10-bit
   YUV420, and compact 10-bit YUV422 source profiles, and programmed through the
-  RGA2 FBCIN register aliases while keeping the destination raster.
+  RGA2 FBCIN register aliases while keeping the destination raster.  AFBC32x8
+  split-mode source images from current ``librga`` DRM/gralloc paths are
+  accepted for the BSP RGA2P RGB-family source-format subset and use the same
+  source-only FBCIN path.
   Pattern/alpha blend outside the alpha-bitmap and color-key subsets below,
   color-key outside the RGBA ``imcolorkey`` profile above, ROP outside the
-  ``imrop`` subset below, tile, AFBC32x8, RFBC destination, overlapping
+  ``imrop`` subset below, tile, YUV AFBC32x8, AFBC32x8 destination, RFBC
+  destination, overlapping
   in-place blits, in-place scaling/conversion/rotation, incompact 10-bit input,
   10-bit output, OSD, pre-intr, and gauss/NN-quantize variants outside the
   subsets below remain unsupported.
@@ -363,8 +367,8 @@ Implemented
   emission,
   acquire-fence fd ownership merging, acquire-fence pending/success/error
   status propagation, async acquire-callback error completion,
-  ffmpeg-facing RGA2 RFBC64x4 8/10-bit 4:2:0/4:2:2 source
-  profile selection and FBCIN command emission, IOMMU fault target matching,
+  ffmpeg-facing RGA2 RFBC64x4 8/10-bit 4:2:0/4:2:2 and RGB-family AFBC32x8
+  source profile selection and FBCIN command emission, IOMMU fault target matching,
   post-reset IOMMU refresh accounting, scheduler priority enqueue/aging,
   scheduler core-counter mapping,
   RGA3 tile8x8 raster/tile round-trip and tile-to-tile command emission,
