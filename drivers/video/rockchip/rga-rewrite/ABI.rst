@@ -430,8 +430,9 @@ Implemented
   emission, RGA3 ``librga`` centered RGB rotate destination-offset emission,
   RGA3 ``librga`` ``immakeBorder()`` reflect top/bottom command emission,
   RGA3 ``librga`` AFBC16x16 copy profile selection and FBCD/FBCE command
-  emission including RGB-family/compact-10-bit read/writeback and source
-  active-offset handling, RGA3 tile8x8 profile selection and stride emission, RGA3
+  emission including RGB-family/compact-10-bit read/writeback, ffmpeg
+  AFBC-to-AFBC filter copies, and source active-offset handling, RGA3 tile8x8
+  profile selection and stride emission, RGA3
   pattern-backed 8/10-bit mixed-depth ``librga`` alpha-YUV overlay,
   no-pattern semiplanar YUV alpha conversion, and AFBC writeback emission,
   ``librga`` global-alpha register emission, RGA3 ``librga`` three-channel
