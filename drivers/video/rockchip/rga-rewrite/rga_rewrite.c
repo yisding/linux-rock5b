@@ -1123,6 +1123,8 @@ struct rk_rga_service {
 
 static struct rk_rga_service rk_rga;
 
+static int rk_rga_release(struct inode *inode, struct file *file);
+
 static int rk_rga_core_counter_index(u32 core_mask)
 {
 	switch (core_mask) {
@@ -6810,6 +6812,232 @@ static void rk_rga_request_config_ioctl_acquire_kunit(struct kunit *test)
 	idr_destroy(&session.imports);
 }
 
+static void rk_rga_request_cancel_configured_ioctl_kunit(struct kunit *test)
+{
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_RGBA_8888);
+	u32 coeffs[3] = { 7, 8, 9 };
+	struct rga_user_request user = {
+		.task_num = 1,
+		.id = 13,
+		.sync_mode = RGA_BLIT_ASYNC,
+	};
+	struct rk_rga_session session = {};
+	struct rk_rga_request *request;
+	struct rk_rga_import *src_import;
+	struct rk_rga_import *dst_import;
+	struct dma_fence *acquire_fence;
+	void __user *task_user;
+	void __user *request_user;
+	void __user *cancel_user;
+	void __user *coeff_user;
+	unsigned int acquire_base_refs;
+	unsigned long uncopied;
+	__u32 cancel_id = 13;
+	int acquire_fd;
+	long ret;
+
+	task_user = rk_rga_kunit_user_buffer(test, sizeof(task));
+	request_user = rk_rga_kunit_user_buffer(test, sizeof(user));
+	cancel_user = rk_rga_kunit_user_buffer(test, sizeof(cancel_id));
+	coeff_user = rk_rga_kunit_user_buffer(test, sizeof(coeffs));
+	KUNIT_ASSERT_NOT_NULL(test, task_user);
+	KUNIT_ASSERT_NOT_NULL(test, request_user);
+	KUNIT_ASSERT_NOT_NULL(test, cancel_user);
+	KUNIT_ASSERT_NOT_NULL(test, coeff_user);
+
+	acquire_fence = rk_rga_kunit_alloc_fence();
+	KUNIT_ASSERT_NOT_NULL(test, acquire_fence);
+	acquire_fd = rk_rga_kunit_install_fence_fd(acquire_fence);
+	KUNIT_ASSERT_GE(test, acquire_fd, 0);
+	acquire_base_refs = kref_read(&acquire_fence->refcount);
+
+	task.handle_flag = 1;
+	task.feature.user_close_fence = 1;
+	task.src.yrgb_addr = 61;
+	task.src.uv_addr = 0;
+	task.src.v_addr = 0;
+	task.dst.yrgb_addr = 62;
+	task.dst.uv_addr = 0;
+	task.dst.v_addr = 0;
+	task.feature.global_alpha_en = true;
+	task.fg_global_alpha = 0xfe;
+	task.gauss_config.size = 3;
+	task.gauss_config.coe_ptr = (uintptr_t)coeff_user;
+	user.task_ptr = (uintptr_t)task_user;
+	user.acquire_fence_fd = acquire_fd;
+
+	uncopied = copy_to_user(task_user, &task, sizeof(task));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+	uncopied = copy_to_user(request_user, &user, sizeof(user));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+	uncopied = copy_to_user(cancel_user, &cancel_id, sizeof(cancel_id));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+	uncopied = copy_to_user(coeff_user, coeffs, sizeof(coeffs));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+
+	mutex_init(&session.lock);
+	idr_init(&session.requests);
+	idr_init(&session.imports);
+
+	request = kzalloc_obj(*request, GFP_KERNEL);
+	src_import = rk_rga_kunit_import(test);
+	dst_import = rk_rga_kunit_import(test);
+	KUNIT_ASSERT_NOT_NULL(test, request);
+	KUNIT_ASSERT_NOT_NULL(test, src_import);
+	KUNIT_ASSERT_NOT_NULL(test, dst_import);
+	src_import->iova = 0x10000000;
+	src_import->size = (size_t)1920 * 1080 * 4;
+	dst_import->iova = 0x20000000;
+	dst_import->size = (size_t)1280 * 720 * 4;
+
+	KUNIT_ASSERT_EQ(test,
+			idr_alloc(&session.requests, request, 13, 14,
+				  GFP_KERNEL),
+			13);
+	KUNIT_ASSERT_EQ(test,
+			idr_alloc(&session.imports, src_import, 61, 62,
+				  GFP_KERNEL),
+			61);
+	KUNIT_ASSERT_EQ(test,
+			idr_alloc(&session.imports, dst_import, 62, 63,
+				  GFP_KERNEL),
+			62);
+
+	ret = rk_rga_ioctl_request_submit((unsigned long)request_user,
+					  &session, false);
+	KUNIT_ASSERT_EQ(test, ret, 0L);
+	KUNIT_EXPECT_TRUE(test, request->configured);
+	KUNIT_EXPECT_NOT_NULL(test, request->gauss_coeffs);
+	KUNIT_EXPECT_EQ(test, refcount_read(&src_import->refs), 2);
+	KUNIT_EXPECT_EQ(test, refcount_read(&dst_import->refs), 2);
+	KUNIT_EXPECT_EQ(test, kref_read(&acquire_fence->refcount),
+			acquire_base_refs + 1);
+
+	ret = rk_rga_ioctl_request_cancel((unsigned long)cancel_user,
+					  &session);
+	KUNIT_EXPECT_EQ(test, ret, 0L);
+	KUNIT_EXPECT_PTR_EQ(test, idr_find(&session.requests, 13), NULL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&src_import->refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&dst_import->refs), 1);
+	KUNIT_EXPECT_EQ(test, kref_read(&acquire_fence->refcount),
+			acquire_base_refs);
+
+	KUNIT_EXPECT_PTR_EQ(test, idr_remove(&session.imports, 61),
+			    src_import);
+	KUNIT_EXPECT_PTR_EQ(test, idr_remove(&session.imports, 62),
+			    dst_import);
+	rk_rga_import_put(src_import);
+	rk_rga_import_put(dst_import);
+	close_fd(acquire_fd);
+	dma_fence_put(acquire_fence);
+	idr_destroy(&session.requests);
+	idr_destroy(&session.imports);
+}
+
+static void rk_rga_release_configured_request_kunit(struct kunit *test)
+{
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_RGBA_8888);
+	struct rga_user_request user = {
+		.task_num = 1,
+		.id = 14,
+	};
+	struct rk_rga_session *session;
+	struct rk_rga_request *request;
+	struct rk_rga_import *src_import;
+	struct rk_rga_import *dst_import;
+	struct dma_fence *acquire_fence;
+	struct file file = {};
+	void __user *task_user;
+	void __user *request_user;
+	unsigned int acquire_base_refs;
+	unsigned long uncopied;
+	int acquire_fd;
+	long ret;
+
+	task_user = rk_rga_kunit_user_buffer(test, sizeof(task));
+	request_user = rk_rga_kunit_user_buffer(test, sizeof(user));
+	KUNIT_ASSERT_NOT_NULL(test, task_user);
+	KUNIT_ASSERT_NOT_NULL(test, request_user);
+
+	acquire_fence = rk_rga_kunit_alloc_fence();
+	KUNIT_ASSERT_NOT_NULL(test, acquire_fence);
+	acquire_fd = rk_rga_kunit_install_fence_fd(acquire_fence);
+	KUNIT_ASSERT_GE(test, acquire_fd, 0);
+	acquire_base_refs = kref_read(&acquire_fence->refcount);
+
+	session = kzalloc_obj(*session, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, session);
+	mutex_init(&session->lock);
+	idr_init(&session->requests);
+	idr_init(&session->imports);
+	file.private_data = session;
+
+	request = kzalloc_obj(*request, GFP_KERNEL);
+	src_import = rk_rga_kunit_import(test);
+	dst_import = rk_rga_kunit_import(test);
+	KUNIT_ASSERT_NOT_NULL(test, request);
+	KUNIT_ASSERT_NOT_NULL(test, src_import);
+	KUNIT_ASSERT_NOT_NULL(test, dst_import);
+	refcount_inc(&src_import->refs);
+	refcount_inc(&dst_import->refs);
+	src_import->iova = 0x10000000;
+	src_import->size = (size_t)1920 * 1080 * 4;
+	dst_import->iova = 0x20000000;
+	dst_import->size = (size_t)1280 * 720 * 4;
+
+	KUNIT_ASSERT_EQ(test,
+			idr_alloc(&session->requests, request, 14, 15,
+				  GFP_KERNEL),
+			14);
+	KUNIT_ASSERT_EQ(test,
+			idr_alloc(&session->imports, src_import, 71, 72,
+				  GFP_KERNEL),
+			71);
+	KUNIT_ASSERT_EQ(test,
+			idr_alloc(&session->imports, dst_import, 72, 73,
+				  GFP_KERNEL),
+			72);
+
+	task.handle_flag = 1;
+	task.feature.user_close_fence = 1;
+	task.src.yrgb_addr = 71;
+	task.src.uv_addr = 0;
+	task.src.v_addr = 0;
+	task.dst.yrgb_addr = 72;
+	task.dst.uv_addr = 0;
+	task.dst.v_addr = 0;
+	user.task_ptr = (uintptr_t)task_user;
+	user.acquire_fence_fd = acquire_fd;
+	uncopied = copy_to_user(task_user, &task, sizeof(task));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+	uncopied = copy_to_user(request_user, &user, sizeof(user));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+
+	ret = rk_rga_ioctl_request_submit((unsigned long)request_user,
+					  session, false);
+	KUNIT_ASSERT_EQ(test, ret, 0L);
+	KUNIT_EXPECT_EQ(test, refcount_read(&src_import->refs), 3);
+	KUNIT_EXPECT_EQ(test, refcount_read(&dst_import->refs), 3);
+	KUNIT_EXPECT_EQ(test, kref_read(&acquire_fence->refcount),
+			acquire_base_refs + 1);
+
+	KUNIT_EXPECT_EQ(test, rk_rga_release(NULL, &file), 0);
+	KUNIT_EXPECT_PTR_EQ(test, file.private_data, NULL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&src_import->refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&dst_import->refs), 1);
+	KUNIT_EXPECT_EQ(test, kref_read(&acquire_fence->refcount),
+			acquire_base_refs);
+
+	rk_rga_import_put(src_import);
+	rk_rga_import_put(dst_import);
+	close_fd(acquire_fd);
+	dma_fence_put(acquire_fence);
+}
+
 static void rk_rga_request_reconfig_gauss_kunit(struct kunit *test)
 {
 	struct rga_req task =
@@ -10855,6 +11083,8 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_request_reconfig_resources_kunit),
 	KUNIT_CASE(rk_rga_request_reconfig_fences_kunit),
 	KUNIT_CASE(rk_rga_request_config_ioctl_acquire_kunit),
+	KUNIT_CASE(rk_rga_request_cancel_configured_ioctl_kunit),
+	KUNIT_CASE(rk_rga_release_configured_request_kunit),
 	KUNIT_CASE(rk_rga_request_reconfig_gauss_kunit),
 	KUNIT_CASE(rk_rga_legacy_blit_async_acquire_kunit),
 	KUNIT_CASE(rk_rga_request_submit_async_acquire_kunit),
