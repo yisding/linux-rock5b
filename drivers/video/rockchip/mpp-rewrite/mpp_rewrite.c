@@ -281,6 +281,10 @@ struct rk_mpp_service {
 	atomic_t started_rkvdec_core_count[RK_MPP_CORE_COUNTER_COUNT];
 	atomic64_t hw_total_ns;
 	atomic64_t hw_max_ns;
+	atomic64_t hw_total_rkvenc_core_ns[RK_MPP_CORE_COUNTER_COUNT];
+	atomic64_t hw_total_rkvdec_core_ns[RK_MPP_CORE_COUNTER_COUNT];
+	atomic64_t hw_max_rkvenc_core_ns[RK_MPP_CORE_COUNTER_COUNT];
+	atomic64_t hw_max_rkvdec_core_ns[RK_MPP_CORE_COUNTER_COUNT];
 	atomic_t queued_job_count;
 	atomic_t timeout_count;
 	atomic_t iommu_fault_count;
@@ -503,15 +507,45 @@ static void rk_mpp_debugfs_create_atomic64(const char *name, atomic64_t *value)
 			    &rk_mpp_debugfs_atomic64_fops);
 }
 
+static void
+rk_mpp_count_core_ns(atomic64_t rkvenc_counters[RK_MPP_CORE_COUNTER_COUNT],
+		     atomic64_t rkvdec_counters[RK_MPP_CORE_COUNTER_COUNT],
+		     const struct rk_mpp_hw *hw, u64 value, bool max)
+{
+	int index = rk_mpp_core_counter_index(hw);
+	atomic64_t *counter;
+
+	if (index < 0)
+		return;
+
+	if (hw->match->type == RK_MPP_DEVICE_RKVENC)
+		counter = &rkvenc_counters[index];
+	else
+		counter = &rkvdec_counters[index];
+
+	if (max)
+		rk_mpp_atomic64_max(counter, value);
+	else
+		atomic64_add(value, counter);
+}
+
 static void rk_mpp_job_note_hw_done(struct rk_mpp_job *job)
 {
+	u64 elapsed;
 	u64 start = job->hw_start_ns;
 
 	if (!start)
 		return;
 
-	job->hw_elapsed_ns += ktime_get_ns() - start;
+	elapsed = ktime_get_ns() - start;
+	job->hw_elapsed_ns += elapsed;
 	job->hw_start_ns = 0;
+	rk_mpp_count_core_ns(job->session->srv->hw_total_rkvenc_core_ns,
+			     job->session->srv->hw_total_rkvdec_core_ns,
+			     job->hw, elapsed, false);
+	rk_mpp_count_core_ns(job->session->srv->hw_max_rkvenc_core_ns,
+			     job->session->srv->hw_max_rkvdec_core_ns,
+			     job->hw, elapsed, true);
 }
 
 static void rk_mpp_job_record_hw_stats(struct rk_mpp_job *job)
@@ -8021,6 +8055,23 @@ rk_mpp_debugfs_create_core_counts(const char *prefix,
 	}
 }
 
+static void
+rk_mpp_debugfs_create_core_times(const char *prefix,
+				 atomic64_t rkvenc_counters[RK_MPP_CORE_COUNTER_COUNT],
+				 atomic64_t rkvdec_counters[RK_MPP_CORE_COUNTER_COUNT])
+{
+	char name[48];
+
+	for (u32 i = 0; i < RK_MPP_CORE_COUNTER_COUNT; i++) {
+		snprintf(name, sizeof(name), "%s_rkvenc_core%u",
+			 prefix, i);
+		rk_mpp_debugfs_create_atomic64(name, &rkvenc_counters[i]);
+		snprintf(name, sizeof(name), "%s_rkvdec_core%u",
+			 prefix, i);
+		rk_mpp_debugfs_create_atomic64(name, &rkvdec_counters[i]);
+	}
+}
+
 static void rk_mpp_hw_pm_disable(void *data)
 {
 	struct device *dev = data;
@@ -8396,6 +8447,12 @@ static int __init rk_mpp_init(void)
 					  rk_mpp_srv.started_rkvdec_core_count);
 	rk_mpp_debugfs_create_atomic64("hw_total_ns", &rk_mpp_srv.hw_total_ns);
 	rk_mpp_debugfs_create_atomic64("hw_max_ns", &rk_mpp_srv.hw_max_ns);
+	rk_mpp_debugfs_create_core_times("hw_total_ns",
+					 rk_mpp_srv.hw_total_rkvenc_core_ns,
+					 rk_mpp_srv.hw_total_rkvdec_core_ns);
+	rk_mpp_debugfs_create_core_times("hw_max_ns",
+					 rk_mpp_srv.hw_max_rkvenc_core_ns,
+					 rk_mpp_srv.hw_max_rkvdec_core_ns);
 	debugfs_create_atomic_t("queued_job_count", 0444,
 				rk_mpp_srv.debugfs_root,
 				&rk_mpp_srv.queued_job_count);
