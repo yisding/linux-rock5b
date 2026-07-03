@@ -157,15 +157,18 @@ Implemented
   reflect/wrap top/bottom source-to-destination tasks and reflect/wrap
   same-destination side-edge tasks, plus the current ``librga`` DRM-fourcc
   ``rga_copy_drm_fourcc_demo`` ``DRM_FORMAT_ABGR8888``/modifier-zero path after
-  userspace maps it to ``RK_FORMAT_RGBA_8888``.  The path requires imported dma-buf backed
-  source/destination images, rejects color-key and unsupported pattern
-  operations, and supports the 8-bit RGB/YUV plus semiplanar 10-bit YUV formats
-  exposed by common ``librga`` and ``ffmpeg-rockchip`` blit/scale/convert users.
+  userspace maps it to ``RK_FORMAT_RGBA_8888``.  The path requires MMU-mapped
+  source/destination images: modern handle requests use the session import
+  table, while legacy direct-buffer requests create job-owned temporary imports
+  from dma-buf fds or user virtual addresses.  It rejects color-key and
+  unsupported pattern operations, and supports the 8-bit RGB/YUV plus
+  semiplanar 10-bit YUV formats exposed by common ``librga`` and
+  ``ffmpeg-rockchip`` blit/scale/convert users.
   This also covers the current JeffyCN ``gstreamer-rockchip`` MPP plugin's
-  legacy ``c_RkRgaBlit()`` conversions: RGB-family input to NV12 for encoder
-  preprocessing, MPP-frame NV12/NV21-style dma-buf input to RGB-family output
-  with optional rotation, and planar I420/YV12-style fallback through RGA2 when
-  RGA3 cannot accept the format.
+  legacy ``c_RkRgaBlit()`` conversions: malloc-backed RGB-family input to
+  dma-buf NV12 for encoder preprocessing, MPP-frame NV12/NV21-style dma-buf
+  input to RGB-family output with optional rotation, and planar I420/YV12-style
+  fallback through RGA2 when RGA3 cannot accept the format.
   Explicit interpolation selectors from current ``librga`` resize calls are
   accepted on native RGA3 bitblits; like the BSP RGA3 register builder, the
   rewrite programs only the RGA3 scale direction and factor fields.
