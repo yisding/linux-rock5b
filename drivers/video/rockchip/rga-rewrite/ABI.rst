@@ -90,9 +90,12 @@ Implemented
   Hardware removal stops new dispatch, completes queued and active jobs with
   ``-ENODEV``, and signals any exported async release fence with that result.
 * Backend-aware core selection for prepared jobs.  The scheduler checks the
-  same supported-operation profile used by command generation, selects an RGA3
-  core for the current hardware-backed profile, and requires that core to match
-  the device that owns the job's dma-buf mappings.
+  same supported-operation profile used by command generation, selects the
+  least-loaded compatible RGA core for the current hardware-backed profile, and
+  requires that core to match the device that owns the job's dma-buf mappings.
+  Common bitblits that are accepted by both RGA3 and RGA2 participate in the
+  same load-based choice so the RK3588 RGA2 core can take work when the RGA3
+  cores are busier, matching the forward-port optional-core policy.
   BSP-compatible ``rga_req.core`` scheduler masks are honored for supported
   profiles: RGA3 core bits ``0x1``/``0x2`` select RGA3 cores and RGA2 bits
   ``0x4``/``0x8`` select RGA2 cores.  Unsupported profiles requested on a
