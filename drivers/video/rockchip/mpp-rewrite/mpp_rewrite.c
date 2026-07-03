@@ -3825,6 +3825,10 @@ static void rk_mpp_core_counter_kunit(struct kunit *test)
 {
 	atomic_t rkvenc[RK_MPP_CORE_COUNTER_COUNT];
 	atomic_t rkvdec[RK_MPP_CORE_COUNTER_COUNT];
+	atomic64_t rkvenc_ns[RK_MPP_CORE_COUNTER_COUNT];
+	atomic64_t rkvdec_ns[RK_MPP_CORE_COUNTER_COUNT];
+	atomic64_t rkvenc_max_ns[RK_MPP_CORE_COUNTER_COUNT];
+	atomic64_t rkvdec_max_ns[RK_MPP_CORE_COUNTER_COUNT];
 	struct rk_mpp_hw hw = {
 		.match = &rk_mpp_rkvenc2_core,
 		.core_id = 1,
@@ -3833,35 +3837,57 @@ static void rk_mpp_core_counter_kunit(struct kunit *test)
 	for (u32 i = 0; i < RK_MPP_CORE_COUNTER_COUNT; i++) {
 		atomic_set(&rkvenc[i], 0);
 		atomic_set(&rkvdec[i], 0);
+		atomic64_set(&rkvenc_ns[i], 0);
+		atomic64_set(&rkvdec_ns[i], 0);
+		atomic64_set(&rkvenc_max_ns[i], 0);
+		atomic64_set(&rkvdec_max_ns[i], 0);
 	}
 
 	KUNIT_EXPECT_EQ(test, rk_mpp_core_counter_index(&hw), 1);
 	rk_mpp_count_core(rkvenc, rkvdec, &hw);
+	rk_mpp_count_core_ns(rkvenc_ns, rkvdec_ns, &hw, 100, false);
+	rk_mpp_count_core_ns(rkvenc_max_ns, rkvdec_max_ns, &hw, 7, true);
+	rk_mpp_count_core_ns(rkvenc_max_ns, rkvdec_max_ns, &hw, 3, true);
 	KUNIT_EXPECT_EQ(test, atomic_read(&rkvenc[1]), 1);
 	KUNIT_EXPECT_EQ(test, atomic_read(&rkvdec[1]), 0);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&rkvenc_ns[1]), 100LL);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&rkvdec_ns[1]), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&rkvenc_max_ns[1]), 7LL);
 
 	hw.match = &rk_mpp_rkvdec2_core;
 	hw.core_id = 2;
 	KUNIT_EXPECT_EQ(test, rk_mpp_core_counter_index(&hw), 2);
 	rk_mpp_count_core(rkvenc, rkvdec, &hw);
+	rk_mpp_count_core_ns(rkvenc_ns, rkvdec_ns, &hw, 50, false);
+	rk_mpp_count_core_ns(rkvenc_max_ns, rkvdec_max_ns, &hw, 9, true);
 	KUNIT_EXPECT_EQ(test, atomic_read(&rkvenc[2]), 0);
 	KUNIT_EXPECT_EQ(test, atomic_read(&rkvdec[2]), 1);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&rkvenc_ns[2]), 0LL);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&rkvdec_ns[2]), 50LL);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&rkvdec_max_ns[2]), 9LL);
 
 	hw.core_id = RK_MPP_CORE_COUNTER_COUNT;
 	KUNIT_EXPECT_EQ(test, rk_mpp_core_counter_index(&hw), -EINVAL);
 	rk_mpp_count_core(rkvenc, rkvdec, &hw);
+	rk_mpp_count_core_ns(rkvenc_ns, rkvdec_ns, &hw, 1000, false);
 
 	hw.core_id = -1;
 	KUNIT_EXPECT_EQ(test, rk_mpp_core_counter_index(&hw), -EINVAL);
 	rk_mpp_count_core(rkvenc, rkvdec, &hw);
+	rk_mpp_count_core_ns(rkvenc_ns, rkvdec_ns, &hw, 1000, false);
 
 	hw.match = &rk_mpp_rkvenc2_ccu;
 	hw.core_id = 0;
 	KUNIT_EXPECT_EQ(test, rk_mpp_core_counter_index(&hw), -EINVAL);
 	rk_mpp_count_core(rkvenc, rkvdec, &hw);
+	rk_mpp_count_core_ns(rkvenc_ns, rkvdec_ns, &hw, 1000, false);
 
 	KUNIT_EXPECT_EQ(test, atomic_read(&rkvenc[1]), 1);
 	KUNIT_EXPECT_EQ(test, atomic_read(&rkvdec[2]), 1);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&rkvenc_ns[1]), 100LL);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&rkvdec_ns[2]), 50LL);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&rkvenc_max_ns[1]), 7LL);
+	KUNIT_EXPECT_EQ(test, atomic64_read(&rkvdec_max_ns[2]), 9LL);
 }
 
 static void rk_mpp_hw_select_rotation_kunit(struct kunit *test)
