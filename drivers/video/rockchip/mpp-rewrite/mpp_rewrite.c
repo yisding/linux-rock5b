@@ -4582,7 +4582,7 @@ static void rk_mpp_reset_session_public_cleanup_kunit(struct kunit *test)
 	mutex_init(&hw.run_lock);
 	INIT_DELAYED_WORK(&hw.timeout_work, rk_mpp_hw_timeout_work);
 
-	import = kzalloc_obj(*import, GFP_KERNEL);
+	import = kzalloc(sizeof(*import), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, import);
 	import->fd = 7;
 	refcount_set(&import->refs, 2);
@@ -4652,7 +4652,7 @@ static void rk_mpp_file_release_public_cleanup_kunit(struct kunit *test)
 	mutex_init(&srv.sched_lock);
 	INIT_LIST_HEAD(&srv.queued_jobs);
 
-	session = kzalloc_obj(*session, GFP_KERNEL);
+	session = kzalloc(sizeof(*session), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, session);
 	session->srv = &srv;
 	session->active_job_count = 1;
@@ -4663,7 +4663,7 @@ static void rk_mpp_file_release_public_cleanup_kunit(struct kunit *test)
 	refcount_set(&session->refs, 1);
 	file.private_data = session;
 
-	import = kzalloc_obj(*import, GFP_KERNEL);
+	import = kzalloc(sizeof(*import), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, import);
 	import->fd = 8;
 	refcount_set(&import->refs, 2);
