@@ -414,6 +414,7 @@ static void rk_mpp_job_put(struct rk_mpp_job *job);
 static bool rk_mpp_hw_take_active_if(struct rk_mpp_hw *hw,
 				     struct rk_mpp_job *match,
 				     u32 *irq_status);
+static void rk_mpp_hw_timeout_work(struct work_struct *work);
 static void rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu);
 static void
 rk_mpp_hw_abort_ccu_active_dependents(struct rk_mpp_hw *ccu,
@@ -424,6 +425,8 @@ static bool rk_mpp_job_rkvenc_slice_done(struct rk_mpp_job *job);
 static void rk_mpp_job_push_rkvenc_slice(struct rk_mpp_job *job, u32 value);
 static int rk_mpp_job_pop_rkvenc_slice(struct rk_mpp_job *job, u32 *value);
 static int rk_mpp_job_apply_rcb_info(struct rk_mpp_job *job);
+static void rk_mpp_session_abort_jobs(struct rk_mpp_session *session);
+static int rk_mpp_session_poll_job(struct rk_mpp_session *session, u32 flags);
 static struct rk_mpp_hw *
 rk_mpp_iommu_find_fault_hw(struct list_head *fault_hws,
 			   struct iommu_domain *domain,
@@ -4096,6 +4099,83 @@ static void rk_mpp_batch_session_switch_split_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&session1.refs), 1);
 }
 
+static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
+{
+	struct rk_mpp_service srv = {};
+	struct rk_mpp_session session = {
+		.srv = &srv,
+		.active_job_count = 2,
+	};
+	struct rk_mpp_hw hw = {};
+	struct rk_mpp_job *queued;
+	struct rk_mpp_job *active;
+
+	mutex_init(&srv.sched_lock);
+	INIT_LIST_HEAD(&srv.queued_jobs);
+	mutex_init(&session.lock);
+	INIT_LIST_HEAD(&session.imports);
+	INIT_LIST_HEAD(&session.active_jobs);
+	init_waitqueue_head(&session.wait);
+	spin_lock_init(&hw.lock);
+	mutex_init(&hw.run_lock);
+	INIT_DELAYED_WORK(&hw.timeout_work, rk_mpp_hw_timeout_work);
+
+	queued = kunit_kzalloc(test, sizeof(*queued), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, queued);
+	active = kunit_kzalloc(test, sizeof(*active), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, active);
+
+	queued->session = &session;
+	queued->hw = &hw;
+	queued->state = RK_MPP_JOB_ACTIVE;
+	queued->result = -EINPROGRESS;
+	refcount_set(&queued->refs, 3);
+	INIT_LIST_HEAD(&queued->link);
+	INIT_LIST_HEAD(&queued->session_link);
+	INIT_LIST_HEAD(&queued->sched_link);
+	INIT_LIST_HEAD(&queued->rkvdec_ccu_node);
+	INIT_LIST_HEAD(&queued->rkvdec_link_node);
+	list_add_tail(&queued->session_link, &session.active_jobs);
+	list_add_tail(&queued->sched_link, &srv.queued_jobs);
+	atomic_set(&hw.queued_job_count, 1);
+	atomic_set(&srv.queued_job_count, 1);
+
+	active->session = &session;
+	active->state = RK_MPP_JOB_ACTIVE;
+	active->result = -EINPROGRESS;
+	refcount_set(&active->refs, 2);
+	INIT_LIST_HEAD(&active->link);
+	INIT_LIST_HEAD(&active->session_link);
+	INIT_LIST_HEAD(&active->sched_link);
+	INIT_LIST_HEAD(&active->rkvdec_ccu_node);
+	INIT_LIST_HEAD(&active->rkvdec_link_node);
+	list_add_tail(&active->session_link, &session.active_jobs);
+
+	rk_mpp_session_abort_jobs(&session);
+
+	KUNIT_EXPECT_TRUE(test, list_empty(&session.active_jobs));
+	KUNIT_EXPECT_EQ(test, session.active_job_count, 0U);
+	KUNIT_EXPECT_TRUE(test, list_empty(&srv.queued_jobs));
+	KUNIT_EXPECT_TRUE(test, list_empty(&queued->session_link));
+	KUNIT_EXPECT_TRUE(test, list_empty(&queued->sched_link));
+	KUNIT_EXPECT_TRUE(test, list_empty(&active->session_link));
+	KUNIT_EXPECT_TRUE(test, list_empty(&active->sched_link));
+	KUNIT_EXPECT_EQ(test, queued->result, -ECANCELED);
+	KUNIT_EXPECT_EQ(test, active->result, -ECANCELED);
+	KUNIT_EXPECT_EQ(test, queued->state,
+			(enum rk_mpp_job_state)RK_MPP_JOB_DONE);
+	KUNIT_EXPECT_EQ(test, active->state,
+			(enum rk_mpp_job_state)RK_MPP_JOB_DONE);
+	KUNIT_EXPECT_EQ(test, refcount_read(&queued->refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&active->refs), 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&hw.queued_job_count), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&srv.queued_job_count), 0);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_session_poll_job(&session,
+						MPP_FLAGS_POLL_NON_BLOCK),
+			-EIO);
+}
+
 static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_check_cmd_v1_kunit),
 	KUNIT_CASE(rk_mpp_get_cmd_butt_kunit),
@@ -4136,6 +4216,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_rkvdec_rcb_width_gate_kunit),
 	KUNIT_CASE(rk_mpp_switch_session_status_kunit),
 	KUNIT_CASE(rk_mpp_batch_session_switch_split_kunit),
+	KUNIT_CASE(rk_mpp_session_abort_jobs_kunit),
 	{}
 };
 
