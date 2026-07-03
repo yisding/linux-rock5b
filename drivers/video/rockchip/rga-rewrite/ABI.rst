@@ -429,7 +429,8 @@ Implemented
   RGA3 ``librga`` RGB rotate, flip/mirror, and combined rotate/mirror
   emission, RGA3 ``librga`` centered RGB rotate destination-offset emission,
   RGA3 ``librga`` ``immakeBorder()`` reflect/wrap top/bottom command emission,
-  RGA3 ``librga`` AFBC16x16 copy profile selection and FBCD/FBCE command
+  RGA3 ``librga`` ``immakeBorder()`` reflect/wrap left/right side-edge command
+  emission, RGA3 ``librga`` AFBC16x16 copy profile selection and FBCD/FBCE command
   emission including RGB-family/compact-10-bit read/writeback, ffmpeg
   AFBC-to-AFBC filter copies, and source active-offset handling, RGA3 tile8x8
   profile selection and stride emission, RGA3
