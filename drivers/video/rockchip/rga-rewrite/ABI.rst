@@ -79,9 +79,10 @@ Implemented
   submitted sync/async job until completion.  ``release()`` marks the session
   closing, rejects newly tracked jobs, cancels unsignaled acquire-fence
   callbacks for jobs that have not reached hardware yet, completes those jobs
-  and their release fences with ``-EFAULT``, then waits for any already queued
-  or active jobs to leave the normal IRQ/timeout completion path before
-  dropping configured requests and imported buffers.
+  and their release fences with ``-EFAULT``, removes queued jobs owned by the
+  closing session before they can reach hardware, resets active jobs owned by
+  that session through the normal recovery path, then waits for the session job
+  list to drain before dropping configured requests and imported buffers.
 * Async pending-acquire handling for modern submit and legacy blit paths.  If
   an async job is blocked by an unsignaled acquire fence, the ioctl exports the
   release-fence fd, arms ``dma_fence`` callbacks, queues dispatch work when the
@@ -372,7 +373,8 @@ Implemented
   request-config ioctl staging with kernel-owned acquire-fd close and no
   release-fence export,
   request cancel and file-close cleanup of configured imports/fences,
-  file-close cleanup of async jobs pending on acquire fences,
+  file-close cleanup of async jobs pending on acquire fences and jobs already
+  queued on hardware,
   request create/cancel ioctl id allocation, usercopy, and miss handling,
   legacy ``RGA_BLIT_ASYNC`` acquire-fence ioctls that copy a release-fence fd
   back through ``rga_req.out_fence_fd`` before deferred dispatch,
