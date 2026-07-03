@@ -192,7 +192,7 @@ Implemented
   foreground WIN1 path, including BSP-matched 90-degree sizing for pattern and
   no-pattern A+B jobs.  The current public
   ``librga`` Porter-Duff modes SRC, DST, SRC_OVER, DST_OVER, SRC_IN, DST_IN,
-  SRC_OUT, DST_OUT, SRC_ATOP, DST_ATOP, and XOR are accepted; CLEAR and other
+  SRC_OUT, DST_OUT, SRC_ATOP, DST_ATOP, XOR, and CLEAR are accepted; other
   unlisted blend modes remain unsupported.  Mixed-depth 8/10-bit
   YUV-destination alpha, converted no-pattern YUV A+B->B, and compressed
   in-place write-back remain unsupported.
@@ -369,7 +369,7 @@ Implemented
   pattern-backed 8-bit ``librga`` alpha-YUV overlay and AFBC writeback emission,
   ``librga`` global-alpha register emission, RGA3 ``librga`` three-channel
   RGB alpha-composite routing/emission, current ``librga`` Porter-Duff blend-mode factor mapping
-  and CLEAR rejection, 10-bit YUV alpha-overlay and AFBC writeback emission, and
+  including CLEAR emission, 10-bit YUV alpha-overlay and AFBC writeback emission, and
   ffmpeg-facing RGA3 raster/FBC/alpha-overlay profile selection, P210-style
   unpacked 10-bit 4:2:2 stride/offset emission, plus
   destination-offset command
