@@ -362,6 +362,8 @@ Implemented
   submit, request config reconfiguration resource replacement,
   request config reconfiguration acquire-fence replacement,
   request config reconfiguration gauss-coefficient replacement and job cloning,
+  request-config ioctl staging with kernel-owned acquire-fd close and no
+  release-fence export,
   request create/cancel ioctl id allocation, usercopy, and miss handling,
   legacy ``RGA_BLIT_ASYNC`` acquire-fence ioctls that copy a release-fence fd
   back through ``rga_req.out_fence_fd`` before deferred dispatch,
