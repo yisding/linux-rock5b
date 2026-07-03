@@ -350,11 +350,11 @@ Implemented
 * RGA2 color palette for the current ``librga`` ``impalette`` sample path.
   The rewrite accepts the BSP two-command sequence emitted by userspace: first
   ``UPDATE_PALETTE_TABLE`` with the 16x16 RGBA8888 LUT image, then
-  ``COLOR_PALETTE`` from a same-size BPP8/YCbCr400 raster source to an
-  RGB-family raster destination.  Palette mode ``3`` and the little-endian
-  color-palette source encoding used by current ``librga`` are programmed; the
-  BSP userspace render mode ``6`` update request is remapped to RGA2 hardware
-  render mode ``3`` when loading the LUT.  BPP1/2/4, scaled/rotated/converted,
+  ``COLOR_PALETTE`` from a same-size BPP1/2/4/8 or ``YCbCr_400`` raster source
+  to an RGB-family raster destination.  Palette modes ``0..3`` and the
+  little-endian color-palette source encoding used by current ``librga`` are
+  programmed; the BSP userspace render mode ``6`` update request is remapped
+  to RGA2 hardware render mode ``3`` when loading the LUT.  Scaled/rotated/converted,
   YUV destination, FBC/tile, pattern, alpha/ROP, OSD, and mixed-feature
   palette variants remain unsupported.
 * Multi-task requests are accepted when every task matches a supported backend
@@ -397,6 +397,8 @@ Implemented
   multi-fill task acceptance, and
   ``librga`` rectangle-task serial fill command emission, compact 10-bit RGA2
   source dispatch/emission including the no-scale force-tile mode, RGA2
+  BPP import stride sizing, BPP1/2/4/8 color-palette source-mode selection,
+  stride/offset emission, and update-palette mode validation, RGA2
   in-place RGB mosaic dispatch/emission, RGA2 RGB ROP dispatch/emission, RGA2
   multi-rectangle ``librga`` mosaic-task serial emission,
   RGB gauss coefficient lifetime and command emission, RGA2 RGB NN quantize
