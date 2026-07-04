@@ -350,6 +350,8 @@ struct rkvenc_ccu {
 	struct mutex lock;
 	struct list_head core_list;
 	struct mpp_dev *main_core;
+	/* cluster shared IOMMU domain, owned by main_core */
+	struct mpp_iommu_shared_domain iommu;
 
 	spinlock_t lock_dchs;
 	union rkvenc2_dual_core_handshake_id dchs[RKVENC_MAX_CORE_NUM];
@@ -2973,37 +2975,32 @@ static int rkvenc_attach_ccu(struct device *dev, struct rkvenc_dev *enc)
 	list_add_tail(&enc->core_link, &ccu->core_list);
 	mutex_unlock(&ccu->lock);
 
-	/* attach the ccu-domain to current core */
+	/*
+	 * Establish or join the cluster's shared IOMMU domain. The first core to
+	 * attach becomes the main core and owns the shared domain (its default
+	 * DMA domain); later cores join it -- borrowing its domain and rw_sem --
+	 * through the helper, replacing the old open-coded per-core field swap.
+	 */
 	if (!ccu->main_core) {
-		/**
-		 * set the first device for the main-core,
-		 * then the domain of the main-core named ccu-domain
-		 */
+		if (!enc->mpp.iommu_info) {
+			ret = -ENODEV;
+			goto err_detach_core;
+		}
+		ret = mpp_iommu_shared_domain_init(&ccu->iommu, enc->mpp.iommu_info);
+		if (ret)
+			goto err_detach_core;
 		ccu->main_core = &enc->mpp;
 	} else {
-		struct mpp_iommu_info *ccu_info, *cur_info;
-		struct iommu_domain *old_domain;
-		struct rw_semaphore *old_rw_sem;
+		struct mpp_iommu_info *cur_info = enc->mpp.iommu_info;
 
-		/* set the ccu-domain for current device */
-		ccu_info = ccu->main_core->iommu_info;
-		cur_info = enc->mpp.iommu_info;
-		if (!ccu_info || !cur_info) {
+		if (!cur_info) {
 			ret = -ENODEV;
 			goto err_detach_core;
 		}
 
-		old_domain = cur_info->domain;
-		old_rw_sem = cur_info->rw_sem;
-		cur_info->domain = ccu_info->domain;
-		cur_info->rw_sem = ccu_info->rw_sem;
-
-		ret = mpp_iommu_attach(cur_info);
-		if (ret) {
-			cur_info->domain = old_domain;
-			cur_info->rw_sem = old_rw_sem;
+		ret = mpp_iommu_shared_domain_bind(&ccu->iommu, cur_info);
+		if (ret)
 			goto err_detach_core;
-		}
 
 		/* increase main core message capacity */
 		ccu->main_core->msgs_cap++;
@@ -3041,6 +3038,8 @@ static void rkvenc_detach_ccu(struct rkvenc_dev *enc)
 
 	if (ccu->main_core == &enc->mpp) {
 		ccu->main_core = NULL;
+		/* owner is gone; reset the shared domain so a re-attach re-inits */
+		memset(&ccu->iommu, 0, sizeof(ccu->iommu));
 	} else if (ccu->main_core && !enc->mpp.msgs_cap &&
 		   ccu->main_core->msgs_cap) {
 		ccu->main_core->msgs_cap--;
