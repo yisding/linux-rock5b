@@ -1,0 +1,116 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/rockchip,rkvdec2.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Rockchip vendor RKVDEC2 decoder nodes
+
+maintainers:
+  - RKMPP forward-port maintainers <rkmpp-forward-port@example.invalid>
+
+description:
+  Vendor MPP VDPU381/RKVDEC2 decoder binding used by Rockchip userspace through
+  /dev/mpp_service. The CCU node coordinates the two decoder cores; board files
+  may convert base video-codec nodes to the vendor-compatible core binding.
+
+properties:
+  compatible:
+    enum:
+      - rockchip,rkv-decoder-v2
+      - rockchip,rkv-decoder-v2-ccu
+
+  reg: true
+  reg-names: true
+  interrupts: true
+  interrupt-names: true
+  clocks: true
+  clock-names: true
+  assigned-clocks: true
+  assigned-clock-rates: true
+  resets: true
+  reset-names: true
+  iommus: true
+  power-domains: true
+
+  rockchip,srv:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      Phandle to the vendor MPP service coordinator node.
+
+  rockchip,ccu:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      Phandle to the decoder CCU node used by dual-core decoder instances.
+
+  rockchip,sram:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      Phandle to the SRAM pool used for decoder row-column buffers.
+
+  rockchip,core-mask:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Bitmask identifying the decoder core in the vendor CCU register layout.
+
+  rockchip,taskqueue-node:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      MPP service task-queue index used by this decoder node.
+
+  rockchip,task-capacity:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Maximum number of queued MPP tasks for this decoder node.
+
+  rockchip,rcb-iova:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 2
+    maxItems: 2
+    description:
+      IOVA base and size reserved for decoder row-column buffers.
+  rockchip,rcb-info:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      minItems: 2
+      maxItems: 2
+    description:
+      Decoder row-column buffer register and size pairs.
+  rockchip,rcb-min-width:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Minimum frame width at which the row-column buffer path is enabled.
+  rockchip,ccu-mode:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Vendor CCU scheduling mode selected by the decoder driver.
+  rockchip,normal-rates:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      Normal operating clock rates programmed by the vendor MPP driver.
+  rockchip,skip-pmu-idle-request:
+    $ref: /schemas/types.yaml#/definitions/flag
+    description:
+      Present when the driver must skip Rockchip PMU idle request calls.
+
+required:
+  - compatible
+
+additionalProperties: true
+
+examples:
+  - |
+    rkvdec-ccu@fdc30000 {
+        compatible = "rockchip,rkv-decoder-v2-ccu";
+        reg = <0x0 0xfdc30000 0x0 0x100>;
+        reg-names = "ccu";
+        rockchip,ccu-mode = <1>;
+    };
+
+    video-codec@fdc38100 {
+        compatible = "rockchip,rkv-decoder-v2";
+        reg = <0x0 0xfdc38100 0x0 0x400>, <0x0 0xfdc38000 0x0 0x100>;
+        reg-names = "regs", "link";
+        rockchip,core-mask = <0x00010001>;
+    };
+...

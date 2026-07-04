@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/rockchip,rkvenc2.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Rockchip vendor RKVENC2 encoder nodes
+
+maintainers:
+  - RKMPP forward-port maintainers <rkmpp-forward-port@example.invalid>
+
+description:
+  Vendor MPP VEPU580/RKVENC2 encoder binding used by Rockchip userspace through
+  /dev/mpp_service. The CCU node is virtual and the core nodes describe the
+  MMIO encoder instances behind Rockchip IOMMUs.
+
+properties:
+  compatible:
+    enum:
+      - rockchip,rkv-encoder-v2-ccu
+      - rockchip,rkv-encoder-v2-core
+
+  reg: true
+  reg-names: true
+  interrupts: true
+  interrupt-names: true
+  clocks: true
+  clock-names: true
+  assigned-clocks: true
+  assigned-clock-rates: true
+  resets: true
+  reset-names: true
+  iommus: true
+  power-domains: true
+
+  rockchip,srv:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      Phandle to the vendor MPP service coordinator node.
+
+  rockchip,ccu:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      Phandle to the encoder CCU node used by dual-core encoder instances.
+
+  rockchip,taskqueue-node:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      MPP service task-queue index used by this encoder node.
+
+  rockchip,task-capacity:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Maximum number of queued MPP tasks for this encoder node.
+
+  rockchip,normal-rates:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      Normal operating clock rates programmed by the vendor MPP driver.
+  rockchip,skip-pmu-idle-request:
+    $ref: /schemas/types.yaml#/definitions/flag
+    description:
+      Present when the driver must skip Rockchip PMU idle request calls.
+
+required:
+  - compatible
+
+additionalProperties: true
+
+examples:
+  - |
+    rkvenc-ccu {
+        compatible = "rockchip,rkv-encoder-v2-ccu";
+    };
+
+    rkvenc-core@fdbd0000 {
+        compatible = "rockchip,rkv-encoder-v2-core";
+        reg = <0x0 0xfdbd0000 0x0 0x6000>;
+        interrupts = <101>;
+        interrupt-names = "irq_rkvenc0";
+        rockchip,taskqueue-node = <7>;
+        rockchip,task-capacity = <8>;
+    };
+...

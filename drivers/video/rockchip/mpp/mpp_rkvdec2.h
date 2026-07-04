@@ -182,7 +182,7 @@ struct rkvdec2_dev {
 	struct reset_control *rst_cabac;
 	struct reset_control *rst_hevc_cabac;
 
-#ifdef CONFIG_PM_DEVFREQ
+#ifdef CONFIG_ROCKCHIP_MPP_RKVDEC2_DEVFREQ
 	struct regulator *vdd;
 	struct devfreq *devfreq;
 	unsigned long volt;
