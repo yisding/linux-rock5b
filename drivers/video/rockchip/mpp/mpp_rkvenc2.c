@@ -33,7 +33,7 @@
 #include <soc/rockchip/rockchip_system_monitor.h>
 #include <soc/rockchip/rockchip_iommu.h>
 
-#ifdef CONFIG_PM_DEVFREQ
+#ifdef CONFIG_ROCKCHIP_MPP_RKVENC2_DEVFREQ
 #include "../../../devfreq/governor.h"
 #endif
 
@@ -57,7 +57,7 @@
 #define to_rkvenc_dev(dev)		\
 		container_of(dev, struct rkvenc_dev, mpp)
 
-#ifdef CONFIG_PM_DEVFREQ
+#ifdef CONFIG_ROCKCHIP_MPP_RKVENC2_DEVFREQ
 static DEFINE_MUTEX(venc_governor_mutex);
 static int venc_governor_count;
 #endif
@@ -335,7 +335,7 @@ struct rkvenc_dev {
 
 	u32 bs_overflow;
 
-#ifdef CONFIG_PM_DEVFREQ
+#ifdef CONFIG_ROCKCHIP_MPP_RKVENC2_DEVFREQ
 	struct devfreq *devfreq;
 	unsigned long core_rate_hz;
 	unsigned long core_current_rate_hz;
@@ -354,6 +354,8 @@ struct rkvenc_ccu {
 	spinlock_t lock_dchs;
 	union rkvenc2_dual_core_handshake_id dchs[RKVENC_MAX_CORE_NUM];
 };
+
+static int rkvenc2_free_rcbbuf(struct platform_device *pdev, struct rkvenc_dev *enc);
 
 static struct rkvenc_hw_info rkvenc_v2_hw_info = {
 	.hw = {
@@ -2134,7 +2136,7 @@ static inline int rkvenc_procfs_ccu_init(struct mpp_dev *mpp)
 }
 #endif
 
-#ifdef CONFIG_PM_DEVFREQ
+#ifdef CONFIG_ROCKCHIP_MPP_RKVENC2_DEVFREQ
 static int rkvenc_devfreq_target(struct device *dev,
 				 unsigned long *freq, u32 flags)
 {
@@ -2404,7 +2406,7 @@ static int rkvenc_init(struct mpp_dev *mpp)
 	if (!enc->rst_core)
 		mpp_err("No core reset resource define\n");
 
-#ifdef CONFIG_PM_DEVFREQ
+#ifdef CONFIG_ROCKCHIP_MPP_RKVENC2_DEVFREQ
 	ret = rkvenc_devfreq_init(mpp);
 	if (ret)
 		dev_dbg(mpp->dev, "venc devfreq not enabled (core clock pinned via DT)\n");
@@ -2415,7 +2417,7 @@ static int rkvenc_init(struct mpp_dev *mpp)
 
 static int rkvenc_exit(struct mpp_dev *mpp)
 {
-#ifdef CONFIG_PM_DEVFREQ
+#ifdef CONFIG_ROCKCHIP_MPP_RKVENC2_DEVFREQ
 	rkvenc_devfreq_remove(mpp);
 #endif
 
@@ -2458,7 +2460,7 @@ static int rkvenc_reset(struct mpp_dev *mpp)
 
 	mpp_debug_enter();
 
-#ifdef CONFIG_PM_DEVFREQ
+#ifdef CONFIG_ROCKCHIP_MPP_RKVENC2_DEVFREQ
 	if (enc->devfreq)
 		mutex_lock(&enc->devfreq->lock);
 #endif
@@ -2490,7 +2492,7 @@ static int rkvenc_reset(struct mpp_dev *mpp)
 
 	mpp_dbg_core("core %d reset idle %lx\n", mpp->core_id, queue->core_idle);
 
-#ifdef CONFIG_PM_DEVFREQ
+#ifdef CONFIG_ROCKCHIP_MPP_RKVENC2_DEVFREQ
 	if (enc->devfreq)
 		mutex_unlock(&enc->devfreq->lock);
 #endif
@@ -2529,7 +2531,7 @@ static int rkvenc_set_freq(struct mpp_dev *mpp, struct mpp_task *mpp_task)
 
 	mpp_clk_set_rate(&enc->aclk_info, task->clk_mode);
 
-#ifdef CONFIG_PM_DEVFREQ
+#ifdef CONFIG_ROCKCHIP_MPP_RKVENC2_DEVFREQ
 	if (enc->devfreq) {
 		unsigned long core_rate_hz;
 
@@ -2642,22 +2644,45 @@ static int rkvenc2_wait_result(struct mpp_session *session,
 
 	if (!enc_task->task_split || enc_task->task_split_done) {
 task_done_ret:
-		ret = wait_event_interruptible(task->wait, test_bit(TASK_STATE_DONE, &task->state));
-		if (ret == -ERESTARTSYS)
-			mpp_err("wait task break by signal in normal mode\n");
+		if (msgs->flags & MPP_FLAGS_POLL_NON_BLOCK) {
+			if (!test_bit(TASK_STATE_DONE, &task->state))
+				return -EAGAIN;
+		} else {
+			ret = wait_event_interruptible(task->wait,
+						       test_bit(TASK_STATE_DONE, &task->state));
+			if (ret) {
+				if (ret == -ERESTARTSYS)
+					mpp_err("wait task break by signal in normal mode\n");
+				return ret;
+			}
+		}
 
-		return rkvenc2_task_default_process(mpp, task);
+		ret = rkvenc2_task_default_process(mpp, task);
+		if (!ret && test_bit(TASK_STATE_ABORT, &task->state))
+			ret = -EIO;
+
+		return ret;
 
 	}
 
 	/* not slice return just wait all slice length */
 	if (!req) {
 		do {
-			ret = wait_event_interruptible(task->wait, kfifo_out(&enc_task->slice_info,
-									     &slice_info, 1));
-			if (ret == -ERESTARTSYS) {
-				mpp_err("wait task break by signal in slice all mode\n");
-				return 0;
+			if (msgs->flags & MPP_FLAGS_POLL_NON_BLOCK) {
+				if (!kfifo_out(&enc_task->slice_info, &slice_info, 1)) {
+					if (test_bit(TASK_STATE_DONE, &task->state))
+						goto task_done_ret;
+					return -EAGAIN;
+				}
+			} else {
+				ret = wait_event_interruptible(task->wait,
+							       kfifo_out(&enc_task->slice_info,
+								 &slice_info, 1));
+				if (ret) {
+					if (ret == -ERESTARTSYS)
+						mpp_err("wait task break by signal in slice all mode\n");
+					return ret;
+				}
 			}
 			mpp_dbg_slice("task %d rd %3d len %d %s\n",
 					task_id, enc_task->slice_rd_cnt, slice_info.slice_len,
@@ -2681,11 +2706,21 @@ task_done_ret:
 
 	/* handle slice mode poll return */
 	do {
-		ret = wait_event_interruptible(task->wait, kfifo_out(&enc_task->slice_info,
-								     &slice_info, 1));
-		if (ret == -ERESTARTSYS) {
-			mpp_err("wait task break by signal in slice one mode\n");
-			return 0;
+		if (msgs->flags & MPP_FLAGS_POLL_NON_BLOCK) {
+			if (!kfifo_out(&enc_task->slice_info, &slice_info, 1)) {
+				if (test_bit(TASK_STATE_DONE, &task->state))
+					goto task_done_ret;
+				return -EAGAIN;
+			}
+		} else {
+			ret = wait_event_interruptible(task->wait,
+						       kfifo_out(&enc_task->slice_info,
+							 &slice_info, 1));
+			if (ret) {
+				if (ret == -ERESTARTSYS)
+					mpp_err("wait task break by signal in slice one mode\n");
+				return ret;
+			}
 		}
 		mpp_dbg_slice("core %d task %d rd %3d len %d %s\n", task_id,
 				mpp->core_id, enc_task->slice_rd_cnt, slice_info.slice_len,
@@ -2785,7 +2820,7 @@ static const struct mpp_dev_var rkvenc_v2_data = {
 	.dev_ops = &rkvenc_dev_ops_v2,
 };
 
-static const struct mpp_dev_var rkvenc_540c_data = {
+static const struct mpp_dev_var rkvenc_540c_data __maybe_unused = {
 	.device_type = MPP_DEVICE_RKVENC,
 	.hw_info = &rkvenc_540c_hw_info.hw,
 	.trans_info = trans_rkvenc_540c,
@@ -2793,7 +2828,7 @@ static const struct mpp_dev_var rkvenc_540c_data = {
 	.dev_ops = &vepu540c_dev_ops_v2,
 };
 
-static const struct mpp_dev_var rkvenc_510_data = {
+static const struct mpp_dev_var rkvenc_510_data __maybe_unused = {
 	.device_type = MPP_DEVICE_RKVENC,
 	.hw_info = &rkvenc_510_hw_info.hw,
 	.trans_info = trans_rkvenc_540c,
@@ -2801,7 +2836,7 @@ static const struct mpp_dev_var rkvenc_510_data = {
 	.dev_ops = &rkvenc_dev_ops_v2,
 };
 
-static const struct mpp_dev_var rkvenc_511_data = {
+static const struct mpp_dev_var rkvenc_511_data __maybe_unused = {
 	.device_type = MPP_DEVICE_RKVENC,
 	.hw_info = &rkvenc_511_hw_info.hw,
 	.trans_info = trans_rkvenc_511,
@@ -2817,7 +2852,7 @@ static const struct mpp_dev_var rkvenc_ccu_data = {
 	.dev_ops = &rkvenc_ccu_dev_ops,
 };
 
-static const struct mpp_dev_var rkvenc_rk3576_ccu_data = {
+static const struct mpp_dev_var rkvenc_rk3576_ccu_data __maybe_unused = {
 	.device_type = MPP_DEVICE_RKVENC,
 	.hw_info = &rkvenc_510_hw_info.hw,
 	.trans_info = trans_rkvenc_540c,
@@ -2903,6 +2938,7 @@ static int rkvenc_ccu_probe(struct platform_device *pdev)
 
 static int rkvenc_attach_ccu(struct device *dev, struct rkvenc_dev *enc)
 {
+	int ret = 0;
 	struct device_node *np;
 	struct platform_device *pdev;
 	struct rkvenc_ccu *ccu;
@@ -2946,16 +2982,28 @@ static int rkvenc_attach_ccu(struct device *dev, struct rkvenc_dev *enc)
 		ccu->main_core = &enc->mpp;
 	} else {
 		struct mpp_iommu_info *ccu_info, *cur_info;
+		struct iommu_domain *old_domain;
+		struct rw_semaphore *old_rw_sem;
 
 		/* set the ccu-domain for current device */
 		ccu_info = ccu->main_core->iommu_info;
 		cur_info = enc->mpp.iommu_info;
-
-		if (cur_info) {
-			cur_info->domain = ccu_info->domain;
-			cur_info->rw_sem = ccu_info->rw_sem;
+		if (!ccu_info || !cur_info) {
+			ret = -ENODEV;
+			goto err_detach_core;
 		}
-		mpp_iommu_attach(cur_info);
+
+		old_domain = cur_info->domain;
+		old_rw_sem = cur_info->rw_sem;
+		cur_info->domain = ccu_info->domain;
+		cur_info->rw_sem = ccu_info->rw_sem;
+
+		ret = mpp_iommu_attach(cur_info);
+		if (ret) {
+			cur_info->domain = old_domain;
+			cur_info->rw_sem = old_rw_sem;
+			goto err_detach_core;
+		}
 
 		/* increase main core message capacity */
 		ccu->main_core->msgs_cap++;
@@ -2967,6 +3015,39 @@ static int rkvenc_attach_ccu(struct device *dev, struct rkvenc_dev *enc)
 	mpp_debug_enter();
 
 	return 0;
+
+err_detach_core:
+	mutex_lock(&ccu->lock);
+	list_del_init(&enc->core_link);
+	ccu->core_num--;
+	mutex_unlock(&ccu->lock);
+	put_device(&pdev->dev);
+	return ret;
+}
+
+static void rkvenc_detach_ccu(struct rkvenc_dev *enc)
+{
+	struct rkvenc_ccu *ccu = enc->ccu;
+
+	if (!ccu)
+		return;
+
+	mutex_lock(&ccu->lock);
+	if (!list_empty(&enc->core_link)) {
+		list_del_init(&enc->core_link);
+		if (ccu->core_num)
+			ccu->core_num--;
+	}
+
+	if (ccu->main_core == &enc->mpp) {
+		ccu->main_core = NULL;
+	} else if (ccu->main_core && !enc->mpp.msgs_cap &&
+		   ccu->main_core->msgs_cap) {
+		ccu->main_core->msgs_cap--;
+	}
+	mutex_unlock(&ccu->lock);
+
+	enc->ccu = NULL;
 }
 
 static int rkvenc2_alloc_rcbbuf(struct platform_device *pdev, struct rkvenc_dev *enc)
@@ -3140,7 +3221,7 @@ static int rkvenc_core_probe(struct platform_device *pdev)
 	ret = rkvenc_attach_ccu(dev, enc);
 	if (ret) {
 		dev_err(dev, "attach ccu failed\n");
-		return ret;
+		goto err_remove_mpp;
 	}
 	rkvenc2_alloc_rcbbuf(pdev, enc);
 
@@ -3151,7 +3232,7 @@ static int rkvenc_core_probe(struct platform_device *pdev)
 					dev_name(dev), mpp);
 	if (ret) {
 		dev_err(dev, "register interrupter runtime failed\n");
-		return -EINVAL;
+		goto err_detach_ccu;
 	}
 	mpp->session_max_buffers = RKVENC_SESSION_MAX_BUFFERS;
 	enc->hw_info = to_rkvenc_info(mpp->var->hw_info);
@@ -3164,6 +3245,13 @@ static int rkvenc_core_probe(struct platform_device *pdev)
 		mpp_dev_register_srv(mpp, mpp->srv);
 
 	return 0;
+
+err_detach_ccu:
+	rkvenc2_free_rcbbuf(pdev, enc);
+	rkvenc_detach_ccu(enc);
+err_remove_mpp:
+	mpp_dev_remove(mpp);
+	return ret;
 }
 
 static int rkvenc_probe_default(struct platform_device *pdev)
@@ -3265,12 +3353,7 @@ static void rkvenc_remove(struct platform_device *pdev)
 		struct rkvenc_dev *enc = to_rkvenc_dev(mpp);
 
 		dev_info(dev, "remove core\n");
-		if (enc->ccu) {
-			mutex_lock(&enc->ccu->lock);
-			list_del_init(&enc->core_link);
-			enc->ccu->core_num--;
-			mutex_unlock(&enc->ccu->lock);
-		}
+		rkvenc_detach_ccu(enc);
 		rkvenc2_free_rcbbuf(pdev, enc);
 		mpp_dev_remove(&enc->mpp);
 		rkvenc_procfs_remove(&enc->mpp);
