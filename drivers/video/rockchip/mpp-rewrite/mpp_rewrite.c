@@ -2621,6 +2621,46 @@ static void rk_mpp_cmd_copies_payload_kunit(struct kunit *test)
 			   rk_mpp_cmd_copies_payload(MPP_CMD_TRANS_FD_TO_IOVA));
 }
 
+static void rk_mpp_set_err_ref_hack_kunit(struct kunit *test)
+{
+	u8 heap_payload[129] = {};
+	u32 stack_payload = 1;
+	struct rk_mpp_session session = {};
+	struct mpp_request req = {
+		.cmd = MPP_CMD_SET_ERR_REF_HACK,
+		.size = sizeof(stack_payload),
+	};
+
+	req.data = rk_mpp_kunit_user_payload(test, &stack_payload,
+					     sizeof(stack_payload));
+	KUNIT_ASSERT_NOT_NULL(test, req.data);
+
+	KUNIT_EXPECT_EQ(test, rk_mpp_process_request(&session, &req, NULL),
+			-EINVAL);
+
+	session.initialized = true;
+	KUNIT_EXPECT_EQ(test, rk_mpp_process_request(&session, &req, NULL), 0);
+
+	req.size = 0;
+	req.data = NULL;
+	KUNIT_EXPECT_EQ(test, rk_mpp_process_request(&session, &req, NULL), 0);
+
+	req.size = sizeof(heap_payload);
+	req.data = rk_mpp_kunit_user_payload(test, heap_payload,
+					     sizeof(heap_payload));
+	KUNIT_ASSERT_NOT_NULL(test, req.data);
+	KUNIT_EXPECT_EQ(test, rk_mpp_process_request(&session, &req, NULL), 0);
+
+	req.size = PAGE_SIZE + 1;
+	KUNIT_EXPECT_EQ(test, rk_mpp_process_request(&session, &req, NULL),
+			-ENOMEM);
+
+	req.size = sizeof(stack_payload);
+	req.data = (void __user *)ULONG_MAX;
+	KUNIT_EXPECT_EQ(test, rk_mpp_process_request(&session, &req, NULL),
+			-EINVAL);
+}
+
 static void rk_mpp_store_codec_info_kunit(struct kunit *test)
 {
 	struct rk_mpp_codec_info_elem elems[] = {
@@ -5169,6 +5209,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_abi_layout_kunit),
 	KUNIT_CASE(rk_mpp_msg_v1_to_request_kunit),
 	KUNIT_CASE(rk_mpp_cmd_copies_payload_kunit),
+	KUNIT_CASE(rk_mpp_set_err_ref_hack_kunit),
 	KUNIT_CASE(rk_mpp_store_codec_info_kunit),
 	KUNIT_CASE(rk_mpp_init_trans_table_kunit),
 	KUNIT_CASE(rk_mpp_reg_offsets_kunit),
