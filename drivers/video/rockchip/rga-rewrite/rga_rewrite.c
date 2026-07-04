@@ -5466,6 +5466,25 @@ static void rk_rga3_rotate_flags_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga3_rotate_flags(&task, &flags), 0);
 	KUNIT_EXPECT_EQ(test, flags, RK_RGA3_ROT_BIT_ROT_90);
 
+	task.rotate_mode = 1;
+	task.sina = 0;
+	task.cosa = -65536;
+	flags = U32_MAX;
+	KUNIT_EXPECT_EQ(test, rk_rga3_rotate_flags(&task, &flags), 0);
+	KUNIT_EXPECT_EQ(test, flags,
+			RK_RGA3_ROT_BIT_X_MIRROR |
+			RK_RGA3_ROT_BIT_Y_MIRROR);
+
+	task.rotate_mode = 1;
+	task.sina = -65536;
+	task.cosa = 0;
+	flags = U32_MAX;
+	KUNIT_EXPECT_EQ(test, rk_rga3_rotate_flags(&task, &flags), 0);
+	KUNIT_EXPECT_EQ(test, flags,
+			RK_RGA3_ROT_BIT_ROT_90 |
+			RK_RGA3_ROT_BIT_X_MIRROR |
+			RK_RGA3_ROT_BIT_Y_MIRROR);
+
 	task.rotate_mode = 1 | (2 << 4);
 	task.sina = -65536;
 	task.cosa = 0;
@@ -9852,6 +9871,64 @@ static void rk_rga_gstreamer_legacy_format_matrix_kunit(struct kunit *test)
 							    &profiles[i]);
 }
 
+static void rk_rga_gstreamer_legacy_rotation_extrema_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
+	enum rk_rga_hw_type type = 0;
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_BGRX_8888,
+					  RK_RGA_FORMAT_YCBCR_420_SP);
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 2,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+	u32 ctrl;
+
+	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_BGRX_8888,
+				    640, 360);
+	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_YCBCR_420_SP,
+				    320, 180);
+	task.rotate_mode = 1;
+	task.sina = 0;
+	task.cosa = -65536;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
+	KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WIN0_R2Y_EN);
+	KUNIT_EXPECT_FALSE(test, ctrl & RK_RGA3_WIN0_ROT);
+	KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WIN0_XMIRROR);
+	KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WIN0_YMIRROR);
+
+	memset(cmd, 0, sizeof(cmd));
+	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_420_SP,
+					 RK_RGA_FORMAT_BGRX_8888);
+	task.src = rk_rga_kunit_img(0x10000000,
+				    RK_RGA_FORMAT_YCBCR_420_SP, 640, 360);
+	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_BGRX_8888,
+				    360, 640);
+	task.rotate_mode = 1;
+	task.sina = -65536;
+	task.cosa = 0;
+	job.cmd_ready = false;
+	type = 0;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
+	KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WIN0_Y2R_EN);
+	KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WIN0_ROT);
+	KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WIN0_XMIRROR);
+	KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WIN0_YMIRROR);
+}
+
 static void rk_rga3_librga_resize_interp_emit_kunit(struct kunit *test)
 {
 	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
@@ -12638,6 +12715,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_ffmpeg_rga3_profiles_kunit),
 	KUNIT_CASE(rk_rga_gstreamer_legacy_convert_profiles_kunit),
 	KUNIT_CASE(rk_rga_gstreamer_legacy_format_matrix_kunit),
+	KUNIT_CASE(rk_rga_gstreamer_legacy_rotation_extrema_kunit),
 	KUNIT_CASE(rk_rga3_librga_resize_interp_emit_kunit),
 	KUNIT_CASE(rk_rga3_librga_drm_abgr_copy_emit_kunit),
 	KUNIT_CASE(rk_rga3_librga_copy_splice_task_kunit),
