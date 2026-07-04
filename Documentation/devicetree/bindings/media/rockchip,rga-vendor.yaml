@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/rockchip,rga-vendor.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Rockchip vendor RGA2/RGA3 nodes
+
+maintainers:
+  - RKMPP forward-port maintainers <rkmpp-forward-port@example.invalid>
+
+description:
+  Vendor RGA nodes used by Rockchip's librga-compatible driver. RK3588 exposes
+  two RGA3 cores and one RGA2 core as separate platform devices.
+
+properties:
+  compatible:
+    enum:
+      - rockchip,rga2_core0
+      - rockchip,rga3_core0
+      - rockchip,rga3_core1
+
+  reg: true
+  interrupts: true
+  interrupt-names: true
+  clocks: true
+  clock-names: true
+  iommus: true
+  power-domains: true
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: true
+
+examples:
+  - |
+    rga@fdb60000 {
+        compatible = "rockchip,rga3_core0";
+        reg = <0x0 0xfdb60000 0x0 0x1000>;
+        interrupts = <114>;
+        interrupt-names = "rga3_core0_irq";
+    };
+...

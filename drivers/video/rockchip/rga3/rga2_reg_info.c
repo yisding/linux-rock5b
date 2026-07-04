@@ -3247,7 +3247,8 @@ static int rga2_get_version(struct rga_scheduler_t *scheduler)
 	if (!major_version && !minor_version)
 		major_version = 2;
 
-	snprintf(scheduler->version.str, 10, "%x.%01x.%05x", major_version,
+	snprintf(scheduler->version.str, sizeof(scheduler->version.str),
+		 "%x.%01x.%05x", major_version,
 		 minor_version, svn_version);
 
 	scheduler->version.major = major_version;
