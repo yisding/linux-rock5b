@@ -51,4 +51,14 @@ config ROCKCHIP_MPP_RKVDEC2_DEVFREQ
 	  When off, the donor's private ../drivers/devfreq/governor.h include is
 	  elided (it is absent from out-of-tree build trees).
 
+config ROCKCHIP_MPP_AV1DEC
+	bool "AV1 decoder"
+	depends on ARM64 && IOMMU_SUPPORT
+	default y
+	select VSI_IOMMU
+	help
+	  Hardware AV1 decoder backend for the Rockchip MPP service framework
+	  on RK3588. This preserves the vendor /dev/mpp_service ABI and uses
+	  the standard Verisilicon IOMMU provider for the AV1 MMU.
+
 endif
