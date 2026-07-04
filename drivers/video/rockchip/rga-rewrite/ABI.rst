@@ -171,7 +171,8 @@ Implemented
   fallback through RGA2 when RGA3 cannot accept the format.  The KUnit matrix
   pins the userspace-visible GStreamer set for BGR16/RGB/BGR/RGBA/BGRA/RGBx/
   BGRx to NV12, NV16/NV61 to NV12, NV12/NV21/NV16/NV61 plus compact 10-bit
-  NV12/NV16 decoder output to RGB-family formats, and planar I420/YV12
+  NV12/NV16 decoder output to RGB-family formats, compact NV12_10LE40/
+  NV16_10LE40 decoder output to scaled 8-bit NV12/NV16, and planar I420/YV12
   round-trips through the RGA2 fallback.
   Explicit interpolation selectors from current ``librga`` resize calls are
   accepted on native RGA3 bitblits; like the BSP RGA3 register builder, the
