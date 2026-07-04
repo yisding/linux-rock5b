@@ -479,6 +479,104 @@ int mpp_iommu_attach(struct mpp_iommu_info *info)
 	return iommu_attach_group(info->domain, info->group);
 }
 
+/*
+ * Initialize a CCU cluster's shared domain from its main core.
+ *
+ * The owner is the service-visible core (rkvdec2 core 0, rkvenc2 main_core);
+ * its default DMA domain becomes the cluster's shared IOVA space and its
+ * rw_sem becomes the cluster-wide map/unmap/reset lock. Secondary cores are
+ * joined later with mpp_iommu_shared_domain_bind().
+ */
+int mpp_iommu_shared_domain_init(struct mpp_iommu_shared_domain *shared,
+				 struct mpp_iommu_info *owner)
+{
+	if (!shared || !owner)
+		return -EINVAL;
+
+	if (!owner->domain || !owner->rw_sem)
+		return -ENODEV;
+
+	shared->owner = owner;
+	shared->domain = owner->domain;
+	shared->rw_sem = owner->rw_sem;
+
+	return 0;
+}
+
+/*
+ * Join a secondary core to the cluster shared domain.
+ *
+ * Point the secondary's iommu_info at the shared domain and rw_sem, then
+ * attach its IOMMU group to that domain so map/unmap/flush on the shared
+ * domain reach this core too. On attach failure the borrowed fields are
+ * rolled back, so the caller can fail the core's probe cleanly and the
+ * secondary keeps its own default domain.
+ *
+ * This centralizes the field swap rkvdec2/rkvenc2 previously open-coded in
+ * their attach paths and, unlike the old decoder path, always shares the
+ * rw_sem so the whole cluster serializes through one lock. Binding the owner
+ * is a no-op: it already sits on the shared domain by construction.
+ */
+int mpp_iommu_shared_domain_bind(struct mpp_iommu_shared_domain *shared,
+				 struct mpp_iommu_info *info)
+{
+	struct iommu_domain *old_domain;
+	struct rw_semaphore *old_rw_sem;
+	int ret;
+
+	if (!shared || !info)
+		return -EINVAL;
+
+	if (!shared->domain || !shared->rw_sem)
+		return -ENODEV;
+
+	if (info == shared->owner)
+		return 0;
+
+	old_domain = info->domain;
+	old_rw_sem = info->rw_sem;
+	info->domain = shared->domain;
+	info->rw_sem = shared->rw_sem;
+
+	ret = mpp_iommu_attach(info);
+	if (ret) {
+		info->domain = old_domain;
+		info->rw_sem = old_rw_sem;
+		return ret;
+	}
+
+	return 0;
+}
+
+/*
+ * Diagnostic: verify a CCU-bound core is actually attached to the shared
+ * domain. This is the single place for shared-domain assertions -- reset,
+ * refresh and empty-domain restore paths must always leave a secondary core
+ * on the cluster domain, never back on its own default domain. Returns true
+ * when the core's current domain is the shared domain.
+ *
+ * This is a warn-once audit hook, not correctness proof of attachment: do not
+ * gate mapping/dispatch on its result.
+ */
+bool mpp_iommu_shared_domain_verify(struct mpp_iommu_shared_domain *shared,
+				    struct mpp_iommu_info *info)
+{
+	struct iommu_domain *cur;
+
+	if (!shared || !info || !shared->domain)
+		return false;
+
+	cur = iommu_get_domain_for_dev(info->dev);
+	if (cur != shared->domain) {
+		dev_warn_once(info->dev,
+			      "iommu: core not on CCU shared domain (cur %p want %p)\n",
+			      cur, shared->domain);
+		return false;
+	}
+
+	return true;
+}
+
 static int mpp_iommu_handle(struct iommu_domain *iommu,
 			    struct device *iommu_dev,
 			    unsigned long iova,
