@@ -2478,6 +2478,9 @@ static int rk_mpp_process_request(struct rk_mpp_session *session,
 static int rk_mpp_job_store_reg_offsets(struct rk_mpp_job *job,
 					const struct rk_mpp_job_req *job_req);
 static int rk_mpp_job_apply_reg_offsets(struct rk_mpp_job *job);
+static int rk_mpp_job_translate_reg_image(struct rk_mpp_job *job);
+static int rk_mpp_rkvdec2_validate(struct rk_mpp_job *job);
+static void rk_mpp_kunit_device_release(struct device *dev);
 
 static void __user *rk_mpp_kunit_user_payload(struct kunit *test,
 					      const void *src, size_t size)
@@ -2979,6 +2982,85 @@ static void rk_mpp_rkvdec2_link_info_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, info->ip_en_base, 0x58U);
 	KUNIT_EXPECT_EQ(test, info->ip_en_val, 0x01000000U);
 	KUNIT_EXPECT_TRUE(test, info->sw_iommu_zap);
+}
+
+static void rk_mpp_rkvdec2_vp9_translate_validate_kunit(struct kunit *test)
+{
+	struct rk_mpp_service srv = {};
+	struct rk_mpp_session session = {
+		.srv = &srv,
+		.client_type = RK_MPP_DEVICE_RKVDEC,
+	};
+	struct rk_mpp_hw hw = {
+		.irq = 42,
+	};
+	struct rk_mpp_job *job;
+	struct rk_mpp_import *import;
+	struct device *dev;
+	u32 raw_vp9_160 = 7 | (4 << 10);
+	u32 raw_vp9_162 = 7 | (8 << 10);
+	u32 raw_h264_only_173 = 7 | (12 << 10);
+
+	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dev);
+	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+	job->reg_image.regs = kunit_kcalloc(test, 200, sizeof(u32), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job->reg_image.regs);
+	import = kzalloc(sizeof(*import), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, import);
+
+	device_initialize(dev);
+	dev->release = rk_mpp_kunit_device_release;
+	mutex_init(&session.lock);
+	INIT_LIST_HEAD(&session.imports);
+	job->session = &session;
+	job->hw = &hw;
+	job->req_cnt = 1;
+	hw.dev = dev;
+	hw.regs[0] = (void __iomem *)0x1;
+	hw.reg_size[0] = RK_MPP_RKVDEC_INT_STA_BASE + sizeof(u32);
+
+	import->fd = 7;
+	import->dev = dev;
+	import->iova = 0x80000000;
+	refcount_set(&import->refs, 1);
+	INIT_LIST_HEAD(&import->link);
+	list_add_tail(&import->link, &session.imports);
+
+	job->reg_image.reg_words = 200;
+	job->reg_image.reg_bytes = 200 * sizeof(u32);
+	job->reg_image.regs[RK_MPP_RKVDEC_REG_FMT] = RK_MPP_RKVDEC_FMT_VP9D;
+	job->reg_image.regs[160] = raw_vp9_160;
+	job->reg_image.regs[162] = raw_vp9_162;
+	job->reg_image.regs[173] = raw_h264_only_173;
+	job->reg_image.read_req_count = 1;
+	job->reg_image.read_reqs[0].cmd = MPP_CMD_SET_REG_READ;
+	job->reg_image.read_reqs[0].offset = RK_MPP_RKVDEC_INT_STA_BASE;
+	job->reg_image.read_reqs[0].size = sizeof(u32);
+	job->reqs[0].req.cmd = MPP_CMD_SET_REG_WRITE;
+	job->reqs[0].req.offset = RK_MPP_RKVDEC_START_BASE;
+	job->reqs[0].req.size = sizeof(u32);
+
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_translate_reg_image(job), 0);
+	KUNIT_EXPECT_TRUE(test, job->reg_image.translated);
+	KUNIT_EXPECT_EQ(test, job->reg_image.regs[160], 0x80000004U);
+	KUNIT_EXPECT_EQ(test, job->reg_image.regs[162], 0x80000008U);
+	KUNIT_EXPECT_EQ(test, job->reg_image.regs[173], raw_h264_only_173);
+	KUNIT_EXPECT_EQ(test, job->import_count, 1U);
+	KUNIT_EXPECT_PTR_EQ(test, job->imports[0], import);
+	KUNIT_EXPECT_EQ(test, refcount_read(&import->refs), 2);
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_validate(job), 0);
+
+	job->reg_image.translated = false;
+	job->reg_image.regs[RK_MPP_RKVDEC_REG_FMT] =
+		ARRAY_SIZE(rk_mpp_rkvdec_tables);
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_translate_reg_image(job), -EINVAL);
+
+	list_del_init(&import->link);
+	if (job->import_count)
+		rk_mpp_import_put(job->imports[0]);
+	rk_mpp_import_put(import);
 }
 
 static void rk_mpp_rkvdec2_link_irq_decode_kunit(struct kunit *test)
@@ -5096,6 +5178,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_rkvdec2_ccu_mode_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_soft_ccu_program_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_link_info_kunit),
+	KUNIT_CASE(rk_mpp_rkvdec2_vp9_translate_validate_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_link_irq_decode_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_fill_link_table_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_link_table_ownership_kunit),
