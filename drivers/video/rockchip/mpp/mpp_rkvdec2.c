@@ -27,6 +27,8 @@
 #include "../drivers/devfreq/governor.h"
 #endif
 
+static int rkvdec2_free_rcbbuf(struct platform_device *pdev, struct rkvdec2_dev *dec);
+
 /*
  * hardware information
  */
@@ -1632,7 +1634,7 @@ static const struct mpp_dev_var rkvdec_v2_data = {
 	.dev_ops = &rkvdec_v2_dev_ops,
 };
 
-static const struct mpp_dev_var rkvdec_rk3568_data = {
+static const struct mpp_dev_var rkvdec_rk3568_data __maybe_unused = {
 	.device_type = MPP_DEVICE_RKVDEC,
 	.hw_info = &rkvdec_rk356x_hw_info,
 	.trans_info = rkvdec_v2_trans,
@@ -1640,7 +1642,7 @@ static const struct mpp_dev_var rkvdec_rk3568_data = {
 	.dev_ops = &rkvdec_rk3568_dev_ops,
 };
 
-static const struct mpp_dev_var rkvdec_rk3528_data = {
+static const struct mpp_dev_var rkvdec_rk3528_data __maybe_unused = {
 	.device_type = MPP_DEVICE_RKVDEC,
 	.hw_info = &rkvdec_vdpu382_hw_info,
 	.trans_info = rkvdec_v2_trans,
@@ -1648,7 +1650,7 @@ static const struct mpp_dev_var rkvdec_rk3528_data = {
 	.dev_ops = &rkvdec_v2_dev_ops,
 };
 
-static const struct mpp_dev_var rkvdec_rk3562_data = {
+static const struct mpp_dev_var rkvdec_rk3562_data __maybe_unused = {
 	.device_type = MPP_DEVICE_RKVDEC,
 	.hw_info = &rkvdec_vdpu382_hw_info,
 	.trans_info = rkvdec_v2_trans,
@@ -1664,7 +1666,7 @@ static const struct mpp_dev_var rkvdec_rk3588_data = {
 	.dev_ops = &rkvdec_v2_dev_ops,
 };
 
-static const struct mpp_dev_var rkvdec_rk3576_data = {
+static const struct mpp_dev_var rkvdec_rk3576_data __maybe_unused = {
 	.device_type = MPP_DEVICE_RKVDEC,
 	.hw_info = &rkvdec_vdpu383_hw_info,
 	.trans_info = rkvdec_vdpu383_trans,
@@ -1672,7 +1674,7 @@ static const struct mpp_dev_var rkvdec_rk3576_data = {
 	.dev_ops = &rkvdec_vdpu383_dev_ops,
 };
 
-static const struct mpp_dev_var rkvdec_rv1126b_data = {
+static const struct mpp_dev_var rkvdec_rv1126b_data __maybe_unused = {
 	.device_type = MPP_DEVICE_RKVDEC,
 	.hw_info = &rkvdec_vdpu384a_hw_info,
 	.trans_info = rkvdec_vdpu384a_trans,
@@ -1754,7 +1756,6 @@ static int rkvdec2_ccu_probe(struct platform_device *pdev)
 	atomic_set(&ccu->power_enabled, 0);
 	INIT_LIST_HEAD(&ccu->unused_list);
 	INIT_LIST_HEAD(&ccu->used_list);
-	platform_set_drvdata(pdev, ccu);
 
 	if (!of_property_read_u32(dev->of_node, "rockchip,ccu-mode", &ccu_mode)) {
 		if (ccu_mode <= RKVDEC2_CCU_MODE_NULL || ccu_mode >= RKVDEC2_CCU_MODE_BUTT)
@@ -1790,6 +1791,7 @@ static int rkvdec2_ccu_probe(struct platform_device *pdev)
 	device_init_wakeup(dev, true);
 	pm_runtime_enable(dev);
 
+	platform_set_drvdata(pdev, ccu);
 	dev_info(dev, "ccu-mode: %d\n", ccu->ccu_mode);
 	return 0;
 }
@@ -1949,7 +1951,7 @@ static int rkvdec2_core_probe(struct platform_device *pdev)
 	ret = rkvdec2_attach_ccu(dev, dec);
 	if (ret) {
 		dev_err(dev, "attach ccu failed\n");
-		return ret;
+		goto err_remove_mpp;
 	}
 
 	/* alloc rcb buffer */
@@ -1958,7 +1960,7 @@ static int rkvdec2_core_probe(struct platform_device *pdev)
 	/* set device for link */
 	ret = rkvdec2_ccu_link_init(pdev, dec);
 	if (ret)
-		return ret;
+		goto err_free_rcb;
 
 	mpp->dev_ops->alloc_task = rkvdec2_ccu_alloc_task;
 	if (dec->ccu->ccu_mode == RKVDEC2_CCU_TASK_SOFT) {
@@ -1970,7 +1972,7 @@ static int rkvdec2_core_probe(struct platform_device *pdev)
 			dec->link_dec->task_capacity = mpp->task_capacity;
 			ret = rkvdec2_ccu_alloc_table(dec, dec->link_dec);
 			if (ret)
-				return ret;
+				goto err_remove_link;
 		}
 		mpp->dev_ops->task_worker = rkvdec2_hard_ccu_worker;
 		irq_proc = rkvdec2_hard_ccu_irq;
@@ -1983,7 +1985,7 @@ static int rkvdec2_core_probe(struct platform_device *pdev)
 					IRQF_SHARED, dev_name(dev), mpp);
 	if (ret) {
 		dev_err(dev, "register interrupter runtime failed\n");
-		return -EINVAL;
+		goto err_remove_link;
 	}
 	/*make sure mpp->irq is startup then can be en/disable*/
 	mpp->is_irq_startup = true;
@@ -1995,6 +1997,16 @@ static int rkvdec2_core_probe(struct platform_device *pdev)
 	if (mpp->core_id == 0)
 		mpp_dev_register_srv(mpp, mpp->srv);
 
+	return ret;
+
+err_remove_link:
+	rkvdec2_link_remove(mpp, dec->link_dec);
+err_free_rcb:
+	rkvdec2_free_rcbbuf(pdev, dec);
+err_remove_mpp:
+	if (dec->mmu_base)
+		iounmap(dec->mmu_base);
+	mpp_dev_remove(mpp);
 	return ret;
 }
 
@@ -2044,7 +2056,7 @@ static int rkvdec2_probe_default(struct platform_device *pdev)
 					IRQF_SHARED, dev_name(dev), mpp);
 	if (ret) {
 		dev_err(dev, "register interrupter runtime failed\n");
-		return -EINVAL;
+		goto err_remove_link;
 	}
 
 	mpp->is_irq_startup = true;
@@ -2062,6 +2074,12 @@ static int rkvdec2_probe_default(struct platform_device *pdev)
 	if (dec->fix && mpp->hw_ops->hack_run)
 		mpp->hw_ops->hack_run(mpp);
 
+	return ret;
+
+err_remove_link:
+	rkvdec2_link_remove(mpp, dec->link_dec);
+	rkvdec2_free_rcbbuf(pdev, dec);
+	mpp_dev_remove(mpp);
 	return ret;
 }
 
@@ -2151,6 +2169,7 @@ static int __maybe_unused rkvdec2_runtime_suspend(struct device *dev)
 		mpp_clk_safe_disable(ccu->aclk_info.clk);
 	} else {
 		struct mpp_dev *mpp = dev_get_drvdata(dev);
+		int ret;
 
 		if (mpp->is_irq_startup) {
 			/* disable core irq */
@@ -2166,7 +2185,16 @@ static int __maybe_unused rkvdec2_runtime_suspend(struct device *dev)
 		 */
 		if (mpp->hw_ops->reset)
 			mpp->hw_ops->reset(mpp);
-		mpp_iommu_refresh(mpp->iommu_info, mpp->dev);
+		ret = mpp_iommu_refresh(mpp->iommu_info, mpp->dev);
+		if (ret) {
+			dev_err(dev, "failed to refresh iommu: %d\n", ret);
+			if (mpp->is_irq_startup) {
+				if (mpp->iommu_info && mpp->iommu_info->got_irq)
+					enable_irq(mpp->iommu_info->irq);
+				enable_irq(mpp->irq);
+			}
+			return ret;
+		}
 
 		if (mpp->hw_ops->clk_off)
 			mpp->hw_ops->clk_off(mpp);

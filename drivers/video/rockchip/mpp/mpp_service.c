@@ -8,6 +8,7 @@
  *	Ding Wei, leo.ding@rock-chips.com
  *
  */
+#undef pr_fmt
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/completion.h>
