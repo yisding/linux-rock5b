@@ -1,0 +1,159 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/rockchip,av1-decoder.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Rockchip MPP AV1 Decoder
+
+maintainers:
+  - Rockchip Linux <linux@rock-chips.com>
+
+description:
+  RK3588 AV1 decoder hardware exposed through the Rockchip MPP service
+  /dev/mpp_service ABI.
+
+properties:
+  compatible:
+    const: rockchip,av1-decoder
+
+  reg:
+    items:
+      - description: VCD register bank
+      - description: cache register bank
+      - description: AFBC register bank
+
+  reg-names:
+    items:
+      - const: vcd
+      - const: cache
+      - const: afbc
+
+  interrupts:
+    items:
+      - description: VCD interrupt
+      - description: cache interrupt
+      - description: AFBC interrupt
+
+  interrupt-names:
+    items:
+      - const: irq_av1d
+      - const: irq_cache
+      - const: irq_afbc
+
+  clocks:
+    items:
+      - description: decoder AXI clock
+      - description: decoder AHB clock
+
+  clock-names:
+    items:
+      - const: aclk_vcodec
+      - const: hclk_vcodec
+
+  assigned-clocks: true
+  assigned-clock-rates: true
+
+  rockchip,normal-rates:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 2
+    maxItems: 2
+    description: Normal operating rates for the AXI and AHB clocks.
+
+  resets:
+    items:
+      - description: AXI reset
+      - description: AHB reset
+
+  reset-names:
+    items:
+      - const: video_a
+      - const: video_h
+
+  iommus:
+    maxItems: 1
+
+  power-domains:
+    maxItems: 1
+
+  rockchip,srv:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: MPP service node phandle.
+
+  rockchip,taskqueue-node:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: MPP service taskqueue index used by this decoder.
+
+  rockchip,skip-pmu-idle-request:
+    type: boolean
+    description:
+      Skip the BSP-only PMU idle handshake around reset. This is required on
+      mainline kernels that do not provide rockchip_pmu_idle_request().
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - interrupt-names
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+  - iommus
+  - power-domains
+  - rockchip,srv
+  - rockchip,taskqueue-node
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/rockchip,rk3588-cru.h>
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+    #include <dt-bindings/power/rk3588-power.h>
+    #include <dt-bindings/reset/rockchip,rk3588-cru.h>
+
+    bus {
+      #address-cells = <2>;
+      #size-cells = <2>;
+
+      cru: clock-controller {
+        #clock-cells = <1>;
+        #reset-cells = <1>;
+      };
+
+      power: power-controller {
+        #power-domain-cells = <1>;
+      };
+
+      mpp_srv: mpp-srv {
+        compatible = "rockchip,mpp-service";
+      };
+
+      av1d_mmu: iommu@fdca0000 {
+        reg = <0x0 0xfdca0000 0x0 0x600>;
+        #iommu-cells = <0>;
+      };
+
+      video-codec@fdc70000 {
+        compatible = "rockchip,av1-decoder";
+        reg = <0x0 0xfdc70000 0x0 0x800>,
+              <0x0 0xfdc80000 0x0 0x400>,
+              <0x0 0xfdc90000 0x0 0x400>;
+        reg-names = "vcd", "cache", "afbc";
+        interrupts = <GIC_SPI 108 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 107 IRQ_TYPE_LEVEL_HIGH 0>,
+                     <GIC_SPI 106 IRQ_TYPE_LEVEL_HIGH 0>;
+        interrupt-names = "irq_av1d", "irq_cache", "irq_afbc";
+        clocks = <&cru ACLK_AV1>, <&cru PCLK_AV1>;
+        clock-names = "aclk_vcodec", "hclk_vcodec";
+        resets = <&cru SRST_A_AV1>, <&cru SRST_P_AV1>;
+        reset-names = "video_a", "video_h";
+        iommus = <&av1d_mmu>;
+        power-domains = <&power RK3588_PD_AV1>;
+        rockchip,srv = <&mpp_srv>;
+        rockchip,taskqueue-node = <11>;
+        rockchip,skip-pmu-idle-request;
+      };
+    };
