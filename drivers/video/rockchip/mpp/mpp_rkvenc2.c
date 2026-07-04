@@ -2490,6 +2490,9 @@ static int rkvenc_reset(struct mpp_dev *mpp)
 		ccu->dchs[mpp->core_id].val[0] = 0;
 		ccu->dchs[mpp->core_id].val[1] = 0;
 		spin_unlock_irqrestore(&ccu->lock_dchs, flags);
+
+		/* audit: reset must leave a CCU core on the shared domain */
+		mpp_iommu_shared_domain_verify(&ccu->iommu, mpp->iommu_info);
 	}
 
 	mpp_dbg_core("core %d reset idle %lx\n", mpp->core_id, queue->core_idle);
@@ -3006,6 +3009,10 @@ static int rkvenc_attach_ccu(struct device *dev, struct rkvenc_dev *enc)
 		ccu->main_core->msgs_cap++;
 		enc->mpp.msgs_cap = 0;
 	}
+
+	/* audit: the core must now sit on the cluster shared domain */
+	mpp_iommu_shared_domain_verify(&ccu->iommu, enc->mpp.iommu_info);
+
 	enc->ccu = ccu;
 
 	dev_info(dev, "attach ccu as core %d\n", enc->mpp.core_id);
@@ -3103,6 +3110,13 @@ static int rkvenc2_alloc_rcbbuf(struct platform_device *pdev, struct rkvenc_dev 
 	sram_size = sram_used < sram_size ? sram_used : sram_size;
 	/* iova map to sram */
 	domain = enc->mpp.iommu_info->domain;
+	/* in a CCU cluster this is the shared domain; reject overlapping windows */
+	if (enc->ccu) {
+		ret = mpp_iommu_shared_domain_reserve_window(&enc->ccu->iommu,
+							     iova, sram_used, dev);
+		if (ret)
+			return ret;
+	}
 	/* 6.18: iommu_map() gained a trailing gfp_t; probe ctx -> GFP_KERNEL */
 	ret = iommu_map(domain, iova, sram_start, sram_size,
 			IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
