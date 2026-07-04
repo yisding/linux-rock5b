@@ -26,6 +26,7 @@
 #include <asm/dma-iommu.h>
 #endif
 #include <soc/rockchip/rockchip_iommu.h>
+#include <soc/rockchip/vsi_iommu.h>
 
 #include "mpp_debug.h"
 #include "mpp_iommu.h"
@@ -489,8 +490,10 @@ static int mpp_iommu_handle(struct iommu_domain *iommu,
 	 * Mask iommu irq, in order for iommu not repeatedly trigger pagefault.
 	 * Until the pagefault task finish by hw timeout.
 	 */
-	if (mpp)
+	if (mpp) {
 		rockchip_iommu_mask_irq(mpp->dev);
+		vsi_iommu_mask_irq(mpp->dev);
+	}
 
 	dev_err(iommu_dev, "fault addr 0x%08lx status %x arg %p\n",
 		iova, status, arg);
@@ -609,6 +612,8 @@ int mpp_iommu_remove(struct mpp_iommu_info *info)
 	if (info->shared)
 		mpp_iommu_attach(info);
 
+	rockchip_iommu_set_fault_handler(info->dev, NULL, NULL);
+	vsi_iommu_set_fault_handler(info->dev, NULL, NULL);
 	iommu_group_put(info->group);
 	platform_device_put(info->pdev);
 
@@ -624,6 +629,12 @@ int mpp_iommu_refresh(struct mpp_iommu_info *info, struct device *dev)
 
 	/* disable iommu */
 	ret = rockchip_iommu_disable(dev);
+	if (ret == -ENODEV) {
+		ret = vsi_iommu_refresh(dev);
+		if (ret == -ENODEV)
+			return mpp_iommu_flush_tlb(info);
+		return ret;
+	}
 	if (ret)
 		return ret;
 	/* re-enable iommu */
@@ -659,17 +670,26 @@ int mpp_iommu_dev_activate(struct mpp_iommu_info *info, struct mpp_dev *dev)
 	} else {
 		info->dev_active = dev;
 		/*
-		 * Switch domain pagefault handler and arg depending on device.
-		 * Since the IOMMU core gained cookie tracking, iommu_set_fault_handler()
-		 * WARNs and bails when the domain already owns a cookie (e.g. the default
-		 * DMA domain from iommu_get_domain_for_dev()). Only register our handler
-		 * on a cookie-less domain; on a DMA-managed domain the IOMMU core reports
-		 * faults itself. (Forward-port fix for 6.18; was unconditional.)
+		 * MPP uses normal DMA domains, so the generic fault-handler cookie path
+		 * cannot be used for Rockchip IOMMUs. The provider hook handles that
+		 * path and we keep the generic fallback for any cookie-less domain.
 		 */
-		if (info->domain &&
-		    info->domain->cookie_type == IOMMU_COOKIE_NONE)
-			iommu_set_fault_handler(info->domain, dev->fault_handler ?
-						dev->fault_handler : mpp_iommu_handle, dev);
+		ret = rockchip_iommu_set_fault_handler(info->dev,
+			dev->fault_handler ? dev->fault_handler : mpp_iommu_handle,
+			dev);
+		if (ret == -ENODEV)
+			ret = vsi_iommu_set_fault_handler(info->dev,
+				dev->fault_handler ? dev->fault_handler : mpp_iommu_handle,
+				dev);
+		if (ret == -ENODEV) {
+			if (info->domain &&
+			    info->domain->cookie_type == IOMMU_COOKIE_NONE)
+				iommu_set_fault_handler(info->domain,
+					dev->fault_handler ?
+					dev->fault_handler : mpp_iommu_handle,
+					dev);
+			ret = 0;
+		}
 
 		dev_dbg(info->dev, "activate -> %p %s\n", dev, dev_name(dev->dev));
 	}
@@ -694,6 +714,10 @@ int mpp_iommu_dev_deactivate(struct mpp_iommu_info *info, struct mpp_dev *dev)
 			info->dev_active ? dev_name(info->dev_active->dev) : NULL);
 
 	dev_dbg(info->dev, "deactivate %p\n", info->dev_active);
+	if (info->dev_active == dev) {
+		rockchip_iommu_set_fault_handler(info->dev, NULL, NULL);
+		vsi_iommu_set_fault_handler(info->dev, NULL, NULL);
+	}
 	info->dev_active = NULL;
 	spin_unlock_irqrestore(&info->dev_lock, flags);
 
