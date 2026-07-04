@@ -1621,6 +1621,9 @@ int rkvdec2_attach_ccu(struct device *dev, struct rkvdec2_dev *dec)
 		}
 	}
 
+	/* audit: the core must now sit on the cluster shared domain */
+	mpp_iommu_shared_domain_verify(&ccu->iommu, dec->mpp.iommu_info);
+
 	dec->ccu = ccu;
 
 	dev_info(dev, "attach ccu as core %d\n", dec->mpp.core_id);
@@ -1870,6 +1873,8 @@ static int rkvdec2_soft_ccu_reset(struct mpp_taskqueue *queue,
 				first_ret = ret;
 		}
 		atomic_set(&mpp->reset_request, 0);
+		/* audit: reset/refresh must leave the core on the shared domain */
+		mpp_iommu_shared_domain_verify(&ccu->iommu, mpp->iommu_info);
 
 		enable_irq(mpp->irq);
 		dev_info(mpp->dev, "reset done\n");
@@ -2496,6 +2501,8 @@ static int rkvdec2_hard_ccu_reset(struct mpp_taskqueue *queue, struct rkvdec2_cc
 		}
 		enable_irq(mpp->irq);
 		atomic_set(&mpp->reset_request, 0);
+		/* audit: reset/refresh must leave the core on the shared domain */
+		mpp_iommu_shared_domain_verify(&ccu->iommu, mpp->iommu_info);
 		val = mpp_read_relaxed(mpp, 272*4);
 		dev_info(mpp->dev, "reset done, idle %d\n", (val & 1));
 	}
