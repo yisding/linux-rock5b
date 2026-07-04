@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/rockchip,mpp-service.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Rockchip vendor MPP service coordinator
+
+maintainers:
+  - RKMPP forward-port maintainers <rkmpp-forward-port@example.invalid>
+
+description:
+  The vendor MPP service node is a virtual coordinator used by Rockchip's
+  /dev/mpp_service encoder and decoder drivers. It has no register window and
+  owns shared taskqueue/resetgroup numbering for child codec cores.
+
+properties:
+  compatible:
+    const: rockchip,mpp-service
+
+  rockchip,taskqueue-count:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Number of MPP task queues owned by the service coordinator.
+
+  rockchip,resetgroup-count:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Number of shared reset groups owned by the service coordinator.
+
+required:
+  - compatible
+
+additionalProperties: true
+
+examples:
+  - |
+    mpp-srv {
+        compatible = "rockchip,mpp-service";
+        rockchip,taskqueue-count = <12>;
+        rockchip,resetgroup-count = <1>;
+    };
+...

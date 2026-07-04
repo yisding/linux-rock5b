@@ -211,6 +211,9 @@ struct rkvdec2_ccu {
 	struct list_head unused_list;
 	struct list_head used_list;
 	u32 timeout_flag;
+
+	/* cluster shared IOMMU domain, established by core 0 (the owner) */
+	struct mpp_iommu_shared_domain iommu;
 };
 
 extern struct rkvdec_link_info rkvdec_link_rk356x_hw_info;

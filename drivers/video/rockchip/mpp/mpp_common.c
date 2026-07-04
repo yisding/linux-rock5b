@@ -9,6 +9,7 @@
  *
  */
 
+#undef pr_fmt
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/clk.h>
@@ -29,6 +30,9 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/nospec.h>
+#ifdef CONFIG_COMPAT
+#include <linux/compat.h>
+#endif
 
 #include <soc/rockchip/pm_domains.h>
 
@@ -44,6 +48,16 @@ struct mpp_msg_v1 {
 	__u32 offset;
 	__u64 data_ptr;
 };
+
+#ifdef CONFIG_COMPAT
+struct mpp_msg_v1_compat {
+	__u32 cmd;
+	__u32 flags;
+	__u32 size;
+	__u32 offset;
+	compat_uptr_t data_ptr;
+};
+#endif
 
 #ifdef CONFIG_ROCKCHIP_MPP_PROC_FS
 const char *mpp_device_name[MPP_DEVICE_BUTT] = {
@@ -688,6 +702,8 @@ mpp_reset_control_get(struct mpp_dev *mpp, enum MPP_RESET_TYPE type, const char 
 
 int mpp_dev_reset(struct mpp_dev *mpp)
 {
+	int ret;
+
 	dev_info(mpp->dev, "resetting...\n");
 
 	disable_irq(mpp->irq);
@@ -716,7 +732,9 @@ int mpp_dev_reset(struct mpp_dev *mpp)
 	 * as an empty operation. Therefore, force to close and then open,
 	 * will be update the domain. In this way, domain can really attach.
 	 */
-	mpp_iommu_refresh(mpp->iommu_info, mpp->dev);
+	ret = mpp_iommu_refresh(mpp->iommu_info, mpp->dev);
+	if (ret)
+		dev_err(mpp->dev, "failed to refresh iommu: %d\n", ret);
 
 	mpp_reset_up_write(mpp->reset_group);
 	mpp_iommu_up_write(mpp->iommu_info);
@@ -727,7 +745,7 @@ int mpp_dev_reset(struct mpp_dev *mpp)
 
 	dev_info(mpp->dev, "reset done\n");
 
-	return 0;
+	return ret;
 }
 
 void mpp_task_run_begin(struct mpp_task *task, u32 timing_en, u32 timeout)
@@ -974,7 +992,7 @@ done:
 static int mpp_wait_result_default(struct mpp_session *session,
 				   struct mpp_task_msgs *msgs)
 {
-	int ret;
+	int ret = 0;
 	struct mpp_task *task;
 	struct mpp_dev *mpp;
 
@@ -986,12 +1004,23 @@ static int mpp_wait_result_default(struct mpp_session *session,
 	}
 	mpp = mpp_get_task_used_device(task, session);
 
-	ret = wait_event_interruptible(task->wait, test_bit(TASK_STATE_DONE, &task->state));
-	if (ret == -ERESTARTSYS)
-		mpp_err("wait task break by signal\n");
+	if (msgs->flags & MPP_FLAGS_POLL_NON_BLOCK) {
+		if (!test_bit(TASK_STATE_DONE, &task->state))
+			return -EAGAIN;
+	} else {
+		ret = wait_event_interruptible(task->wait,
+					       test_bit(TASK_STATE_DONE, &task->state));
+		if (ret) {
+			if (ret == -ERESTARTSYS)
+				mpp_err("wait task break by signal\n");
+			return ret;
+		}
+	}
 
 	if (mpp->dev_ops->result)
 		ret = mpp->dev_ops->result(mpp, task, msgs);
+	if (!ret && test_bit(TASK_STATE_ABORT, &task->state))
+		ret = -EIO;
 	mpp_debug_func(DEBUG_TASK_INFO, "wait done session %d:%d count %d task %d state %lx\n",
 		       session->device_type, session->index, atomic_read(&session->task_count),
 		       task->task_index, task->state);
@@ -1504,8 +1533,37 @@ static void task_msgs_add(struct mpp_task_msgs *msgs, struct list_head *head)
 	}
 }
 
+static int mpp_copy_msg_v1(struct mpp_msg_v1 *msg_v1, void __user **msg,
+				   bool compat_ioctl)
+{
+#ifdef CONFIG_COMPAT
+	if (compat_ioctl) {
+		struct mpp_msg_v1_compat msg_v1_compat;
+
+		if (copy_from_user(&msg_v1_compat, *msg, sizeof(msg_v1_compat)))
+			return -EFAULT;
+
+		msg_v1->cmd = msg_v1_compat.cmd;
+		msg_v1->flags = msg_v1_compat.flags;
+		msg_v1->size = msg_v1_compat.size;
+		msg_v1->offset = msg_v1_compat.offset;
+		msg_v1->data_ptr = (unsigned long)compat_ptr(msg_v1_compat.data_ptr);
+		*msg = (void __user *)((u8 __user *)*msg + sizeof(msg_v1_compat));
+
+		return 0;
+	}
+#endif
+
+	if (copy_from_user(msg_v1, *msg, sizeof(*msg_v1)))
+		return -EFAULT;
+
+	*msg = (void __user *)((u8 __user *)*msg + sizeof(*msg_v1));
+
+	return 0;
+}
+
 static int mpp_collect_msgs(struct list_head *head, struct mpp_session *session,
-			    unsigned int cmd, void __user *msg)
+			    unsigned int cmd, void __user *msg, bool compat_ioctl)
 {
 	struct mpp_msg_v1 msg_v1;
 	struct mpp_request *req;
@@ -1520,10 +1578,9 @@ static int mpp_collect_msgs(struct list_head *head, struct mpp_session *session,
 
 next:
 	/* first, parse to fixed struct */
-	if (copy_from_user(&msg_v1, msg, sizeof(msg_v1)))
-		return -EFAULT;
-
-	msg += sizeof(msg_v1);
+	ret = mpp_copy_msg_v1(&msg_v1, &msg, compat_ioctl);
+	if (ret)
+		return ret;
 
 	mpp_debug(DEBUG_IOCTL, "cmd %x collect flags %08x, size %d, offset %x\n",
 		  msg_v1.cmd, msg_v1.flags, msg_v1.size, msg_v1.offset);
@@ -1678,9 +1735,10 @@ static void mpp_msgs_trigger(struct list_head *msgs_list)
 	}
 }
 
-static void mpp_msgs_wait(struct list_head *msgs_list)
+static int mpp_msgs_wait(struct list_head *msgs_list)
 {
 	struct mpp_task_msgs *msgs, *n;
+	int first_ret = 0;
 
 	/* poll and release each task */
 	list_for_each_entry_safe(msgs, n, msgs_list, list) {
@@ -1692,15 +1750,20 @@ static void mpp_msgs_wait(struct list_head *msgs_list)
 			if (ret) {
 				mpp_err("session %d wait result ret %d\n",
 					session->index, ret);
+				if (!first_ret)
+					first_ret = ret;
 			}
 		}
 
 		put_task_msgs(msgs);
 
 	}
+
+	return first_ret;
 }
 
-static long mpp_dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+static long mpp_dev_ioctl_common(struct file *filp, unsigned int cmd,
+					 unsigned long arg, bool compat_ioctl)
 {
 	struct mpp_service *srv;
 	struct mpp_session *session = (struct mpp_session *)filp->private_data;
@@ -1727,18 +1790,36 @@ static long mpp_dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg
 
 	INIT_LIST_HEAD(&msgs_list);
 
-	ret = mpp_collect_msgs(&msgs_list, session, cmd, (void __user *)arg);
+	ret = mpp_collect_msgs(&msgs_list, session, cmd, (void __user *)arg,
+			       compat_ioctl);
 	if (ret)
 		mpp_err("collect msgs failed %d\n", ret);
 
 	mpp_msgs_trigger(&msgs_list);
 
-	mpp_msgs_wait(&msgs_list);
+	if (!ret)
+		ret = mpp_msgs_wait(&msgs_list);
+	else
+		mpp_msgs_wait(&msgs_list);
 
 	mpp_debug_leave();
 
 	return ret;
 }
+
+static long mpp_dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+	return mpp_dev_ioctl_common(filp, cmd, arg, false);
+}
+
+#ifdef CONFIG_COMPAT
+static long mpp_dev_compat_ioctl(struct file *filp, unsigned int cmd,
+				 unsigned long arg)
+{
+	return mpp_dev_ioctl_common(filp, cmd,
+				      (unsigned long)compat_ptr(arg), true);
+}
+#endif
 
 static int mpp_dev_open(struct inode *inode, struct file *filp)
 {
@@ -1799,7 +1880,7 @@ const struct file_operations rockchip_mpp_fops = {
 	.release	= mpp_dev_release,
 	.unlocked_ioctl = mpp_dev_ioctl,
 #ifdef CONFIG_COMPAT
-	.compat_ioctl   = mpp_dev_ioctl,
+	.compat_ioctl   = mpp_dev_compat_ioctl,
 #endif
 };
 
@@ -2021,13 +2102,26 @@ int mpp_task_finish(struct mpp_session *session,
 		    struct mpp_task *task)
 {
 	struct mpp_dev *mpp = mpp_get_task_used_device(task, session);
+	int ret = 0;
+	int reset_ret;
 
 	if (mpp->dev_ops->finish)
-		mpp->dev_ops->finish(mpp, task);
+		ret = mpp->dev_ops->finish(mpp, task);
+	if (ret) {
+		dev_err(mpp->dev, "task finish failed: %d\n", ret);
+		set_bit(TASK_STATE_ABORT, &task->state);
+	}
 
 	mpp_reset_up_read(mpp->reset_group);
-	if (atomic_read(&mpp->reset_request) > 0)
-		mpp_dev_reset(mpp);
+	if (atomic_read(&mpp->reset_request) > 0) {
+		reset_ret = mpp_dev_reset(mpp);
+		if (reset_ret) {
+			dev_err(mpp->dev, "reset recovery failed: %d\n", reset_ret);
+			set_bit(TASK_STATE_ABORT, &task->state);
+			if (!ret)
+				ret = reset_ret;
+		}
+	}
 	mpp_power_off(mpp);
 
 	set_bit(TASK_STATE_FINISH, &task->state);
@@ -2049,7 +2143,7 @@ int mpp_task_finish(struct mpp_session *session,
 	wake_up(&task->wait);
 	mpp_taskqueue_pop_running(mpp->queue, task);
 
-	return 0;
+	return ret;
 }
 
 int mpp_task_finalize(struct mpp_session *session,
@@ -2231,14 +2325,13 @@ int mpp_dev_probe(struct mpp_dev *mpp,
 	}
 	mpp->io_base = res->start;
 
-	/*
-	 * TODO: here or at the device itself, some device does not
-	 * have the iommu, maybe in the device is better.
-	 */
+	/* The forward-ported RK3588 MPP blocks require an attached IOMMU. */
 	mpp->iommu_info = mpp_iommu_probe(dev);
 	if (IS_ERR(mpp->iommu_info)) {
-		dev_err(dev, "failed to attach iommu\n");
+		ret = PTR_ERR(mpp->iommu_info);
+		dev_err(dev, "failed to attach iommu: %d\n", ret);
 		mpp->iommu_info = NULL;
+		goto failed;
 	} else {
 		mpp->iommu_info->queue = mpp->queue;
 	}
@@ -2263,6 +2356,8 @@ int mpp_dev_probe(struct mpp_dev *mpp,
 
 	return ret;
 failed:
+	mpp_iommu_remove(mpp->iommu_info);
+	mpp->iommu_info = NULL;
 	mpp_detach_workqueue(mpp);
 	device_init_wakeup(dev, false);
 	pm_runtime_disable(dev);

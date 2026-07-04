@@ -634,6 +634,7 @@ static void *rkvdec2_link_prepare(struct mpp_dev *mpp,
 
 static int rkvdec2_link_reset(struct mpp_dev *mpp)
 {
+	int ret;
 
 	dev_info(mpp->dev, "resetting...\n");
 
@@ -656,7 +657,9 @@ static int rkvdec2_link_reset(struct mpp_dev *mpp)
 	 * as an empty operation. Therefore, force to close and then open,
 	 * will be update the domain. In this way, domain can really attach.
 	 */
-	mpp_iommu_refresh(mpp->iommu_info, mpp->dev);
+	ret = mpp_iommu_refresh(mpp->iommu_info, mpp->dev);
+	if (ret)
+		dev_err(mpp->dev, "failed to refresh iommu: %d\n", ret);
 
 	mpp_reset_up_write(mpp->reset_group);
 	mpp_iommu_up_write(mpp->iommu_info);
@@ -665,7 +668,7 @@ static int rkvdec2_link_reset(struct mpp_dev *mpp)
 	mpp_iommu_enable_irq(mpp->iommu_info);
 	dev_info(mpp->dev, "reset done\n");
 
-	return 0;
+	return ret;
 }
 
 static int rkvdec2_link_irq(struct mpp_dev *mpp)
@@ -1103,6 +1106,7 @@ static void rkvdec2_link_try_dequeue(struct mpp_dev *mpp)
 		      readl(link_dec->reg_base + RKVDEC_LINK_EN_BASE) : 0;
 	u32 force_dequeue = iommu_fault || !link_en;
 	u32 dequeue_cnt = 0;
+	int reset_ret = 0;
 	unsigned long flags;
 
 	list_for_each_entry_safe(mpp_task, n, &queue->running_list, queue_link) {
@@ -1153,11 +1157,17 @@ static void rkvdec2_link_try_dequeue(struct mpp_dev *mpp)
 			dev_err(mpp->dev, "session %d task %d timeout %d abort %d force_dequeue %d\n",
 				mpp_task->session->index, mpp_task->task_index,
 				timeout_flag, abort_flag, force_dequeue);
-			rkvdec2_link_reset(mpp);
+			reset_ret = rkvdec2_link_reset(mpp);
+			if (reset_ret) {
+				dev_err(mpp->dev, "link reset failed: %d\n", reset_ret);
+				set_bit(TASK_STATE_ABORT, &mpp_task->state);
+			}
 			reset_flag = 1;
-			dec->mmu_fault = 0;
-			mpp->irq_status = 0;
-			force_dequeue = 0;
+			if (!reset_ret) {
+				dec->mmu_fault = 0;
+				mpp->irq_status = 0;
+				force_dequeue = 0;
+			}
 		}
 
 		cancel_delayed_work_sync(&mpp_task->timeout_work);
@@ -1198,11 +1208,16 @@ static void rkvdec2_link_try_dequeue(struct mpp_dev *mpp)
 		wake_up(&mpp_task->wait);
 		mpp_dev_load(mpp, mpp_task);
 		kref_put(&mpp_task->ref, rkvdec2_link_free_task);
+		if (reset_ret)
+			break;
 	}
 
 	/* resend running task after reset */
-	if (reset_flag && !list_empty(&queue->running_list))
+	if (reset_flag && reset_ret) {
+		atomic_set(&mpp->reset_request, 1);
+	} else if (reset_flag && !list_empty(&queue->running_list)) {
 		rkvdec2_link_resend(mpp);
+	}
 }
 
 static int mpp_task_queue(struct mpp_dev *mpp, struct mpp_task *mpp_task)
@@ -1426,7 +1441,13 @@ void rkvdec2_link_worker(struct kthread_work *work_s)
 
 	/* process reset */
 	if (atomic_read(&mpp->reset_request)) {
-		rkvdec2_link_reset(mpp);
+		int ret = rkvdec2_link_reset(mpp);
+
+		if (ret) {
+			dev_err(mpp->dev, "link reset failed: %d\n", ret);
+			atomic_set(&mpp->reset_request, 1);
+			goto done;
+		}
 		/* resend running task after reset */
 		if (!list_empty(&queue->running_list))
 			rkvdec2_link_resend(mpp);
@@ -1554,33 +1575,50 @@ int rkvdec2_attach_ccu(struct device *dev, struct rkvdec2_dev *dec)
 	}
 
 	ret = of_property_read_u32(dev->of_node, "rockchip,core-mask", &dec->core_mask);
-	if (ret)
+	if (ret) {
+		put_device(&pdev->dev);
 		return ret;
+	}
 	dev_info(dev, "core_mask=%08x\n", dec->core_mask);
 
-	/* if not the main-core, then attach the main core domain to current */
-	if (dec->mpp.core_id != 0) {
-		struct mpp_taskqueue *queue;
-		struct mpp_iommu_info *ccu_info, *cur_info;
-
-		queue = dec->mpp.queue;
+	/*
+	 * Establish or join the cluster's shared IOMMU domain. Core 0 is the
+	 * service-visible owner, so its default DMA domain is the shared IOVA
+	 * space; secondary cores join that domain (borrowing its rw_sem too) so
+	 * a task dispatched to any core sees the same mappings. This replaces
+	 * the old open-coded per-core domain swap; unlike it, the decoder now
+	 * also shares the owner's rw_sem, matching the encoder.
+	 */
+	if (dec->mpp.core_id == 0) {
+		/* the CCU decoder cluster requires an IOMMU on its owner core */
+		if (!dec->mpp.iommu_info) {
+			put_device(&pdev->dev);
+			return -ENODEV;
+		}
+		ret = mpp_iommu_shared_domain_init(&ccu->iommu, dec->mpp.iommu_info);
+		if (ret) {
+			put_device(&pdev->dev);
+			return ret;
+		}
+	} else {
 		/*
-		 * A secondary core attaches to the main core's (core 0) IOMMU
-		 * domain. If core 0 has not registered in the queue yet, defer so
-		 * this core retries after core 0 probes -- otherwise queue->cores[0]
-		 * is NULL and we oops. (Only guaranteed core0-first for a built-in
-		 * driver / correct boot order.)
+		 * If core 0 has not established the shared domain yet, defer so
+		 * this core retries after core 0 probes -- only guaranteed
+		 * core0-first for a built-in driver / correct boot order.
 		 */
-		if (!queue || !queue->cores[0]) {
+		if (!ccu->iommu.owner) {
 			put_device(&pdev->dev);
 			return -EPROBE_DEFER;
 		}
-		/* set the ccu-domain for current device */
-		ccu_info = queue->cores[0]->iommu_info;
-		cur_info = dec->mpp.iommu_info;
-		if (cur_info)
-			cur_info->domain = ccu_info->domain;
-		mpp_iommu_attach(cur_info);
+		if (!dec->mpp.iommu_info) {
+			put_device(&pdev->dev);
+			return -ENODEV;
+		}
+		ret = mpp_iommu_shared_domain_bind(&ccu->iommu, dec->mpp.iommu_info);
+		if (ret) {
+			put_device(&pdev->dev);
+			return ret;
+		}
 	}
 
 	dec->ccu = ccu;
@@ -1780,9 +1818,11 @@ static int rkvdec2_soft_ccu_reset(struct mpp_taskqueue *queue,
 				  struct rkvdec2_ccu *ccu)
 {
 	int i;
+	int first_ret = 0;
 
 	for (i = queue->core_count - 1; i >= 0; i--) {
 		u32 val;
+		int ret;
 
 		struct mpp_dev *mpp = queue->cores[i];
 		struct rkvdec2_dev *dec = to_rkvdec2_dev(mpp);
@@ -1823,7 +1863,12 @@ static int rkvdec2_soft_ccu_reset(struct mpp_taskqueue *queue,
 		/* connect core and ccu */
 		writel(dec->core_mask & RKVDEC_CCU_CORE_RW_MASK,
 		       ccu->reg_base + RKVDEC_CCU_CORE_IDLE_BASE);
-		mpp_iommu_refresh(mpp->iommu_info, mpp->dev);
+		ret = mpp_iommu_refresh(mpp->iommu_info, mpp->dev);
+		if (ret) {
+			dev_err(mpp->dev, "iommu refresh failed: %d\n", ret);
+			if (!first_ret)
+				first_ret = ret;
+		}
 		atomic_set(&mpp->reset_request, 0);
 
 		enable_irq(mpp->irq);
@@ -1831,7 +1876,7 @@ static int rkvdec2_soft_ccu_reset(struct mpp_taskqueue *queue,
 	}
 	atomic_set(&queue->reset_request, 0);
 
-	return 0;
+	return first_ret;
 }
 
 void *rkvdec2_ccu_alloc_task(struct mpp_session *session,
@@ -2120,6 +2165,7 @@ void rkvdec2_soft_ccu_worker(struct kthread_work *work_s)
 	struct mpp_dev *mpp = container_of(work_s, struct mpp_dev, work);
 	struct mpp_taskqueue *queue = mpp->queue;
 	struct rkvdec2_dev *dec = to_rkvdec2_dev(mpp);
+	int ret;
 
 	mpp_debug_enter();
 
@@ -2130,7 +2176,11 @@ void rkvdec2_soft_ccu_worker(struct kthread_work *work_s)
 	if (atomic_read(&queue->reset_request)) {
 		if (!rkvdec2_core_working(queue)) {
 			rkvdec2_ccu_power_on(queue, dec->ccu);
-			rkvdec2_soft_ccu_reset(queue, dec->ccu);
+			ret = rkvdec2_soft_ccu_reset(queue, dec->ccu);
+			if (ret) {
+				dev_err(mpp->dev, "soft ccu reset failed: %d\n", ret);
+				atomic_set(&queue->reset_request, 1);
+			}
 		}
 	}
 
@@ -2398,12 +2448,14 @@ static int rkvdec2_hard_ccu_dequeue(struct mpp_taskqueue *queue,
 static int rkvdec2_hard_ccu_reset(struct mpp_taskqueue *queue, struct rkvdec2_ccu *ccu)
 {
 	u32 i = 0;
+	int first_ret = 0;
 
 	mpp_debug_enter();
 
 	/* reset and active core */
 	for (i = 0; i < queue->core_count; i++) {
 		u32 val = 0;
+		int ret;
 		struct mpp_dev *mpp = queue->cores[i];
 		struct rkvdec2_dev *dec = to_rkvdec2_dev(mpp);
 
@@ -2436,7 +2488,12 @@ static int rkvdec2_hard_ccu_reset(struct mpp_taskqueue *queue, struct rkvdec2_cc
 #else
 		rkvdec2_reset(mpp);
 #endif
-		mpp_iommu_refresh(mpp->iommu_info, mpp->dev);
+		ret = mpp_iommu_refresh(mpp->iommu_info, mpp->dev);
+		if (ret) {
+			dev_err(mpp->dev, "iommu refresh failed: %d\n", ret);
+			if (!first_ret)
+				first_ret = ret;
+		}
 		enable_irq(mpp->irq);
 		atomic_set(&mpp->reset_request, 0);
 		val = mpp_read_relaxed(mpp, 272*4);
@@ -2448,7 +2505,7 @@ static int rkvdec2_hard_ccu_reset(struct mpp_taskqueue *queue, struct rkvdec2_cc
 	mpp_safe_unreset(ccu->rst_a);
 
 	mpp_debug_leave();
-	return 0;
+	return first_ret;
 }
 
 static struct mpp_task *
@@ -2690,6 +2747,7 @@ void rkvdec2_hard_ccu_worker(struct kthread_work *work_s)
 	struct mpp_dev *mpp = container_of(work_s, struct mpp_dev, work);
 	struct mpp_taskqueue *queue = mpp->queue;
 	struct rkvdec2_dev *dec = to_rkvdec2_dev(mpp);
+	int ret;
 
 	mpp_debug_enter();
 
@@ -2709,13 +2767,20 @@ void rkvdec2_hard_ccu_worker(struct kthread_work *work_s)
 			cancel_delayed_work(&loop->timeout_work);
 		}
 		/* reset process */
-		rkvdec2_hard_ccu_reset(queue, dec->ccu);
+		ret = rkvdec2_hard_ccu_reset(queue, dec->ccu);
+		if (ret) {
+			dev_err(mpp->dev, "hard ccu reset failed: %d\n", ret);
+			atomic_set(&queue->reset_request, 1);
+			goto skip_resend;
+		}
 		atomic_set(&queue->reset_request, 0);
 
 		/* relink running task iova in list, and resend them to hw */
 		if (!list_empty(&queue->running_list))
 			rkvdec2_hard_ccu_resend_tasks(mpp, queue);
 	}
+
+skip_resend:
 
 	/* 3. process pending task */
 	while (1) {
