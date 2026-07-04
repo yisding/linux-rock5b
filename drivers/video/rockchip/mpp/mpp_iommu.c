@@ -577,6 +577,50 @@ bool mpp_iommu_shared_domain_verify(struct mpp_iommu_shared_domain *shared,
 	return true;
 }
 
+/*
+ * Record a fixed RCB/SRAM IOVA window for a CCU cluster and reject an overlap.
+ *
+ * Every core in a cluster maps its own RCB/SRAM window into the one shared
+ * domain, each at a distinct fixed IOVA from its "rockchip,rcb-iova" DT
+ * property. Two cores whose windows overlap would corrupt each other's fixed
+ * buffers in the shared IOVA space, so refuse the second map and say so loudly.
+ * Windows are tracked per cluster; the array is cleared when the owner detaches.
+ */
+int mpp_iommu_shared_domain_reserve_window(struct mpp_iommu_shared_domain *shared,
+					   dma_addr_t iova, size_t size,
+					   struct device *dev)
+{
+	unsigned int i;
+
+	if (!shared || !size)
+		return -EINVAL;
+
+	for (i = 0; i < shared->nr_windows; i++) {
+		dma_addr_t a0 = shared->windows[i].iova;
+		size_t asz = shared->windows[i].size;
+
+		/* half-open ranges overlap iff each starts before the other ends */
+		if (iova < a0 + asz && a0 < iova + size) {
+			dev_err(dev,
+				"CCU fixed IOVA window %pad+%#zx overlaps existing %pad+%#zx\n",
+				&iova, size, &a0, asz);
+			return -EADDRINUSE;
+		}
+	}
+
+	if (shared->nr_windows >= MPP_IOMMU_MAX_FIXED_WINDOWS) {
+		dev_warn(dev, "CCU fixed IOVA window table full; not tracking %pad\n",
+			 &iova);
+		return 0;
+	}
+
+	shared->windows[shared->nr_windows].iova = iova;
+	shared->windows[shared->nr_windows].size = size;
+	shared->nr_windows++;
+
+	return 0;
+}
+
 static int mpp_iommu_handle(struct iommu_domain *iommu,
 			    struct device *iommu_dev,
 			    unsigned long iova,

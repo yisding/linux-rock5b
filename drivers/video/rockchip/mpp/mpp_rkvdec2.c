@@ -1851,6 +1851,13 @@ static int rkvdec2_alloc_rcbbuf(struct platform_device *pdev, struct rkvdec2_dev
 	sram_size = rcb_size < sram_size ? rcb_size : sram_size;
 	/* iova map to sram */
 	domain = dec->mpp.iommu_info->domain;
+	/* in a CCU cluster this is the shared domain; reject overlapping windows */
+	if (dec->ccu) {
+		ret = mpp_iommu_shared_domain_reserve_window(&dec->ccu->iommu,
+							     iova, rcb_size, dev);
+		if (ret)
+			return ret;
+	}
 	ret = iommu_map(domain, iova, sram_start, sram_size, IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
 	if (ret) {
 		dev_err(dev, "sram iommu_map error.\n");

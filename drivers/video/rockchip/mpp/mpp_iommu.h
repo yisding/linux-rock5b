@@ -107,6 +107,9 @@ struct mpp_iommu_info {
 	struct mpp_taskqueue *queue;
 };
 
+/* fixed RCB/SRAM windows tracked per CCU cluster (one per core + slack) */
+#define MPP_IOMMU_MAX_FIXED_WINDOWS	8
+
 /*
  * CCU cluster shared IOMMU domain.
  *
@@ -134,6 +137,17 @@ struct mpp_iommu_shared_domain {
 	struct iommu_domain *domain;
 	/* cluster-wide map/unmap/reset serialization == owner->rw_sem */
 	struct rw_semaphore *rw_sem;
+	/*
+	 * Fixed RCB/SRAM IOVA windows mapped into this cluster domain. Each core
+	 * maps its own SRAM window at a distinct fixed IOVA (Rock 5B decoder:
+	 * core 0 0xFFF00000, core 1 0xFFE00000), so tracking them lets us reject
+	 * an accidental overlap inside the one shared domain.
+	 */
+	struct {
+		dma_addr_t iova;
+		size_t size;
+	} windows[MPP_IOMMU_MAX_FIXED_WINDOWS];
+	unsigned int nr_windows;
 };
 
 struct mpp_dma_session *
@@ -172,6 +186,9 @@ int mpp_iommu_shared_domain_bind(struct mpp_iommu_shared_domain *shared,
 				 struct mpp_iommu_info *info);
 bool mpp_iommu_shared_domain_verify(struct mpp_iommu_shared_domain *shared,
 				    struct mpp_iommu_info *info);
+int mpp_iommu_shared_domain_reserve_window(struct mpp_iommu_shared_domain *shared,
+					   dma_addr_t iova, size_t size,
+					   struct device *dev);
 
 int mpp_iommu_refresh(struct mpp_iommu_info *info, struct device *dev);
 int mpp_iommu_flush_tlb(struct mpp_iommu_info *info);
