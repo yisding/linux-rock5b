@@ -5379,6 +5379,9 @@ static void rk_rga_hw_enqueue_job_locked(struct rk_rga_hw *hw,
 					 struct rk_rga_job *job);
 static int rk_rga_job_queue_on_hw(struct rk_rga_job *job, struct rk_rga_hw *hw,
 				  bool take_ref);
+static bool rk_rga_hw_abort_session_jobs(struct rk_rga_hw *hw,
+					 struct rk_rga_session *session,
+					 int result);
 static struct rk_rga_hw *
 rk_rga_iommu_find_fault_hw(struct list_head *fault_hws,
 			   struct iommu_domain *domain,
@@ -5608,6 +5611,36 @@ static long rk_rga_ioctl_import_buffer(unsigned long arg,
 				       struct rk_rga_session *session);
 static long rk_rga_ioctl_release_buffer(unsigned long arg,
 					struct rk_rga_session *session);
+
+struct rk_rga_kunit_sync_ioctl {
+	struct work_struct work;
+	struct rk_rga_session *session;
+	void __user *task_user;
+	long ret;
+	bool done;
+};
+
+static void rk_rga_kunit_sync_ioctl_work(struct work_struct *work)
+{
+	struct rk_rga_kunit_sync_ioctl *ioctl =
+		container_of(work, struct rk_rga_kunit_sync_ioctl, work);
+
+	ioctl->ret = rk_rga_ioctl_blit((unsigned long)ioctl->task_user,
+				       ioctl->session, RGA_BLIT_SYNC);
+	WRITE_ONCE(ioctl->done, true);
+}
+
+static u32 rk_rga_kunit_hw_queued_jobs(struct rk_rga_hw *hw)
+{
+	unsigned long flags;
+	u32 queued;
+
+	spin_lock_irqsave(&hw->job_lock, flags);
+	queued = hw->queued_jobs;
+	spin_unlock_irqrestore(&hw->job_lock, flags);
+
+	return queued;
+}
 static struct rk_rga_import *rk_rga_kunit_import(struct kunit *test);
 
 static void __user *rk_rga_kunit_user_buffer(struct kunit *test, size_t size)
@@ -8146,6 +8179,135 @@ static void rk_rga_request_reconfig_gauss_kunit(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, idr_remove(&session.imports, 41),
 			    src_import);
 	KUNIT_EXPECT_PTR_EQ(test, idr_remove(&session.imports, 42),
+			    dst_import);
+	rk_rga_import_put(src_import);
+	rk_rga_import_put(dst_import);
+	idr_destroy(&session.requests);
+	idr_destroy(&session.imports);
+}
+
+static void rk_rga_legacy_blit_sync_wait_kunit(struct kunit *test)
+{
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_RGBA_8888);
+	struct rga_req user_task;
+	struct rk_rga_session session = {};
+	struct rk_rga_import *src_import;
+	struct rk_rga_import *dst_import;
+	struct rk_rga_hw hw = { };
+	struct rk_rga_job active = { };
+	struct rk_rga_kunit_sync_ioctl ioctl = {
+		.session = &session,
+		.ret = -EINVAL,
+	};
+	void __user *task_user;
+	unsigned long uncopied;
+	bool queued = false;
+
+	task_user = rk_rga_kunit_user_buffer(test, sizeof(task));
+	KUNIT_ASSERT_NOT_NULL(test, task_user);
+
+	task.handle_flag = 1;
+	task.src.yrgb_addr = 11;
+	task.src.uv_addr = 0;
+	task.src.v_addr = 0;
+	task.dst.yrgb_addr = 12;
+	task.dst.uv_addr = 0;
+	task.dst.v_addr = 0;
+	task.out_fence_fd = -1;
+
+	uncopied = copy_to_user(task_user, &task, sizeof(task));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+
+	rk_rga_session_init(&session);
+	src_import = rk_rga_kunit_import(test);
+	dst_import = rk_rga_kunit_import(test);
+	KUNIT_ASSERT_NOT_NULL(test, src_import);
+	KUNIT_ASSERT_NOT_NULL(test, dst_import);
+	src_import->iova = 0x10000000;
+	src_import->size = (size_t)1920 * 1080 * 4;
+	dst_import->iova = 0x20000000;
+	dst_import->size = (size_t)1280 * 720 * 4;
+
+	KUNIT_ASSERT_EQ(test,
+			idr_alloc(&session.imports, src_import, 11, 12,
+				  GFP_KERNEL),
+			11);
+	KUNIT_ASSERT_EQ(test,
+			idr_alloc(&session.imports, dst_import, 12, 13,
+				  GFP_KERNEL),
+			12);
+
+	mutex_init(&hw.run_lock);
+	spin_lock_init(&hw.job_lock);
+	init_waitqueue_head(&hw.idle);
+	INIT_LIST_HEAD(&hw.node);
+	INIT_LIST_HEAD(&hw.job_queue);
+	INIT_DELAYED_WORK(&hw.timeout_work, rk_rga_hw_timeout_work);
+	refcount_set(&hw.refs, 1);
+	hw.type = RK_RGA_HW_RGA3;
+	hw.core_mask = BIT(0);
+	hw.active_job = &active;
+
+	mutex_init(&rk_rga.hw_lock);
+	INIT_LIST_HEAD(&rk_rga.hw_list);
+	rk_rga.core_select_seq = 0;
+	list_add_tail(&hw.node, &rk_rga.hw_list);
+
+	ioctl.task_user = task_user;
+	INIT_WORK(&ioctl.work, rk_rga_kunit_sync_ioctl_work);
+	schedule_work(&ioctl.work);
+
+	for (u32 i = 0; i < 100; i++) {
+		if (rk_rga_kunit_hw_queued_jobs(&hw) == 1) {
+			queued = true;
+			break;
+		}
+		if (READ_ONCE(ioctl.done))
+			break;
+		usleep_range(1000, 2000);
+	}
+
+	if (queued) {
+		KUNIT_EXPECT_FALSE(test, READ_ONCE(ioctl.done));
+		KUNIT_EXPECT_EQ(test, refcount_read(&src_import->refs), 2);
+		KUNIT_EXPECT_EQ(test, refcount_read(&dst_import->refs), 2);
+		KUNIT_EXPECT_EQ(test, refcount_read(&hw.refs), 2);
+		KUNIT_EXPECT_TRUE(test,
+				  rk_rga_hw_abort_session_jobs(&hw, &session,
+							       0));
+	} else {
+		unsigned long flags;
+
+		KUNIT_FAIL(test, "sync legacy blit did not queue before returning");
+		spin_lock_irqsave(&hw.job_lock, flags);
+		hw.removing = true;
+		spin_unlock_irqrestore(&hw.job_lock, flags);
+		rk_rga_hw_abort_session_jobs(&hw, &session, -ETIMEDOUT);
+	}
+
+	flush_work(&ioctl.work);
+	KUNIT_EXPECT_TRUE(test, READ_ONCE(ioctl.done));
+	KUNIT_EXPECT_EQ(test, ioctl.ret, 0L);
+	KUNIT_EXPECT_TRUE(test, list_empty(&hw.job_queue));
+	KUNIT_EXPECT_EQ(test, hw.queued_jobs, 0U);
+	KUNIT_EXPECT_EQ(test, refcount_read(&hw.refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&src_import->refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&dst_import->refs), 1);
+
+	uncopied = copy_from_user(&user_task, task_user, sizeof(user_task));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+	KUNIT_EXPECT_EQ(test, user_task.handle_flag & 1, 1U);
+	KUNIT_EXPECT_EQ(test, user_task.src.yrgb_addr, 11ULL);
+	KUNIT_EXPECT_EQ(test, user_task.dst.yrgb_addr, 12ULL);
+	KUNIT_EXPECT_EQ(test, user_task.out_fence_fd, -1);
+
+	hw.active_job = NULL;
+	list_del_init(&hw.node);
+	KUNIT_EXPECT_PTR_EQ(test, idr_remove(&session.imports, 11),
+			    src_import);
+	KUNIT_EXPECT_PTR_EQ(test, idr_remove(&session.imports, 12),
 			    dst_import);
 	rk_rga_import_put(src_import);
 	rk_rga_import_put(dst_import);
@@ -12690,6 +12852,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_last_hw_remove_pending_acquire_kunit),
 	KUNIT_CASE(rk_rga_release_queued_job_kunit),
 	KUNIT_CASE(rk_rga_request_reconfig_gauss_kunit),
+	KUNIT_CASE(rk_rga_legacy_blit_sync_wait_kunit),
 	KUNIT_CASE(rk_rga_legacy_blit_async_acquire_kunit),
 	KUNIT_CASE(rk_rga_request_submit_async_acquire_kunit),
 	KUNIT_CASE(rk_rga_version_queries_kunit),
