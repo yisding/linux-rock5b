@@ -23,7 +23,12 @@ Implemented
   messages, including when a later batch entry switches back to an earlier
   session.  Invalid descriptors are reported in the batch entry's
   ``mpp_bat_msg.ret`` field as ``-EBADF``, and ``MPP_BAT_MSG_DONE`` entries
-  are consumed as no-op markers.
+  are consumed as no-op markers.  The current libmpp batch-server wait layout
+  is recognized narrowly as repeated ``SET_SESSION_FD`` +
+  ``POLL_HW_FINISH|POLL_NON_BLOCK|LAST_MSG`` pairs: the rewrite infers the
+  wait-array capacity from the first status pointer, continues through valid
+  next slots, stops at fresh zeroed unused slots, and skips stale completed
+  slots marked ``MPP_BAT_MSG_DONE``.
 * RK3588 BSP-style RKVENC2/RKVDEC2 platform-device binding with devm-managed
   MMIO, IRQ, clock, and reset discovery.
   Device-tree ``rockchip,normal-rates`` entries that match the clock list are
@@ -252,8 +257,9 @@ Implemented
   flexible-buffer sizing, RKVENC2 slice-mode detection and slice FIFO
   overflow/final-slice reporting, ``POLL_HW_FINISH`` nonblocking pending-job
   ``-EAGAIN`` without consuming the active job, and ``SET_SESSION_FD``
-  invalid-fd status, done-marker handling, batch job splitting, and public
-  ``RESET_SESSION``/file-close cleanup of imports plus queued/active jobs.
+  invalid-fd status, done-marker handling, batch job splitting, libmpp
+  batch-wait layout continuation, and public ``RESET_SESSION``/file-close
+  cleanup of imports plus queued/active jobs.
 
 Recognized But Unsupported
 --------------------------
