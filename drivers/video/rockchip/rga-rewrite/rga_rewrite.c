@@ -5611,6 +5611,7 @@ static long rk_rga_ioctl_import_buffer(unsigned long arg,
 				       struct rk_rga_session *session);
 static long rk_rga_ioctl_release_buffer(unsigned long arg,
 					struct rk_rga_session *session);
+static long rk_rga_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 
 struct rk_rga_kunit_sync_ioctl {
 	struct work_struct work;
@@ -8656,6 +8657,36 @@ static void rk_rga_version_queries_kunit(struct kunit *test)
 	list_del_init(&rga3.node);
 	INIT_LIST_HEAD(&rk_rga.hw_list);
 	rk_rga_refresh_hw_versions();
+}
+
+static void rk_rga_legacy_noop_ioctls_kunit(struct kunit *test)
+{
+	static const unsigned int cmds[] = {
+		RGA_CACHE_FLUSH,
+		RGA_FLUSH,
+		RGA2_FLUSH,
+		RGA_GET_RESULT,
+		RGA2_GET_RESULT,
+	};
+	struct rk_rga_session session = {};
+	struct file file = {
+		.private_data = &session,
+	};
+	int base_count;
+	size_t i;
+
+	base_count = atomic_read(&rk_rga.ioctl_count);
+
+	for (i = 0; i < ARRAY_SIZE(cmds); i++) {
+		KUNIT_EXPECT_EQ(test, rk_rga_ioctl(&file, cmds[i], 0), 0L);
+		KUNIT_EXPECT_EQ(test, atomic_read(&rk_rga.ioctl_count),
+				base_count + (int)i + 1);
+	}
+
+	file.private_data = NULL;
+	KUNIT_EXPECT_EQ(test, rk_rga_ioctl(&file, RGA_FLUSH, 0), -EINVAL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&rk_rga.ioctl_count),
+			base_count + (int)ARRAY_SIZE(cmds));
 }
 
 static void rk_rga_request_remove_free_kunit(struct kunit *test)
@@ -12856,6 +12887,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_legacy_blit_async_acquire_kunit),
 	KUNIT_CASE(rk_rga_request_submit_async_acquire_kunit),
 	KUNIT_CASE(rk_rga_version_queries_kunit),
+	KUNIT_CASE(rk_rga_legacy_noop_ioctls_kunit),
 	KUNIT_CASE(rk_rga_request_remove_free_kunit),
 	KUNIT_CASE(rk_rga_import_buffer_size_kunit),
 	KUNIT_CASE(rk_rga_import_buffer_ioctl_errors_kunit),
