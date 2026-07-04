@@ -404,7 +404,6 @@ struct rk_mpp_job {
 	u64 hw_start_ns;
 	u64 hw_elapsed_ns;
 	spinlock_t rkvenc_slice_lock;
-	struct mpp_bat_msg __user *batch_status;
 	DECLARE_KFIFO(rkvenc_slice_fifo, u32, RK_MPP_RKVENC_MAX_SLICE_FIFO);
 	struct mpp_request poll_req;
 	struct rk_mpp_reg_image reg_image;
@@ -416,11 +415,6 @@ struct rk_mpp_job {
 struct rk_mpp_batch_state {
 	struct list_head jobs;
 	struct rk_mpp_job *cur_job;
-	struct mpp_bat_msg __user *batch_status;
-	struct mpp_bat_msg __user *batch_status_base;
-	void __user *msg_base;
-	u32 msg_count;
-	u32 batch_wait_limit;
 	u32 req_cnt;
 	bool skip_group;
 };
@@ -2481,20 +2475,14 @@ static void rk_mpp_rkvenc2_dchs_release(struct rk_mpp_job *job);
 static int rk_mpp_switch_session(struct rk_mpp_session **session,
 				 struct fd *held_fd,
 				 const struct rk_mpp_msg_v1 *msg,
-				 struct mpp_bat_msg __user **batch_status,
 				 bool *skip_group);
-static void rk_mpp_batch_wait_maybe_start(struct rk_mpp_batch_state *batch,
-					  const struct rk_mpp_msg_v1 *msg,
-					  u32 msg_idx);
-static int rk_mpp_batch_wait_continue(struct rk_mpp_batch_state *batch,
-				      const struct rk_mpp_msg_v1 *msg,
-				      u32 msg_idx, void __user *next_user,
-				      bool *cont);
+static bool
+rk_mpp_is_batch_server_wait_ioctl(void __user *msg_base,
+				  const struct rk_mpp_msg_v1 *first);
 static int rk_mpp_process_request(struct rk_mpp_session *session,
 				  struct mpp_request *req,
 				  struct rk_mpp_batch_state *batch);
 static int rk_mpp_execute_jobs(struct rk_mpp_batch_state *batch);
-static int rk_mpp_job_write_batch_status(struct rk_mpp_job *job, int ret);
 static int rk_mpp_job_store_reg_offsets(struct rk_mpp_job *job,
 					const struct rk_mpp_job_req *job_req);
 static int rk_mpp_job_apply_reg_offsets(struct rk_mpp_job *job);
@@ -4661,7 +4649,6 @@ static void rk_mpp_switch_session_status_kunit(struct kunit *test)
 		.fd = U32_MAX,
 		.ret = 1234,
 	};
-	struct mpp_bat_msg __user *batch_status = NULL;
 	struct mpp_bat_msg out = {};
 	struct rk_mpp_msg_v1 msg = {};
 	void __user *user;
@@ -4675,10 +4662,9 @@ static void rk_mpp_switch_session_status_kunit(struct kunit *test)
 
 	KUNIT_EXPECT_EQ(test,
 			rk_mpp_switch_session(&active, &held_fd, &msg,
-					      &batch_status, &skip_group), 0);
+					      &skip_group), 0);
 	KUNIT_EXPECT_PTR_EQ(test, active, &session);
 	KUNIT_EXPECT_PTR_EQ(test, fd_file(held_fd), NULL);
-	KUNIT_EXPECT_PTR_EQ(test, batch_status, user);
 	KUNIT_EXPECT_TRUE(test, skip_group);
 	uncopied = copy_from_user(&out, user, sizeof(out));
 	KUNIT_EXPECT_EQ(test, uncopied, 0UL);
@@ -4693,15 +4679,13 @@ static void rk_mpp_switch_session_status_kunit(struct kunit *test)
 	user = rk_mpp_kunit_user_payload(test, &bat, sizeof(bat));
 	KUNIT_ASSERT_NOT_NULL(test, user);
 	msg.data_ptr = (uintptr_t)user;
-	batch_status = NULL;
 	skip_group = false;
 
 	KUNIT_EXPECT_EQ(test,
 			rk_mpp_switch_session(&active, &held_fd, &msg,
-					      &batch_status, &skip_group), 0);
+					      &skip_group), 0);
 	KUNIT_EXPECT_PTR_EQ(test, active, &session);
 	KUNIT_EXPECT_PTR_EQ(test, fd_file(held_fd), NULL);
-	KUNIT_EXPECT_PTR_EQ(test, batch_status, user);
 	KUNIT_EXPECT_TRUE(test, skip_group);
 	uncopied = copy_from_user(&out, user, sizeof(out));
 	KUNIT_EXPECT_EQ(test, uncopied, 0UL);
@@ -4710,18 +4694,15 @@ static void rk_mpp_switch_session_status_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, out.flag, (__u64)MPP_BAT_MSG_DONE);
 }
 
-static void rk_mpp_batch_wait_layout_kunit(struct kunit *test)
+static void rk_mpp_batch_server_wait_detect_kunit(struct kunit *test)
 {
 	struct {
 		struct rk_mpp_msg_v1 reqs[4];
 		struct mpp_bat_msg bat[2];
 	} layout = {};
-	struct rk_mpp_batch_state batch = {};
-	struct rk_mpp_msg_v1 msg = {};
 	void __user *user;
 	unsigned long uncopied;
 	uintptr_t base;
-	bool cont;
 
 	user = rk_mpp_kunit_user_payload(test, &layout, sizeof(layout));
 	KUNIT_ASSERT_NOT_NULL(test, user);
@@ -4745,40 +4726,24 @@ static void rk_mpp_batch_wait_layout_kunit(struct kunit *test)
 	uncopied = copy_to_user(user, &layout, sizeof(layout));
 	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
 
-	batch.msg_base = user;
-	rk_mpp_batch_wait_maybe_start(&batch, &layout.reqs[0], 0);
-	KUNIT_EXPECT_EQ(test, batch.batch_wait_limit, 4U);
-	KUNIT_EXPECT_PTR_EQ(test, batch.batch_status_base,
-			    (struct mpp_bat_msg __user *)
-			    (base + sizeof(layout.reqs)));
-
-	uncopied = copy_from_user(&msg,
-				  (void __user *)(base +
-						   sizeof(struct rk_mpp_msg_v1)),
-				  sizeof(msg));
-	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
-	KUNIT_EXPECT_EQ(test,
-			rk_mpp_batch_wait_continue(&batch, &msg, 1,
-						   (void __user *)(base +
-						   2 * sizeof(msg)),
-						   &cont), 0);
-	KUNIT_EXPECT_TRUE(test, cont);
+	KUNIT_EXPECT_TRUE(test,
+			  rk_mpp_is_batch_server_wait_ioctl(user,
+							    &layout.reqs[0]));
 
 	layout.reqs[2] = (struct rk_mpp_msg_v1){};
 	uncopied = copy_to_user(user, &layout, sizeof(layout));
 	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
-	KUNIT_EXPECT_EQ(test,
-			rk_mpp_batch_wait_continue(&batch, &msg, 1,
-						   (void __user *)(base +
-						   2 * sizeof(msg)),
-						   &cont), 0);
-	KUNIT_EXPECT_FALSE(test, cont);
+	KUNIT_EXPECT_FALSE(test,
+			   rk_mpp_is_batch_server_wait_ioctl(user,
+							     &layout.reqs[0]));
 
-	batch = (struct rk_mpp_batch_state){ .msg_base = user };
 	layout.reqs[0].data_ptr = base +
 		(RK_MPP_MAX_BATCH_WAIT_MSGS + 2) * sizeof(struct rk_mpp_msg_v1);
-	rk_mpp_batch_wait_maybe_start(&batch, &layout.reqs[0], 0);
-	KUNIT_EXPECT_EQ(test, batch.batch_wait_limit, 0U);
+	uncopied = copy_to_user(user, &layout, sizeof(layout));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+	KUNIT_EXPECT_FALSE(test,
+			   rk_mpp_is_batch_server_wait_ioctl(user,
+							     &layout.reqs[0]));
 }
 
 static void rk_mpp_batch_session_switch_split_kunit(struct kunit *test)
@@ -4932,71 +4897,6 @@ static void rk_mpp_session_poll_nonblock_pending_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&job->refs), 1);
 
 	list_del_init(&job->session_link);
-}
-
-static void rk_mpp_batch_poll_status_kunit(struct kunit *test)
-{
-	struct rk_mpp_session session = {
-		.initialized = true,
-		.active_job_count = 1,
-	};
-	struct mpp_bat_msg bat = {
-		.ret = 0,
-	};
-	struct mpp_bat_msg out = {};
-	struct rk_mpp_batch_state *batch;
-	struct rk_mpp_job *poll_job;
-	struct rk_mpp_job *active;
-	void __user *user;
-	unsigned long uncopied;
-
-	mutex_init(&session.lock);
-	INIT_LIST_HEAD(&session.active_jobs);
-	init_waitqueue_head(&session.wait);
-	batch = kunit_kzalloc(test, sizeof(*batch), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, batch);
-	poll_job = kunit_kzalloc(test, sizeof(*poll_job), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, poll_job);
-
-	poll_job->session = &session;
-	poll_job->poll_cnt = 1;
-	poll_job->flags = MPP_FLAGS_POLL_NON_BLOCK;
-	INIT_LIST_HEAD(&batch->jobs);
-	INIT_LIST_HEAD(&poll_job->link);
-	list_add_tail(&poll_job->link, &batch->jobs);
-
-	user = rk_mpp_kunit_user_payload(test, &bat, sizeof(bat));
-	KUNIT_ASSERT_NOT_NULL(test, user);
-	poll_job->batch_status = user;
-
-	active = kunit_kzalloc(test, sizeof(*active), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, active);
-	active->session = &session;
-	active->state = RK_MPP_JOB_ACTIVE;
-	active->result = -EINPROGRESS;
-	refcount_set(&active->refs, 1);
-	INIT_LIST_HEAD(&active->session_link);
-	list_add_tail(&active->session_link, &session.active_jobs);
-
-	KUNIT_EXPECT_EQ(test, rk_mpp_execute_jobs(batch), 0);
-	uncopied = copy_from_user(&out, user, sizeof(out));
-	KUNIT_EXPECT_EQ(test, uncopied, 0UL);
-	KUNIT_EXPECT_EQ(test, out.ret, EAGAIN);
-	KUNIT_EXPECT_FALSE(test, list_empty(&session.active_jobs));
-	KUNIT_EXPECT_EQ(test, session.active_job_count, 1U);
-
-	list_del_init(&active->session_link);
-	session.active_job_count = 0;
-	out.ret = 0;
-	uncopied = copy_to_user(user, &out, sizeof(out));
-	KUNIT_EXPECT_EQ(test, uncopied, 0UL);
-
-	KUNIT_EXPECT_EQ(test, rk_mpp_execute_jobs(batch), 0);
-	uncopied = copy_from_user(&out, user, sizeof(out));
-	KUNIT_EXPECT_EQ(test, uncopied, 0UL);
-	KUNIT_EXPECT_EQ(test, out.ret, -EIO);
-
-	list_del_init(&poll_job->link);
 }
 
 static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
@@ -5413,11 +5313,10 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_rcb_invalid_index_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec_rcb_width_gate_kunit),
 	KUNIT_CASE(rk_mpp_switch_session_status_kunit),
-	KUNIT_CASE(rk_mpp_batch_wait_layout_kunit),
+	KUNIT_CASE(rk_mpp_batch_server_wait_detect_kunit),
 	KUNIT_CASE(rk_mpp_batch_session_switch_split_kunit),
 	KUNIT_CASE(rk_mpp_release_fd_all_devices_kunit),
 	KUNIT_CASE(rk_mpp_session_poll_nonblock_pending_kunit),
-	KUNIT_CASE(rk_mpp_batch_poll_status_kunit),
 	KUNIT_CASE(rk_mpp_session_abort_jobs_kunit),
 	KUNIT_CASE(rk_mpp_session_abort_hw_active_kunit),
 	KUNIT_CASE(rk_mpp_reset_session_public_cleanup_kunit),
@@ -6218,7 +6117,6 @@ rk_mpp_batch_get_job(struct rk_mpp_batch_state *batch,
 
 	job->session = session;
 	job->state = RK_MPP_JOB_STAGED;
-	job->batch_status = batch->batch_status;
 	refcount_set(&job->refs, 1);
 	spin_lock_init(&job->rkvenc_slice_lock);
 	INIT_KFIFO(job->rkvenc_slice_fifo);
@@ -8425,20 +8323,6 @@ static int rk_mpp_job_add_request(struct rk_mpp_session *session,
 	return 0;
 }
 
-static int rk_mpp_job_write_batch_status(struct rk_mpp_job *job, int ret)
-{
-	int status;
-
-	if (!job->batch_status)
-		return ret;
-
-	status = ret == -EAGAIN ? EAGAIN : ret;
-	if (copy_to_user(&job->batch_status->ret, &status, sizeof(status)))
-		return -EFAULT;
-
-	return 0;
-}
-
 static int rk_mpp_execute_jobs(struct rk_mpp_batch_state *batch)
 {
 	struct rk_mpp_job *job;
@@ -8480,7 +8364,6 @@ static int rk_mpp_execute_jobs(struct rk_mpp_batch_state *batch)
 			else
 				poll_ret = rk_mpp_session_poll_job(job->session,
 								   job->flags);
-			poll_ret = rk_mpp_job_write_batch_status(job, poll_ret);
 			if (poll_ret && !ret)
 				ret = poll_ret;
 		}
@@ -8574,35 +8457,33 @@ static int rk_mpp_process_request(struct rk_mpp_session *session,
 	}
 }
 
-static bool rk_mpp_batch_wait_set_valid(const struct rk_mpp_batch_state *batch,
-					const struct rk_mpp_msg_v1 *msg,
-					u32 msg_idx)
+static bool
+rk_mpp_batch_server_wait_set_valid(const struct rk_mpp_msg_v1 *msg,
+				   u32 msg_idx,
+				   struct mpp_bat_msg __user *status_base)
 {
 	unsigned long expected;
 
-	if (!batch->batch_wait_limit || msg_idx >= batch->batch_wait_limit ||
-	    msg_idx % 2)
+	if (msg_idx % 2)
 		return false;
 	if (msg->cmd != MPP_CMD_SET_SESSION_FD ||
 	    msg->flags != MPP_FLAGS_MULTI_MSG ||
 	    msg->offset || msg->size != sizeof(struct mpp_bat_msg))
 		return false;
 
-	expected = (unsigned long)batch->batch_status_base;
+	expected = (unsigned long)status_base;
 	expected += (msg_idx / 2) * sizeof(struct mpp_bat_msg);
 
 	return msg->data_ptr == expected;
 }
 
-static bool rk_mpp_batch_wait_poll_valid(const struct rk_mpp_batch_state *batch,
-					 const struct rk_mpp_msg_v1 *msg,
-					 u32 msg_idx)
+static bool rk_mpp_batch_server_wait_poll_valid(const struct rk_mpp_msg_v1 *msg,
+						u32 msg_idx)
 {
 	u32 flags = MPP_FLAGS_MULTI_MSG | MPP_FLAGS_LAST_MSG |
 		    MPP_FLAGS_POLL_NON_BLOCK;
 
-	if (!batch->batch_wait_limit || msg_idx >= batch->batch_wait_limit ||
-	    !(msg_idx % 2))
+	if (!(msg_idx % 2))
 		return false;
 
 	return msg->cmd == MPP_CMD_POLL_HW_FINISH &&
@@ -8610,63 +8491,63 @@ static bool rk_mpp_batch_wait_poll_valid(const struct rk_mpp_batch_state *batch,
 	       !msg->size && !msg->data_ptr;
 }
 
-static void rk_mpp_batch_wait_maybe_start(struct rk_mpp_batch_state *batch,
-					  const struct rk_mpp_msg_v1 *msg,
-					  u32 msg_idx)
+static bool
+rk_mpp_is_batch_server_wait_ioctl(void __user *msg_base,
+				  const struct rk_mpp_msg_v1 *first)
 {
-	unsigned long base = (unsigned long)batch->msg_base;
-	unsigned long data = (unsigned long)(uintptr_t)msg->data_ptr;
+	struct mpp_bat_msg __user *status_base;
+	unsigned long base = (unsigned long)msg_base;
+	unsigned long data = (unsigned long)(uintptr_t)first->data_ptr;
 	unsigned long span;
 	u32 limit;
+	u32 i;
 
-	if (batch->batch_wait_limit || msg_idx)
-		return;
-	if (msg->cmd != MPP_CMD_SET_SESSION_FD ||
-	    msg->flags != MPP_FLAGS_MULTI_MSG ||
-	    msg->offset || msg->size != sizeof(struct mpp_bat_msg))
-		return;
+	if (first->cmd != MPP_CMD_SET_SESSION_FD ||
+	    first->flags != MPP_FLAGS_MULTI_MSG ||
+	    first->offset || first->size != sizeof(struct mpp_bat_msg))
+		return false;
 	if (data <= base)
-		return;
+		return false;
 
 	span = data - base;
 	if (span % sizeof(struct rk_mpp_msg_v1))
-		return;
+		return false;
 
 	limit = span / sizeof(struct rk_mpp_msg_v1);
 	if (limit < 2 || limit > RK_MPP_MAX_BATCH_WAIT_MSGS || limit % 2)
-		return;
+		return false;
 
-	batch->batch_wait_limit = limit;
-	batch->batch_status_base =
-		(struct mpp_bat_msg __user *)(uintptr_t)msg->data_ptr;
-}
+	status_base = (struct mpp_bat_msg __user *)(uintptr_t)first->data_ptr;
+	for (i = 0; i < limit; i++) {
+		struct rk_mpp_msg_v1 msg;
 
-static int rk_mpp_batch_wait_continue(struct rk_mpp_batch_state *batch,
-				      const struct rk_mpp_msg_v1 *msg,
-				      u32 msg_idx, void __user *next_user,
-				      bool *cont)
-{
-	struct rk_mpp_msg_v1 next;
+		if (i) {
+			void __user *src;
 
-	*cont = false;
+			src = (u8 __user *)msg_base +
+			      i * sizeof(struct rk_mpp_msg_v1);
+			if (copy_from_user(&msg, src, sizeof(msg)))
+				return false;
+		} else {
+			msg = *first;
+		}
 
-	if (!rk_mpp_batch_wait_poll_valid(batch, msg, msg_idx))
-		return 0;
-	if (msg_idx + 1 >= batch->batch_wait_limit)
-		return 0;
-	if (copy_from_user(&next, next_user, sizeof(next)))
-		return -EFAULT;
-	if (!rk_mpp_batch_wait_set_valid(batch, &next, msg_idx + 1))
-		return 0;
+		if (i % 2) {
+			if (!rk_mpp_batch_server_wait_poll_valid(&msg, i))
+				return false;
+		} else {
+			if (!rk_mpp_batch_server_wait_set_valid(&msg, i,
+								status_base))
+				return false;
+		}
+	}
 
-	*cont = true;
-	return 0;
+	return true;
 }
 
 static int rk_mpp_switch_session(struct rk_mpp_session **session,
 				 struct fd *held_fd,
 				 const struct rk_mpp_msg_v1 *msg,
-				 struct mpp_bat_msg __user **batch_status,
 				 bool *skip_group)
 {
 	struct mpp_bat_msg bat_msg;
@@ -8678,7 +8559,6 @@ static int rk_mpp_switch_session(struct rk_mpp_session **session,
 	if (copy_from_user(&bat_msg, ubatch, sizeof(bat_msg)))
 		return -EFAULT;
 
-	*batch_status = ubatch;
 	*skip_group = false;
 
 	if (bat_msg.flag & MPP_BAT_MSG_DONE) {
@@ -8720,12 +8600,11 @@ static int rk_mpp_collect_msgs(struct rk_mpp_session *session,
 
 	memset(&batch, 0, sizeof(batch));
 	INIT_LIST_HEAD(&batch.jobs);
-	batch.msg_base = arg;
 
 	for (;;) {
 		struct rk_mpp_msg_v1 msg;
 		struct mpp_request req;
-		u32 msg_idx;
+		void __user *msg_user = arg;
 		bool last;
 
 		if (copy_from_user(&msg, arg, sizeof(msg))) {
@@ -8733,7 +8612,6 @@ static int rk_mpp_collect_msgs(struct rk_mpp_session *session,
 			break;
 		}
 		arg += sizeof(msg);
-		msg_idx = batch.msg_count++;
 
 		if (rk_mpp_check_cmd_v1(msg.cmd)) {
 			ret = -EFAULT;
@@ -8744,35 +8622,23 @@ static int rk_mpp_collect_msgs(struct rk_mpp_session *session,
 		       (msg.flags & MPP_FLAGS_LAST_MSG);
 
 		if (msg.cmd == MPP_CMD_SET_SESSION_FD) {
-			rk_mpp_batch_wait_maybe_start(&batch, &msg, msg_idx);
+			if (rk_mpp_is_batch_server_wait_ioctl(msg_user, &msg)) {
+				ret = -EOPNOTSUPP;
+				break;
+			}
 			ret = rk_mpp_switch_session(&session, &held_fd, &msg,
-						    &batch.batch_status,
 						    &batch.skip_group);
 			batch.cur_job = NULL;
 			if (ret)
 				break;
-			if (last) {
-				bool cont;
-
-				ret = rk_mpp_batch_wait_continue(&batch, &msg,
-								 msg_idx, arg,
-								 &cont);
-				if (ret || !cont)
-					break;
-			}
+			if (last)
+				break;
 			continue;
 		}
 
 		if (batch.skip_group) {
-			if (last) {
-				bool cont;
-
-				ret = rk_mpp_batch_wait_continue(&batch, &msg,
-								 msg_idx, arg,
-								 &cont);
-				if (ret || !cont)
-					break;
-			}
+			if (last)
+				break;
 			continue;
 		}
 
@@ -8787,14 +8653,8 @@ static int rk_mpp_collect_msgs(struct rk_mpp_session *session,
 		ret = rk_mpp_process_request(session, &req, &batch);
 		if (ret)
 			break;
-		if (last) {
-			bool cont;
-
-			ret = rk_mpp_batch_wait_continue(&batch, &msg,
-							 msg_idx, arg, &cont);
-			if (ret || !cont)
-				break;
-		}
+		if (last)
+			break;
 	}
 
 	if (!ret)
