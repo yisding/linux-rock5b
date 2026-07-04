@@ -107,6 +107,35 @@ struct mpp_iommu_info {
 	struct mpp_taskqueue *queue;
 };
 
+/*
+ * CCU cluster shared IOMMU domain.
+ *
+ * A multicore CCU cluster (rkvdec2 or rkvenc2) shares one IOVA address space
+ * across all of its hardware cores. That space is the main/service-visible
+ * core's default DMA domain -- the domain the DMA API (VB2, dma_buf import,
+ * mpp_dma_session_create()) already populates -- so every buffer mapped for
+ * the cluster is visible to whichever core a task is dispatched to.
+ *
+ * Each participating core's IOMMU is attached to that one domain; the Rockchip
+ * provider keeps a per-domain IOMMU list (struct rk_iommu_domain::iommus), so a
+ * single iommu_map()/iommu_unmap()/flush on the shared domain reaches every
+ * attached core.
+ *
+ * This object makes that ownership explicit and auditable: codec drivers join
+ * their secondary cores through it instead of open-coding domain/rw_sem swaps
+ * on struct mpp_iommu_info. The encoder and decoder clusters own separate
+ * shared domains and must never share one with each other, with RGA, or with
+ * the AV1/VSI path.
+ */
+struct mpp_iommu_shared_domain {
+	/* main/service-visible core that owns the shared domain */
+	struct mpp_iommu_info *owner;
+	/* shared IOVA space == owner->domain (owner's default DMA domain) */
+	struct iommu_domain *domain;
+	/* cluster-wide map/unmap/reset serialization == owner->rw_sem */
+	struct rw_semaphore *rw_sem;
+};
+
 struct mpp_dma_session *
 mpp_dma_session_create(struct device *dev, u32 max_buffers);
 int mpp_dma_session_destroy(struct mpp_dma_session *dma);
@@ -136,6 +165,13 @@ int mpp_iommu_remove(struct mpp_iommu_info *info);
 
 int mpp_iommu_attach(struct mpp_iommu_info *info);
 int mpp_iommu_detach(struct mpp_iommu_info *info);
+
+int mpp_iommu_shared_domain_init(struct mpp_iommu_shared_domain *shared,
+				 struct mpp_iommu_info *owner);
+int mpp_iommu_shared_domain_bind(struct mpp_iommu_shared_domain *shared,
+				 struct mpp_iommu_info *info);
+bool mpp_iommu_shared_domain_verify(struct mpp_iommu_shared_domain *shared,
+				    struct mpp_iommu_info *info);
 
 int mpp_iommu_refresh(struct mpp_iommu_info *info, struct device *dev);
 int mpp_iommu_flush_tlb(struct mpp_iommu_info *info);
