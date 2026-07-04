@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0
 menuconfig ROCKCHIP_MULTI_RGA
 	tristate "MULTI_RGA"
-	depends on ARCH_ROCKCHIP
+	depends on ARCH_ROCKCHIP && ROCKCHIP_IOMMU
 	default y
 	select SYNC_FILE
 	help
