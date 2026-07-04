@@ -1211,6 +1211,18 @@ static struct iommu_device *rk_iommu_probe_device(struct device *dev)
 	data->link = device_link_add(dev, iommu->dev,
 				     DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME);
 
+	/*
+	 * RGA and other Rockchip multimedia clients can depend on dma_map_sg()
+	 * returning a single contiguous IOVA span for an imported buffer. Allow
+	 * the DMA layer to merge the full 32-bit IOMMU aperture into one segment.
+	 */
+	if (!dev->dma_parms)
+		dev->dma_parms = kzalloc(sizeof(*dev->dma_parms), GFP_KERNEL);
+	if (!dev->dma_parms)
+		return ERR_PTR(-ENOMEM);
+
+	dma_set_max_seg_size(dev, DMA_BIT_MASK(32));
+
 	return &iommu->iommu;
 }
 
