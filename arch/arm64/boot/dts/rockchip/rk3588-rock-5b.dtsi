@@ -99,6 +99,31 @@
 	status = "okay";
 };
 
+&av1d {
+	compatible = "rockchip,av1-decoder";
+	reg = <0x0 0xfdc70000 0x0 0x800>,
+	      <0x0 0xfdc80000 0x0 0x400>,
+	      <0x0 0xfdc90000 0x0 0x400>;
+	reg-names = "vcd", "cache", "afbc";
+	interrupts = <GIC_SPI 108 IRQ_TYPE_LEVEL_HIGH 0>,
+		     <GIC_SPI 107 IRQ_TYPE_LEVEL_HIGH 0>,
+		     <GIC_SPI 106 IRQ_TYPE_LEVEL_HIGH 0>;
+	interrupt-names = "irq_av1d", "irq_cache", "irq_afbc";
+	clock-names = "aclk_vcodec", "hclk_vcodec";
+	rockchip,normal-rates = <400000000>, <400000000>;
+	resets = <&cru SRST_A_AV1>, <&cru SRST_P_AV1>;
+	reset-names = "video_a", "video_h";
+	iommus = <&av1d_mmu>;
+	rockchip,srv = <&mpp_srv>;
+	rockchip,taskqueue-node = <11>;
+	rockchip,skip-pmu-idle-request;
+	status = "okay";
+};
+
+&av1d_mmu {
+	status = "okay";
+};
+
 &rkvenc_ccu {
 	status = "okay";
 };
@@ -108,6 +133,7 @@
 };
 
 &rkvenc0_mmu {
+	rockchip,disable-mmu-reset;
 	status = "okay";
 };
 
@@ -116,6 +142,7 @@
 };
 
 &rkvenc1_mmu {
+	rockchip,disable-mmu-reset;
 	status = "okay";
 };
 
