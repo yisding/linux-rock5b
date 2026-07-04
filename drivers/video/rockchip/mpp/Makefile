@@ -2,9 +2,10 @@
 #
 # Rockchip MPP service framework - VEPU580 / rkvenc2 (H.264/H.265) encoder.
 #
-# compat/ holds small inline shims for the BSP-only <soc/rockchip/*.h> services
-# that are absent on mainline; -I$(src)/compat lets the donor sources build
-# unmodified. MPP_VERSION replaces the donor's git-shellout version string.
+# compat/ holds small inline shims for BSP-only <soc/rockchip/*.h> services
+# that are still absent on mainline. The Rockchip IOMMU helpers now live in
+# include/soc/rockchip and drivers/iommu/rockchip-iommu.c.
+# MPP_VERSION replaces the donor's git-shellout version string.
 
 ccflags-y += -I$(src)/compat
 ccflags-y += -DMPP_VERSION=\"6.18-rkvenc-fwport\"
