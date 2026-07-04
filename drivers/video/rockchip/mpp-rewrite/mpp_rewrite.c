@@ -402,6 +402,7 @@ struct rk_mpp_job {
 	u64 hw_start_ns;
 	u64 hw_elapsed_ns;
 	spinlock_t rkvenc_slice_lock;
+	struct mpp_bat_msg __user *batch_status;
 	DECLARE_KFIFO(rkvenc_slice_fifo, u32, RK_MPP_RKVENC_MAX_SLICE_FIFO);
 	struct mpp_request poll_req;
 	struct rk_mpp_reg_image reg_image;
@@ -413,7 +414,9 @@ struct rk_mpp_job {
 struct rk_mpp_batch_state {
 	struct list_head jobs;
 	struct rk_mpp_job *cur_job;
+	struct mpp_bat_msg __user *batch_status;
 	u32 req_cnt;
+	bool skip_group;
 };
 
 static const struct file_operations rk_mpp_fops;
@@ -2471,10 +2474,14 @@ static void rk_mpp_rkvenc2_dchs_patch(struct rk_mpp_job *job);
 static void rk_mpp_rkvenc2_dchs_release(struct rk_mpp_job *job);
 static int rk_mpp_switch_session(struct rk_mpp_session **session,
 				 struct fd *held_fd,
-				 const struct rk_mpp_msg_v1 *msg);
+				 const struct rk_mpp_msg_v1 *msg,
+				 struct mpp_bat_msg __user **batch_status,
+				 bool *skip_group);
 static int rk_mpp_process_request(struct rk_mpp_session *session,
 				  struct mpp_request *req,
 				  struct rk_mpp_batch_state *batch);
+static int rk_mpp_execute_jobs(struct rk_mpp_batch_state *batch);
+static int rk_mpp_job_write_batch_status(struct rk_mpp_job *job, int ret);
 static int rk_mpp_job_store_reg_offsets(struct rk_mpp_job *job,
 					const struct rk_mpp_job_req *job_req);
 static int rk_mpp_job_apply_reg_offsets(struct rk_mpp_job *job);
@@ -4641,20 +4648,25 @@ static void rk_mpp_switch_session_status_kunit(struct kunit *test)
 		.fd = U32_MAX,
 		.ret = 1234,
 	};
+	struct mpp_bat_msg __user *batch_status = NULL;
 	struct mpp_bat_msg out = {};
 	struct rk_mpp_msg_v1 msg = {};
 	void __user *user;
 	unsigned long uncopied;
+	bool skip_group = false;
 
 	user = rk_mpp_kunit_user_payload(test, &bat, sizeof(bat));
 	KUNIT_ASSERT_NOT_NULL(test, user);
 	msg.data_ptr = (uintptr_t)user;
 	msg.size = sizeof(bat);
 
-	KUNIT_EXPECT_EQ(test, rk_mpp_switch_session(&active, &held_fd, &msg),
-			0);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_switch_session(&active, &held_fd, &msg,
+					      &batch_status, &skip_group), 0);
 	KUNIT_EXPECT_PTR_EQ(test, active, &session);
 	KUNIT_EXPECT_PTR_EQ(test, fd_file(held_fd), NULL);
+	KUNIT_EXPECT_PTR_EQ(test, batch_status, user);
+	KUNIT_EXPECT_TRUE(test, skip_group);
 	uncopied = copy_from_user(&out, user, sizeof(out));
 	KUNIT_EXPECT_EQ(test, uncopied, 0UL);
 	KUNIT_EXPECT_EQ(test, out.ret, -EBADF);
@@ -4668,11 +4680,16 @@ static void rk_mpp_switch_session_status_kunit(struct kunit *test)
 	user = rk_mpp_kunit_user_payload(test, &bat, sizeof(bat));
 	KUNIT_ASSERT_NOT_NULL(test, user);
 	msg.data_ptr = (uintptr_t)user;
+	batch_status = NULL;
+	skip_group = false;
 
-	KUNIT_EXPECT_EQ(test, rk_mpp_switch_session(&active, &held_fd, &msg),
-			0);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_switch_session(&active, &held_fd, &msg,
+					      &batch_status, &skip_group), 0);
 	KUNIT_EXPECT_PTR_EQ(test, active, &session);
 	KUNIT_EXPECT_PTR_EQ(test, fd_file(held_fd), NULL);
+	KUNIT_EXPECT_PTR_EQ(test, batch_status, user);
+	KUNIT_EXPECT_TRUE(test, skip_group);
 	uncopied = copy_from_user(&out, user, sizeof(out));
 	KUNIT_EXPECT_EQ(test, uncopied, 0UL);
 	KUNIT_EXPECT_EQ(test, out.ret, 77);
@@ -4831,6 +4848,71 @@ static void rk_mpp_session_poll_nonblock_pending_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&job->refs), 1);
 
 	list_del_init(&job->session_link);
+}
+
+static void rk_mpp_batch_poll_status_kunit(struct kunit *test)
+{
+	struct rk_mpp_session session = {
+		.initialized = true,
+		.active_job_count = 1,
+	};
+	struct mpp_bat_msg bat = {
+		.ret = 0,
+	};
+	struct mpp_bat_msg out = {};
+	struct rk_mpp_batch_state *batch;
+	struct rk_mpp_job *poll_job;
+	struct rk_mpp_job *active;
+	void __user *user;
+	unsigned long uncopied;
+
+	mutex_init(&session.lock);
+	INIT_LIST_HEAD(&session.active_jobs);
+	init_waitqueue_head(&session.wait);
+	batch = kunit_kzalloc(test, sizeof(*batch), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, batch);
+	poll_job = kunit_kzalloc(test, sizeof(*poll_job), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, poll_job);
+
+	poll_job->session = &session;
+	poll_job->poll_cnt = 1;
+	poll_job->flags = MPP_FLAGS_POLL_NON_BLOCK;
+	INIT_LIST_HEAD(&batch->jobs);
+	INIT_LIST_HEAD(&poll_job->link);
+	list_add_tail(&poll_job->link, &batch->jobs);
+
+	user = rk_mpp_kunit_user_payload(test, &bat, sizeof(bat));
+	KUNIT_ASSERT_NOT_NULL(test, user);
+	poll_job->batch_status = user;
+
+	active = kunit_kzalloc(test, sizeof(*active), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, active);
+	active->session = &session;
+	active->state = RK_MPP_JOB_ACTIVE;
+	active->result = -EINPROGRESS;
+	refcount_set(&active->refs, 1);
+	INIT_LIST_HEAD(&active->session_link);
+	list_add_tail(&active->session_link, &session.active_jobs);
+
+	KUNIT_EXPECT_EQ(test, rk_mpp_execute_jobs(batch), 0);
+	uncopied = copy_from_user(&out, user, sizeof(out));
+	KUNIT_EXPECT_EQ(test, uncopied, 0UL);
+	KUNIT_EXPECT_EQ(test, out.ret, EAGAIN);
+	KUNIT_EXPECT_FALSE(test, list_empty(&session.active_jobs));
+	KUNIT_EXPECT_EQ(test, session.active_job_count, 1U);
+
+	list_del_init(&active->session_link);
+	session.active_job_count = 0;
+	out.ret = 0;
+	uncopied = copy_to_user(user, &out, sizeof(out));
+	KUNIT_EXPECT_EQ(test, uncopied, 0UL);
+
+	KUNIT_EXPECT_EQ(test, rk_mpp_execute_jobs(batch), 0);
+	uncopied = copy_from_user(&out, user, sizeof(out));
+	KUNIT_EXPECT_EQ(test, uncopied, 0UL);
+	KUNIT_EXPECT_EQ(test, out.ret, -EIO);
+
+	list_del_init(&poll_job->link);
 }
 
 static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
@@ -5250,6 +5332,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_batch_session_switch_split_kunit),
 	KUNIT_CASE(rk_mpp_release_fd_all_devices_kunit),
 	KUNIT_CASE(rk_mpp_session_poll_nonblock_pending_kunit),
+	KUNIT_CASE(rk_mpp_batch_poll_status_kunit),
 	KUNIT_CASE(rk_mpp_session_abort_jobs_kunit),
 	KUNIT_CASE(rk_mpp_session_abort_hw_active_kunit),
 	KUNIT_CASE(rk_mpp_reset_session_public_cleanup_kunit),
@@ -6050,6 +6133,7 @@ rk_mpp_batch_get_job(struct rk_mpp_batch_state *batch,
 
 	job->session = session;
 	job->state = RK_MPP_JOB_STAGED;
+	job->batch_status = batch->batch_status;
 	refcount_set(&job->refs, 1);
 	spin_lock_init(&job->rkvenc_slice_lock);
 	INIT_KFIFO(job->rkvenc_slice_fifo);
@@ -8256,6 +8340,20 @@ static int rk_mpp_job_add_request(struct rk_mpp_session *session,
 	return 0;
 }
 
+static int rk_mpp_job_write_batch_status(struct rk_mpp_job *job, int ret)
+{
+	int status;
+
+	if (!job->batch_status)
+		return ret;
+
+	status = ret == -EAGAIN ? EAGAIN : ret;
+	if (copy_to_user(&job->batch_status->ret, &status, sizeof(status)))
+		return -EFAULT;
+
+	return 0;
+}
+
 static int rk_mpp_execute_jobs(struct rk_mpp_batch_state *batch)
 {
 	struct rk_mpp_job *job;
@@ -8297,6 +8395,7 @@ static int rk_mpp_execute_jobs(struct rk_mpp_batch_state *batch)
 			else
 				poll_ret = rk_mpp_session_poll_job(job->session,
 								   job->flags);
+			poll_ret = rk_mpp_job_write_batch_status(job, poll_ret);
 			if (poll_ret && !ret)
 				ret = poll_ret;
 		}
@@ -8392,7 +8491,9 @@ static int rk_mpp_process_request(struct rk_mpp_session *session,
 
 static int rk_mpp_switch_session(struct rk_mpp_session **session,
 				 struct fd *held_fd,
-				 const struct rk_mpp_msg_v1 *msg)
+				 const struct rk_mpp_msg_v1 *msg,
+				 struct mpp_bat_msg __user **batch_status,
+				 bool *skip_group)
 {
 	struct mpp_bat_msg bat_msg;
 	struct mpp_bat_msg __user *ubatch;
@@ -8403,14 +8504,20 @@ static int rk_mpp_switch_session(struct rk_mpp_session **session,
 	if (copy_from_user(&bat_msg, ubatch, sizeof(bat_msg)))
 		return -EFAULT;
 
-	if (bat_msg.flag & MPP_BAT_MSG_DONE)
+	*batch_status = ubatch;
+	*skip_group = false;
+
+	if (bat_msg.flag & MPP_BAT_MSG_DONE) {
+		*skip_group = true;
 		return 0;
+	}
 
 	f = fdget(bat_msg.fd);
 	if (!fd_file(f)) {
 		ret = -EBADF;
 		if (copy_to_user(&ubatch->ret, &ret, sizeof(ubatch->ret)))
 			pr_debug("failed to write bad-fd result\n");
+		*skip_group = true;
 		return 0;
 	}
 
@@ -8460,9 +8567,17 @@ static int rk_mpp_collect_msgs(struct rk_mpp_session *session,
 		       (msg.flags & MPP_FLAGS_LAST_MSG);
 
 		if (msg.cmd == MPP_CMD_SET_SESSION_FD) {
-			ret = rk_mpp_switch_session(&session, &held_fd, &msg);
+			ret = rk_mpp_switch_session(&session, &held_fd, &msg,
+						    &batch.batch_status,
+						    &batch.skip_group);
 			batch.cur_job = NULL;
 			if (ret || last)
+				break;
+			continue;
+		}
+
+		if (batch.skip_group) {
+			if (last)
 				break;
 			continue;
 		}
