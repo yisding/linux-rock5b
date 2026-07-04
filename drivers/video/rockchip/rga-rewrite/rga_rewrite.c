@@ -9769,6 +9769,16 @@ static void rk_rga_gstreamer_legacy_format_matrix_kunit(struct kunit *test)
 			.dst_format = RK_RGA_FORMAT_YCBCR_420_SP,
 			.expected_type = RK_RGA_HW_RGA3,
 		}, {
+			.src_format = RK_RGA_FORMAT_YCBCR_420_SP_10B,
+			.dst_format = RK_RGA_FORMAT_YCBCR_420_SP,
+			.expected_type = RK_RGA_HW_RGA3,
+			.expect_src_yuv10_compact = true,
+		}, {
+			.src_format = RK_RGA_FORMAT_YCBCR_422_SP_10B,
+			.dst_format = RK_RGA_FORMAT_YCBCR_422_SP,
+			.expected_type = RK_RGA_HW_RGA3,
+			.expect_src_yuv10_compact = true,
+		}, {
 			.src_format = RK_RGA_FORMAT_YCBCR_420_SP,
 			.dst_format = RK_RGA_FORMAT_BGR_565,
 			.expected_type = RK_RGA_HW_RGA3,
