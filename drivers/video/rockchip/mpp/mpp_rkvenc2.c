@@ -23,6 +23,7 @@
 #include <linux/uaccess.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
+#include <linux/rculist.h>
 #include <linux/proc_fs.h>
 #include <linux/pm_runtime.h>
 #include <linux/nospec.h>
@@ -315,6 +316,7 @@ struct rkvenc_dev {
 	struct mpp_clk_info aclk_info;
 	struct mpp_clk_info hclk_info;
 	struct mpp_clk_info core_clk_info;
+	bool core_clk_enabled;
 	u32 default_max_load;
 #ifdef CONFIG_ROCKCHIP_MPP_PROC_FS
 	struct proc_dir_entry *procfs;
@@ -324,6 +326,7 @@ struct rkvenc_dev {
 	struct reset_control *rst_core;
 	/* for ccu */
 	struct rkvenc_ccu *ccu;
+	struct platform_device *ccu_pdev;
 	struct list_head core_link;
 
 	/* internal rcb-memory */
@@ -1299,7 +1302,8 @@ static void *rkvenc2_prepare(struct mpp_dev *mpp, struct mpp_task *mpp_task)
 	return mpp_task;
 }
 
-static void rkvenc2_patch_dchs(struct rkvenc_dev *enc, struct rkvenc_task *task)
+static int rkvenc2_patch_dchs(struct rkvenc_dev *enc, struct rkvenc_task *task,
+			      bool *patched)
 {
 	struct rkvenc_ccu *ccu;
 	union rkvenc2_dual_core_handshake_id *dchs;
@@ -1310,13 +1314,15 @@ static void rkvenc2_patch_dchs(struct rkvenc_dev *enc, struct rkvenc_task *task)
 	unsigned long flags;
 	int i;
 
+	*patched = false;
+
 	if (!enc->ccu)
-		return;
+		return 0;
 
 	if (core_id >= RKVENC_MAX_CORE_NUM) {
 		dev_err(enc->mpp.dev, "invalid core id %d max %d\n",
 			core_id, RKVENC_MAX_CORE_NUM);
-		return;
+		return -EINVAL;
 	}
 
 	ccu = enc->ccu;
@@ -1329,7 +1335,7 @@ static void rkvenc2_patch_dchs(struct rkvenc_dev *enc, struct rkvenc_task *task)
 		spin_unlock_irqrestore(&ccu->lock_dchs, flags);
 
 		mpp_err("can not config when core %d is still working\n", core_id);
-		return;
+		return -EBUSY;
 	}
 
 	if (mpp_debug_unlikely(DEBUG_CORE))
@@ -1383,7 +1389,7 @@ static void rkvenc2_patch_dchs(struct rkvenc_dev *enc, struct rkvenc_task *task)
 			mpp_err("task %d:%d on core %d failed to find a txid\n",
 				mpp_task->session->pid, mpp_task->task_id,
 				mpp_task->core_id);
-			return;
+			return -ENOSPC;
 		}
 
 		clear_bit(txid_map, &id_valid);
@@ -1397,7 +1403,7 @@ static void rkvenc2_patch_dchs(struct rkvenc_dev *enc, struct rkvenc_task *task)
 				mpp_err("task %d:%d on core %d failed to find a rxid\n",
 					mpp_task->session->pid, mpp_task->task_id,
 					mpp_task->core_id);
-				return;
+				return -ENOSPC;
 			}
 
 			task_dchs->rxe_map = 0;
@@ -1415,8 +1421,11 @@ static void rkvenc2_patch_dchs(struct rkvenc_dev *enc, struct rkvenc_task *task)
 	task->reg[RKVENC_CLASS_PIC].data[hw->dcsh_class_ofst] = task_dchs->val[0];
 
 	dchs[core_id].working = 1;
+	*patched = true;
 
 	spin_unlock_irqrestore(&ccu->lock_dchs, flags);
+
+	return 0;
 }
 
 static void rkvenc2_update_dchs(struct rkvenc_dev *enc, struct rkvenc_task *task)
@@ -1490,10 +1499,12 @@ static int rkvenc_run(struct mpp_dev *mpp, struct mpp_task *mpp_task)
 {
 	u32 i, j;
 	u32 start_val = 0;
+	int ret;
 	struct rkvenc_dev *enc = to_rkvenc_dev(mpp);
 	struct rkvenc_task *task = to_rkvenc_task(mpp_task);
 	struct rkvenc_hw_info *hw = enc->hw_info;
 	u32 timing_en = mpp->srv->timing_en;
+	bool dchs_patched;
 
 	mpp_debug_enter();
 
@@ -1507,10 +1518,11 @@ static int rkvenc_run(struct mpp_dev *mpp, struct mpp_task *mpp_task)
 	/* clear hardware counter */
 	mpp_write_relaxed(mpp, 0x5300, 0x2);
 
-	rkvenc2_patch_dchs(enc, task);
+	ret = rkvenc2_patch_dchs(enc, task, &dchs_patched);
+	if (ret)
+		goto err_leave;
 
 	for (i = 0; i < task->w_req_cnt; i++) {
-		int ret;
 		u32 s, e, off;
 		u32 *regs;
 
@@ -1518,8 +1530,10 @@ static int rkvenc_run(struct mpp_dev *mpp, struct mpp_task *mpp_task)
 		struct mpp_request *req = &task->w_reqs[i];
 
 		ret = rkvenc_get_class_msg(task, req->offset, &msg);
-		if (ret)
-			return -EINVAL;
+		if (ret) {
+			ret = -EINVAL;
+			goto err_dchs;
+		}
 
 		s = (req->offset - msg.offset) / sizeof(u32);
 		e = s + req->size / sizeof(u32);
@@ -1569,8 +1583,15 @@ static int rkvenc_run(struct mpp_dev *mpp, struct mpp_task *mpp_task)
 		 */
 		if (rec_fbc_dis) {
 			mpp_clk_safe_disable(enc->core_clk_info.clk);
+			enc->core_clk_enabled = false;
 			mpp_write(mpp, 0x300, enc_pic | BIT(30) | BIT(31));
-			mpp_clk_safe_enable(enc->core_clk_info.clk);
+			ret = mpp_clk_safe_enable(enc->core_clk_info.clk);
+			if (ret) {
+				dev_err(mpp->dev, "core clk re-enable failed: %d\n",
+					ret);
+				goto err_run_begin;
+			}
+			enc->core_clk_enabled = true;
 		} else {
 			mpp_write(mpp, 0x300, enc_pic | BIT(30));
 		}
@@ -1585,6 +1606,25 @@ static int rkvenc_run(struct mpp_dev *mpp, struct mpp_task *mpp_task)
 	mpp_debug_leave();
 
 	return 0;
+
+err_run_begin:
+	if (dchs_patched)
+		rkvenc2_update_dchs(enc, task);
+	mpp->cur_task = NULL;
+	clear_bit(TASK_STATE_START, &mpp_task->state);
+	mpp_task_run_end(mpp_task, timing_en);
+	cancel_delayed_work_sync(&mpp_task->timeout_work);
+	mpp_debug_leave();
+
+	return ret;
+
+err_dchs:
+	if (dchs_patched)
+		rkvenc2_update_dchs(enc, task);
+err_leave:
+	mpp_debug_leave();
+
+	return ret;
 }
 
 static void rkvenc2_read_slice_len(struct mpp_dev *mpp, struct rkvenc_task *task,
@@ -2510,12 +2550,27 @@ static int rkvenc_reset(struct mpp_dev *mpp)
 static int rkvenc_clk_on(struct mpp_dev *mpp)
 {
 	struct rkvenc_dev *enc = to_rkvenc_dev(mpp);
+	int ret;
 
-	mpp_clk_safe_enable(enc->aclk_info.clk);
-	mpp_clk_safe_enable(enc->hclk_info.clk);
-	mpp_clk_safe_enable(enc->core_clk_info.clk);
+	ret = mpp_clk_safe_enable(enc->aclk_info.clk);
+	if (ret)
+		return ret;
+	ret = mpp_clk_safe_enable(enc->hclk_info.clk);
+	if (ret)
+		goto err_hclk;
+	ret = mpp_clk_safe_enable(enc->core_clk_info.clk);
+	if (ret)
+		goto err_core;
+	enc->core_clk_enabled = true;
 
 	return 0;
+
+err_core:
+	clk_disable_unprepare(enc->hclk_info.clk);
+err_hclk:
+	clk_disable_unprepare(enc->aclk_info.clk);
+
+	return ret;
 }
 
 static int rkvenc_clk_off(struct mpp_dev *mpp)
@@ -2524,7 +2579,10 @@ static int rkvenc_clk_off(struct mpp_dev *mpp)
 
 	clk_disable_unprepare(enc->aclk_info.clk);
 	clk_disable_unprepare(enc->hclk_info.clk);
-	clk_disable_unprepare(enc->core_clk_info.clk);
+	if (enc->core_clk_enabled) {
+		clk_disable_unprepare(enc->core_clk_info.clk);
+		enc->core_clk_enabled = false;
+	}
 
 	return 0;
 }
@@ -2619,6 +2677,29 @@ static void rkvenc2_task_timeout_process(struct mpp_session *session,
 	rkvenc2_task_pop_pending(task);
 }
 
+static bool rkvenc2_slice_ready(struct rkvenc_task *enc_task,
+				struct mpp_task *task,
+				union rkvenc2_slice_len_info *slice_info,
+				bool *got_slice)
+{
+	*got_slice = kfifo_out(&enc_task->slice_info, slice_info, 1);
+
+	return *got_slice || test_bit(TASK_STATE_DONE, &task->state);
+}
+
+static int rkvenc2_wait_slice(struct mpp_task *task,
+			      struct rkvenc_task *enc_task,
+			      union rkvenc2_slice_len_info *slice_info,
+			      bool *got_slice)
+{
+	*got_slice = false;
+
+	return wait_event_interruptible(task->wait,
+					rkvenc2_slice_ready(enc_task, task,
+							    slice_info,
+							    got_slice));
+}
+
 static int rkvenc2_wait_result(struct mpp_session *session,
 			       struct mpp_task_msgs *msgs)
 {
@@ -2629,6 +2710,7 @@ static int rkvenc2_wait_result(struct mpp_session *session,
 	struct mpp_dev *mpp;
 	union rkvenc2_slice_len_info slice_info;
 	u32 task_id;
+	bool got_slice;
 	int ret = 0;
 
 	mutex_lock(&session->pending_lock);
@@ -2680,14 +2762,15 @@ task_done_ret:
 					return -EAGAIN;
 				}
 			} else {
-				ret = wait_event_interruptible(task->wait,
-							       kfifo_out(&enc_task->slice_info,
-								 &slice_info, 1));
+				ret = rkvenc2_wait_slice(task, enc_task,
+							 &slice_info, &got_slice);
 				if (ret) {
 					if (ret == -ERESTARTSYS)
 						mpp_err("wait task break by signal in slice all mode\n");
 					return ret;
 				}
+				if (!got_slice)
+					goto task_done_ret;
 			}
 			mpp_dbg_slice("task %d rd %3d len %d %s\n",
 					task_id, enc_task->slice_rd_cnt, slice_info.slice_len,
@@ -2718,14 +2801,15 @@ task_done_ret:
 				return -EAGAIN;
 			}
 		} else {
-			ret = wait_event_interruptible(task->wait,
-						       kfifo_out(&enc_task->slice_info,
-							 &slice_info, 1));
+			ret = rkvenc2_wait_slice(task, enc_task,
+						 &slice_info, &got_slice);
 			if (ret) {
 				if (ret == -ERESTARTSYS)
 					mpp_err("wait task break by signal in slice one mode\n");
 				return ret;
 			}
+			if (!got_slice)
+				goto task_done_ret;
 		}
 		mpp_dbg_slice("core %d task %d rd %3d len %d %s\n", task_id,
 				mpp->core_id, enc_task->slice_rd_cnt, slice_info.slice_len,
@@ -2975,8 +3059,7 @@ static int rkvenc_attach_ccu(struct device *dev, struct rkvenc_dev *enc)
 	INIT_LIST_HEAD(&enc->core_link);
 	mutex_lock(&ccu->lock);
 	ccu->core_num++;
-	list_add_tail(&enc->core_link, &ccu->core_list);
-	mutex_unlock(&ccu->lock);
+	list_add_tail_rcu(&enc->core_link, &ccu->core_list);
 
 	/*
 	 * Establish or join the cluster's shared IOMMU domain. The first core to
@@ -2987,23 +3070,23 @@ static int rkvenc_attach_ccu(struct device *dev, struct rkvenc_dev *enc)
 	if (!ccu->main_core) {
 		if (!enc->mpp.iommu_info) {
 			ret = -ENODEV;
-			goto err_detach_core;
+			goto err_detach_core_locked;
 		}
 		ret = mpp_iommu_shared_domain_init(&ccu->iommu, enc->mpp.iommu_info);
 		if (ret)
-			goto err_detach_core;
+			goto err_detach_core_locked;
 		ccu->main_core = &enc->mpp;
 	} else {
 		struct mpp_iommu_info *cur_info = enc->mpp.iommu_info;
 
 		if (!cur_info) {
 			ret = -ENODEV;
-			goto err_detach_core;
+			goto err_detach_core_locked;
 		}
 
 		ret = mpp_iommu_shared_domain_bind(&ccu->iommu, cur_info);
 		if (ret)
-			goto err_detach_core;
+			goto err_detach_core_locked;
 
 		/* increase main core message capacity */
 		ccu->main_core->msgs_cap++;
@@ -3014,17 +3097,20 @@ static int rkvenc_attach_ccu(struct device *dev, struct rkvenc_dev *enc)
 	mpp_iommu_shared_domain_verify(&ccu->iommu, enc->mpp.iommu_info);
 
 	enc->ccu = ccu;
+	enc->ccu_pdev = pdev;
+	mutex_unlock(&ccu->lock);
 
 	dev_info(dev, "attach ccu as core %d\n", enc->mpp.core_id);
 	mpp_debug_enter();
 
 	return 0;
 
-err_detach_core:
-	mutex_lock(&ccu->lock);
-	list_del_init(&enc->core_link);
+err_detach_core_locked:
+	list_del_rcu(&enc->core_link);
 	ccu->core_num--;
 	mutex_unlock(&ccu->lock);
+	synchronize_rcu();
+	INIT_LIST_HEAD(&enc->core_link);
 	put_device(&pdev->dev);
 	return ret;
 }
@@ -3032,26 +3118,52 @@ err_detach_core:
 static void rkvenc_detach_ccu(struct rkvenc_dev *enc)
 {
 	struct rkvenc_ccu *ccu = enc->ccu;
+	bool unlinked = false;
 
 	if (!ccu)
 		return;
 
 	mutex_lock(&ccu->lock);
-	if (!list_empty(&enc->core_link)) {
-		list_del_init(&enc->core_link);
-		if (ccu->core_num)
-			ccu->core_num--;
-	}
 
 	if (ccu->main_core == &enc->mpp) {
+		struct rkvenc_dev *core;
+
+		list_for_each_entry(core, &ccu->core_list, core_link) {
+			if (core == enc)
+				continue;
+			rkvenc2_free_rcbbuf(core->mpp.iommu_info ?
+					    core->mpp.iommu_info->pdev : NULL,
+					    core);
+			mpp_iommu_shared_domain_unbind(&ccu->iommu,
+						       core->mpp.iommu_info);
+		}
 		ccu->main_core = NULL;
 		/* owner is gone; reset the shared domain so a re-attach re-inits */
 		memset(&ccu->iommu, 0, sizeof(ccu->iommu));
-	} else if (ccu->main_core && !enc->mpp.msgs_cap &&
-		   ccu->main_core->msgs_cap) {
-		ccu->main_core->msgs_cap--;
+	} else {
+		mpp_iommu_shared_domain_unbind(&ccu->iommu, enc->mpp.iommu_info);
+		if (ccu->main_core && !enc->mpp.msgs_cap &&
+		    ccu->main_core->msgs_cap)
+			ccu->main_core->msgs_cap--;
+	}
+
+	if (!list_empty(&enc->core_link)) {
+		list_del_rcu(&enc->core_link);
+		if (ccu->core_num)
+			ccu->core_num--;
+		unlinked = true;
 	}
 	mutex_unlock(&ccu->lock);
+
+	if (unlinked) {
+		synchronize_rcu();
+		INIT_LIST_HEAD(&enc->core_link);
+	}
+
+	if (enc->ccu_pdev) {
+		put_device(&enc->ccu_pdev->dev);
+		enc->ccu_pdev = NULL;
+	}
 
 	enc->ccu = NULL;
 }
@@ -3067,24 +3179,23 @@ static int rkvenc2_alloc_rcbbuf(struct platform_device *pdev, struct rkvenc_dev 
 	resource_size_t sram_start, sram_end;
 	struct iommu_domain *domain;
 	struct device *dev = &pdev->dev;
+	u64 aligned_iova;
+	u64 aligned_size;
 
 	/* get rcb iova start and size */
 	ret = device_property_read_u32_array(dev, "rockchip,rcb-iova", vals, 2);
 	if (ret)
 		return ret;
 
-	iova = PAGE_ALIGN(vals[0]);
-	sram_used = PAGE_ALIGN(vals[1]);
-	if (!sram_used) {
-		dev_err(dev, "sram rcb invalid.\n");
+	aligned_iova = ALIGN((u64)vals[0], PAGE_SIZE);
+	aligned_size = ALIGN((u64)vals[1], PAGE_SIZE);
+	if (!aligned_size || aligned_iova > U32_MAX || aligned_size > U32_MAX) {
+		dev_err(dev, "sram rcb invalid: iova %#llx size %#llx\n",
+			aligned_iova, aligned_size);
 		return -EINVAL;
 	}
-	/* alloc reserve iova for rcb */
-	ret = mpp_iommu_reserve_iova(enc->mpp.iommu_info, iova, sram_used);
-	if (ret) {
-		dev_err(dev, "alloc rcb iova error.\n");
-		return ret;
-	}
+	iova = aligned_iova;
+	sram_used = aligned_size;
 	/* get sram device node */
 	sram_np = of_parse_phandle(dev->of_node, "rockchip,sram", 0);
 	if (!sram_np) {
@@ -3108,8 +3219,6 @@ static int rkvenc2_alloc_rcbbuf(struct platform_device *pdev, struct rkvenc_dev 
 	}
 	sram_size = sram_end - sram_start;
 	sram_size = sram_used < sram_size ? sram_used : sram_size;
-	/* iova map to sram */
-	domain = enc->mpp.iommu_info->domain;
 	/* in a CCU cluster this is the shared domain; reject overlapping windows */
 	if (enc->ccu) {
 		ret = mpp_iommu_shared_domain_reserve_window(&enc->ccu->iommu,
@@ -3117,12 +3226,28 @@ static int rkvenc2_alloc_rcbbuf(struct platform_device *pdev, struct rkvenc_dev 
 		if (ret)
 			return ret;
 	}
+	/* alloc reserve iova for rcb */
+	ret = mpp_iommu_reserve_iova(enc->mpp.iommu_info, iova, sram_used);
+	if (ret) {
+		dev_err(dev, "alloc rcb iova error.\n");
+		if (enc->ccu)
+			mpp_iommu_shared_domain_unreserve_window(&enc->ccu->iommu,
+								 iova, sram_used);
+		return ret;
+	}
+
+	enc->sram_size = sram_size;
+	enc->sram_used = sram_used;
+	enc->sram_iova = iova;
+
+	/* iova map to sram */
+	domain = enc->mpp.iommu_info->domain;
 	/* 6.18: iommu_map() gained a trailing gfp_t; probe ctx -> GFP_KERNEL */
 	ret = iommu_map(domain, iova, sram_start, sram_size,
 			IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
 	if (ret) {
 		dev_err(dev, "sram iommu_map error.\n");
-		return ret;
+		goto err_free_rcb;
 	}
 	/* alloc dma for the remaining buffer, sram + dma */
 	if (sram_size < sram_used) {
@@ -3133,23 +3258,19 @@ static int rkvenc2_alloc_rcbbuf(struct platform_device *pdev, struct rkvenc_dev 
 		if (!page) {
 			dev_err(dev, "unable to allocate pages\n");
 			ret = -ENOMEM;
-			goto err_sram_map;
+			goto err_free_rcb;
 		}
+		enc->rcb_page = page;
 		/* iova map to dma */
 		/* 6.18: iommu_map() gained a trailing gfp_t; probe ctx -> GFP_KERNEL */
 		ret = iommu_map(domain, iova + sram_size, page_to_phys(page),
 				page_size, IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
 		if (ret) {
 			dev_err(dev, "page iommu_map error.\n");
-			__free_pages(page, get_order(page_size));
-			goto err_sram_map;
+			goto err_free_rcb;
 		}
-		enc->rcb_page = page;
 	}
 
-	enc->sram_size = sram_size;
-	enc->sram_used = sram_used;
-	enc->sram_iova = iova;
 	enc->sram_enabled = -1;
 	dev_info(dev, "sram_start %pa\n", &sram_start);
 	dev_info(dev, "sram_iova %pad\n", &enc->sram_iova);
@@ -3158,8 +3279,8 @@ static int rkvenc2_alloc_rcbbuf(struct platform_device *pdev, struct rkvenc_dev 
 
 	return 0;
 
-err_sram_map:
-	iommu_unmap(domain, iova, sram_size);
+err_free_rcb:
+	rkvenc2_free_rcbbuf(pdev, enc);
 
 	return ret;
 }
@@ -3170,19 +3291,47 @@ static int rkvenc2_iommu_fault_handle(struct iommu_domain *iommu,
 {
 	struct mpp_dev *mpp = (struct mpp_dev *)arg;
 	struct rkvenc_dev *enc = to_rkvenc_dev(mpp);
-	struct mpp_task *mpp_task;
 	struct rkvenc_ccu *ccu = enc->ccu;
+	struct rkvenc_dev *fault_enc = enc;
+	struct mpp_task *mpp_task;
 
 	if (ccu) {
-		struct rkvenc_dev *core = NULL, *n;
+		struct rkvenc_dev *core;
+		bool found = false;
 
-		list_for_each_entry_safe(core, n, &ccu->core_list, core_link) {
+		rcu_read_lock();
+		list_for_each_entry_rcu(core, &ccu->core_list, core_link) {
 			if (core->mpp.iommu_info &&
 			    (&core->mpp.iommu_info->pdev->dev == iommu_dev)) {
 				mpp = &core->mpp;
+				fault_enc = core;
+				found = true;
 				break;
 			}
 		}
+		if (!found) {
+			dev_err(mpp->dev, "page fault from unknown RKVENC IOMMU device %s\n",
+				dev_name(iommu_dev));
+			rcu_read_unlock();
+			return -ENODEV;
+		}
+
+		/*
+		 * Mask iommu irq, in order for iommu not repeatedly trigger pagefault.
+		 * Until the pagefault task finish by hw timeout.
+		 */
+		rockchip_iommu_mask_irq(mpp->dev);
+
+		mpp_task = mpp->cur_task;
+		dev_info(mpp->dev, "core %d page fault found dchs %08x\n",
+			 mpp->core_id,
+			 mpp_read_relaxed(&fault_enc->mpp, DCHS_REG_OFFSET));
+
+		if (mpp_task)
+			mpp_task_dump_mem_region(mpp, mpp_task);
+		rcu_read_unlock();
+
+		return 0;
 	}
 
 	/*
@@ -3193,7 +3342,7 @@ static int rkvenc2_iommu_fault_handle(struct iommu_domain *iommu,
 
 	mpp_task = mpp->cur_task;
 	dev_info(mpp->dev, "core %d page fault found dchs %08x\n",
-		 mpp->core_id, mpp_read_relaxed(&enc->mpp, DCHS_REG_OFFSET));
+		 mpp->core_id, mpp_read_relaxed(&fault_enc->mpp, DCHS_REG_OFFSET));
 
 	if (mpp_task)
 		mpp_task_dump_mem_region(mpp, mpp_task);
@@ -3236,7 +3385,9 @@ static int rkvenc_core_probe(struct platform_device *pdev)
 		dev_err(dev, "attach ccu failed\n");
 		goto err_remove_mpp;
 	}
-	rkvenc2_alloc_rcbbuf(pdev, enc);
+	ret = rkvenc2_alloc_rcbbuf(pdev, enc);
+	if (ret)
+		goto err_detach_ccu;
 
 	ret = devm_request_threaded_irq(dev, mpp->irq,
 					mpp_dev_irq,
@@ -3292,7 +3443,9 @@ static int rkvenc_probe_default(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	rkvenc2_alloc_rcbbuf(pdev, enc);
+	ret = rkvenc2_alloc_rcbbuf(pdev, enc);
+	if (ret)
+		goto failed_get_irq;
 
 	ret = devm_request_threaded_irq(dev, mpp->irq,
 					mpp_dev_irq,
@@ -3311,6 +3464,7 @@ static int rkvenc_probe_default(struct platform_device *pdev)
 	return 0;
 
 failed_get_irq:
+	rkvenc2_free_rcbbuf(pdev, enc);
 	mpp_dev_remove(mpp);
 
 	return ret;
@@ -3338,18 +3492,28 @@ static int rkvenc_probe(struct platform_device *pdev)
 
 static int rkvenc2_free_rcbbuf(struct platform_device *pdev, struct rkvenc_dev *enc)
 {
-	struct iommu_domain *domain;
+	struct mpp_iommu_info *info = enc->mpp.iommu_info;
+	struct iommu_domain *domain = info ? info->domain : NULL;
 
 	if (enc->rcb_page) {
 		size_t page_size = PAGE_ALIGN(enc->sram_used - enc->sram_size);
 		int order = min(get_order(page_size), MAX_PAGE_ORDER);
 
 		__free_pages(enc->rcb_page, order);
+		enc->rcb_page = NULL;
 	}
-	if (enc->sram_iova) {
-		domain = enc->mpp.iommu_info->domain;
+	if (enc->sram_iova && domain)
 		iommu_unmap(domain, enc->sram_iova, enc->sram_used);
-	}
+	if (enc->sram_iova && info)
+		mpp_iommu_unreserve_iova(info, enc->sram_iova, enc->sram_used);
+	if (enc->sram_iova && enc->ccu)
+		mpp_iommu_shared_domain_unreserve_window(&enc->ccu->iommu,
+							 enc->sram_iova,
+							 enc->sram_used);
+
+	enc->sram_iova = 0;
+	enc->sram_size = 0;
+	enc->sram_used = 0;
 
 	return 0;
 }
@@ -3366,8 +3530,8 @@ static void rkvenc_remove(struct platform_device *pdev)
 		struct rkvenc_dev *enc = to_rkvenc_dev(mpp);
 
 		dev_info(dev, "remove core\n");
-		rkvenc_detach_ccu(enc);
 		rkvenc2_free_rcbbuf(pdev, enc);
+		rkvenc_detach_ccu(enc);
 		mpp_dev_remove(&enc->mpp);
 		rkvenc_procfs_remove(&enc->mpp);
 	} else {
