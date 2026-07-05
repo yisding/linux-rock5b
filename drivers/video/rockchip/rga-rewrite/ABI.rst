@@ -304,13 +304,12 @@ Implemented
   ``immakeBorder()``
   reflect/wrap left and right edge tasks.  RFBC64x4 source images emitted by
   legacy ``ffmpeg-rockchip`` for Rockchip RFBC DRM frames, and AFBC32x8
-  split-mode source images from ``librga`` DRM/gralloc paths, are deprecated
-  RGA2-Pro compatibility code rather than RK3588 required ABI.  Public RK3588
-  material identifies the SoC as one RGA2-Enhance core plus two RGA3 cores, and
-  the current ffmpeg target removed RFBC modifiers.  The rewrite keeps these
-  source-only FBCIN profiles temporarily for historical conformance coverage,
-  but they must not be extended without RK3588 BSP hardware evidence and are
-  marked for removal.
+  split-mode source images from ``librga`` DRM/gralloc paths, are RGA2-Pro
+  compatibility modes rather than RK3588 required ABI.  Public RK3588 material
+  identifies the SoC as one RGA2-Enhance core plus two RGA3 cores, the current
+  ffmpeg target removed RFBC modifiers, and the rewrite now rejects these
+  source-only FBCIN profiles with ``-EOPNOTSUPP`` instead of carrying an
+  executable RGA2-Pro path.
   Pattern/alpha blend outside the alpha-bitmap and color-key subsets below,
   Y4/Y8 full-CSC dither output outside the current RGB-to-YUV ``librga`` path,
   color-key outside the RGBA ``imcolorkey`` profile above, ROP outside the
@@ -437,8 +436,7 @@ Implemented
   queued hardware-removal abort completion and release-fence signaling,
   last-hardware pending-acquire abort completion and release-fence signaling,
   selected-core removal race completion and release-fence signaling,
-  deprecated RGA2-Pro RFBC64x4 8/10-bit 4:2:0/4:2:2 and RGB-family AFBC32x8
-  source profile selection and FBCIN command emission, IOMMU fault target
+  RGA2-Pro RFBC64x4/AFBC32x8 source profile rejection, IOMMU fault target
   matching,
   post-reset IOMMU refresh accounting, scheduler priority enqueue/aging,
   scheduler core-counter and per-core timing mapping,
@@ -483,10 +481,9 @@ Recognized But Unsupported
 * RGA2 hardware command generation outside the solid color fill, raster bitblit,
   and color-palette profiles above, including full-CSC outside raster bitblit.
 * RGA3 pattern outside the supported alpha-overlay profile, color-key outside
-  the RGB ``imcolorkey`` profile, per-channel rotation,
-  RFBC/AFBC32x8 outside the deprecated source-only RGA2-Pro compatibility
-  profiles, tile outside simple bitblits, physical-address channels, and
-  non-bitblit operation modes.
+  the RGB ``imcolorkey`` profile, per-channel rotation, RFBC/AFBC32x8 source
+  and destination modes, tile outside simple bitblits, physical-address
+  channels, and non-bitblit operation modes.
 Unsupported submit profiles return ``-EOPNOTSUPP`` after copying, validating,
 preparing, queuing, dispatching, resolving imported buffers, allocating an owned
 command buffer, and power-sequencing an owned job to the backend boundary.
