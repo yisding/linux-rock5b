@@ -18,6 +18,7 @@
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/kref.h>
+#include <linux/overflow.h>
 #include <linux/slab.h>
 #include <linux/pm_runtime.h>
 #include <linux/platform_device.h>
@@ -77,6 +78,45 @@ mpp_dma_find_buffer_fd(struct mpp_dma_session *dma, int fd)
 	dma_buf_put(dmabuf);
 
 	return out;
+}
+
+static int mpp_dma_check_iova_contract(struct mpp_dma_session *dma, int fd,
+				       struct sg_table *sgt)
+{
+	dma_addr_t dma_addr;
+	unsigned int dma_len;
+	u64 dma_end;
+
+	if (!sgt || !sgt->sgl) {
+		dev_err(dma->dev, "reject fd %d DMA mapping: empty sg table\n", fd);
+		return -EINVAL;
+	}
+
+	if (sgt->nents != 1) {
+		dev_err(dma->dev,
+			"reject fd %d DMA mapping: expected one DMA segment, got %u, orig_nents = %u\n",
+			fd, sgt->nents, sgt->orig_nents);
+		return -EOPNOTSUPP;
+	}
+
+	dma_addr = sg_dma_address(sgt->sgl);
+	dma_len = sg_dma_len(sgt->sgl);
+	if (!dma_len) {
+		dev_err(dma->dev,
+			"reject fd %d DMA mapping: zero length segment, iova = %pad\n",
+			fd, &dma_addr);
+		return -EINVAL;
+	}
+
+	dma_end = (u64)dma_addr + dma_len - 1;
+	if (dma_addr > DMA_BIT_MASK(32) || dma_end > DMA_BIT_MASK(32)) {
+		dev_err(dma->dev,
+			"reject fd %d DMA mapping: 32-bit IOVA span overflow, iova = %pad, size = %u, end = 0x%llx\n",
+			fd, &dma_addr, dma_len, dma_end);
+		return -EOVERFLOW;
+	}
+
+	return 0;
 }
 
 /* Release the buffer from the current list */
@@ -259,6 +299,10 @@ struct mpp_dma_buffer *mpp_dma_import_fd(struct mpp_iommu_info *iommu_info,
 		mpp_err("dma_buf_map_attachment fd %d failed(%d)\n", fd, ret);
 		goto fail_map;
 	}
+	ret = mpp_dma_check_iova_contract(dma, fd, sgt);
+	if (ret)
+		goto fail_map_attachment;
+
 	buffer->iova = sg_dma_address(sgt->sgl);
 	buffer->size = sg_dma_len(sgt->sgl);
 	buffer->attach = attach;
@@ -281,6 +325,8 @@ struct mpp_dma_buffer *mpp_dma_import_fd(struct mpp_iommu_info *iommu_info,
 
 	return buffer;
 
+fail_map_attachment:
+	dma_buf_unmap_attachment_unlocked(attach, sgt, buffer->dir);
 fail_map:
 	dma_buf_detach(buffer->dmabuf, attach);
 fail_attach:
@@ -479,6 +525,36 @@ int mpp_iommu_attach(struct mpp_iommu_info *info)
 	return iommu_attach_group(info->domain, info->group);
 }
 
+static int mpp_iommu_attach_current_domain(struct mpp_iommu_info *info)
+{
+	if (!info)
+		return 0;
+
+	if (info->domain == iommu_get_domain_for_dev(info->dev))
+		return 0;
+
+	return iommu_attach_group(info->domain, info->group);
+}
+
+static int mpp_iommu_check_iova_span(dma_addr_t iova, size_t size, u64 *end)
+{
+	u64 dma_end;
+
+	if (!size)
+		return -EINVAL;
+
+	if (check_add_overflow((u64)iova, (u64)size - 1, &dma_end))
+		return -EOVERFLOW;
+
+	if (iova > DMA_BIT_MASK(32) || dma_end > DMA_BIT_MASK(32))
+		return -EOVERFLOW;
+
+	if (end)
+		*end = dma_end;
+
+	return 0;
+}
+
 /*
  * Initialize a CCU cluster's shared domain from its main core.
  *
@@ -499,6 +575,8 @@ int mpp_iommu_shared_domain_init(struct mpp_iommu_shared_domain *shared,
 	shared->owner = owner;
 	shared->domain = owner->domain;
 	shared->rw_sem = owner->rw_sem;
+	shared->nr_windows = 0;
+	spin_lock_init(&shared->window_lock);
 
 	return 0;
 }
@@ -533,15 +611,61 @@ int mpp_iommu_shared_domain_bind(struct mpp_iommu_shared_domain *shared,
 	if (info == shared->owner)
 		return 0;
 
+	if (info->shared_domain == shared)
+		return 0;
+
+	if (info->shared_domain)
+		return -EBUSY;
+
 	old_domain = info->domain;
 	old_rw_sem = info->rw_sem;
 	info->domain = shared->domain;
 	info->rw_sem = shared->rw_sem;
 
-	ret = mpp_iommu_attach(info);
+	ret = mpp_iommu_attach_current_domain(info);
 	if (ret) {
 		info->domain = old_domain;
 		info->rw_sem = old_rw_sem;
+		return ret;
+	}
+
+	info->shared_domain = shared;
+
+	return 0;
+}
+
+int mpp_iommu_shared_domain_unbind(struct mpp_iommu_shared_domain *shared,
+				   struct mpp_iommu_info *info)
+{
+	struct iommu_domain *cur;
+	int ret;
+
+	if (!shared || !info)
+		return 0;
+
+	if (info == shared->owner)
+		return 0;
+
+	if (info->shared_domain != shared)
+		return 0;
+
+	iommu_detach_group(shared->domain, info->group);
+
+	info->domain = info->default_domain;
+	info->rw_sem = info->default_rw_sem;
+	info->shared_domain = NULL;
+
+	cur = iommu_get_domain_for_dev(info->dev);
+	if (cur == info->domain)
+		return 0;
+
+	ret = iommu_attach_group(info->domain, info->group);
+	if (ret) {
+		dev_err(info->dev, "failed to restore default IOMMU domain: %d\n", ret);
+		info->domain = shared->domain;
+		info->rw_sem = shared->rw_sem;
+		info->shared_domain = shared;
+		mpp_iommu_attach_current_domain(info);
 		return ret;
 	}
 
@@ -590,17 +714,30 @@ int mpp_iommu_shared_domain_reserve_window(struct mpp_iommu_shared_domain *share
 					   dma_addr_t iova, size_t size,
 					   struct device *dev)
 {
+	unsigned long flags;
+	u64 end;
 	unsigned int i;
+	int ret;
 
-	if (!shared || !size)
+	if (!shared)
 		return -EINVAL;
 
+	ret = mpp_iommu_check_iova_span(iova, size, &end);
+	if (ret) {
+		dev_err(dev,
+			"invalid CCU fixed IOVA window %pad+%#zx: %d\n",
+			&iova, size, ret);
+		return ret;
+	}
+
+	spin_lock_irqsave(&shared->window_lock, flags);
 	for (i = 0; i < shared->nr_windows; i++) {
 		dma_addr_t a0 = shared->windows[i].iova;
 		size_t asz = shared->windows[i].size;
+		u64 a_end = (u64)a0 + asz - 1;
 
-		/* half-open ranges overlap iff each starts before the other ends */
-		if (iova < a0 + asz && a0 < iova + size) {
+		if ((u64)iova <= a_end && (u64)a0 <= end) {
+			spin_unlock_irqrestore(&shared->window_lock, flags);
 			dev_err(dev,
 				"CCU fixed IOVA window %pad+%#zx overlaps existing %pad+%#zx\n",
 				&iova, size, &a0, asz);
@@ -609,16 +746,43 @@ int mpp_iommu_shared_domain_reserve_window(struct mpp_iommu_shared_domain *share
 	}
 
 	if (shared->nr_windows >= MPP_IOMMU_MAX_FIXED_WINDOWS) {
-		dev_warn(dev, "CCU fixed IOVA window table full; not tracking %pad\n",
-			 &iova);
-		return 0;
+		spin_unlock_irqrestore(&shared->window_lock, flags);
+		dev_err(dev, "CCU fixed IOVA window table full; rejecting %pad\n",
+			&iova);
+		return -ENOSPC;
 	}
 
 	shared->windows[shared->nr_windows].iova = iova;
 	shared->windows[shared->nr_windows].size = size;
 	shared->nr_windows++;
+	spin_unlock_irqrestore(&shared->window_lock, flags);
 
 	return 0;
+}
+
+void mpp_iommu_shared_domain_unreserve_window(struct mpp_iommu_shared_domain *shared,
+					      dma_addr_t iova, size_t size)
+{
+	unsigned long flags;
+	unsigned int i;
+
+	if (!shared || !size)
+		return;
+
+	spin_lock_irqsave(&shared->window_lock, flags);
+	for (i = 0; i < shared->nr_windows; i++) {
+		if (shared->windows[i].iova != iova ||
+		    shared->windows[i].size != size)
+			continue;
+
+		shared->nr_windows--;
+		if (i != shared->nr_windows)
+			shared->windows[i] = shared->windows[shared->nr_windows];
+		memset(&shared->windows[shared->nr_windows], 0,
+		       sizeof(shared->windows[shared->nr_windows]));
+		break;
+	}
+	spin_unlock_irqrestore(&shared->window_lock, flags);
 }
 
 static int mpp_iommu_handle(struct iommu_domain *iommu,
@@ -715,11 +879,13 @@ mpp_iommu_probe(struct device *dev)
 
 	init_rwsem(&info->rw_sem_self);
 	info->rw_sem = &info->rw_sem_self;
+	info->default_rw_sem = &info->rw_sem_self;
 	spin_lock_init(&info->dev_lock);
 	info->dev = dev;
 	info->pdev = pdev;
 	info->group = group;
 	info->domain = domain;
+	info->default_domain = domain;
 	info->dev_active = NULL;
 	info->irq = platform_get_irq(pdev, 0);
 	info->got_irq = (info->irq < 0) ? false : true;
@@ -745,6 +911,30 @@ err_put_pdev:
 	return ERR_PTR(ret);
 }
 
+static void mpp_iommu_clear_fault_handler(struct mpp_iommu_info *info)
+{
+	if (!info)
+		return;
+
+	if (info->rockchip_fault_handler) {
+		rockchip_iommu_set_fault_handler(info->dev, NULL, NULL);
+		info->rockchip_fault_handler = false;
+	}
+
+	if (info->vsi_fault_handler) {
+		vsi_iommu_set_fault_handler(info->dev, NULL, NULL);
+		info->vsi_fault_handler = false;
+	}
+
+	if (info->generic_fault_handler && info->domain &&
+	    info->domain->cookie_type == IOMMU_COOKIE_FAULT_HANDLER) {
+		info->domain->handler = NULL;
+		info->domain->handler_token = NULL;
+		info->domain->cookie_type = IOMMU_COOKIE_NONE;
+		info->generic_fault_handler = false;
+	}
+}
+
 int mpp_iommu_remove(struct mpp_iommu_info *info)
 {
 	if (!info)
@@ -754,8 +944,7 @@ int mpp_iommu_remove(struct mpp_iommu_info *info)
 	if (info->shared)
 		mpp_iommu_attach(info);
 
-	rockchip_iommu_set_fault_handler(info->dev, NULL, NULL);
-	vsi_iommu_set_fault_handler(info->dev, NULL, NULL);
+	mpp_iommu_clear_fault_handler(info);
 	iommu_group_put(info->group);
 	platform_device_put(info->pdev);
 
@@ -810,30 +999,38 @@ int mpp_iommu_dev_activate(struct mpp_iommu_info *info, struct mpp_dev *dev)
 			dev ? dev_name(dev->dev) : NULL);
 		ret = -EINVAL;
 	} else {
-		info->dev_active = dev;
+		iommu_fault_handler_t handler;
+
 		/*
 		 * MPP uses normal DMA domains, so the generic fault-handler cookie path
 		 * cannot be used for Rockchip IOMMUs. The provider hook handles that
 		 * path and we keep the generic fallback for any cookie-less domain.
 		 */
+		handler = dev->fault_handler ? dev->fault_handler : mpp_iommu_handle;
 		ret = rockchip_iommu_set_fault_handler(info->dev,
-			dev->fault_handler ? dev->fault_handler : mpp_iommu_handle,
-			dev);
-		if (ret == -ENODEV)
+						       handler, dev);
+		if (!ret) {
+			info->rockchip_fault_handler = true;
+		} else if (ret == -ENODEV) {
 			ret = vsi_iommu_set_fault_handler(info->dev,
-				dev->fault_handler ? dev->fault_handler : mpp_iommu_handle,
-				dev);
+							  handler, dev);
+			if (!ret)
+				info->vsi_fault_handler = true;
+		}
 		if (ret == -ENODEV) {
 			if (info->domain &&
-			    info->domain->cookie_type == IOMMU_COOKIE_NONE)
+			    info->domain->cookie_type == IOMMU_COOKIE_NONE) {
 				iommu_set_fault_handler(info->domain,
-					dev->fault_handler ?
-					dev->fault_handler : mpp_iommu_handle,
-					dev);
-			ret = 0;
+							handler, dev);
+				info->generic_fault_handler = true;
+				ret = 0;
+			}
 		}
 
-		dev_dbg(info->dev, "activate -> %p %s\n", dev, dev_name(dev->dev));
+		if (!ret) {
+			info->dev_active = dev;
+			dev_dbg(info->dev, "activate -> %p %s\n", dev, dev_name(dev->dev));
+		}
 	}
 
 	spin_unlock_irqrestore(&info->dev_lock, flags);
@@ -850,16 +1047,16 @@ int mpp_iommu_dev_deactivate(struct mpp_iommu_info *info, struct mpp_dev *dev)
 
 	spin_lock_irqsave(&info->dev_lock, flags);
 
-	if (info->dev_active != dev)
+	if (info->dev_active != dev) {
 		dev_err(info->dev, "can not deactivate %s when %s activated\n",
 			dev_name(dev->dev),
 			info->dev_active ? dev_name(info->dev_active->dev) : NULL);
+		spin_unlock_irqrestore(&info->dev_lock, flags);
+		return -EBUSY;
+	}
 
 	dev_dbg(info->dev, "deactivate %p\n", info->dev_active);
-	if (info->dev_active == dev) {
-		rockchip_iommu_set_fault_handler(info->dev, NULL, NULL);
-		vsi_iommu_set_fault_handler(info->dev, NULL, NULL);
-	}
+	mpp_iommu_clear_fault_handler(info);
 	info->dev_active = NULL;
 	spin_unlock_irqrestore(&info->dev_lock, flags);
 
@@ -868,14 +1065,22 @@ int mpp_iommu_dev_deactivate(struct mpp_iommu_info *info, struct mpp_dev *dev)
 
 int mpp_iommu_reserve_iova(struct mpp_iommu_info *info, dma_addr_t iova, size_t size)
 {
-
 	struct iommu_domain *domain;
 	struct mpp_iommu_dma_cookie *cookie;
 	struct iova_domain *iovad;
 	unsigned long pfn_lo, pfn_hi;
+	u64 end;
+	int ret;
 
 	if (!info)
-		return 0;
+		return -EINVAL;
+
+	ret = mpp_iommu_check_iova_span(iova, size, &end);
+	if (ret) {
+		dev_err(info->dev, "invalid reserved IOVA span %pad+%#zx: %d\n",
+			&iova, size, ret);
+		return ret;
+	}
 
 	domain = info->domain;
 	if (!domain || !domain->iova_cookie)
@@ -888,10 +1093,30 @@ int mpp_iommu_reserve_iova(struct mpp_iommu_info *info, dma_addr_t iova, size_t 
 
 	/* iova will be freed automatically by put_iova_domain() */
 	pfn_lo = iova_pfn(iovad, iova);
-	pfn_hi = iova_pfn(iovad, iova + size - 1);
+	pfn_hi = iova_pfn(iovad, end);
 	if (!reserve_iova(iovad, pfn_lo, pfn_hi))
 		return -EINVAL;
 
 	return 0;
 
+}
+
+void mpp_iommu_unreserve_iova(struct mpp_iommu_info *info, dma_addr_t iova, size_t size)
+{
+	struct iommu_domain *domain;
+	struct mpp_iommu_dma_cookie *cookie;
+	struct iova_domain *iovad;
+
+	if (!info || !size)
+		return;
+
+	domain = info->domain;
+	if (!domain || !domain->iova_cookie)
+		return;
+
+	BUILD_BUG_ON(offsetof(struct mpp_iommu_dma_cookie, iovad) != 0);
+	cookie = (struct mpp_iommu_dma_cookie *)domain->iova_cookie;
+	iovad = &cookie->iovad;
+
+	free_iova(iovad, iova_pfn(iovad, iova));
 }

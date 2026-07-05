@@ -212,6 +212,10 @@ struct rkvdec2_ccu {
 	struct list_head used_list;
 	u32 timeout_flag;
 
+	/* lock for core attach/detach and shared-domain ownership */
+	struct mutex lock;
+	struct list_head core_list;
+	struct mpp_dev *main_core;
 	/* cluster shared IOMMU domain, established by core 0 (the owner) */
 	struct mpp_iommu_shared_domain iommu;
 };
@@ -238,6 +242,7 @@ void rkvdec2_link_session_deinit(struct mpp_session *session);
 
 /* for ccu link */
 int rkvdec2_attach_ccu(struct device *dev, struct rkvdec2_dev *dec);
+void rkvdec2_detach_ccu(struct rkvdec2_dev *dec);
 int rkvdec2_ccu_link_init(struct platform_device *pdev, struct rkvdec2_dev *dec);
 void *rkvdec2_ccu_alloc_task(struct mpp_session *session, struct mpp_task_msgs *msgs);
 int rkvdec2_soft_ccu_iommu_fault_handle(struct iommu_domain *iommu,
