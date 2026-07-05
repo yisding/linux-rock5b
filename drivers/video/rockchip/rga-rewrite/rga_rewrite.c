@@ -8924,6 +8924,53 @@ static void rk_rga_release_buffer_ioctl_kunit(struct kunit *test)
 	idr_destroy(&session.imports);
 }
 
+static void rk_rga_buffer_pool_zero_count_kunit(struct kunit *test)
+{
+	struct rga_external_buffer buffer = {};
+	struct rga_buffer_pool pool = {};
+	struct rk_rga_session session = {};
+	void __user *pool_user;
+	void __user *buffer_user;
+	unsigned long uncopied;
+
+	pool_user = rk_rga_kunit_user_buffer(test, sizeof(pool));
+	buffer_user = rk_rga_kunit_user_buffer(test, sizeof(buffer));
+	KUNIT_ASSERT_NOT_NULL(test, pool_user);
+	KUNIT_ASSERT_NOT_NULL(test, buffer_user);
+
+	mutex_init(&session.lock);
+	idr_init(&session.imports);
+
+	pool.size = 0;
+	pool.buffers_ptr = (uintptr_t)buffer_user;
+	uncopied = copy_to_user(pool_user, &pool, sizeof(pool));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_ioctl_import_buffer((unsigned long)pool_user,
+						   &session),
+			0L);
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_ioctl_release_buffer((unsigned long)pool_user,
+						    &session),
+			0L);
+	KUNIT_EXPECT_TRUE(test, idr_is_empty(&session.imports));
+
+	pool.buffers_ptr = 0;
+	uncopied = copy_to_user(pool_user, &pool, sizeof(pool));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_ioctl_import_buffer((unsigned long)pool_user,
+						   &session),
+			-EFAULT);
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_ioctl_release_buffer((unsigned long)pool_user,
+						    &session),
+			-EFAULT);
+	KUNIT_EXPECT_TRUE(test, idr_is_empty(&session.imports));
+
+	idr_destroy(&session.imports);
+}
+
 static void rk_rga_acquire_fd_ownership_kunit(struct kunit *test)
 {
 	struct rk_rga_acquire_fd fds[2] = {};
@@ -12993,6 +13040,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_import_buffer_size_kunit),
 	KUNIT_CASE(rk_rga_import_buffer_ioctl_errors_kunit),
 	KUNIT_CASE(rk_rga_release_buffer_ioctl_kunit),
+	KUNIT_CASE(rk_rga_buffer_pool_zero_count_kunit),
 	KUNIT_CASE(rk_rga_acquire_fd_ownership_kunit),
 	KUNIT_CASE(rk_rga_acquire_fence_status_kunit),
 	KUNIT_CASE(rk_rga_acquire_callbacks_result_kunit),
