@@ -11,6 +11,62 @@
 #include "rga_job.h"
 #include "rga_debugger.h"
 
+static int rga_dma_check_iova_contract(struct sg_table *sgt, const char *source)
+{
+	dma_addr_t dma_addr;
+	unsigned int dma_len;
+	u64 dma_end;
+
+	if (!sgt || !sgt->sgl) {
+		rga_err("reject %s DMA mapping: empty sg table\n", source);
+		return -EINVAL;
+	}
+
+	if (sgt->nents != 1) {
+		rga_err("reject %s DMA mapping: expected one DMA segment, got %u, orig_nents = %u\n",
+			source, sgt->nents, sgt->orig_nents);
+		return -EOPNOTSUPP;
+	}
+
+	dma_addr = sg_dma_address(sgt->sgl);
+	dma_len = sg_dma_len(sgt->sgl);
+	if (!dma_len) {
+		rga_err("reject %s DMA mapping: zero length segment, iova = %pad\n",
+			source, &dma_addr);
+		return -EINVAL;
+	}
+
+	dma_end = (u64)dma_addr + dma_len - 1;
+	if (dma_addr > U32_MAX || dma_end > U32_MAX) {
+		rga_err("reject %s DMA mapping: 32-bit IOVA span overflow, iova = %pad, size = %u, end = 0x%llx\n",
+			source, &dma_addr, dma_len, dma_end);
+		return -EOVERFLOW;
+	}
+
+	return 0;
+}
+
+static int rga_dma_set_buffer_mapping(struct sg_table *sgt,
+				      struct rga_dma_buffer *buffer,
+				      enum dma_data_direction dir,
+				      struct device *map_dev,
+				      const char *source)
+{
+	int ret;
+
+	ret = rga_dma_check_iova_contract(sgt, source);
+	if (ret)
+		return ret;
+
+	buffer->sgt = sgt;
+	buffer->dma_addr = sg_dma_address(sgt->sgl);
+	buffer->dir = dir;
+	buffer->size = sg_dma_len(sgt->sgl);
+	buffer->map_dev = map_dev;
+
+	return 0;
+}
+
 int rga_virtual_memory_check(void *vaddr, u32 w, u32 h, u32 format, int fd)
 {
 	int bits = 32;
@@ -56,7 +112,7 @@ int rga_dma_memory_check(struct rga_dma_buffer *rga_dma_buffer, struct rga_img_i
 
 	if (!IS_ERR_OR_NULL(dma_buf)) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
-		ret = dma_buf_vmap(dma_buf, &map);
+		ret = dma_buf_vmap_unlocked(dma_buf, &map);
 		vaddr = ret ? NULL : map.vaddr;
 #else
 		vaddr = dma_buf_vmap(dma_buf);
@@ -69,7 +125,7 @@ int rga_dma_memory_check(struct rga_dma_buffer *rga_dma_buffer, struct rga_img_i
 			return -EINVAL;
 		}
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
-		dma_buf_vunmap(dma_buf, &map);
+		dma_buf_vunmap_unlocked(dma_buf, &map);
 #else
 		dma_buf_vunmap(dma_buf, vaddr);
 #endif
@@ -81,8 +137,7 @@ int rga_dma_memory_check(struct rga_dma_buffer *rga_dma_buffer, struct rga_img_i
 int rga_dma_map_sgt(struct sg_table *sgt, struct rga_dma_buffer *buffer,
 		    enum dma_data_direction dir, struct device *map_dev)
 {
-	int i, ret = 0;
-	struct scatterlist *sg = NULL;
+	int ret = 0;
 
 	ret = dma_map_sg(map_dev, sgt->sgl, sgt->orig_nents, dir);
 	if (ret <= 0) {
@@ -91,13 +146,11 @@ int rga_dma_map_sgt(struct sg_table *sgt, struct rga_dma_buffer *buffer,
 	}
 	sgt->nents = ret;
 
-	buffer->sgt = sgt;
-	buffer->dma_addr = sg_dma_address(sgt->sgl);
-	buffer->dir = dir;
-	buffer->size = 0;
-	for_each_sgtable_sg(sgt, sg, i)
-		buffer->size += sg_dma_len(sg);
-	buffer->map_dev = map_dev;
+	ret = rga_dma_set_buffer_mapping(sgt, buffer, dir, map_dev, "sg_table");
+	if (ret) {
+		dma_unmap_sg(map_dev, sgt->sgl, sgt->orig_nents, dir);
+		return ret;
+	}
 
 	return 0;
 }
@@ -118,8 +171,7 @@ int rga_dma_map_buf(struct dma_buf *dma_buf, struct rga_dma_buffer *rga_dma_buff
 {
 	struct dma_buf_attachment *attach = NULL;
 	struct sg_table *sgt = NULL;
-	struct scatterlist *sg = NULL;
-	int i, ret = 0;
+	int ret = 0;
 
 	if (dma_buf != NULL) {
 		get_dma_buf(dma_buf);
@@ -135,25 +187,24 @@ int rga_dma_map_buf(struct dma_buf *dma_buf, struct rga_dma_buffer *rga_dma_buff
 		goto err_get_attach;
 	}
 
-	sgt = dma_buf_map_attachment(attach, dir);
+	sgt = dma_buf_map_attachment_unlocked(attach, dir);
 	if (IS_ERR(sgt)) {
 		ret = PTR_ERR(sgt);
 		rga_err("Failed to map attachment, ret[%d]\n", ret);
 		goto err_get_sgt;
 	}
 
+	ret = rga_dma_set_buffer_mapping(sgt, rga_dma_buffer, dir, map_dev, "dma_buf");
+	if (ret)
+		goto err_map_attachment;
+
 	rga_dma_buffer->dma_buf = dma_buf;
 	rga_dma_buffer->attach = attach;
-	rga_dma_buffer->sgt = sgt;
-	rga_dma_buffer->dma_addr = sg_dma_address(sgt->sgl);
-	rga_dma_buffer->dir = dir;
-	rga_dma_buffer->size = 0;
-	for_each_sgtable_sg(sgt, sg, i)
-		rga_dma_buffer->size += sg_dma_len(sg);
-	rga_dma_buffer->map_dev = map_dev;
 
 	return ret;
 
+err_map_attachment:
+	dma_buf_unmap_attachment_unlocked(attach, sgt, dir);
 err_get_sgt:
 	if (attach)
 		dma_buf_detach(dma_buf, attach);
@@ -170,8 +221,7 @@ int rga_dma_map_fd(int fd, struct rga_dma_buffer *rga_dma_buffer,
 	struct dma_buf *dma_buf = NULL;
 	struct dma_buf_attachment *attach = NULL;
 	struct sg_table *sgt = NULL;
-	struct scatterlist *sg = NULL;
-	int i, ret = 0;
+	int ret = 0;
 
 	dma_buf = dma_buf_get(fd);
 	if (IS_ERR(dma_buf)) {
@@ -187,25 +237,24 @@ int rga_dma_map_fd(int fd, struct rga_dma_buffer *rga_dma_buffer,
 		goto err_get_attach;
 	}
 
-	sgt = dma_buf_map_attachment(attach, dir);
+	sgt = dma_buf_map_attachment_unlocked(attach, dir);
 	if (IS_ERR(sgt)) {
 		ret = PTR_ERR(sgt);
 		rga_err("Failed to map attachment, ret[%d]\n", ret);
 		goto err_get_sgt;
 	}
 
+	ret = rga_dma_set_buffer_mapping(sgt, rga_dma_buffer, dir, map_dev, "dma_buf_fd");
+	if (ret)
+		goto err_map_attachment;
+
 	rga_dma_buffer->dma_buf = dma_buf;
 	rga_dma_buffer->attach = attach;
-	rga_dma_buffer->sgt = sgt;
-	rga_dma_buffer->dma_addr = sg_dma_address(sgt->sgl);
-	rga_dma_buffer->dir = dir;
-	rga_dma_buffer->size = 0;
-	for_each_sgtable_sg(sgt, sg, i)
-		rga_dma_buffer->size += sg_dma_len(sg);
-	rga_dma_buffer->map_dev = map_dev;
 
 	return ret;
 
+err_map_attachment:
+	dma_buf_unmap_attachment_unlocked(attach, sgt, dir);
 err_get_sgt:
 	if (attach)
 		dma_buf_detach(dma_buf, attach);
@@ -219,9 +268,9 @@ err_get_attach:
 void rga_dma_unmap_buf(struct rga_dma_buffer *rga_dma_buffer)
 {
 	if (rga_dma_buffer->attach && rga_dma_buffer->sgt)
-		dma_buf_unmap_attachment(rga_dma_buffer->attach,
-					 rga_dma_buffer->sgt,
-					 rga_dma_buffer->dir);
+		dma_buf_unmap_attachment_unlocked(rga_dma_buffer->attach,
+						  rga_dma_buffer->sgt,
+						  rga_dma_buffer->dir);
 
 	if (rga_dma_buffer->attach) {
 		dma_buf_detach(rga_dma_buffer->dma_buf, rga_dma_buffer->attach);

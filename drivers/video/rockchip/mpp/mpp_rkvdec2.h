@@ -207,6 +207,8 @@ struct rkvdec2_dev {
 
 	/* for ccu link mode */
 	struct rkvdec2_ccu *ccu;
+	struct platform_device *ccu_pdev;
+	struct list_head core_link;
 	u32 core_mask;
 	u32 task_index;
 	/* mmu info */
@@ -227,6 +229,7 @@ int rkvdec2_free_session(struct mpp_session *session);
 int rkvdec2_result(struct mpp_dev *mpp, struct mpp_task *mpp_task,
 		   struct mpp_task_msgs *msgs);
 int rkvdec2_reset(struct mpp_dev *mpp);
+int rkvdec2_free_rcbbuf(struct platform_device *pdev, struct rkvdec2_dev *dec);
 
 void mpp_devfreq_set_core_rate(struct mpp_dev *mpp, enum MPP_CLOCK_MODE mode);
 

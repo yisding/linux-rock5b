@@ -12,6 +12,8 @@
 #include "rga_common.h"
 #include "rga_hw_config.h"
 
+#include <soc/rockchip/rockchip_iommu.h>
+
 int rga_user_memory_check(struct page **pages, u32 w, u32 h, u32 format, int flag)
 {
 	int bits;
@@ -238,17 +240,75 @@ static int rga_iommu_intr_fault_handler(struct iommu_domain *iommu, struct devic
 		scheduler->ops->soft_reset(scheduler);
 	}
 
-	if (status & RGA_IOMMU_IRQ_PAGE_FAULT) {
-		rga_err("RGA IOMMU: page fault! Please check the memory size.\n");
-		job->ret = -EACCES;
-	} else if (status & RGA_IOMMU_IRQ_BUS_ERROR) {
+	if (status & (ROCKCHIP_IOMMU_FAULT_BUS_ERROR | RGA_IOMMU_IRQ_BUS_ERROR)) {
 		rga_err("RGA IOMMU: bus error! Please check if the memory is invalid or has been freed.\n");
 		job->ret = -EACCES;
+	} else if (status == IOMMU_FAULT_WRITE) {
+		rga_err("RGA IOMMU: write fault! Please check the memory size.\n");
+		job->ret = -EACCES;
 	} else {
-		rga_err("RGA IOMMU: Wrong IOMMU interrupt signal!\n");
+		rga_err("RGA IOMMU: read fault! Please check the memory size.\n");
+		job->ret = -EACCES;
 	}
 
 	return 0;
+}
+
+static int rga_iommu_set_fault_handler(struct rga_scheduler_t *scheduler)
+{
+	struct rga_iommu_info *info = scheduler->iommu_info;
+	int ret;
+
+	if (!info)
+		return 0;
+
+	ret = rockchip_iommu_set_fault_handler(info->dev,
+					       rga_iommu_intr_fault_handler,
+					       scheduler);
+	if (!ret) {
+		info->rockchip_fault_handler = true;
+		return 0;
+	}
+	if (ret != -ENODEV)
+		return ret;
+
+	if (info->domain &&
+	    info->domain->cookie_type == IOMMU_COOKIE_FAULT_HANDLER &&
+	    info->domain->handler == rga_iommu_intr_fault_handler)
+		return 0;
+
+	if (info->domain &&
+	    info->domain->cookie_type == IOMMU_COOKIE_NONE) {
+		iommu_set_fault_handler(info->domain,
+					rga_iommu_intr_fault_handler,
+					scheduler);
+		info->generic_fault_handler = true;
+		return 0;
+	}
+
+	dev_err(info->dev, "failed to install RGA IOMMU fault handler\n");
+
+	return ret;
+}
+
+static void rga_iommu_clear_fault_handler(struct rga_iommu_info *info)
+{
+	if (!info)
+		return;
+
+	if (info->rockchip_fault_handler) {
+		rockchip_iommu_set_fault_handler(info->dev, NULL, NULL);
+		info->rockchip_fault_handler = false;
+	}
+
+	if (info->generic_fault_handler && info->domain &&
+	    info->domain->cookie_type == IOMMU_COOKIE_FAULT_HANDLER &&
+	    info->domain->handler == rga_iommu_intr_fault_handler) {
+		info->domain->handler = NULL;
+		info->domain->handler_token = NULL;
+		info->domain->cookie_type = IOMMU_COOKIE_NONE;
+		info->generic_fault_handler = false;
+	}
 }
 
 int rga_iommu_detach(struct rga_iommu_info *info)
@@ -266,6 +326,44 @@ int rga_iommu_attach(struct rga_iommu_info *info)
 		return 0;
 
 	return iommu_attach_group(info->domain, info->group);
+}
+
+static void rga_iommu_unbind_shared_domain(struct rga_iommu_info *info)
+{
+	struct iommu_domain *cur;
+	struct iommu_domain *shared_domain;
+	struct device *shared_default_dev;
+	bool was_shared;
+	int ret;
+
+	if (!info || !info->shared_domain)
+		return;
+
+	shared_domain = info->domain;
+	shared_default_dev = info->default_dev;
+	was_shared = info->shared_domain;
+
+	rga_iommu_detach(info);
+	info->domain = info->default_domain;
+	info->default_dev = info->dev;
+	info->shared_domain = false;
+
+	cur = iommu_get_domain_for_dev(info->dev);
+	if (cur == info->domain)
+		return;
+
+	ret = rga_iommu_attach(info);
+	if (ret) {
+		dev_err(info->dev, "failed to restore default RGA IOMMU domain: %d\n",
+			ret);
+		info->domain = shared_domain;
+		info->default_dev = shared_default_dev;
+		info->shared_domain = was_shared;
+		ret = rga_iommu_attach(info);
+		if (ret)
+			dev_err(info->dev, "failed to reattach shared RGA IOMMU domain: %d\n",
+				ret);
+	}
 }
 
 struct rga_iommu_info *rga_iommu_probe(struct device *dev)
@@ -295,6 +393,7 @@ struct rga_iommu_info *rga_iommu_probe(struct device *dev)
 	info->default_dev = info->dev;
 	info->group = group;
 	info->domain = domain;
+	info->default_domain = domain;
 
 	return info;
 
@@ -336,24 +435,30 @@ int rga_iommu_bind(void)
 			if (main_iommu == NULL) {
 				main_iommu = scheduler->iommu_info;
 				main_iommu_index = i;
-				/*
-				 * Since the IOMMU core gained cookie tracking,
-				 * iommu_set_fault_handler() WARNs when the domain
-				 * already owns a cookie (the default DMA domain from
-				 * iommu_get_domain_for_dev()). Only register our
-				 * handler on a cookie-less domain; on a DMA-managed
-				 * domain the IOMMU core reports faults itself.
-				 * (Forward-port fix for 6.18.)
-				 */
-				if (main_iommu->domain &&
-				    main_iommu->domain->cookie_type == IOMMU_COOKIE_NONE)
-					iommu_set_fault_handler(main_iommu->domain,
-								rga_iommu_intr_fault_handler,
-								(void *)scheduler);
+				ret = rga_iommu_set_fault_handler(scheduler);
+				if (ret)
+					goto err_unbind;
 			} else {
-				scheduler->iommu_info->domain = main_iommu->domain;
-				scheduler->iommu_info->default_dev = main_iommu->default_dev;
-				rga_iommu_attach(scheduler->iommu_info);
+				struct rga_iommu_info *info = scheduler->iommu_info;
+				struct device *old_default_dev = info->default_dev;
+				struct iommu_domain *old_domain = info->domain;
+
+				info->domain = main_iommu->domain;
+				info->default_dev = main_iommu->default_dev;
+				ret = rga_iommu_attach(info);
+				if (ret) {
+					dev_err(scheduler->dev,
+						"failed to attach shared RGA IOMMU domain: %d\n",
+						ret);
+					info->domain = old_domain;
+					info->default_dev = old_default_dev;
+					goto err_unbind;
+				}
+				info->shared_domain = true;
+
+				ret = rga_iommu_set_fault_handler(scheduler);
+				if (ret)
+					goto err_unbind;
 			}
 
 			break;
@@ -368,7 +473,7 @@ int rga_iommu_bind(void)
 				ret = PTR_ERR(rga_drvdata->mmu_base);
 				rga_drvdata->mmu_base = NULL;
 
-				return ret;
+				goto err_unbind;
 			}
 
 			main_mmu_index = i;
@@ -398,13 +503,19 @@ int rga_iommu_bind(void)
 	} else {
 		rga_drvdata->map_scheduler_index = -1;
 		pr_err("%s, binding map scheduler failed!\n", __func__);
-		return -EFAULT;
+		ret = -EFAULT;
+		goto err_unbind;
 	}
 
 	pr_info("IOMMU binding successfully, default mapping core[0x%x]\n",
 		rga_drvdata->scheduler[rga_drvdata->map_scheduler_index]->core);
 
 	return 0;
+
+err_unbind:
+	rga_iommu_unbind();
+
+	return ret;
 }
 
 void rga_iommu_unbind(void)
@@ -412,8 +523,10 @@ void rga_iommu_unbind(void)
 	int i;
 
 	for (i = 0; i < rga_drvdata->num_of_scheduler; i++)
-		if (rga_drvdata->scheduler[i]->iommu_info != NULL)
-			rga_iommu_detach(rga_drvdata->scheduler[i]->iommu_info);
+		if (rga_drvdata->scheduler[i]->iommu_info) {
+			rga_iommu_clear_fault_handler(rga_drvdata->scheduler[i]->iommu_info);
+			rga_iommu_unbind_shared_domain(rga_drvdata->scheduler[i]->iommu_info);
+		}
 
 	if (rga_drvdata->mmu_base)
 		rga_mmu_base_free(&rga_drvdata->mmu_base);
