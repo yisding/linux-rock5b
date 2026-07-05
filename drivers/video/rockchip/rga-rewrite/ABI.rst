@@ -303,13 +303,14 @@ Implemented
   same-format, no-scale raster mirror copies emitted by current ``librga`` for
   ``immakeBorder()``
   reflect/wrap left and right edge tasks.  RFBC64x4 source images emitted by
-  ``ffmpeg-rockchip`` for Rockchip RFBC DRM frames are accepted for the BSP RGA2P
-  YUV source-format subset, including the current 8-bit YUV420, compact 10-bit
-  YUV420, and compact 10-bit YUV422 source profiles, and programmed through the
-  RGA2 FBCIN register aliases while keeping the destination raster.  AFBC32x8
-  split-mode source images from current ``librga`` DRM/gralloc paths are
-  accepted for the BSP RGA2P RGB-family source-format subset and use the same
-  source-only FBCIN path.
+  legacy ``ffmpeg-rockchip`` for Rockchip RFBC DRM frames, and AFBC32x8
+  split-mode source images from ``librga`` DRM/gralloc paths, are deprecated
+  RGA2-Pro compatibility code rather than RK3588 required ABI.  Public RK3588
+  material identifies the SoC as one RGA2-Enhance core plus two RGA3 cores, and
+  the current ffmpeg target removed RFBC modifiers.  The rewrite keeps these
+  source-only FBCIN profiles temporarily for historical conformance coverage,
+  but they must not be extended without RK3588 BSP hardware evidence and are
+  marked for removal.
   Pattern/alpha blend outside the alpha-bitmap and color-key subsets below,
   Y4/Y8 full-CSC dither output outside the current RGB-to-YUV ``librga`` path,
   color-key outside the RGBA ``imcolorkey`` profile above, ROP outside the
@@ -435,8 +436,9 @@ Implemented
   queued hardware-removal abort completion and release-fence signaling,
   last-hardware pending-acquire abort completion and release-fence signaling,
   selected-core removal race completion and release-fence signaling,
-  ffmpeg-facing RGA2 RFBC64x4 8/10-bit 4:2:0/4:2:2 and RGB-family AFBC32x8
-  source profile selection and FBCIN command emission, IOMMU fault target matching,
+  deprecated RGA2-Pro RFBC64x4 8/10-bit 4:2:0/4:2:2 and RGB-family AFBC32x8
+  source profile selection and FBCIN command emission, IOMMU fault target
+  matching,
   post-reset IOMMU refresh accounting, scheduler priority enqueue/aging,
   scheduler core-counter and per-core timing mapping,
   RGA3 tile8x8 raster/tile round-trip and tile-to-tile command emission,
@@ -481,7 +483,8 @@ Recognized But Unsupported
   and color-palette profiles above, including full-CSC outside raster bitblit.
 * RGA3 pattern outside the supported alpha-overlay profile, color-key outside
   the RGB ``imcolorkey`` profile, per-channel rotation,
-  RFBC/AFBC32x8, tile outside simple bitblits, physical-address channels, and
+  RFBC/AFBC32x8 outside the deprecated source-only RGA2-Pro compatibility
+  profiles, tile outside simple bitblits, physical-address channels, and
   non-bitblit operation modes.
 Unsupported submit profiles return ``-EOPNOTSUPP`` after copying, validating,
 preparing, queuing, dispatching, resolving imported buffers, allocating an owned
