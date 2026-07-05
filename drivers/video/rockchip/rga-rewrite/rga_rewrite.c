@@ -7232,6 +7232,98 @@ static void rk_rga_direct_img_mem_type_kunit(struct kunit *test)
 			RK_RGA_DIRECT_IMG_USERPTR);
 }
 
+static void rk_rga_request_config_direct_phys_reject_kunit(struct kunit *test)
+{
+	struct rga_req tasks[2] = {
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_RGBA_8888),
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_RGBA_8888),
+	};
+	struct rga_user_request user = {
+		.task_num = ARRAY_SIZE(tasks),
+		.id = 8,
+	};
+	struct rk_rga_session session = {};
+	struct rk_rga_request *request;
+	struct rk_rga_import *src_import;
+	struct rk_rga_import *dst_import;
+	void __user *task_user;
+	unsigned long uncopied;
+	int ret;
+
+	task_user = rk_rga_kunit_user_buffer(test, sizeof(tasks));
+	KUNIT_ASSERT_NOT_NULL(test, task_user);
+
+	tasks[0].handle_flag = 1;
+	tasks[0].src.yrgb_addr = 81;
+	tasks[0].src.uv_addr = 0;
+	tasks[0].src.v_addr = 0;
+	tasks[0].dst.yrgb_addr = 82;
+	tasks[0].dst.uv_addr = 0;
+	tasks[0].dst.v_addr = 0;
+	tasks[1].handle_flag = 0;
+	tasks[1].mmu_info.mmu_flag = 0;
+	tasks[1].src.yrgb_addr = 0x10000000;
+	tasks[1].src.uv_addr = 0;
+	tasks[1].src.v_addr = 0;
+	tasks[1].dst.yrgb_addr = 0x20000000;
+	tasks[1].dst.uv_addr = 0;
+	tasks[1].dst.v_addr = 0;
+	user.task_ptr = (uintptr_t)task_user;
+
+	uncopied = copy_to_user(task_user, tasks, sizeof(tasks));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+
+	mutex_init(&session.lock);
+	idr_init(&session.requests);
+	idr_init(&session.imports);
+
+	request = kzalloc_obj(*request, GFP_KERNEL);
+	src_import = rk_rga_kunit_import(test);
+	dst_import = rk_rga_kunit_import(test);
+	KUNIT_ASSERT_NOT_NULL(test, request);
+	KUNIT_ASSERT_NOT_NULL(test, src_import);
+	KUNIT_ASSERT_NOT_NULL(test, dst_import);
+	src_import->iova = 0x10000000;
+	src_import->size = (size_t)1920 * 1080 * 4;
+	dst_import->iova = 0x20000000;
+	dst_import->size = (size_t)1280 * 720 * 4;
+
+	KUNIT_ASSERT_EQ(test,
+			idr_alloc(&session.requests, request, 8, 9,
+				  GFP_KERNEL),
+			8);
+	KUNIT_ASSERT_EQ(test,
+			idr_alloc(&session.imports, src_import, 81, 82,
+				  GFP_KERNEL),
+			81);
+	KUNIT_ASSERT_EQ(test,
+			idr_alloc(&session.imports, dst_import, 82, 83,
+				  GFP_KERNEL),
+			82);
+
+	ret = rk_rga_request_config(&session, &user, NULL);
+	KUNIT_EXPECT_EQ(test, ret, -EOPNOTSUPP);
+	KUNIT_EXPECT_PTR_EQ(test, idr_find(&session.requests, 8), request);
+	KUNIT_EXPECT_FALSE(test, request->configured);
+	KUNIT_EXPECT_PTR_EQ(test, request->tasks, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, request->imports, NULL);
+	KUNIT_EXPECT_EQ(test, request->import_count, 0U);
+	KUNIT_EXPECT_EQ(test, refcount_read(&src_import->refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&dst_import->refs), 1);
+
+	KUNIT_EXPECT_TRUE(test, rk_rga_request_remove_free(&session, 8));
+	KUNIT_EXPECT_PTR_EQ(test, idr_remove(&session.imports, 81),
+			    src_import);
+	KUNIT_EXPECT_PTR_EQ(test, idr_remove(&session.imports, 82),
+			    dst_import);
+	rk_rga_import_put(src_import);
+	rk_rga_import_put(dst_import);
+	idr_destroy(&session.requests);
+	idr_destroy(&session.imports);
+}
+
 static void rk_rga_request_reconfig_resources_kunit(struct kunit *test)
 {
 	struct rga_req task =
@@ -13075,6 +13167,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_request_create_cancel_ioctl_kunit),
 	KUNIT_CASE(rk_rga_request_config_handles_kunit),
 	KUNIT_CASE(rk_rga_direct_img_mem_type_kunit),
+	KUNIT_CASE(rk_rga_request_config_direct_phys_reject_kunit),
 	KUNIT_CASE(rk_rga_request_reconfig_resources_kunit),
 	KUNIT_CASE(rk_rga_request_reconfig_fences_kunit),
 	KUNIT_CASE(rk_rga_request_config_ioctl_acquire_kunit),
