@@ -20,6 +20,8 @@
 
 struct rga_drvdata_t *rga_drvdata;
 
+#define RGA_IOMMU_DMA_LIMIT	(DMA_BIT_MASK(32) - SZ_512M)
+
 /* set hrtimer */
 static struct hrtimer timer;
 static ktime_t kt;
@@ -47,6 +49,12 @@ static int rga_mpi_set_channel_buffer(struct dma_buf *dma_buf,
 	channel_info->yrgb_addr = buffer.handle;
 
 	return 0;
+}
+
+static void rga_set_iommu_dma_limit(struct device *dev)
+{
+	if (!dev->bus_dma_limit || dev->bus_dma_limit > RGA_IOMMU_DMA_LIMIT)
+		dev->bus_dma_limit = RGA_IOMMU_DMA_LIMIT;
 }
 
 static void rga_mpi_set_channel_info(uint32_t flags_mask, uint32_t flags,
@@ -1485,6 +1493,7 @@ static int rga_drv_probe(struct platform_device *pdev)
 
 		dma_set_mask(dev, DMA_BIT_MASK(40));
 		dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
+		rga_set_iommu_dma_limit(dev);
 	} else {
 		dma_set_mask(dev, DMA_BIT_MASK(32));
 		dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
