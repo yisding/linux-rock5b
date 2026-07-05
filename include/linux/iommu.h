@@ -43,6 +43,7 @@ struct notifier_block;
 struct iommu_sva;
 struct iommu_dma_cookie;
 struct iommu_dma_msi_cookie;
+struct iova_domain;
 struct iommu_fault_param;
 struct iommufd_ctx;
 struct iommufd_viommu;
@@ -1555,10 +1556,18 @@ static inline void iommu_debugfs_setup(void) {}
 
 #ifdef CONFIG_IOMMU_DMA
 int iommu_get_msi_cookie(struct iommu_domain *domain, dma_addr_t base);
+struct iova_domain *
+iommu_dma_get_iova_domain(struct iommu_domain *domain);
 #else /* CONFIG_IOMMU_DMA */
 static inline int iommu_get_msi_cookie(struct iommu_domain *domain, dma_addr_t base)
 {
 	return -ENODEV;
+}
+
+static inline struct iova_domain *
+iommu_dma_get_iova_domain(struct iommu_domain *domain)
+{
+	return NULL;
 }
 #endif	/* CONFIG_IOMMU_DMA */
 

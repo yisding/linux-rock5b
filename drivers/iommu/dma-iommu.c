@@ -383,6 +383,20 @@ int iommu_get_dma_cookie(struct iommu_domain *domain)
 }
 
 /**
+ * iommu_dma_get_iova_domain - Return the DMA-API IOVA allocator for a domain
+ * @domain: IOMMU domain prepared for DMA-API usage
+ */
+struct iova_domain *iommu_dma_get_iova_domain(struct iommu_domain *domain)
+{
+	if (!domain || domain->cookie_type != IOMMU_COOKIE_DMA_IOVA ||
+	    !domain->iova_cookie)
+		return NULL;
+
+	return &domain->iova_cookie->iovad;
+}
+EXPORT_SYMBOL_GPL(iommu_dma_get_iova_domain);
+
+/**
  * iommu_get_msi_cookie - Acquire just MSI remapping resources
  * @domain: IOMMU domain to prepare
  * @base: Start address of IOVA region for MSI mappings
