@@ -20,8 +20,6 @@
 
 struct rga_drvdata_t *rga_drvdata;
 
-#define RGA_IOMMU_DMA_LIMIT	(DMA_BIT_MASK(32) - SZ_512M)
-
 /* set hrtimer */
 static struct hrtimer timer;
 static ktime_t kt;
