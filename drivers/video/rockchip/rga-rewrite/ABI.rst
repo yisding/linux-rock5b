@@ -416,6 +416,7 @@ Implemented
   import-buffer ioctl physical-address rejection and malformed-pool returns,
   release-buffer ioctl handle removal and malformed-pool returns,
   ``librga`` virtual-address import sizing and physical import rejection,
+  direct physical-address submit rejection after temporary import rollback,
   RGA2 fill RGB/YUV destination-offset emission,
   packed YUV422 fill destination format/offset emission,
   YUV-fill chroma-alignment rejection, packed-YUV420 fill emission,
