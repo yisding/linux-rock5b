@@ -778,7 +778,7 @@ static inline int mpp_safe_unreset(struct reset_control *rst)
 static inline int mpp_clk_safe_enable(struct clk *clk)
 {
 	if (clk)
-		clk_prepare_enable(clk);
+		return clk_prepare_enable(clk);
 
 	return 0;
 }
