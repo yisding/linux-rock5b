@@ -482,6 +482,13 @@
 #define RK_RGA_RASTER_MODE			BIT(0)
 #define RK_RGA_FBC_MODE			BIT(1)
 #define RK_RGA_TILE_MODE			BIT(2)
+/*
+ * RKFBC64x4 and AFBC32x8 are RGA2-Pro compressed modes. RK3588 is
+ * documented as one RGA2-Enhance core plus two RGA3 cores, so these mode
+ * constants and the source-only FBCIN helpers below are deprecated
+ * compatibility code. Do not extend them without RK3588 hardware evidence;
+ * remove them once legacy conformance coverage has been retired.
+ */
 #define RK_RGA_RKFBC_MODE			BIT(4)
 #define RK_RGA_AFBC32X8_MODE			BIT(5)
 #define RK_RGA_10BIT_INCOMPACT			1
@@ -1740,6 +1747,11 @@ static int rk_rga_fbc_layout(const struct rga_img_info_t *img,
 
 	return layout->total_size ? 0 : -EINVAL;
 }
+
+/*
+ * Deprecated RGA2-Pro compressed-source helpers. They stay isolated so their
+ * planned removal does not affect the normal RK3588 RGA2-Enhance/RGA3 paths.
+ */
 
 static u32 rk_rga_rkfbc_head_stride(const struct rga_img_info_t *img)
 {
@@ -4287,6 +4299,7 @@ static int rk_rga2_format_info(u32 format, bool write,
 	}
 }
 
+/* Deprecated RGA2-Pro FBCIN format maps; RK3588 target does not rely on them. */
 static int rk_rga2_rkfbc_format(u32 format, u32 *fbc_format)
 {
 	switch (format) {
