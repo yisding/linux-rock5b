@@ -44,6 +44,7 @@
 #include <linux/wait.h>
 #include <linux/pm_runtime.h>
 #include <linux/sched/mm.h>
+#include <linux/sizes.h>
 #include <linux/string_helpers.h>
 
 #include <asm/cacheflush.h>
@@ -67,6 +68,7 @@
 #include "rga.h"
 
 #define RGA_CORE_REG_OFFSET 0x10000
+#define RGA_IOMMU_DMA_LIMIT	(DMA_BIT_MASK(32) - SZ_512M)
 
 /* load interval: 1000ms */
 #define RGA_LOAD_INTERVAL_US 1000000
@@ -148,13 +150,6 @@ enum RGA_DEVICE_TYPE {
 	RGA_DEVICE_BUTT,
 };
 
-struct rga_iommu_dma_cookie {
-	enum iommu_dma_cookie_type  type;
-
-	/* Full allocator for IOMMU_DMA_IOVA_COOKIE */
-	struct iova_domain  iovad;
-};
-
 struct rga_iommu_info {
 	struct device *dev;
 	struct device *default_dev;		/* for dma-buf_api */
@@ -179,6 +174,7 @@ struct rga_dma_buffer {
 
 	dma_addr_t iova;
 	dma_addr_t dma_addr;
+	size_t iova_size;
 	unsigned long size;
 	/*
 	 * The offset of the first page of the sgt.
@@ -192,6 +188,7 @@ struct rga_dma_buffer {
 	 * default domain or the current device.
 	 */
 	struct device *map_dev;
+	bool iommu_mapped;
 };
 
 struct rga_virt_addr {
@@ -206,6 +203,7 @@ struct rga_virt_addr {
 	/* The offset of the first page of the virtual address */
 	size_t offset;
 
+	bool writable;
 	int result;
 };
 

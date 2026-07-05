@@ -249,8 +249,11 @@ static void rga_free_virt_addr(struct rga_virt_addr **virt_addr_p)
 	if (virt_addr == NULL)
 		return;
 
-	for (i = 0; i < virt_addr->result; i++)
+	for (i = 0; i < virt_addr->result; i++) {
+		if (virt_addr->writable)
+			set_page_dirty_lock(virt_addr->pages[i]);
 		put_page(virt_addr->pages[i]);
+	}
 
 	free_pages((unsigned long)virt_addr->pages, virt_addr->pages_order);
 	kfree(virt_addr);
@@ -260,7 +263,7 @@ static void rga_free_virt_addr(struct rga_virt_addr **virt_addr_p)
 static int rga_alloc_virt_addr(struct rga_virt_addr **virt_addr_p,
 			       uint64_t viraddr,
 			       struct rga_memory_parm *memory_parm,
-			       int writeFlag,
+			       int write_flag,
 			       struct mm_struct *mm)
 {
 	int i;
@@ -299,7 +302,8 @@ static int rga_alloc_virt_addr(struct rga_virt_addr **virt_addr_p,
 	}
 
 	/* get pages from virtual address. */
-	ret = rga_get_user_pages(pages, viraddr >> PAGE_SHIFT, count, writeFlag, mm);
+	ret = rga_get_user_pages(pages, viraddr >> PAGE_SHIFT, count,
+				 write_flag, mm);
 	if (ret < 0) {
 		rga_err("failed to get pages from virtual adrees: 0x%lx\n",
 		       (unsigned long)viraddr);
@@ -324,6 +328,7 @@ static int rga_alloc_virt_addr(struct rga_virt_addr **virt_addr_p,
 	virt_addr->page_count = count;
 	virt_addr->size = img_size;
 	virt_addr->offset = offset;
+	virt_addr->writable = write_flag;
 	virt_addr->result = result;
 
 	return 0;
@@ -1407,7 +1412,13 @@ static int rga_mm_sync_dma_sg_for_device(struct rga_internal_buffer *buffer,
 			return -EINVAL;
 		}
 
-		dma_sync_sg_for_device(scheduler->dev, sgt->sgl, sgt->orig_nents, dir);
+		if (rga_mm_is_invalid_dma_buffer(buffer->dma_buffer)) {
+			rga_job_err(job, "invalid dma-buffer with IOMMU device!\n");
+			return -EFAULT;
+		}
+
+		dma_sync_sg_for_device(buffer->dma_buffer->map_dev, sgt->sgl,
+				       sgt->orig_nents, dir);
 	}
 
 	if (DEBUGGER_EN(TIME))
@@ -1454,7 +1465,13 @@ static int rga_mm_sync_dma_sg_for_cpu(struct rga_internal_buffer *buffer,
 			return -EINVAL;
 		}
 
-		dma_sync_sg_for_cpu(scheduler->dev, sgt->sgl, sgt->orig_nents, dir);
+		if (rga_mm_is_invalid_dma_buffer(buffer->dma_buffer)) {
+			rga_job_err(job, "invalid dma-buffer with IOMMU device!\n");
+			return -EFAULT;
+		}
+
+		dma_sync_sg_for_cpu(buffer->dma_buffer->map_dev, sgt->sgl,
+				    sgt->orig_nents, dir);
 	}
 
 	if (DEBUGGER_EN(TIME))
