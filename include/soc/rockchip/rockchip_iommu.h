@@ -10,6 +10,9 @@
 
 struct device;
 
+/* Rockchip provider-private bit delivered through rockchip_iommu_set_fault_handler(). */
+#define ROCKCHIP_IOMMU_FAULT_BUS_ERROR	0x100
+
 #if IS_ENABLED(CONFIG_ROCKCHIP_IOMMU)
 int rockchip_iommu_enable(struct device *dev);
 int rockchip_iommu_disable(struct device *dev);

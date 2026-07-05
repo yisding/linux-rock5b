@@ -187,6 +187,16 @@ mpp_taskqueue_pop_running(struct mpp_taskqueue *queue,
 	return 0;
 }
 
+static void mpp_taskqueue_fail_running(struct mpp_taskqueue *queue,
+				       struct mpp_task *task)
+{
+	set_bit(TASK_STATE_ABORT, &task->state);
+	set_bit(TASK_STATE_FINISH, &task->state);
+	set_bit(TASK_STATE_DONE, &task->state);
+	wake_up(&task->wait);
+	mpp_taskqueue_pop_running(queue, task);
+}
+
 static void
 mpp_taskqueue_trigger_work(struct mpp_dev *mpp)
 {
@@ -195,11 +205,24 @@ mpp_taskqueue_trigger_work(struct mpp_dev *mpp)
 
 int mpp_power_on(struct mpp_dev *mpp)
 {
-	pm_runtime_get_sync(mpp->dev);
+	int ret;
+
+	ret = pm_runtime_resume_and_get(mpp->dev);
+	if (ret) {
+		dev_err(mpp->dev, "pm_runtime_resume_and_get failed: %d\n", ret);
+		return ret;
+	}
 	pm_stay_awake(mpp->dev);
 
-	if (mpp->hw_ops->clk_on)
-		mpp->hw_ops->clk_on(mpp);
+	if (mpp->hw_ops->clk_on) {
+		ret = mpp->hw_ops->clk_on(mpp);
+		if (ret) {
+			dev_err(mpp->dev, "clk_on failed: %d\n", ret);
+			pm_relax(mpp->dev);
+			pm_runtime_put_sync_suspend(mpp->dev);
+			return ret;
+		}
+	}
 
 	return 0;
 }
@@ -820,7 +843,11 @@ static int mpp_task_run(struct mpp_dev *mpp,
 		return -ENODATA;
 	}
 
-	mpp_power_on(mpp);
+	ret = mpp_power_on(mpp);
+	if (ret) {
+		mpp_reset_up_read(mpp->reset_group);
+		return ret;
+	}
 	mpp_debug_func(DEBUG_TASK_INFO, "%s session %d:%d task %d state 0x%lx\n",
 		       dev_name(mpp->dev), session->device_type,
 		       session->index, task->task_index, task->state);
@@ -828,9 +855,23 @@ static int mpp_task_run(struct mpp_dev *mpp,
 	if (mpp->auto_freq_en && mpp->hw_ops->set_freq)
 		mpp->hw_ops->set_freq(mpp, task);
 
-	mpp_iommu_dev_activate(mpp->iommu_info, mpp);
-	if (mpp->dev_ops->run)
-		mpp->dev_ops->run(mpp, task);
+	ret = mpp_iommu_dev_activate(mpp->iommu_info, mpp);
+	if (ret) {
+		dev_err(mpp->dev, "mpp_iommu_dev_activate failed: %d\n", ret);
+		mpp_power_off(mpp);
+		mpp_reset_up_read(mpp->reset_group);
+		return ret;
+	}
+	if (mpp->dev_ops->run) {
+		ret = mpp->dev_ops->run(mpp, task);
+		if (ret) {
+			dev_err(mpp->dev, "device run failed: %d\n", ret);
+			mpp_iommu_dev_deactivate(mpp->iommu_info, mpp);
+			mpp_power_off(mpp);
+			mpp_reset_up_read(mpp->reset_group);
+			return ret;
+		}
+	}
 
 	mpp_debug_leave();
 
@@ -980,7 +1021,7 @@ again:
 		mpp_taskqueue_pending_to_run(queue, task);
 		set_bit(TASK_STATE_RUNNING, &task->state);
 		if (mpp_task_run(task_mpp, task))
-			mpp_taskqueue_pop_running(queue, task);
+			mpp_taskqueue_fail_running(queue, task);
 		else
 			goto again;
 	}
@@ -2344,9 +2385,19 @@ int mpp_dev_probe(struct mpp_dev *mpp,
 
 	/* read hardware id */
 	if (hw_info->reg_id >= 0) {
-		pm_runtime_get_sync(dev);
-		if (mpp->hw_ops->clk_on)
-			mpp->hw_ops->clk_on(mpp);
+		ret = pm_runtime_resume_and_get(dev);
+		if (ret) {
+			dev_err(dev, "pm_runtime_resume_and_get failed: %d\n", ret);
+			goto failed;
+		}
+		if (mpp->hw_ops->clk_on) {
+			ret = mpp->hw_ops->clk_on(mpp);
+			if (ret) {
+				dev_err(dev, "clk_on failed: %d\n", ret);
+				pm_runtime_put_sync_suspend(dev);
+				goto failed;
+			}
+		}
 
 		hw_info->hw_id = mpp_read(mpp, hw_info->reg_id * sizeof(u32));
 		if (mpp->hw_ops->clk_off)

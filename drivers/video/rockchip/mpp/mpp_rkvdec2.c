@@ -27,8 +27,6 @@
 #include "../drivers/devfreq/governor.h"
 #endif
 
-static int rkvdec2_free_rcbbuf(struct platform_device *pdev, struct rkvdec2_dev *dec);
-
 /*
  * hardware information
  */
@@ -1322,14 +1320,36 @@ static int rkvdec2_rk3576_exit(struct mpp_dev *mpp)
 static int rkvdec2_clk_on(struct mpp_dev *mpp)
 {
 	struct rkvdec2_dev *dec = to_rkvdec2_dev(mpp);
+	int ret;
 
-	mpp_clk_safe_enable(dec->aclk_info.clk);
-	mpp_clk_safe_enable(dec->hclk_info.clk);
-	mpp_clk_safe_enable(dec->core_clk_info.clk);
-	mpp_clk_safe_enable(dec->cabac_clk_info.clk);
-	mpp_clk_safe_enable(dec->hevc_cabac_clk_info.clk);
+	ret = mpp_clk_safe_enable(dec->aclk_info.clk);
+	if (ret)
+		return ret;
+	ret = mpp_clk_safe_enable(dec->hclk_info.clk);
+	if (ret)
+		goto err_hclk;
+	ret = mpp_clk_safe_enable(dec->core_clk_info.clk);
+	if (ret)
+		goto err_core;
+	ret = mpp_clk_safe_enable(dec->cabac_clk_info.clk);
+	if (ret)
+		goto err_cabac;
+	ret = mpp_clk_safe_enable(dec->hevc_cabac_clk_info.clk);
+	if (ret)
+		goto err_hevc_cabac;
 
 	return 0;
+
+err_hevc_cabac:
+	clk_disable_unprepare(dec->cabac_clk_info.clk);
+err_cabac:
+	clk_disable_unprepare(dec->core_clk_info.clk);
+err_core:
+	clk_disable_unprepare(dec->hclk_info.clk);
+err_hclk:
+	clk_disable_unprepare(dec->aclk_info.clk);
+
+	return ret;
 }
 
 static int rkvdec2_clk_off(struct mpp_dev *mpp)
@@ -1756,6 +1776,8 @@ static int rkvdec2_ccu_probe(struct platform_device *pdev)
 	atomic_set(&ccu->power_enabled, 0);
 	INIT_LIST_HEAD(&ccu->unused_list);
 	INIT_LIST_HEAD(&ccu->used_list);
+	mutex_init(&ccu->lock);
+	INIT_LIST_HEAD(&ccu->core_list);
 
 	if (!of_property_read_u32(dev->of_node, "rockchip,ccu-mode", &ccu_mode)) {
 		if (ccu_mode <= RKVDEC2_CCU_MODE_NULL || ccu_mode >= RKVDEC2_CCU_MODE_BUTT)
@@ -1807,6 +1829,8 @@ static int rkvdec2_alloc_rcbbuf(struct platform_device *pdev, struct rkvdec2_dev
 	resource_size_t sram_start, sram_end;
 	struct iommu_domain *domain;
 	struct device *dev = &pdev->dev;
+	u64 aligned_iova;
+	u64 aligned_size;
 
 	/* get rcb iova start and size */
 	ret = device_property_read_u32_array(dev, "rockchip,rcb-iova", vals, 2);
@@ -1814,18 +1838,15 @@ static int rkvdec2_alloc_rcbbuf(struct platform_device *pdev, struct rkvdec2_dev
 		dev_err(dev, "could not find property rcb-iova\n");
 		return ret;
 	}
-	iova = PAGE_ALIGN(vals[0]);
-	rcb_size = PAGE_ALIGN(vals[1]);
-	if (!rcb_size) {
-		dev_err(dev, "rcb_size invalid.\n");
+	aligned_iova = ALIGN((u64)vals[0], PAGE_SIZE);
+	aligned_size = ALIGN((u64)vals[1], PAGE_SIZE);
+	if (!aligned_size || aligned_iova > U32_MAX || aligned_size > U32_MAX) {
+		dev_err(dev, "rcb iova invalid: iova %#llx size %#llx\n",
+			aligned_iova, aligned_size);
 		return -EINVAL;
 	}
-	/* alloc reserve iova for rcb */
-	ret = mpp_iommu_reserve_iova(dec->mpp.iommu_info, iova, rcb_size);
-	if (ret) {
-		dev_err(dev, "alloc rcb iova error.\n");
-		return ret;
-	}
+	iova = aligned_iova;
+	rcb_size = aligned_size;
 	/* get sram device node */
 	sram_np = of_parse_phandle(dev->of_node, "rockchip,sram", 0);
 	if (!sram_np) {
@@ -1849,8 +1870,6 @@ static int rkvdec2_alloc_rcbbuf(struct platform_device *pdev, struct rkvdec2_dev
 	}
 	sram_size = sram_end - sram_start;
 	sram_size = rcb_size < sram_size ? rcb_size : sram_size;
-	/* iova map to sram */
-	domain = dec->mpp.iommu_info->domain;
 	/* in a CCU cluster this is the shared domain; reject overlapping windows */
 	if (dec->ccu) {
 		ret = mpp_iommu_shared_domain_reserve_window(&dec->ccu->iommu,
@@ -1858,10 +1877,26 @@ static int rkvdec2_alloc_rcbbuf(struct platform_device *pdev, struct rkvdec2_dev
 		if (ret)
 			return ret;
 	}
+	/* alloc reserve iova for rcb */
+	ret = mpp_iommu_reserve_iova(dec->mpp.iommu_info, iova, rcb_size);
+	if (ret) {
+		dev_err(dev, "alloc rcb iova error.\n");
+		if (dec->ccu)
+			mpp_iommu_shared_domain_unreserve_window(&dec->ccu->iommu,
+								 iova, rcb_size);
+		return ret;
+	}
+
+	dec->sram_size = sram_size;
+	dec->rcb_size = rcb_size;
+	dec->rcb_iova = iova;
+
+	/* iova map to sram */
+	domain = dec->mpp.iommu_info->domain;
 	ret = iommu_map(domain, iova, sram_start, sram_size, IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
 	if (ret) {
 		dev_err(dev, "sram iommu_map error.\n");
-		return ret;
+		goto err_free_rcb;
 	}
 	/* alloc dma for the remaining buffer, sram + dma */
 	if (sram_size < rcb_size) {
@@ -1872,21 +1907,17 @@ static int rkvdec2_alloc_rcbbuf(struct platform_device *pdev, struct rkvdec2_dev
 		if (!page) {
 			dev_err(dev, "unable to allocate pages\n");
 			ret = -ENOMEM;
-			goto err_sram_map;
+			goto err_free_rcb;
 		}
+		dec->rcb_page = page;
 		/* iova map to dma */
 		ret = iommu_map(domain, iova + sram_size, page_to_phys(page),
 				page_size, IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
 		if (ret) {
 			dev_err(dev, "page iommu_map error.\n");
-			__free_pages(page, get_order(page_size));
-			goto err_sram_map;
+			goto err_free_rcb;
 		}
-		dec->rcb_page = page;
 	}
-	dec->sram_size = sram_size;
-	dec->rcb_size = rcb_size;
-	dec->rcb_iova = iova;
 	dev_info(dev, "sram_start %pa\n", &sram_start);
 	dev_info(dev, "rcb_iova %pad\n", &dec->rcb_iova);
 	dev_info(dev, "sram_size %u\n", dec->sram_size);
@@ -1914,8 +1945,8 @@ static int rkvdec2_alloc_rcbbuf(struct platform_device *pdev, struct rkvdec2_dev
 
 	return 0;
 
-err_sram_map:
-	iommu_unmap(domain, iova, sram_size);
+err_free_rcb:
+	rkvdec2_free_rcbbuf(pdev, dec);
 
 	return ret;
 }
@@ -1962,7 +1993,9 @@ static int rkvdec2_core_probe(struct platform_device *pdev)
 	}
 
 	/* alloc rcb buffer */
-	rkvdec2_alloc_rcbbuf(pdev, dec);
+	ret = rkvdec2_alloc_rcbbuf(pdev, dec);
+	if (ret)
+		goto err_detach_ccu;
 
 	/* set device for link */
 	ret = rkvdec2_ccu_link_init(pdev, dec);
@@ -2010,6 +2043,8 @@ err_remove_link:
 	rkvdec2_link_remove(mpp, dec->link_dec);
 err_free_rcb:
 	rkvdec2_free_rcbbuf(pdev, dec);
+err_detach_ccu:
+	rkvdec2_detach_ccu(dec);
 err_remove_mpp:
 	if (dec->mmu_base)
 		iounmap(dec->mmu_base);
@@ -2046,8 +2081,13 @@ static int rkvdec2_probe_default(struct platform_device *pdev)
 		return ret;
 	}
 
-	rkvdec2_alloc_rcbbuf(pdev, dec);
-	rkvdec2_link_init(pdev, dec);
+	ret = rkvdec2_alloc_rcbbuf(pdev, dec);
+	if (ret)
+		goto err_remove_mpp;
+
+	ret = rkvdec2_link_init(pdev, dec);
+	if (ret)
+		goto err_free_rcb;
 
 	irq_proc = mpp_dev_irq;
 	if (dec->link_dec && (mpp->task_capacity > 1)) {
@@ -2085,7 +2125,9 @@ static int rkvdec2_probe_default(struct platform_device *pdev)
 
 err_remove_link:
 	rkvdec2_link_remove(mpp, dec->link_dec);
+err_free_rcb:
 	rkvdec2_free_rcbbuf(pdev, dec);
+err_remove_mpp:
 	mpp_dev_remove(mpp);
 	return ret;
 }
@@ -2119,20 +2161,30 @@ static int rkvdec2_probe(struct platform_device *pdev)
 	return ret;
 }
 
-static int rkvdec2_free_rcbbuf(struct platform_device *pdev, struct rkvdec2_dev *dec)
+int rkvdec2_free_rcbbuf(struct platform_device *pdev, struct rkvdec2_dev *dec)
 {
-	struct iommu_domain *domain;
+	struct mpp_iommu_info *info = dec->mpp.iommu_info;
+	struct iommu_domain *domain = info ? info->domain : NULL;
 
 	if (dec->rcb_page) {
 		size_t page_size = PAGE_ALIGN(dec->rcb_size - dec->sram_size);
 		int order = min(get_order(page_size), MAX_PAGE_ORDER);
 
 		__free_pages(dec->rcb_page, order);
+		dec->rcb_page = NULL;
 	}
-	if (dec->rcb_iova) {
-		domain = dec->mpp.iommu_info->domain;
+	if (dec->rcb_iova && domain)
 		iommu_unmap(domain, dec->rcb_iova, dec->rcb_size);
-	}
+	if (dec->rcb_iova && info)
+		mpp_iommu_unreserve_iova(info, dec->rcb_iova, dec->rcb_size);
+	if (dec->rcb_iova && dec->ccu)
+		mpp_iommu_shared_domain_unreserve_window(&dec->ccu->iommu,
+							 dec->rcb_iova,
+							 dec->rcb_size);
+
+	dec->rcb_iova = 0;
+	dec->sram_size = 0;
+	dec->rcb_size = 0;
 
 	return 0;
 }
@@ -2154,6 +2206,7 @@ static void rkvdec2_remove(struct platform_device *pdev)
 			dec->mmu_base = NULL;
 		}
 		rkvdec2_free_rcbbuf(pdev, dec);
+		rkvdec2_detach_ccu(dec);
 		mpp_dev_remove(mpp);
 		rkvdec2_procfs_remove(mpp);
 		rkvdec2_link_remove(mpp, dec->link_dec);
@@ -2217,13 +2270,17 @@ static int __maybe_unused rkvdec2_runtime_resume(struct device *dev)
 	if (strstr(dev_name(dev), "ccu")) {
 		struct rkvdec2_ccu *ccu = dev_get_drvdata(dev);
 
-		mpp_clk_safe_enable(ccu->aclk_info.clk);
+		return mpp_clk_safe_enable(ccu->aclk_info.clk);
 	} else {
 		struct mpp_dev *mpp = dev_get_drvdata(dev);
 		struct rkvdec2_dev *dec = to_rkvdec2_dev(mpp);
+		int ret;
 
-		if (mpp->hw_ops->clk_on)
-			mpp->hw_ops->clk_on(mpp);
+		if (mpp->hw_ops->clk_on) {
+			ret = mpp->hw_ops->clk_on(mpp);
+			if (ret)
+				return ret;
+		}
 		if (mpp->is_irq_startup) {
 			/* enable core irq */
 			enable_irq(mpp->irq);

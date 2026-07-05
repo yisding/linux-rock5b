@@ -196,9 +196,9 @@ static u32 vsi_iova_page_offset(u32 iova)
 	return (iova & VSI_IOVA_PAGE_MASK) >> VSI_IOVA_PAGE_SHIFT;
 }
 
-static bool vsi_iommu_call_fault_handler(struct vsi_iommu *iommu,
-						struct iommu_domain *domain,
-						dma_addr_t iova, int flags)
+static int vsi_iommu_call_fault_handler(struct vsi_iommu *iommu,
+					struct iommu_domain *domain,
+					dma_addr_t iova, int flags)
 {
 	iommu_fault_handler_t handler;
 	unsigned long irq_flags;
@@ -210,11 +210,9 @@ static bool vsi_iommu_call_fault_handler(struct vsi_iommu *iommu,
 	spin_unlock_irqrestore(&iommu->fault_lock, irq_flags);
 
 	if (!handler || !domain || domain == &vsi_identity_domain)
-		return false;
+		return -EOPNOTSUPP;
 
-	handler(domain, iommu->dev, iova, flags, token);
-
-	return true;
+	return handler(domain, iommu->dev, iova, flags, token);
 }
 
 static void vsi_iommu_mask_irq_locked(struct vsi_iommu *iommu)
@@ -258,8 +256,10 @@ static irqreturn_t vsi_iommu_irq(int irq, void *dev_id)
 
 	if (fault) {
 		int fault_flags = vsi_iommu_fault_flags(status);
+		int fault_ret;
 
-		if (!vsi_iommu_call_fault_handler(iommu, domain, iova, fault_flags)) {
+		fault_ret = vsi_iommu_call_fault_handler(iommu, domain, iova, fault_flags);
+		if (fault_ret) {
 			if (domain && domain != &vsi_identity_domain)
 				report_iommu_fault(domain, iommu->dev, iova, fault_flags);
 			else
@@ -772,6 +772,21 @@ static struct iommu_device *vsi_iommu_probe_device(struct device *dev)
 	if (!link)
 		dev_err(dev, "Unable to link %s\n", dev_name(provider_dev));
 	put_device(provider_dev);
+
+	/*
+	 * MPP dma-buf imports pass a single IOVA/size pair to the hardware.
+	 * Allow the DMA API to merge mappings across the full 32-bit aperture.
+	 */
+	if (!dev->dma_parms)
+		dev->dma_parms = devm_kzalloc(dev, sizeof(*dev->dma_parms),
+					      GFP_KERNEL);
+	if (!dev->dma_parms) {
+		if (link)
+			device_link_del(link);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	dma_set_max_seg_size(dev, DMA_BIT_MASK(32));
 
 	dev_iommu_priv_set(dev, iommu);
 	return &iommu->iommu;

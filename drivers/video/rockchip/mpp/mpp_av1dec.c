@@ -154,6 +154,7 @@ struct av1dec_dev {
 
 	void __iomem *reg_base[AV1DEC_CLASS_BUTT];
 	int irq[AV1DEC_CLASS_BUTT];
+	bool afbc_irq_active;
 };
 
 static struct av1dec_hw_info av1dec_hw_info = {
@@ -689,6 +690,45 @@ static int av1dec_vcd_irq(struct mpp_dev *mpp)
 	return IRQ_WAKE_THREAD;
 }
 
+static bool av1dec_afbc_ack(struct av1dec_dev *dec)
+{
+	u32 ack_status;
+	u32 ctl_val;
+
+	if (!dec->reg_base[AV1DEC_CLASS_AFBC])
+		return false;
+
+	ack_status = readl(dec->reg_base[AV1DEC_CLASS_AFBC] + REG_ACKNOWLEDGE);
+	if (!(ack_status & 0x1))
+		return false;
+
+	ctl_val = readl(dec->reg_base[AV1DEC_CLASS_AFBC] + REG_CONTROL);
+	ctl_val |= 1;
+	writel_relaxed(ctl_val, dec->reg_base[AV1DEC_CLASS_AFBC] + REG_CONTROL);
+
+	return true;
+}
+
+static irqreturn_t av1dec_afbc_irq(int irq, void *param)
+{
+	struct mpp_dev *mpp = param;
+	struct av1dec_dev *dec = to_av1dec_dev(mpp);
+	bool handled;
+	int ret;
+
+	if (!READ_ONCE(dec->afbc_irq_active))
+		return IRQ_NONE;
+
+	ret = pm_runtime_get_if_in_use(mpp->dev);
+	if (ret <= 0)
+		return IRQ_NONE;
+
+	handled = READ_ONCE(dec->afbc_irq_active) && av1dec_afbc_ack(dec);
+	pm_runtime_put_noidle(mpp->dev);
+
+	return handled ? IRQ_HANDLED : IRQ_NONE;
+}
+
 static int av1dec_isr(struct mpp_dev *mpp)
 {
 	struct mpp_task *mpp_task = mpp->cur_task;
@@ -717,14 +757,7 @@ static int av1dec_isr(struct mpp_dev *mpp)
 	writel_relaxed(0x00000000, dec->reg_base[AV1DEC_CLASS_CACHE] + 0x208);
 
 	if (((regs[321] >> 9) & 0x3) == 0x2) {
-		u32 ack_status = readl(dec->reg_base[AV1DEC_CLASS_AFBC] + REG_ACKNOWLEDGE);
-
-		if ((ack_status & 0x1) == 0x1) {
-			u32 ctl_val = readl(dec->reg_base[AV1DEC_CLASS_AFBC] + REG_CONTROL);
-
-			ctl_val |= 1;
-			writel_relaxed(ctl_val, dec->reg_base[AV1DEC_CLASS_AFBC] + REG_CONTROL);
-		}
+		av1dec_afbc_ack(dec);
 	}
 	task->irq_status = mpp->irq_status;
 	mpp_debug(DEBUG_IRQ_STATUS, "irq_status: %08x\n", task->irq_status);
@@ -936,9 +969,18 @@ static int av1dec_reset(struct mpp_dev *mpp)
 static int av1dec_clk_on(struct mpp_dev *mpp)
 {
 	struct av1dec_dev *dec = to_av1dec_dev(mpp);
+	int ret;
 
-	mpp_clk_safe_enable(dec->aclk_info.clk);
-	mpp_clk_safe_enable(dec->hclk_info.clk);
+	ret = mpp_clk_safe_enable(dec->aclk_info.clk);
+	if (ret)
+		return ret;
+
+	ret = mpp_clk_safe_enable(dec->hclk_info.clk);
+	if (ret) {
+		clk_disable_unprepare(dec->aclk_info.clk);
+		return ret;
+	}
+	WRITE_ONCE(dec->afbc_irq_active, true);
 
 	return 0;
 }
@@ -946,6 +988,10 @@ static int av1dec_clk_on(struct mpp_dev *mpp)
 static int av1dec_clk_off(struct mpp_dev *mpp)
 {
 	struct av1dec_dev *dec = to_av1dec_dev(mpp);
+
+	WRITE_ONCE(dec->afbc_irq_active, false);
+	if (dec->irq[AV1DEC_CLASS_AFBC] > 0)
+		synchronize_irq(dec->irq[AV1DEC_CLASS_AFBC]);
 
 	clk_disable_unprepare(dec->aclk_info.clk);
 	clk_disable_unprepare(dec->hclk_info.clk);
@@ -1029,6 +1075,8 @@ static int av1dec_afbc_init(struct platform_device *pdev, struct av1dec_dev *dec
 		return -EINVAL;
 	}
 	dec->irq[AV1DEC_CLASS_AFBC] = platform_get_irq(pdev, 2);
+	if (dec->irq[AV1DEC_CLASS_AFBC] < 0)
+		return dec->irq[AV1DEC_CLASS_AFBC];
 
 	return 0;
 }
@@ -1080,6 +1128,15 @@ static int av1dec_probe(struct platform_device *pdev)
 	ret = av1dec_afbc_init(pdev, dec);
 	if (ret)
 		goto failed_get_irq;
+	ret = devm_request_threaded_irq(dev, dec->irq[AV1DEC_CLASS_AFBC],
+					av1dec_afbc_irq,
+					NULL,
+					IRQF_SHARED,
+					"av1dec-afbc", mpp);
+	if (ret) {
+		dev_err(dev, "register afbc interrupter runtime failed\n");
+		goto failed_get_irq;
+	}
 	mpp->session_max_buffers = AV1DEC_SESSION_MAX_BUFFERS;
 	av1dec_procfs_init(mpp);
 	mpp_dev_register_srv(mpp, mpp->srv);
