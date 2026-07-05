@@ -6,6 +6,7 @@
  */
 
 #include <linux/iommu.h>
+#include <linux/iommu-dma.h>
 #include <linux/overflow.h>
 
 #include "rga_dma_buf.h"
@@ -420,20 +421,30 @@ int rga_dma_map_sgt(struct sg_table *sgt, struct rga_dma_buffer *buffer,
 
 	/*
 	 * TEMP DIAGNOSTIC (scattered virt_addr / "Route B" investigation): when the
-	 * DMA layer returns more than one segment, log why, so we can distinguish a
-	 * max_seg_size cap from a non-coalescing (direct/identity) mapping. If
-	 * max_seg_size is already large and nents == orig_nents, the device is not on
-	 * the coalescing iommu-dma path and no seg-size change can help — that is the
-	 * signal that scattered virt_addr needs a driver-owned iommu_map_sg, not a
-	 * config tweak. Remove once the scattered-buffer question is settled.
+	 * DMA layer returns more than one segment, log why. The first run measured
+	 * max_seg_size=0xffffffff, nents==orig_nents (zero merge), and domain_type=0x3
+	 * (IOMMU_DOMAIN_DMA — a *translated* DMA-API domain, not identity). Since
+	 * sg_alloc_table_from_pages() builds a mergeable (page-aligned-run) sgt, a real
+	 * iommu_dma_map_sg() on that domain would have coalesced to one segment. It did
+	 * not, so the open question is whether this device's dma_map_sg() actually
+	 * dispatches to iommu_dma_map_sg() at all. use_dma_iommu() reads dev->dma_iommu,
+	 * the exact flag that gates that dispatch:
+	 *   false -> device is NOT on the coalescing iommu-dma path despite the DMA
+	 *            domain (a dma-ops wiring / map_dev-selection gap); fixable by
+	 *            routing this device onto iommu-dma ("Option 1"), no manual IOMMU.
+	 *   true  -> iommu_dma_map_sg() runs yet still returns non-coalesced segments;
+	 *            a deeper issue that leans toward a driver-owned iommu_map_sg
+	 *            ("Route B").
+	 * Remove once the scattered-buffer question is settled.
 	 */
 	if (sgt->nents != 1) {
 		struct iommu_domain *diag_dom = iommu_get_domain_for_dev(map_dev);
 
-		rga_err("DIAG rga_dma_map_sgt: dev=%s max_seg_size=%u orig_nents=%u nents=%u domain_type=0x%x\n",
+		rga_err("DIAG rga_dma_map_sgt: dev=%s max_seg_size=%u orig_nents=%u nents=%u domain_type=0x%x use_dma_iommu=%d\n",
 			dev_name(map_dev), dma_get_max_seg_size(map_dev),
 			sgt->orig_nents, sgt->nents,
-			diag_dom ? diag_dom->type : 0);
+			diag_dom ? diag_dom->type : 0,
+			use_dma_iommu(map_dev));
 	}
 
 	ret = rga_dma_check_iova_contract(sgt, "sg_table", false);
