@@ -418,6 +418,24 @@ int rga_dma_map_sgt(struct sg_table *sgt, struct rga_dma_buffer *buffer,
 	}
 	sgt->nents = ret;
 
+	/*
+	 * TEMP DIAGNOSTIC (scattered virt_addr / "Route B" investigation): when the
+	 * DMA layer returns more than one segment, log why, so we can distinguish a
+	 * max_seg_size cap from a non-coalescing (direct/identity) mapping. If
+	 * max_seg_size is already large and nents == orig_nents, the device is not on
+	 * the coalescing iommu-dma path and no seg-size change can help — that is the
+	 * signal that scattered virt_addr needs a driver-owned iommu_map_sg, not a
+	 * config tweak. Remove once the scattered-buffer question is settled.
+	 */
+	if (sgt->nents != 1) {
+		struct iommu_domain *diag_dom = iommu_get_domain_for_dev(map_dev);
+
+		rga_err("DIAG rga_dma_map_sgt: dev=%s max_seg_size=%u orig_nents=%u nents=%u domain_type=0x%x\n",
+			dev_name(map_dev), dma_get_max_seg_size(map_dev),
+			sgt->orig_nents, sgt->nents,
+			diag_dom ? diag_dom->type : 0);
+	}
+
 	ret = rga_dma_check_iova_contract(sgt, "sg_table", false);
 	if (ret) {
 		dma_unmap_sg(map_dev, sgt->sgl, sgt->orig_nents, dir);
