@@ -5,45 +5,314 @@
  * Author: Huang Lee <Putin.li@rock-chips.com>
  */
 
+#include <linux/iommu.h>
+#include <linux/overflow.h>
+
 #include "rga_dma_buf.h"
 #include "rga.h"
 #include "rga_common.h"
 #include "rga_job.h"
 #include "rga_debugger.h"
 
-static int rga_dma_check_iova_contract(struct sg_table *sgt, const char *source)
+static int rga_dma_check_iova_span(dma_addr_t dma_addr, size_t size,
+				   const char *source, bool log_errors)
 {
-	dma_addr_t dma_addr;
-	unsigned int dma_len;
 	u64 dma_end;
 
-	if (!sgt || !sgt->sgl) {
-		rga_err("reject %s DMA mapping: empty sg table\n", source);
+	if (!size) {
+		if (log_errors)
+			rga_err("reject %s DMA mapping: zero length segment, iova = %pad\n",
+				source, &dma_addr);
 		return -EINVAL;
 	}
 
-	if (sgt->nents != 1) {
-		rga_err("reject %s DMA mapping: expected one DMA segment, got %u, orig_nents = %u\n",
-			source, sgt->nents, sgt->orig_nents);
-		return -EOPNOTSUPP;
-	}
-
-	dma_addr = sg_dma_address(sgt->sgl);
-	dma_len = sg_dma_len(sgt->sgl);
-	if (!dma_len) {
-		rga_err("reject %s DMA mapping: zero length segment, iova = %pad\n",
-			source, &dma_addr);
-		return -EINVAL;
-	}
-
-	dma_end = (u64)dma_addr + dma_len - 1;
-	if (dma_addr > U32_MAX || dma_end > U32_MAX) {
-		rga_err("reject %s DMA mapping: 32-bit IOVA span overflow, iova = %pad, size = %u, end = 0x%llx\n",
-			source, &dma_addr, dma_len, dma_end);
+	if (check_add_overflow((u64)dma_addr, (u64)size - 1, &dma_end) ||
+	    dma_addr > U32_MAX || dma_end > U32_MAX) {
+		if (log_errors)
+			rga_err("reject %s DMA mapping: 32-bit IOVA span overflow, iova = %pad, size = %zu, end = 0x%llx\n",
+				source, &dma_addr, size, dma_end);
 		return -EOVERFLOW;
 	}
 
 	return 0;
+}
+
+static int rga_dma_check_iova_contract(struct sg_table *sgt,
+				       const char *source, bool log_errors)
+{
+	if (!sgt || !sgt->sgl) {
+		if (log_errors)
+			rga_err("reject %s DMA mapping: empty sg table\n",
+				source);
+		return -EINVAL;
+	}
+
+	if (sgt->nents != 1) {
+		if (log_errors)
+			rga_err("reject %s DMA mapping: expected one DMA segment, got %u, orig_nents = %u\n",
+				source, sgt->nents, sgt->orig_nents);
+		return -EOPNOTSUPP;
+	}
+
+	return rga_dma_check_iova_span(sg_dma_address(sgt->sgl),
+				       sg_dma_len(sgt->sgl), source,
+				       log_errors);
+}
+
+static void rga_dma_reset_sgt_dma_state(struct sg_table *sgt)
+{
+	struct scatterlist *sg;
+	unsigned int i;
+
+	for_each_sg(sgt->sgl, sg, sgt->orig_nents, i) {
+		sg_dma_address(sg) = DMA_MAPPING_ERROR;
+#ifdef CONFIG_NEED_SG_DMA_LENGTH
+		sg_dma_len(sg) = 0;
+#endif
+#ifdef CONFIG_NEED_SG_DMA_FLAGS
+		sg->dma_flags &= ~(SG_DMA_BUS_ADDRESS | SG_DMA_SWIOTLB);
+#endif
+	}
+
+	sgt->nents = sgt->orig_nents;
+}
+
+static int rga_dma_iommu_prot(struct device *dev,
+			      enum dma_data_direction dir)
+{
+	int prot = dev_is_dma_coherent(dev) ? IOMMU_CACHE : 0;
+
+	switch (dir) {
+	case DMA_BIDIRECTIONAL:
+		return prot | IOMMU_READ | IOMMU_WRITE;
+	case DMA_TO_DEVICE:
+		return prot | IOMMU_READ;
+	case DMA_FROM_DEVICE:
+		return prot | IOMMU_WRITE;
+	default:
+		return 0;
+	}
+}
+
+static struct iova_domain *rga_dma_iommu_iovad(struct iommu_domain *domain)
+{
+	return iommu_dma_get_iova_domain(domain);
+}
+
+static int rga_dma_alloc_iommu_iova(struct iommu_domain *domain,
+				    struct device *dev, size_t size,
+				    dma_addr_t *iova_out)
+{
+	struct iova_domain *iovad;
+	unsigned long shift;
+	unsigned long iova_len;
+	unsigned long iova;
+	u64 dma_limit;
+
+	iovad = rga_dma_iommu_iovad(domain);
+	if (!iovad)
+		return -EOPNOTSUPP;
+
+	/*
+	 * Route B exposes one byte-contiguous RGA span. Larger IOVA granules can
+	 * force padding between non-contiguous user pages, so fail closed.
+	 */
+	if (iovad->granule > PAGE_SIZE)
+		return -EOPNOTSUPP;
+
+	if (iova_align(iovad, size) != size)
+		return -EINVAL;
+
+	shift = iova_shift(iovad);
+	iova_len = size >> shift;
+	if (!iova_len)
+		return -EINVAL;
+
+	dma_limit = dma_get_mask(dev);
+	if (dev->bus_dma_limit)
+		dma_limit = min_t(u64, dma_limit, dev->bus_dma_limit);
+	dma_limit = min_t(u64, dma_limit, RGA_IOMMU_DMA_LIMIT);
+	if (domain->geometry.force_aperture)
+		dma_limit = min_t(u64, dma_limit,
+				  domain->geometry.aperture_end);
+
+	iova = alloc_iova_fast(iovad, iova_len, dma_limit >> shift, true);
+	if (!iova)
+		return -ENOMEM;
+
+	*iova_out = (dma_addr_t)iova << shift;
+
+	return 0;
+}
+
+static void rga_dma_free_iommu_iova(struct iommu_domain *domain,
+				    dma_addr_t iova, size_t size)
+{
+	struct iova_domain *iovad = rga_dma_iommu_iovad(domain);
+
+	if (!iovad)
+		return;
+
+	free_iova_fast(iovad, iova_pfn(iovad, iova),
+		       size >> iova_shift(iovad));
+}
+
+static int rga_dma_alloc_aligned_sgt(struct sg_table *sgt,
+				     struct sg_table *aligned_sgt,
+				     size_t *data_size, size_t *map_size)
+{
+	struct scatterlist *src;
+	struct scatterlist *dst;
+	size_t data = 0;
+	size_t map = 0;
+	int i;
+	int ret;
+
+	if (!sgt || !sgt->sgl || !sgt->orig_nents)
+		return -EINVAL;
+
+	ret = sg_alloc_table(aligned_sgt, sgt->orig_nents, GFP_KERNEL);
+	if (ret)
+		return ret;
+
+	dst = aligned_sgt->sgl;
+	for_each_sg(sgt->sgl, src, sgt->orig_nents, i) {
+		phys_addr_t phys = sg_phys(src);
+		phys_addr_t start = ALIGN_DOWN(phys, PAGE_SIZE);
+		u64 end = (u64)phys + src->length;
+		u64 aligned_end = ALIGN(end, PAGE_SIZE);
+		size_t len;
+
+		if (!src->length || end < phys || aligned_end < end) {
+			ret = -EINVAL;
+			goto err_free_table;
+		}
+
+		len = aligned_end - start;
+		if (len > UINT_MAX ||
+		    check_add_overflow(data, (size_t)src->length, &data) ||
+		    check_add_overflow(map, len, &map)) {
+			ret = -EOVERFLOW;
+			goto err_free_table;
+		}
+
+		sg_set_page(dst, phys_to_page(start), len, 0);
+		dst = sg_next(dst);
+	}
+
+	if (!data || !map) {
+		ret = -EINVAL;
+		goto err_free_table;
+	}
+
+	*data_size = data;
+	*map_size = map;
+
+	return 0;
+
+err_free_table:
+	sg_free_table(aligned_sgt);
+	return ret;
+}
+
+static int rga_dma_map_sgt_iommu(struct sg_table *sgt,
+				 struct rga_dma_buffer *buffer,
+				 enum dma_data_direction dir,
+				 struct device *map_dev)
+{
+	struct iommu_domain *domain = iommu_get_domain_for_dev(map_dev);
+	struct sg_table aligned_sgt;
+	size_t data_size;
+	size_t map_size;
+	size_t buffer_size;
+	size_t offset;
+	dma_addr_t iova;
+	ssize_t mapped;
+	int prot;
+	int ret;
+
+	if (!domain || !(domain->type & __IOMMU_DOMAIN_PAGING))
+		return -EOPNOTSUPP;
+
+	memset(&aligned_sgt, 0, sizeof(aligned_sgt));
+	ret = rga_dma_alloc_aligned_sgt(sgt, &aligned_sgt, &data_size,
+					&map_size);
+	if (ret)
+		return ret;
+
+	offset = sgt->sgl->offset;
+	if (check_add_overflow(offset, data_size, &buffer_size)) {
+		ret = -EOVERFLOW;
+		goto err_free_aligned_sgt;
+	}
+
+	ret = rga_dma_alloc_iommu_iova(domain, map_dev, map_size, &iova);
+	if (ret)
+		goto err_free_aligned_sgt;
+
+	prot = rga_dma_iommu_prot(map_dev, dir);
+	if (!prot) {
+		ret = -EINVAL;
+		goto err_free_iova;
+	}
+
+	mapped = iommu_map_sg(domain, iova, aligned_sgt.sgl,
+			      aligned_sgt.orig_nents, prot, GFP_KERNEL);
+	if (mapped < 0) {
+		ret = mapped;
+		goto err_free_iova;
+	}
+	if ((size_t)mapped < map_size) {
+		if (mapped)
+			iommu_unmap(domain, iova, mapped);
+		ret = -EIO;
+		goto err_free_iova;
+	}
+
+	ret = rga_dma_check_iova_span(iova + offset, data_size,
+				      "driver-owned IOMMU", true);
+	if (ret)
+		goto err_unmap_iova;
+
+	sg_free_table(&aligned_sgt);
+
+	buffer->sgt = sgt;
+	buffer->domain = domain;
+	buffer->dir = dir;
+	buffer->iova = iova;
+	buffer->dma_addr = iova;
+	buffer->iova_size = map_size;
+	buffer->size = buffer_size;
+	buffer->offset = offset;
+	buffer->map_dev = map_dev;
+	buffer->iommu_mapped = true;
+
+	return 0;
+
+err_unmap_iova:
+	iommu_unmap(domain, iova, map_size);
+err_free_iova:
+	rga_dma_free_iommu_iova(domain, iova, map_size);
+err_free_aligned_sgt:
+	sg_free_table(&aligned_sgt);
+	return ret;
+}
+
+static void rga_dma_unmap_sgt_iommu(struct rga_dma_buffer *buffer)
+{
+	size_t unmapped;
+
+	if (!buffer->domain || !buffer->iova_size)
+		return;
+
+	unmapped = iommu_unmap(buffer->domain, buffer->iova,
+			       buffer->iova_size);
+	if (unmapped != buffer->iova_size)
+		rga_err("driver-owned IOMMU unmap short: iova = %pad, size = %zu, unmapped = %zu\n",
+			&buffer->iova, buffer->iova_size, unmapped);
+
+	rga_dma_free_iommu_iova(buffer->domain, buffer->iova,
+				buffer->iova_size);
 }
 
 static int rga_dma_set_buffer_mapping(struct sg_table *sgt,
@@ -54,7 +323,7 @@ static int rga_dma_set_buffer_mapping(struct sg_table *sgt,
 {
 	int ret;
 
-	ret = rga_dma_check_iova_contract(sgt, source);
+	ret = rga_dma_check_iova_contract(sgt, source, true);
 	if (ret)
 		return ret;
 
@@ -63,6 +332,9 @@ static int rga_dma_set_buffer_mapping(struct sg_table *sgt,
 	buffer->dir = dir;
 	buffer->size = sg_dma_len(sgt->sgl);
 	buffer->map_dev = map_dev;
+	buffer->offset = 0;
+	buffer->iova_size = 0;
+	buffer->iommu_mapped = false;
 
 	return 0;
 }
@@ -146,7 +418,23 @@ int rga_dma_map_sgt(struct sg_table *sgt, struct rga_dma_buffer *buffer,
 	}
 	sgt->nents = ret;
 
-	ret = rga_dma_set_buffer_mapping(sgt, buffer, dir, map_dev, "sg_table");
+	ret = rga_dma_check_iova_contract(sgt, "sg_table", false);
+	if (ret) {
+		dma_unmap_sg(map_dev, sgt->sgl, sgt->orig_nents, dir);
+		rga_dma_reset_sgt_dma_state(sgt);
+
+		if (ret == -EOPNOTSUPP || ret == -EOVERFLOW) {
+			ret = rga_dma_map_sgt_iommu(sgt, buffer, dir,
+						    map_dev);
+			if (!ret)
+				return 0;
+		}
+
+		return ret;
+	}
+
+	ret = rga_dma_set_buffer_mapping(sgt, buffer, dir, map_dev,
+					 "sg_table");
 	if (ret) {
 		dma_unmap_sg(map_dev, sgt->sgl, sgt->orig_nents, dir);
 		return ret;
@@ -159,6 +447,11 @@ void rga_dma_unmap_sgt(struct rga_dma_buffer *buffer)
 {
 	if (!buffer->sgt)
 		return;
+
+	if (buffer->iommu_mapped) {
+		rga_dma_unmap_sgt_iommu(buffer);
+		return;
+	}
 
 	dma_unmap_sg(buffer->map_dev,
 		     buffer->sgt->sgl,
