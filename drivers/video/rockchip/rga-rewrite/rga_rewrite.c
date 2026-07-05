@@ -214,8 +214,6 @@
 #define RK_RGA2_OSD_CTRL1_UNFIX_INDEX		GENMASK(19, 16)
 
 #define RK_RGA2_SRC_FORMAT			GENMASK(3, 0)
-#define RK_RGA2_SRC_FBCIN_MODE			GENMASK(1, 0)
-#define RK_RGA2_SRC_FBCIN_FORMAT		GENMASK(3, 2)
 #define RK_RGA2_SRC_RB_SWAP			BIT(4)
 #define RK_RGA2_SRC_ALPHA_SWAP			BIT(5)
 #define RK_RGA2_SRC_UV_SWAP			BIT(6)
@@ -484,10 +482,9 @@
 #define RK_RGA_TILE_MODE			BIT(2)
 /*
  * RKFBC64x4 and AFBC32x8 are RGA2-Pro compressed modes. RK3588 is
- * documented as one RGA2-Enhance core plus two RGA3 cores, so these mode
- * constants and the source-only FBCIN helpers below are deprecated
- * compatibility code. Do not extend them without RK3588 hardware evidence;
- * remove them once legacy conformance coverage has been retired.
+ * documented as one RGA2-Enhance core plus two RGA3 cores, so the rewrite
+ * recognizes these userspace mode values but rejects submit profiles that
+ * require them.
  */
 #define RK_RGA_RKFBC_MODE			BIT(4)
 #define RK_RGA_AFBC32X8_MODE			BIT(5)
@@ -4293,56 +4290,6 @@ static int rk_rga2_format_info(u32 format, bool write,
 		info->hw_format = 0x8;
 		info->yuv400 = true;
 		info->y4_lut = true;
-		return 0;
-	default:
-		return -EOPNOTSUPP;
-	}
-}
-
-/* Deprecated RGA2-Pro FBCIN format maps; RK3588 target does not rely on them. */
-static int rk_rga2_rkfbc_format(u32 format, u32 *fbc_format)
-{
-	switch (format) {
-	case RK_RGA_FORMAT_YCBCR_420_SP:
-	case RK_RGA_FORMAT_YCRCB_420_SP:
-	case RK_RGA_FORMAT_YCBCR_420_SP_10B:
-	case RK_RGA_FORMAT_YCRCB_420_SP_10B:
-		*fbc_format = 0;
-		return 0;
-	case RK_RGA_FORMAT_YCBCR_422_SP:
-	case RK_RGA_FORMAT_YCRCB_422_SP:
-	case RK_RGA_FORMAT_YCBCR_422_SP_10B:
-	case RK_RGA_FORMAT_YCRCB_422_SP_10B:
-		*fbc_format = 1;
-		return 0;
-	case RK_RGA_FORMAT_YCBCR_444_SP:
-	case RK_RGA_FORMAT_YCRCB_444_SP:
-		*fbc_format = 2;
-		return 0;
-	case RK_RGA_FORMAT_YCBCR_400:
-		*fbc_format = 0;
-		return 0;
-	default:
-		return -EOPNOTSUPP;
-	}
-}
-
-static int rk_rga2_afbc32x8_format(u32 format, u32 *fbc_format)
-{
-	switch (format) {
-	case RK_RGA_FORMAT_RGBA_8888:
-	case RK_RGA_FORMAT_BGRA_8888:
-	case RK_RGA_FORMAT_RGBX_8888:
-	case RK_RGA_FORMAT_BGRX_8888:
-	case RK_RGA_FORMAT_XRGB_8888:
-	case RK_RGA_FORMAT_XBGR_8888:
-	case RK_RGA_FORMAT_ARGB_8888:
-	case RK_RGA_FORMAT_ABGR_8888:
-		*fbc_format = 0;
-		return 0;
-	case RK_RGA_FORMAT_RGB_888:
-	case RK_RGA_FORMAT_BGR_888:
-		*fbc_format = 1;
 		return 0;
 	default:
 		return -EOPNOTSUPP;
@@ -9505,8 +9452,9 @@ static void rk_rga_bitblt_hw_type_mask_kunit(struct kunit *test)
 					 RK_RGA_FORMAT_RGBA_8888);
 	task.src.rd_mode = RK_RGA_RKFBC_MODE;
 	type_mask = 0;
-	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask), 0);
-	KUNIT_EXPECT_EQ(test, type_mask, RK_RGA_HW_TYPE_MASK_RGA2);
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, type_mask, 0U);
 }
 
 static void rk_rga_find_best_hw_for_job_kunit(struct kunit *test)
@@ -11504,7 +11452,6 @@ static void rk_rga2_src_crop_emit_kunit(struct kunit *test)
 
 static void rk_rga_ffmpeg_fbc_profiles_kunit(struct kunit *test)
 {
-	u32 cmd[RK_RGA2_CMD_REG_COUNT] = { };
 	enum rk_rga_hw_type type = 0;
 	struct rga_req task =
 		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_420_SP,
@@ -11513,10 +11460,7 @@ static void rk_rga_ffmpeg_fbc_profiles_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
 	};
-	u32 src_info;
 
 	task.src.rd_mode = RK_RGA_FBC_MODE;
 	task.src.vir_h = 1088;
@@ -11531,144 +11475,57 @@ static void rk_rga_ffmpeg_fbc_profiles_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 
+	/* RGA2-Pro compressed source modes are recognized but unsupported. */
 	task.src.rd_mode = RK_RGA_RKFBC_MODE;
 	task.dst.rd_mode = RK_RGA_RASTER_MODE;
 	task.src.x_offset = 64;
 	task.src.y_offset = 4;
 	type = 0;
-	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
-	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
-	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
 
-	src_info = cmd[RK_RGA2_SRC_INFO_OFFSET / 4];
-	KUNIT_EXPECT_EQ(test, src_info & RK_RGA2_SRC_FBCIN_MODE,
-			FIELD_PREP(RK_RGA2_SRC_FBCIN_MODE, 0));
-	KUNIT_EXPECT_EQ(test, src_info & RK_RGA2_SRC_FBCIN_FORMAT,
-			FIELD_PREP(RK_RGA2_SRC_FBCIN_FORMAT, 0));
-	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_BASE0_OFFSET / 4],
-			lower_32_bits(task.src.yrgb_addr));
-	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_BASE1_OFFSET / 4],
-			lower_32_bits(task.src.yrgb_addr));
-	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_BASE2_OFFSET / 4],
-			64U | (4U << 16));
-	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_VIR_INFO_OFFSET / 4],
-			(ALIGN((u32)task.src.vir_w, 64) / 64) * 4);
-	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_ACT_INFO_OFFSET / 4],
-			((u32)task.src.act_w - 1) |
-			(((u32)task.src.act_h - 1) << 16));
-
-	memset(cmd, 0, sizeof(cmd));
 	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_420_SP_10B,
 					 RK_RGA_FORMAT_RGBA_8888);
 	task.src.rd_mode = RK_RGA_RKFBC_MODE;
 	task.dst.rd_mode = RK_RGA_RASTER_MODE;
 	task.src.x_offset = 96;
 	task.src.y_offset = 12;
-	job.cmd_ready = false;
 	type = 0;
-	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
-	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
-	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
 
-	src_info = cmd[RK_RGA2_SRC_INFO_OFFSET / 4];
-	KUNIT_EXPECT_TRUE(test, src_info & RK_RGA2_SRC_YUV10_EN);
-	KUNIT_EXPECT_TRUE(test, src_info & RK_RGA2_SRC_YUV10_ROUND_EN);
-	KUNIT_EXPECT_EQ(test, src_info & RK_RGA2_SRC_FBCIN_MODE,
-			FIELD_PREP(RK_RGA2_SRC_FBCIN_MODE, 0));
-	KUNIT_EXPECT_EQ(test, src_info & RK_RGA2_SRC_FBCIN_FORMAT,
-			FIELD_PREP(RK_RGA2_SRC_FBCIN_FORMAT, 0));
-	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_BASE0_OFFSET / 4],
-			lower_32_bits(task.src.yrgb_addr));
-	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_BASE1_OFFSET / 4],
-			lower_32_bits(task.src.yrgb_addr));
-	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_BASE2_OFFSET / 4],
-			96U | (12U << 16));
-	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_VIR_INFO_OFFSET / 4],
-			(ALIGN((u32)task.src.vir_w, 64) / 64) * 4);
-
-	memset(cmd, 0, sizeof(cmd));
 	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_422_SP_10B,
 					 RK_RGA_FORMAT_RGBA_8888);
 	task.src.rd_mode = RK_RGA_RKFBC_MODE;
 	task.dst.rd_mode = RK_RGA_RASTER_MODE;
 	task.src.x_offset = 128;
 	task.src.y_offset = 8;
-	job.cmd_ready = false;
 	type = 0;
-	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
-	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
-	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
 
-	src_info = cmd[RK_RGA2_SRC_INFO_OFFSET / 4];
-	KUNIT_EXPECT_TRUE(test, src_info & RK_RGA2_SRC_YUV10_EN);
-	KUNIT_EXPECT_TRUE(test, src_info & RK_RGA2_SRC_YUV10_ROUND_EN);
-	KUNIT_EXPECT_EQ(test, src_info & RK_RGA2_SRC_FBCIN_MODE,
-			FIELD_PREP(RK_RGA2_SRC_FBCIN_MODE, 0));
-	KUNIT_EXPECT_EQ(test, src_info & RK_RGA2_SRC_FBCIN_FORMAT,
-			FIELD_PREP(RK_RGA2_SRC_FBCIN_FORMAT, 1));
-	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_BASE0_OFFSET / 4],
-			lower_32_bits(task.src.yrgb_addr));
-	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_BASE1_OFFSET / 4],
-			lower_32_bits(task.src.yrgb_addr));
-	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_BASE2_OFFSET / 4],
-			128U | (8U << 16));
-	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_VIR_INFO_OFFSET / 4],
-			(ALIGN((u32)task.src.vir_w, 64) / 64) * 4);
-
-	memset(cmd, 0, sizeof(cmd));
 	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
 					 RK_RGA_FORMAT_BGRA_8888);
 	task.src.rd_mode = RK_RGA_AFBC32X8_MODE;
 	task.dst.rd_mode = RK_RGA_RASTER_MODE;
 	task.src.x_offset = 32;
 	task.src.y_offset = 8;
-	job.cmd_ready = false;
 	type = 0;
-	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
-	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
-	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
 
-	src_info = cmd[RK_RGA2_SRC_INFO_OFFSET / 4];
-	KUNIT_EXPECT_EQ(test, src_info & RK_RGA2_SRC_FBCIN_MODE,
-			FIELD_PREP(RK_RGA2_SRC_FBCIN_MODE, 1));
-	KUNIT_EXPECT_EQ(test, src_info & RK_RGA2_SRC_FBCIN_FORMAT,
-			FIELD_PREP(RK_RGA2_SRC_FBCIN_FORMAT, 0));
-	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_BASE0_OFFSET / 4],
-			lower_32_bits(task.src.yrgb_addr));
-	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_BASE1_OFFSET / 4],
-			lower_32_bits(task.src.yrgb_addr));
-	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_BASE2_OFFSET / 4],
-			32U | (8U << 16));
-	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_VIR_INFO_OFFSET / 4],
-			(ALIGN((u32)task.src.vir_w, 32) / 32) * 4);
-
-	memset(cmd, 0, sizeof(cmd));
 	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGB_888,
 					 RK_RGA_FORMAT_BGRA_8888);
 	task.src.rd_mode = RK_RGA_AFBC32X8_MODE;
 	task.dst.rd_mode = RK_RGA_RASTER_MODE;
-	job.cmd_ready = false;
 	type = 0;
-	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
-	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
-	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
-
-	src_info = cmd[RK_RGA2_SRC_INFO_OFFSET / 4];
-	KUNIT_EXPECT_EQ(test, src_info & RK_RGA2_SRC_FBCIN_MODE,
-			FIELD_PREP(RK_RGA2_SRC_FBCIN_MODE, 1));
-	KUNIT_EXPECT_EQ(test, src_info & RK_RGA2_SRC_FBCIN_FORMAT,
-			FIELD_PREP(RK_RGA2_SRC_FBCIN_FORMAT, 1));
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
 
 	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_420_SP,
 					 RK_RGA_FORMAT_RGBA_8888);
 	task.src.rd_mode = RK_RGA_AFBC32X8_MODE;
 	task.dst.rd_mode = RK_RGA_RASTER_MODE;
-	job.cmd_ready = false;
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
 			-EOPNOTSUPP);
@@ -13585,10 +13442,7 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 	ret = rk_rga2_validate_full_csc(task);
 	if (ret)
 		return ret;
-	if (task->src.rd_mode &&
-	    task->src.rd_mode != RK_RGA_RASTER_MODE &&
-	    task->src.rd_mode != RK_RGA_RKFBC_MODE &&
-	    task->src.rd_mode != RK_RGA_AFBC32X8_MODE)
+	if (task->src.rd_mode && task->src.rd_mode != RK_RGA_RASTER_MODE)
 		return -EOPNOTSUPP;
 	if (task->dst.rd_mode && task->dst.rd_mode != RK_RGA_RASTER_MODE)
 		return -EOPNOTSUPP;
@@ -13616,20 +13470,6 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 	if (profile->src_fmt.yuv10 &&
 	    !rk_rga_img_yuv10_compact(&task->src))
 		return -EOPNOTSUPP;
-	if (task->src.rd_mode == RK_RGA_RKFBC_MODE) {
-		u32 fbc_format;
-
-		ret = rk_rga2_rkfbc_format(task->src.format, &fbc_format);
-		if (ret)
-			return ret;
-	} else if (task->src.rd_mode == RK_RGA_AFBC32X8_MODE) {
-		u32 fbc_format;
-
-		ret = rk_rga2_afbc32x8_format(task->src.format, &fbc_format);
-		if (ret)
-			return ret;
-	}
-
 	ret = rk_rga2_validate_image(&task->src, &profile->src_fmt);
 	if (ret)
 		return ret;
@@ -14493,18 +14333,10 @@ static bool rk_rga2_format_needs_force_tile(u32 format)
 	}
 }
 
-static bool rk_rga2_src_compressed(const struct rga_req *task)
-{
-	return task->src.rd_mode == RK_RGA_RKFBC_MODE ||
-	       task->src.rd_mode == RK_RGA_AFBC32X8_MODE;
-}
-
 static bool rk_rga2_needs_force_tile(const struct rga_req *task,
 				     const struct rk_rga2_transform *transform,
 				     u32 dst_w, u32 dst_h)
 {
-	if (rk_rga2_src_compressed(task))
-		return false;
 	if (task->src.act_w != dst_w || task->src.act_h != dst_h)
 		return false;
 	if (transform->src_rot_mode || transform->src_mir_mode)
@@ -14532,34 +14364,22 @@ static int rk_rga2_emit_src(struct rk_rga_job *job,
 	u32 x_factor;
 	u32 y_factor;
 	u32 src_info;
-	u32 fbc_format;
 	__u64 y_addr;
 	u32 u_addr = 0;
 	u32 v_addr = 0;
 	bool h_filter;
 	bool v_filter;
-	bool src_compressed = rk_rga2_src_compressed(task);
 	u32 active_w;
 	u32 active_h;
 	int ret;
 
-	if (src_compressed) {
-		stride = task->src.rd_mode == RK_RGA_RKFBC_MODE ?
-			 rk_rga_rkfbc_head_stride(&task->src) :
-			 rk_rga_afbc32x8_head_stride(&task->src);
-		uv_stride = 0;
-		y_offset = 0;
-		uv_offset = 0;
-	} else {
-		ret = rk_rga2_stride(&task->src, src_fmt, &stride,
-				     &uv_stride);
-		if (ret)
-			return ret;
-		ret = rk_rga2_image_offsets(&task->src, src_fmt, &y_offset,
-					    &uv_offset);
-		if (ret)
-			return ret;
-	}
+	ret = rk_rga2_stride(&task->src, src_fmt, &stride, &uv_stride);
+	if (ret)
+		return ret;
+	ret = rk_rga2_image_offsets(&task->src, src_fmt, &y_offset,
+				    &uv_offset);
+	if (ret)
+		return ret;
 	ret = rk_rga2_scale_factor(task->src.act_w, dst_w,
 				   task->interp.horiz, &h_mode, &x_factor,
 				   &h_filter, &active_w);
@@ -14612,41 +14432,24 @@ static int rk_rga2_emit_src(struct rk_rga_job *job,
 			    FIELD_PREP(RK_RGA2_SRC_TRANS_ENABLE,
 				       task->src_trans_mode >> 1);
 
-	if (src_compressed) {
-		ret = task->src.rd_mode == RK_RGA_RKFBC_MODE ?
-		      rk_rga2_rkfbc_format(task->src.format, &fbc_format) :
-		      rk_rga2_afbc32x8_format(task->src.format, &fbc_format);
-		if (ret)
-			return ret;
-		src_info |= FIELD_PREP(RK_RGA2_SRC_FBCIN_MODE,
-				       task->src.rd_mode ==
-				       RK_RGA_AFBC32X8_MODE) |
-			    FIELD_PREP(RK_RGA2_SRC_FBCIN_FORMAT, fbc_format);
-		y_addr = task->src.yrgb_addr;
-		u_addr = lower_32_bits(task->src.yrgb_addr);
-		v_addr = (u32)task->src.x_offset |
-			 ((u32)task->src.y_offset << 16);
-	} else {
-		src_info |= FIELD_PREP(RK_RGA2_SRC_FORMAT,
-				       src_fmt->hw_format);
-		if (check_add_overflow(task->src.yrgb_addr, (__u64)y_offset,
-				       &y_addr))
-			return -EOVERFLOW;
-		if (src_fmt->plane_width) {
-			__u64 u64_addr;
+	src_info |= FIELD_PREP(RK_RGA2_SRC_FORMAT, src_fmt->hw_format);
+	if (check_add_overflow(task->src.yrgb_addr, (__u64)y_offset,
+			       &y_addr))
+		return -EOVERFLOW;
+	if (src_fmt->plane_width) {
+		__u64 u64_addr;
 
-			if (check_add_overflow(task->src.uv_addr,
-					       (__u64)uv_offset, &u64_addr))
-				return -EOVERFLOW;
-			u_addr = lower_32_bits(u64_addr);
-			if (check_add_overflow(task->src.v_addr,
-					       (__u64)uv_offset, &u64_addr))
-				return -EOVERFLOW;
-			v_addr = lower_32_bits(u64_addr);
-		} else if (src_fmt->yuv400) {
-			u_addr = lower_32_bits(y_addr);
-			v_addr = u_addr;
-		}
+		if (check_add_overflow(task->src.uv_addr,
+				       (__u64)uv_offset, &u64_addr))
+			return -EOVERFLOW;
+		u_addr = lower_32_bits(u64_addr);
+		if (check_add_overflow(task->src.v_addr,
+				       (__u64)uv_offset, &u64_addr))
+			return -EOVERFLOW;
+		v_addr = lower_32_bits(u64_addr);
+	} else if (src_fmt->yuv400) {
+		u_addr = lower_32_bits(y_addr);
+		v_addr = u_addr;
 	}
 
 	rk_rga_cmd_write(job, RK_RGA2_SRC_INFO_OFFSET, src_info);
@@ -14655,8 +14458,7 @@ static int rk_rga2_emit_src(struct rk_rga_job *job,
 	rk_rga_cmd_write(job, RK_RGA2_SRC_BASE1_OFFSET, u_addr);
 	rk_rga_cmd_write(job, RK_RGA2_SRC_BASE2_OFFSET, v_addr);
 	rk_rga_cmd_write(job, RK_RGA2_SRC_BASE3_OFFSET, 0);
-	rk_rga_cmd_write(job, RK_RGA2_SRC_VIR_INFO_OFFSET,
-			 src_compressed ? stride : stride >> 2);
+	rk_rga_cmd_write(job, RK_RGA2_SRC_VIR_INFO_OFFSET, stride >> 2);
 	rk_rga_cmd_write(job, RK_RGA2_SRC_ACT_INFO_OFFSET,
 			 (active_w - 1) | ((active_h - 1) << 16));
 	rk_rga_cmd_write(job, RK_RGA2_SRC_X_FACTOR_OFFSET, x_factor);
