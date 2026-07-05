@@ -159,7 +159,11 @@ struct rga_iommu_info {
 	struct device *dev;
 	struct device *default_dev;		/* for dma-buf_api */
 	struct iommu_domain *domain;
+	struct iommu_domain *default_domain;
 	struct iommu_group *group;
+	bool shared_domain;
+	bool rockchip_fault_handler;
+	bool generic_fault_handler;
 };
 
 struct rga_dma_buffer {
