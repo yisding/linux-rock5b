@@ -10127,6 +10127,16 @@ static void rk_rga_gstreamer_legacy_format_matrix_kunit(struct kunit *test)
 struct rk_rga_rknn_case {
 	u32 src_format;
 	u32 dst_format;
+	u16 src_w;
+	u16 src_h;
+	u16 src_x;
+	u16 src_y;
+	u16 dst_w;
+	u16 dst_h;
+	u16 dst_x;
+	u16 dst_y;
+	u16 dst_vir_w;
+	u16 dst_vir_h;
 	bool expect_y2r;
 	bool expect_r2y;
 	u32 expected_wr_stride_bytes;
@@ -10149,10 +10159,24 @@ rk_rga_rknn_preprocess_profile_case(struct kunit *test,
 		.cmd_vaddr = cmd,
 		.cmd_size = sizeof(cmd),
 	};
+	u16 src_w = profile->src_w ?: 64;
+	u16 src_h = profile->src_h ?: 64;
+	u16 dst_w = profile->dst_w ?: 32;
+	u16 dst_h = profile->dst_h ?: 32;
+	u16 dst_vir_w = profile->dst_vir_w ?: dst_w;
+	u16 dst_vir_h = profile->dst_vir_h ?: dst_h;
 	u32 ctrl;
 
-	task.src = rk_rga_kunit_img(0x10000000, profile->src_format, 64, 64);
-	task.dst = rk_rga_kunit_img(0x20000000, profile->dst_format, 32, 32);
+	task.src = rk_rga_kunit_img(0x10000000, profile->src_format,
+				    src_w, src_h);
+	task.dst = rk_rga_kunit_img(0x20000000, profile->dst_format,
+				    dst_w, dst_h);
+	task.src.x_offset = profile->src_x;
+	task.src.y_offset = profile->src_y;
+	task.dst.x_offset = profile->dst_x;
+	task.dst.y_offset = profile->dst_y;
+	task.dst.vir_w = dst_vir_w;
+	task.dst.vir_h = dst_vir_h;
 	task.yuv2rgb_mode = profile->expect_y2r || profile->expect_r2y;
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
@@ -10166,15 +10190,25 @@ rk_rga_rknn_preprocess_profile_case(struct kunit *test,
 	KUNIT_EXPECT_EQ(test, !!(ctrl & RK_RGA3_WIN0_R2Y_EN),
 			!!profile->expect_r2y);
 	KUNIT_EXPECT_FALSE(test, ctrl & RK_RGA3_WIN0_ROT);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_ACT_OFF_OFFSET / 4],
+			(u32)profile->src_x | ((u32)profile->src_y << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
-			32U | (32U << 16));
+			(u32)dst_w | ((u32)dst_h << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_Y_BASE_OFFSET / 4],
-			lower_32_bits(task.dst.yrgb_addr));
+			lower_32_bits(task.dst.yrgb_addr +
+				      (u64)profile->dst_y *
+				      profile->expected_wr_stride_bytes +
+				      profile->dst_x *
+				      (profile->expected_wr_stride_bytes /
+				       dst_vir_w)));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4] << 2,
 			profile->expected_wr_stride_bytes);
 	if (profile->expected_wr_uv_stride_bytes) {
 		KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_U_BASE_OFFSET / 4],
-				lower_32_bits(task.dst.uv_addr));
+				lower_32_bits(task.dst.uv_addr +
+					      (u64)(profile->dst_y / 2) *
+					      profile->expected_wr_uv_stride_bytes +
+					      profile->dst_x));
 		KUNIT_EXPECT_EQ(test,
 				cmd[RK_RGA3_WR_PL_VIR_STRIDE_OFFSET / 4] << 2,
 				profile->expected_wr_uv_stride_bytes);
@@ -10204,6 +10238,20 @@ static void rk_rga_rknn_preprocess_profiles_kunit(struct kunit *test)
 			.dst_format = RK_RGA_FORMAT_RGB_888,
 			.expect_y2r = true,
 			.expected_wr_stride_bytes = 32U * 3U,
+		}, {
+			.src_format = RK_RGA_FORMAT_RGBA_8888,
+			.dst_format = RK_RGA_FORMAT_RGB_888,
+			.src_w = 64,
+			.src_h = 64,
+			.src_x = 8,
+			.src_y = 6,
+			.dst_w = 40,
+			.dst_h = 32,
+			.dst_x = 12,
+			.dst_y = 8,
+			.dst_vir_w = 64,
+			.dst_vir_h = 48,
+			.expected_wr_stride_bytes = 64U * 3U,
 		},
 	};
 	size_t i;
