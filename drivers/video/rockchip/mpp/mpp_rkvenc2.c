@@ -3385,9 +3385,11 @@ static int rkvenc_core_probe(struct platform_device *pdev)
 		dev_err(dev, "attach ccu failed\n");
 		goto err_remove_mpp;
 	}
-	ret = rkvenc2_alloc_rcbbuf(pdev, enc);
-	if (ret)
-		goto err_detach_ccu;
+	/*
+	 * BSP treats the RCB SRAM mapping as best-effort. RK3588 rkvenc-core
+	 * nodes do not provide rockchip,rcb-iova, so do not fail probe here.
+	 */
+	rkvenc2_alloc_rcbbuf(pdev, enc);
 
 	ret = devm_request_threaded_irq(dev, mpp->irq,
 					mpp_dev_irq,
@@ -3443,9 +3445,11 @@ static int rkvenc_probe_default(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	ret = rkvenc2_alloc_rcbbuf(pdev, enc);
-	if (ret)
-		goto failed_get_irq;
+	/*
+	 * BSP treats the RCB SRAM mapping as best-effort. RK3588 rkvenc-core
+	 * nodes do not provide rockchip,rcb-iova, so do not fail probe here.
+	 */
+	rkvenc2_alloc_rcbbuf(pdev, enc);
 
 	ret = devm_request_threaded_irq(dev, mpp->irq,
 					mpp_dev_irq,
