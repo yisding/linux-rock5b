@@ -17,6 +17,7 @@
 #include <linux/kconfig.h>
 #include <linux/list.h>
 #include <linux/videodev2.h>
+#include <media/v4l2-metrics.h>
 
 struct video_device;
 struct v4l2_ctrl_handler;
@@ -45,6 +46,7 @@ struct v4l2_fh {
 	struct list_head	list;
 	struct video_device	*vdev;
 	struct v4l2_ctrl_handler *ctrl_handler;
+	struct v4l2_metrics	metrics;
 	enum v4l2_priority	prio;
 	uint32_t		tgid;
 	int			fd;
