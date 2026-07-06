@@ -1208,6 +1208,10 @@ struct rk_rga_service {
 	atomic_t iommu_fault_count;
 	atomic_t iommu_refresh_count;
 	atomic_t unsupported_count;
+	atomic_t route_b_attempt_count;
+	atomic_t route_b_ok_count;
+	atomic_t route_b_active_count;
+	bool route_b_force_remap;
 };
 
 static struct rk_rga_service rk_rga;
@@ -1781,6 +1785,7 @@ static void rk_rga_unmap_userptr_iommu(struct iommu_domain *domain,
 		       &base, iova_size, unmapped);
 
 	rk_rga_free_iommu_iova(domain, base, iova_size);
+	atomic_dec(&rk_rga.route_b_active_count);
 }
 
 static void rk_rga_unmap_userptr_sgt(struct device *dev, struct sg_table *sgt,
@@ -16960,6 +16965,7 @@ static int rk_rga_map_userptr_sgt(struct rk_rga_import *import,
 				  bool *iommu_mapped_out)
 {
 	struct sg_table *sgt;
+	bool force_iommu;
 	int ret;
 
 	*sgt_out = NULL;
@@ -16982,22 +16988,27 @@ static int rk_rga_map_userptr_sgt(struct rk_rga_import *import,
 	if (ret)
 		goto err_free_table;
 
+	force_iommu = READ_ONCE(rk_rga.route_b_force_remap);
 	ret = rk_rga_check_dma_sgt(sgt, "userptr", import->size, iova_out,
 				   false);
-	if (!ret) {
+	if (!ret && !force_iommu) {
 		*sgt_out = sgt;
 		return 0;
 	}
 
 	dma_unmap_sgtable(dev, sgt, DMA_BIDIRECTIONAL, 0);
 	rk_rga_reset_sgt_dma_state(sgt);
-	if (ret != -EOPNOTSUPP && ret != -EOVERFLOW)
+	if (ret && ret != -EOPNOTSUPP && ret != -EOVERFLOW)
 		goto err_free_table;
 
+	atomic_inc(&rk_rga.route_b_attempt_count);
 	ret = rk_rga_map_userptr_sgt_iommu(import, dev, sgt, iova_out,
 					   domain_out, iova_size_out);
 	if (ret)
 		goto err_free_table;
+
+	atomic_inc(&rk_rga.route_b_ok_count);
+	atomic_inc(&rk_rga.route_b_active_count);
 
 	*sgt_out = sgt;
 	*iommu_mapped_out = true;
@@ -17884,6 +17895,19 @@ rk_rga_debugfs_create_core_times(const char *prefix,
 	}
 }
 
+static void rk_rga_debugfs_create_route_b(void)
+{
+	struct dentry *dir;
+
+	dir = debugfs_create_dir("route_b", rk_rga.debugfs_root);
+	debugfs_create_atomic_t("attempt", 0444, dir,
+				&rk_rga.route_b_attempt_count);
+	debugfs_create_atomic_t("ok", 0444, dir, &rk_rga.route_b_ok_count);
+	debugfs_create_atomic_t("active", 0444, dir,
+				&rk_rga.route_b_active_count);
+	debugfs_create_bool("force_remap", 0600, dir, &rk_rga.route_b_force_remap);
+}
+
 static int __init rk_rga_init(void)
 {
 	int ret;
@@ -17968,6 +17992,7 @@ static int __init rk_rga_init(void)
 	debugfs_create_atomic_t("iommu_refresh_count", 0444,
 				rk_rga.debugfs_root,
 				&rk_rga.iommu_refresh_count);
+	rk_rga_debugfs_create_route_b();
 	debugfs_create_atomic_t("unsupported_count", 0444, rk_rga.debugfs_root,
 				&rk_rga.unsupported_count);
 
