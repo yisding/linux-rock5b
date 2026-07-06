@@ -8,6 +8,7 @@
 
 #include <linux/clk.h>
 #include <linux/compiler.h>
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
@@ -112,6 +113,7 @@ struct rk_iommu_ops {
 
 struct rk_iommu {
 	struct device *dev;
+	u64 fault_count;		/* page + bus faults on this MMU (debug) */
 	void __iomem **bases;
 	int num_mmu;
 	int num_irq;
@@ -615,6 +617,9 @@ static irqreturn_t rk_iommu_irq(int irq, void *dev_id)
 
 		ret = IRQ_HANDLED;
 		iova = rk_iommu_read(iommu->bases[i], RK_MMU_PAGE_FAULT_ADDR);
+
+		if (int_status & (RK_MMU_IRQ_PAGE_FAULT | RK_MMU_IRQ_BUS_ERROR))
+			iommu->fault_count++;
 
 		if (int_status & RK_MMU_IRQ_PAGE_FAULT) {
 			int flags;
@@ -1593,6 +1598,16 @@ static int rk_iommu_probe(struct platform_device *pdev)
 	err = iommu_device_register(&iommu->iommu, &rk_iommu_ops, dev);
 	if (err)
 		goto err_remove_sysfs;
+
+	{
+		static struct dentry *rk_iommu_debug_root;
+
+		if (!rk_iommu_debug_root)
+			rk_iommu_debug_root =
+				debugfs_create_dir("rockchip-iommu", NULL);
+		debugfs_create_u64(dev_name(dev), 0444, rk_iommu_debug_root,
+				   &iommu->fault_count);
+	}
 
 	return 0;
 err_remove_sysfs:

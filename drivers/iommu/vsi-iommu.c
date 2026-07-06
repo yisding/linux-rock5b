@@ -17,6 +17,7 @@
 
 #include <linux/clk.h>
 #include <linux/compiler.h>
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
@@ -42,6 +43,7 @@
 
 struct vsi_iommu {
 	struct device *dev;
+	u64 fault_count;		/* faults seen by this AV1-decoder MMU (debug) */
 	void __iomem *regs;
 	struct clk_bulk_data *clocks;
 	int num_clocks;
@@ -248,6 +250,7 @@ static irqreturn_t vsi_iommu_irq(int irq, void *dev_id)
 		iova = readl(iommu->regs + VSI_MMU_PAGE_FAULT_ADDR);
 		domain = iommu->domain;
 		fault = true;
+		iommu->fault_count++;
 		vsi_iommu_mask_irq_locked(iommu);
 	}
 	writel(0, iommu->regs + VSI_MMU_STATUS_BASE);
@@ -964,6 +967,16 @@ static int vsi_iommu_probe(struct platform_device *pdev)
 	err = iommu_device_register(&iommu->iommu, &vsi_iommu_ops, dev);
 	if (err)
 		goto err_remove_sysfs;
+
+	{
+		static struct dentry *vsi_iommu_debug_root;
+
+		if (!vsi_iommu_debug_root)
+			vsi_iommu_debug_root =
+				debugfs_create_dir("vsi-iommu", NULL);
+		debugfs_create_u64(dev_name(dev), 0444, vsi_iommu_debug_root,
+				   &iommu->fault_count);
+	}
 
 	return 0;
 
