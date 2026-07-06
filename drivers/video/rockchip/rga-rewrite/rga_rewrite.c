@@ -12827,6 +12827,69 @@ static void rk_rga3_display_rgb565_rotate_kunit(struct kunit *test)
 			32U);
 }
 
+static void rk_rga2_display_xrgb_rotate_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA2_CMD_REG_COUNT] = { };
+	enum rk_rga_hw_type type = 0;
+	struct rga_req task = {
+		.render_mode = RK_RGA_RENDER_BITBLT,
+		.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_XRGB_8888,
+					64, 32),
+		.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_XRGB_8888,
+					32, 64),
+		.rotate_mode = 1,
+		.sina = -65536,
+	};
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 2,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+	u32 mode_ctrl;
+	u32 src_info;
+	u32 dst_info;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+
+	mode_ctrl = cmd[RK_RGA2_MODE_CTRL_OFFSET / 4];
+	KUNIT_EXPECT_EQ(test, mode_ctrl & RK_RGA2_MODE_RENDER_MODE,
+			FIELD_PREP(RK_RGA2_MODE_RENDER_MODE,
+				   RK_RGA_RENDER_BITBLT));
+	KUNIT_EXPECT_TRUE(test, mode_ctrl & RK_RGA2_MODE_INTR_CF_E);
+
+	src_info = cmd[RK_RGA2_SRC_INFO_OFFSET / 4];
+	KUNIT_EXPECT_EQ(test, src_info & RK_RGA2_SRC_FORMAT,
+			FIELD_PREP(RK_RGA2_SRC_FORMAT, 0x1));
+	KUNIT_EXPECT_FALSE(test, src_info & RK_RGA2_SRC_RB_SWAP);
+	KUNIT_EXPECT_TRUE(test, src_info & RK_RGA2_SRC_ALPHA_SWAP);
+	KUNIT_EXPECT_EQ(test, src_info & RK_RGA2_SRC_ROT_MODE,
+			FIELD_PREP(RK_RGA2_SRC_ROT_MODE, 3));
+	KUNIT_EXPECT_EQ(test, src_info & RK_RGA2_SRC_MIR_MODE, 0U);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_BASE0_OFFSET / 4],
+			lower_32_bits(task.src.yrgb_addr));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_VIR_INFO_OFFSET / 4],
+			64U);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_ACT_INFO_OFFSET / 4],
+			63U | (31U << 16));
+
+	dst_info = cmd[RK_RGA2_DST_INFO_OFFSET / 4];
+	KUNIT_EXPECT_EQ(test, dst_info & RK_RGA2_DST_FORMAT,
+			FIELD_PREP(RK_RGA2_DST_FORMAT, 0x1));
+	KUNIT_EXPECT_FALSE(test, dst_info & RK_RGA2_DST_RB_SWAP);
+	KUNIT_EXPECT_TRUE(test, dst_info & RK_RGA2_DST_ALPHA_SWAP);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_BASE0_OFFSET / 4],
+			lower_32_bits(task.dst.yrgb_addr + 31U * 128U));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_VIR_INFO_OFFSET / 4],
+			32U);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_ACT_INFO_OFFSET / 4],
+			63U | (31U << 16));
+}
+
 static void rk_rga3_pattern_rotate_reject_kunit(struct kunit *test)
 {
 	struct rk_rga3_bitblt_profile profile;
@@ -13609,6 +13672,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga3_librga_rgb_composite_emit_kunit),
 	KUNIT_CASE(rk_rga3_display_partial_alpha_blend_kunit),
 	KUNIT_CASE(rk_rga3_display_rgb565_rotate_kunit),
+	KUNIT_CASE(rk_rga2_display_xrgb_rotate_kunit),
 	KUNIT_CASE(rk_rga3_pattern_rotate_reject_kunit),
 	KUNIT_CASE(rk_rga3_librga_blend_modes_kunit),
 	KUNIT_CASE(rk_rga3_alpha_yuv10_overlay_emit_kunit),
