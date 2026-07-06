@@ -257,8 +257,9 @@ Implemented
   overflow/final-slice reporting, ``POLL_HW_FINISH`` nonblocking pending-job
   ``-EAGAIN`` without consuming the active job, and ``SET_SESSION_FD``
   invalid-fd status, done-marker handling, batch job splitting,
-  batch-server wait-layout rejection, and public ``RESET_SESSION``/file-close
-  cleanup of imports plus queued/active jobs.
+  batch-server wait-layout recognition plus collector-level ``-EOPNOTSUPP``
+  rejection without status-slot writeback, and public ``RESET_SESSION``/
+  file-close cleanup of imports plus queued/active jobs.
 
 Recognized But Unsupported
 --------------------------
