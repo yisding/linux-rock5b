@@ -22,6 +22,7 @@
 #include "rga_mm.h"
 #include "rga_common.h"
 #include "rga_job.h"
+#include "rga_dma_buf.h"
 
 #define RGA_DEBUGGER_ROOT_NAME "rkrga"
 
@@ -689,6 +690,8 @@ int rga_debugfs_init(void)
 		pr_err("Could not install rga_debugger_root_list debugfs\n");
 		goto CREATE_FAIL;
 	}
+
+	rga_route_b_debugfs_init(debugger->debugfs_dir);
 
 	return 0;
 

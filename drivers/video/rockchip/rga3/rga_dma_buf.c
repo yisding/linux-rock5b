@@ -5,8 +5,11 @@
  * Author: Huang Lee <Putin.li@rock-chips.com>
  */
 
+#include <linux/atomic.h>
+#include <linux/debugfs.h>
 #include <linux/iommu.h>
 #include <linux/iommu-dma.h>
+#include <linux/moduleparam.h>
 #include <linux/overflow.h>
 
 #include "rga_dma_buf.h"
@@ -14,6 +17,30 @@
 #include "rga_common.h"
 #include "rga_job.h"
 #include "rga_debugger.h"
+
+/* --- Route B (scattered-userptr IOMMU remap) debug instrumentation --- */
+static bool rga_force_iommu_remap;
+module_param(rga_force_iommu_remap, bool, 0644);
+MODULE_PARM_DESC(rga_force_iommu_remap,
+	"debug: route every driver-owned map through Route B even when contiguous");
+
+static atomic_t rga_rb_attempt = ATOMIC_INIT(0);
+static atomic_t rga_rb_ok = ATOMIC_INIT(0);
+static atomic_t rga_rb_active = ATOMIC_INIT(0);
+
+void rga_route_b_debugfs_init(struct dentry *parent)
+{
+	struct dentry *rb;
+
+	if (IS_ERR_OR_NULL(parent))
+		return;
+
+	rb = debugfs_create_dir("route_b", parent);
+	debugfs_create_atomic_t("attempt", 0444, rb, &rga_rb_attempt);
+	debugfs_create_atomic_t("ok", 0444, rb, &rga_rb_ok);
+	debugfs_create_atomic_t("active", 0444, rb, &rga_rb_active);
+	debugfs_create_bool("force_remap", 0644, rb, &rga_force_iommu_remap);
+}
 
 static int rga_dma_check_iova_span(dma_addr_t dma_addr, size_t size,
 				   const char *source, bool log_errors)
@@ -235,6 +262,8 @@ static int rga_dma_map_sgt_iommu(struct sg_table *sgt,
 	if (!domain || !(domain->type & __IOMMU_DOMAIN_PAGING))
 		return -EOPNOTSUPP;
 
+	atomic_inc(&rga_rb_attempt);
+
 	memset(&aligned_sgt, 0, sizeof(aligned_sgt));
 	ret = rga_dma_alloc_aligned_sgt(sgt, &aligned_sgt, &data_size,
 					&map_size);
@@ -246,6 +275,10 @@ static int rga_dma_map_sgt_iommu(struct sg_table *sgt,
 		ret = -EOVERFLOW;
 		goto err_free_aligned_sgt;
 	}
+
+	if (DEBUGGER_EN(MM))
+		rga_err("routeB: orig_nents=%u data=%zu map=%zu offset=%#zx\n",
+			sgt->orig_nents, data_size, map_size, offset);
 
 	ret = rga_dma_alloc_iommu_iova(domain, map_dev, map_size, &iova);
 	if (ret)
@@ -288,6 +321,12 @@ static int rga_dma_map_sgt_iommu(struct sg_table *sgt,
 	buffer->map_dev = map_dev;
 	buffer->iommu_mapped = true;
 
+	atomic_inc(&rga_rb_ok);
+	atomic_inc(&rga_rb_active);
+	if (DEBUGGER_EN(MM))
+		rga_err("routeB ok: iova=%pad map=%zu offset=%#zx\n",
+			&iova, map_size, offset);
+
 	return 0;
 
 err_unmap_iova:
@@ -314,6 +353,8 @@ static void rga_dma_unmap_sgt_iommu(struct rga_dma_buffer *buffer)
 
 	rga_dma_free_iommu_iova(buffer->domain, buffer->iova,
 				buffer->iova_size);
+
+	atomic_dec(&rga_rb_active);
 }
 
 static int rga_dma_set_buffer_mapping(struct sg_table *sgt,
@@ -484,6 +525,12 @@ int rga_dma_map_sgt(struct sg_table *sgt, struct rga_dma_buffer *buffer,
 		}
 
 		return ret;
+	}
+
+	if (rga_force_iommu_remap) {
+		dma_unmap_sg(map_dev, sgt->sgl, sgt->orig_nents, dir);
+		rga_dma_reset_sgt_dma_state(sgt);
+		return rga_dma_map_sgt_iommu(sgt, buffer, dir, map_dev);
 	}
 
 	ret = rga_dma_set_buffer_mapping(sgt, buffer, dir, map_dev,
