@@ -21,6 +21,7 @@
 #include <linux/videodev2.h>
 #include <linux/workqueue.h>
 #include <media/v4l2-event.h>
+#include <media/v4l2-metrics.h>
 #include <media/v4l2-mem2mem.h>
 #include <media/videobuf2-core.h>
 #include <media/videobuf2-vmalloc.h>
@@ -92,6 +93,9 @@ static void hantro_job_finish(struct hantro_dev *vpu,
 			      struct hantro_ctx *ctx,
 			      enum vb2_buffer_state result)
 {
+	v4l2_metrics_update_hw_time(&ctx->fh.metrics,
+				   ktime_to_ns(ktime_sub(ktime_get(), ctx->start_time)));
+
 	pm_runtime_put_autosuspend(vpu->dev);
 
 	clk_bulk_disable(vpu->variant->num_clocks, vpu->clocks);
@@ -193,6 +197,8 @@ static void device_run(void *priv)
 		goto err_cancel_job;
 
 	v4l2_m2m_buf_copy_metadata(src, dst);
+
+	ctx->start_time = ktime_get();
 
 	if (ctx->codec_ops->run(ctx))
 		goto err_cancel_job;
@@ -674,6 +680,9 @@ static int hantro_open(struct file *filp)
 
 	v4l2_fh_init(&ctx->fh, vdev);
 	v4l2_fh_add(&ctx->fh, filp);
+	v4l2_metrics_set_driver_type(&ctx->fh.metrics,
+				   ctx->is_encoder ? V4L2_DRIVER_TYPE_STATELESS_ENCODER
+						   : V4L2_DRIVER_TYPE_STATELESS_DECODER);
 
 	hantro_reset_fmts(ctx);
 
@@ -711,10 +720,20 @@ static int hantro_release(struct file *filp)
 	return 0;
 }
 
+static void hantro_show_fdinfo(struct seq_file *m, struct file *f)
+{
+	struct hantro_ctx *ctx = file_to_ctx(f);
+	struct hantro_dev *vpu = ctx->dev;
+
+	v4l2_metrics_show(&ctx->fh.metrics, m, 0);
+	v4l2_metrics_show_clock(m, vpu->clocks[0].clk, 0);
+}
+
 static const struct v4l2_file_operations hantro_fops = {
 	.owner = THIS_MODULE,
 	.open = hantro_open,
 	.release = hantro_release,
+	.show_fdinfo = hantro_show_fdinfo,
 	.poll = v4l2_m2m_fop_poll,
 	.unlocked_ioctl = video_ioctl2,
 	.mmap = v4l2_m2m_fop_mmap,

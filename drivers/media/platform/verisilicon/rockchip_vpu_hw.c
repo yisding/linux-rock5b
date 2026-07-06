@@ -423,14 +423,20 @@ static irqreturn_t rockchip_vpu2_vepu_irq(int irq, void *dev_id)
 static irqreturn_t rk3588_vpu981_irq(int irq, void *dev_id)
 {
 	struct hantro_dev *vpu = dev_id;
+	struct hantro_ctx *ctx =
+		v4l2_m2m_get_curr_priv(vpu->m2m_dev);
 	enum vb2_buffer_state state;
 	struct hantro_ctx *ctx =
 		v4l2_m2m_get_curr_priv(vpu->m2m_dev);
 	u32 status;
+	u32 cycles;
 
 	status = vdpu_read(vpu, AV1_REG_INTERRUPT);
 	state = (status & AV1_REG_INTERRUPT_DEC_RDY_INT) ?
 		VB2_BUF_STATE_DONE : VB2_BUF_STATE_ERROR;
+
+	cycles = vdpu_read(vpu, AV1_CYCLE_COUNT);
+	v4l2_metrics_update_hw_cycles(&ctx->fh.metrics, cycles);
 
 	vdpu_write(vpu, 0, AV1_REG_INTERRUPT);
 	vdpu_write(vpu, AV1_REG_CONFIG_DEC_CLK_GATE_E, AV1_REG_CONFIG);
