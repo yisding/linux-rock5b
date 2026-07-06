@@ -2482,6 +2482,8 @@ rk_mpp_is_batch_server_wait_ioctl(void __user *msg_base,
 static int rk_mpp_process_request(struct rk_mpp_session *session,
 				  struct mpp_request *req,
 				  struct rk_mpp_batch_state *batch);
+static int rk_mpp_collect_msgs(struct rk_mpp_session *session,
+			       unsigned int cmd, void __user *arg);
 static int rk_mpp_execute_jobs(struct rk_mpp_batch_state *batch);
 static int rk_mpp_job_store_reg_offsets(struct rk_mpp_job *job,
 					const struct rk_mpp_job_req *job_req);
@@ -4746,6 +4748,48 @@ static void rk_mpp_batch_server_wait_detect_kunit(struct kunit *test)
 							     &layout.reqs[0]));
 }
 
+static void rk_mpp_batch_server_wait_collect_reject_kunit(struct kunit *test)
+{
+	struct rk_mpp_service srv = {};
+	struct rk_mpp_session session = {
+		.srv = &srv,
+	};
+	struct {
+		struct rk_mpp_msg_v1 reqs[2];
+		struct mpp_bat_msg bat[1];
+	} layout = {};
+	struct mpp_bat_msg out = {};
+	void __user *user;
+	unsigned long uncopied;
+	uintptr_t base;
+
+	user = rk_mpp_kunit_user_payload(test, &layout, sizeof(layout));
+	KUNIT_ASSERT_NOT_NULL(test, user);
+	base = (uintptr_t)user;
+
+	layout.reqs[0].cmd = MPP_CMD_SET_SESSION_FD;
+	layout.reqs[0].flags = MPP_FLAGS_MULTI_MSG;
+	layout.reqs[0].size = sizeof(struct mpp_bat_msg);
+	layout.reqs[0].data_ptr = base + sizeof(layout.reqs);
+	layout.reqs[1].cmd = MPP_CMD_POLL_HW_FINISH;
+	layout.reqs[1].flags = MPP_FLAGS_MULTI_MSG | MPP_FLAGS_LAST_MSG |
+				MPP_FLAGS_POLL_NON_BLOCK;
+	layout.bat[0].fd = U32_MAX;
+	layout.bat[0].ret = 123;
+	uncopied = copy_to_user(user, &layout, sizeof(layout));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_collect_msgs(&session, MPP_IOC_CFG_V1, user),
+			-EOPNOTSUPP);
+
+	uncopied = copy_from_user(&out, (u8 __user *)user +
+				  sizeof(layout.reqs), sizeof(out));
+	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
+	KUNIT_EXPECT_EQ(test, out.ret, 123);
+	KUNIT_EXPECT_EQ(test, out.fd, U32_MAX);
+}
+
 static void rk_mpp_batch_session_switch_split_kunit(struct kunit *test)
 {
 	struct rk_mpp_session session0 = {};
@@ -5314,6 +5358,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_rkvdec_rcb_width_gate_kunit),
 	KUNIT_CASE(rk_mpp_switch_session_status_kunit),
 	KUNIT_CASE(rk_mpp_batch_server_wait_detect_kunit),
+	KUNIT_CASE(rk_mpp_batch_server_wait_collect_reject_kunit),
 	KUNIT_CASE(rk_mpp_batch_session_switch_split_kunit),
 	KUNIT_CASE(rk_mpp_release_fd_all_devices_kunit),
 	KUNIT_CASE(rk_mpp_session_poll_nonblock_pending_kunit),
