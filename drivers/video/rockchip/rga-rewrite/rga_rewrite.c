@@ -12597,6 +12597,115 @@ static void rk_rga3_librga_rgb_composite_emit_kunit(struct kunit *test)
 			expected_bottom_alpha);
 }
 
+static void rk_rga3_display_partial_alpha_blend_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
+	enum rk_rga_hw_type type = 0;
+	struct rga_req task = {
+		.render_mode = RK_RGA_RENDER_BITBLT,
+		.src = rk_rga_kunit_img(0x10000000,
+					RK_RGA_FORMAT_BGRA_8888,
+					64, 48),
+		.dst = rk_rga_kunit_img(0x20000000,
+					RK_RGA_FORMAT_BGRA_8888,
+					80, 64),
+		.alpha_rop_flag = BIT(0) | BIT(3) | BIT(4) | BIT(9),
+		.PD_mode = RK_RGA_ALPHA_BLEND_SRC_OVER,
+		.feature.global_alpha_en = true,
+		.fg_global_alpha = 0xff,
+		.bg_global_alpha = 0xff,
+	};
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 2,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+	u32 expected_top_ctrl;
+	u32 expected_bottom_ctrl;
+	u32 expected_top_alpha;
+	u32 expected_bottom_alpha;
+
+	task.src.x_offset = 8;
+	task.src.y_offset = 6;
+	task.src.act_w = 28;
+	task.src.act_h = 20;
+	task.dst.x_offset = 24;
+	task.dst.y_offset = 18;
+	task.dst.act_w = 28;
+	task.dst.act_h = 20;
+
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_Y_BASE_OFFSET / 4],
+			lower_32_bits(task.dst.yrgb_addr));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_SRC_SIZE_OFFSET / 4],
+			64U | (48U << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_ACT_OFF_OFFSET / 4],
+			24U | (18U << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_ACT_SIZE_OFFSET / 4],
+			28U | (20U << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
+			28U | (20U << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN1_Y_BASE_OFFSET / 4],
+			lower_32_bits(task.src.yrgb_addr));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN1_SRC_SIZE_OFFSET / 4],
+			36U | (26U << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN1_ACT_OFF_OFFSET / 4],
+			8U | (6U << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN1_ACT_SIZE_OFFSET / 4],
+			28U | (20U << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN1_DST_SIZE_OFFSET / 4],
+			28U | (20U << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_CTRL_OFFSET / 4],
+			FIELD_PREP(RK_RGA3_OVLP_MODE, 1) |
+			RK_RGA3_OVLP_TOP_ALPHA_EN);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_OFF_OFFSET / 4],
+			24U | (18U << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_Y_BASE_OFFSET / 4],
+			lower_32_bits(task.dst.yrgb_addr));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4],
+			80U);
+
+	expected_top_ctrl =
+		FIELD_PREP(RK_RGA3_ALPHA_COLOR_MODE,
+			   RK_RGA3_ALPHA_NO_PRE_MULTIPLIED) |
+		FIELD_PREP(RK_RGA3_ALPHA_BLEND_MODE,
+			   RK_RGA3_ALPHA_PER_PIXEL) |
+		FIELD_PREP(RK_RGA3_ALPHA_FACTOR, RK_RGA3_ALPHA_ONE) |
+		FIELD_PREP(RK_RGA3_ALPHA_GLOBAL, 0xff);
+	expected_bottom_ctrl =
+		FIELD_PREP(RK_RGA3_ALPHA_COLOR_MODE,
+			   RK_RGA3_ALPHA_NO_PRE_MULTIPLIED) |
+		FIELD_PREP(RK_RGA3_ALPHA_BLEND_MODE,
+			   RK_RGA3_ALPHA_PER_PIXEL) |
+		FIELD_PREP(RK_RGA3_ALPHA_FACTOR,
+			   RK_RGA3_ALPHA_OPPOSITE_INVERSE) |
+		FIELD_PREP(RK_RGA3_ALPHA_GLOBAL, 0xff);
+	expected_top_alpha =
+		FIELD_PREP(RK_RGA3_ALPHA_BLEND_MODE,
+			   RK_RGA3_ALPHA_PER_PIXEL) |
+		FIELD_PREP(RK_RGA3_ALPHA_FACTOR, RK_RGA3_ALPHA_ONE);
+	expected_bottom_alpha =
+		FIELD_PREP(RK_RGA3_ALPHA_BLEND_MODE,
+			   RK_RGA3_ALPHA_PER_PIXEL) |
+		FIELD_PREP(RK_RGA3_ALPHA_FACTOR,
+			   RK_RGA3_ALPHA_OPPOSITE_INVERSE);
+
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_TOP_CTRL_OFFSET / 4],
+			expected_top_ctrl);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_BOT_CTRL_OFFSET / 4],
+			expected_bottom_ctrl);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_TOP_ALPHA_OFFSET / 4],
+			expected_top_alpha);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_BOT_ALPHA_OFFSET / 4],
+			expected_bottom_alpha);
+}
+
 static void rk_rga3_pattern_rotate_reject_kunit(struct kunit *test)
 {
 	struct rk_rga3_bitblt_profile profile;
@@ -13376,6 +13485,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga3_librga_slt_alpha_emit_kunit),
 	KUNIT_CASE(rk_rga3_librga_global_alpha_emit_kunit),
 	KUNIT_CASE(rk_rga3_librga_rgb_composite_emit_kunit),
+	KUNIT_CASE(rk_rga3_display_partial_alpha_blend_kunit),
 	KUNIT_CASE(rk_rga3_pattern_rotate_reject_kunit),
 	KUNIT_CASE(rk_rga3_librga_blend_modes_kunit),
 	KUNIT_CASE(rk_rga3_alpha_yuv10_overlay_emit_kunit),
