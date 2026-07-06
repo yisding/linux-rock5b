@@ -17,6 +17,7 @@
 #include <linux/delay.h>
 #include <linux/dma-fence.h>
 #include <linux/dma-buf.h>
+#include <linux/dma-map-ops.h>
 #include <linux/dma-mapping.h>
 #include <linux/fdtable.h>
 #include <linux/file.h>
@@ -25,6 +26,7 @@
 #include <linux/io.h>
 #include <linux/iommu.h>
 #include <linux/interrupt.h>
+#include <linux/iova.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
 #if IS_ENABLED(CONFIG_ROCKCHIP_RGA_REWRITE_KUNIT_TEST)
@@ -45,7 +47,9 @@
 #include <linux/refcount.h>
 #include <linux/reset.h>
 #include <linux/scatterlist.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/stddef.h>
 #include <linux/sync_file.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
@@ -61,6 +65,7 @@
 #define RK_RGA3_CMD_REG_COUNT		48
 #define RK_RGA_JOB_TIMEOUT_MS		1000
 #define RK_RGA_RESET_TIMEOUT_US		1000
+#define RK_RGA_IOMMU_DMA_LIMIT		(DMA_BIT_MASK(32) - SZ_512M)
 #define RK_RGA_FULL_CSC_ENABLE		BIT(0)
 
 #define RK_RGA2_SYS_CTRL	0x000
@@ -1016,11 +1021,14 @@ struct rk_rga_import {
 	struct dma_buf_attachment *attach;
 	struct sg_table *sgt;
 	struct page **pages;
+	struct iommu_domain *domain;
 	dma_addr_t iova;
+	size_t iova_size;
 	size_t size;
 	unsigned int page_count;
 	unsigned int pinned_pages;
 	unsigned int page_offset;
+	bool iommu_mapped;
 };
 
 struct rk_rga_job_mapping {
@@ -1028,8 +1036,12 @@ struct rk_rga_job_mapping {
 	struct device *dev;
 	struct dma_buf_attachment *attach;
 	struct sg_table *sgt;
+	struct iommu_domain *domain;
 	dma_addr_t iova;
+	size_t iova_size;
+	unsigned int page_offset;
 	bool userptr;
+	bool iommu_mapped;
 };
 
 struct rk_rga_img_layout {
@@ -1514,6 +1526,12 @@ static void rk_rga_hw_power_off(struct rk_rga_hw *hw)
 	pm_runtime_put_sync(hw->dev);
 }
 
+static void rk_rga_set_iommu_dma_limit(struct device *dev)
+{
+	if (!dev->bus_dma_limit || dev->bus_dma_limit > RK_RGA_IOMMU_DMA_LIMIT)
+		dev->bus_dma_limit = RK_RGA_IOMMU_DMA_LIMIT;
+}
+
 static struct device *rk_rga_get_map_dev(void)
 {
 	struct rk_rga_hw *hw;
@@ -1541,6 +1559,249 @@ static struct device *rk_rga_get_map_dev(void)
 	return dev;
 }
 
+static int rk_rga_check_iova_span(dma_addr_t iova, size_t size,
+				  const char *source, bool log_errors)
+{
+	u64 end;
+
+	if (!size)
+		return -EINVAL;
+
+	if (check_add_overflow((u64)iova, (u64)size - 1, &end) ||
+	    iova > U32_MAX || end > U32_MAX) {
+		if (log_errors)
+			pr_err("reject %s DMA mapping: 32-bit IOVA span overflow, iova=%pad size=%zu end=%#llx\n",
+			       source, &iova, size, end);
+		return -EOVERFLOW;
+	}
+
+	return 0;
+}
+
+static int rk_rga_check_dma_sgt(struct sg_table *sgt, const char *source,
+				size_t required_size, dma_addr_t *iova_out,
+				bool log_errors)
+{
+	if (!sgt || !sgt->sgl)
+		return -EINVAL;
+	if (sgt->nents != 1) {
+		if (log_errors)
+			pr_err("reject %s DMA mapping: expected one DMA segment, got %u, orig_nents=%u\n",
+			       source, sgt->nents, sgt->orig_nents);
+		return -EOPNOTSUPP;
+	}
+
+	if (!sg_dma_len(sgt->sgl))
+		return -EINVAL;
+
+	*iova_out = sg_dma_address(sgt->sgl);
+
+	if (!required_size)
+		required_size = sg_dma_len(sgt->sgl);
+
+	if (sg_dma_len(sgt->sgl) < required_size) {
+		if (log_errors)
+			pr_err("reject %s DMA mapping: segment too small, len=%u required=%zu\n",
+			       source, sg_dma_len(sgt->sgl), required_size);
+		return -EINVAL;
+	}
+
+	return rk_rga_check_iova_span(*iova_out, required_size, source,
+				      log_errors);
+}
+
+static void rk_rga_reset_sgt_dma_state(struct sg_table *sgt)
+{
+	struct scatterlist *sg;
+	unsigned int i;
+
+	for_each_sg(sgt->sgl, sg, sgt->orig_nents, i) {
+		sg_dma_address(sg) = DMA_MAPPING_ERROR;
+#ifdef CONFIG_NEED_SG_DMA_LENGTH
+		sg_dma_len(sg) = 0;
+#endif
+#ifdef CONFIG_NEED_SG_DMA_FLAGS
+		sg->dma_flags &= ~(SG_DMA_BUS_ADDRESS | SG_DMA_SWIOTLB);
+#endif
+	}
+
+	sgt->nents = sgt->orig_nents;
+}
+
+static int rk_rga_iommu_prot(struct device *dev, enum dma_data_direction dir)
+{
+	int prot = dev_is_dma_coherent(dev) ? IOMMU_CACHE : 0;
+
+	switch (dir) {
+	case DMA_BIDIRECTIONAL:
+		return prot | IOMMU_READ | IOMMU_WRITE;
+	case DMA_TO_DEVICE:
+		return prot | IOMMU_READ;
+	case DMA_FROM_DEVICE:
+		return prot | IOMMU_WRITE;
+	default:
+		return 0;
+	}
+}
+
+static struct iova_domain *rk_rga_iommu_iovad(struct iommu_domain *domain)
+{
+	return iommu_dma_get_iova_domain(domain);
+}
+
+static int rk_rga_alloc_iommu_iova(struct iommu_domain *domain,
+				   struct device *dev, size_t size,
+				   dma_addr_t *iova_out)
+{
+	struct iova_domain *iovad;
+	unsigned long shift;
+	unsigned long iova_len;
+	unsigned long iova;
+	u64 dma_limit;
+
+	iovad = rk_rga_iommu_iovad(domain);
+	if (!iovad)
+		return -EOPNOTSUPP;
+
+	/*
+	 * Route B exposes one byte-contiguous RGA span. Larger IOVA granules can
+	 * force padding between non-contiguous user pages, so fail closed.
+	 */
+	if (iovad->granule > PAGE_SIZE)
+		return -EOPNOTSUPP;
+
+	if (iova_align(iovad, size) != size)
+		return -EINVAL;
+
+	shift = iova_shift(iovad);
+	iova_len = size >> shift;
+	if (!iova_len)
+		return -EINVAL;
+
+	dma_limit = dma_get_mask(dev);
+	if (dev->bus_dma_limit)
+		dma_limit = min_t(u64, dma_limit, dev->bus_dma_limit);
+	dma_limit = min_t(u64, dma_limit, RK_RGA_IOMMU_DMA_LIMIT);
+	if (domain->geometry.force_aperture)
+		dma_limit = min_t(u64, dma_limit,
+				  domain->geometry.aperture_end);
+
+	iova = alloc_iova_fast(iovad, iova_len, dma_limit >> shift, true);
+	if (!iova)
+		return -ENOMEM;
+
+	*iova_out = (dma_addr_t)iova << shift;
+
+	return 0;
+}
+
+static void rk_rga_free_iommu_iova(struct iommu_domain *domain,
+				   dma_addr_t iova, size_t size)
+{
+	struct iova_domain *iovad = rk_rga_iommu_iovad(domain);
+
+	if (!iovad)
+		return;
+
+	free_iova_fast(iovad, iova_pfn(iovad, iova),
+		       size >> iova_shift(iovad));
+}
+
+static int rk_rga_alloc_aligned_sgt(struct sg_table *sgt,
+				    struct sg_table *aligned_sgt,
+				    size_t *data_size, size_t *map_size)
+{
+	struct scatterlist *src;
+	struct scatterlist *dst;
+	size_t data = 0;
+	size_t map = 0;
+	int ret;
+	int i;
+
+	if (!sgt || !sgt->sgl || !sgt->orig_nents)
+		return -EINVAL;
+
+	ret = sg_alloc_table(aligned_sgt, sgt->orig_nents, GFP_KERNEL);
+	if (ret)
+		return ret;
+
+	dst = aligned_sgt->sgl;
+	for_each_sg(sgt->sgl, src, sgt->orig_nents, i) {
+		phys_addr_t phys = sg_phys(src);
+		phys_addr_t start = ALIGN_DOWN(phys, PAGE_SIZE);
+		u64 end = (u64)phys + src->length;
+		u64 aligned_end = ALIGN(end, PAGE_SIZE);
+		size_t len;
+
+		if (!src->length || end < phys || aligned_end < end) {
+			ret = -EINVAL;
+			goto err_free_table;
+		}
+
+		len = aligned_end - start;
+		if (len > UINT_MAX ||
+		    check_add_overflow(data, (size_t)src->length, &data) ||
+		    check_add_overflow(map, len, &map)) {
+			ret = -EOVERFLOW;
+			goto err_free_table;
+		}
+
+		sg_set_page(dst, phys_to_page(start), len, 0);
+		dst = sg_next(dst);
+	}
+
+	if (!data || !map) {
+		ret = -EINVAL;
+		goto err_free_table;
+	}
+
+	*data_size = data;
+	*map_size = map;
+
+	return 0;
+
+err_free_table:
+	sg_free_table(aligned_sgt);
+	return ret;
+}
+
+static void rk_rga_unmap_userptr_iommu(struct iommu_domain *domain,
+				       dma_addr_t iova, size_t iova_size,
+				       unsigned int page_offset)
+{
+	dma_addr_t base = iova - page_offset;
+	size_t unmapped;
+
+	if (!domain || !iova_size)
+		return;
+
+	unmapped = iommu_unmap(domain, base, iova_size);
+	if (unmapped != iova_size)
+		pr_err("driver-owned IOMMU unmap short: iova=%pad size=%zu unmapped=%zu\n",
+		       &base, iova_size, unmapped);
+
+	rk_rga_free_iommu_iova(domain, base, iova_size);
+}
+
+static void rk_rga_unmap_userptr_sgt(struct device *dev, struct sg_table *sgt,
+				     struct iommu_domain *domain,
+				     dma_addr_t iova, size_t iova_size,
+				     unsigned int page_offset,
+				     bool iommu_mapped)
+{
+	if (!sgt)
+		return;
+
+	if (iommu_mapped)
+		rk_rga_unmap_userptr_iommu(domain, iova, iova_size,
+					   page_offset);
+	else
+		dma_unmap_sgtable(dev, sgt, DMA_BIDIRECTIONAL, 0);
+
+	sg_free_table(sgt);
+	kfree(sgt);
+}
+
 static void rk_rga_import_destroy(struct rk_rga_import *import)
 {
 	if (import->type == RK_RGA_IMPORT_DMABUF) {
@@ -1552,12 +1813,11 @@ static void rk_rga_import_destroy(struct rk_rga_import *import)
 		if (import->dmabuf)
 			dma_buf_put(import->dmabuf);
 	} else if (import->type == RK_RGA_IMPORT_USERPTR) {
-		if (import->sgt) {
-			dma_unmap_sgtable(import->dev, import->sgt,
-					   DMA_BIDIRECTIONAL, 0);
-			sg_free_table(import->sgt);
-			kfree(import->sgt);
-		}
+		rk_rga_unmap_userptr_sgt(import->dev, import->sgt,
+					 import->domain, import->iova,
+					 import->iova_size,
+					 import->page_offset,
+					 import->iommu_mapped);
 		if (import->pages) {
 			unpin_user_pages_dirty_lock(import->pages,
 						    import->pinned_pages,
@@ -2437,10 +2697,12 @@ static void rk_rga_job_clear_mappings(struct rk_rga_job *job)
 		struct rk_rga_job_mapping *mapping = &job->mappings[i];
 
 		if (mapping->sgt && mapping->userptr) {
-			dma_unmap_sgtable(mapping->dev, mapping->sgt,
-					   DMA_BIDIRECTIONAL, 0);
-			sg_free_table(mapping->sgt);
-			kfree(mapping->sgt);
+			rk_rga_unmap_userptr_sgt(mapping->dev, mapping->sgt,
+						 mapping->domain,
+						 mapping->iova,
+						 mapping->iova_size,
+						 mapping->page_offset,
+						 mapping->iommu_mapped);
 		} else if (mapping->sgt) {
 			dma_buf_unmap_attachment(mapping->attach, mapping->sgt,
 						 DMA_BIDIRECTIONAL);
@@ -2525,7 +2787,10 @@ static int rk_rga_job_alloc_cmd(struct rk_rga_job *job, struct rk_rga_hw *hw)
 static int rk_rga_map_userptr_sgt(struct rk_rga_import *import,
 				  struct device *dev,
 				  struct sg_table **sgt_out,
-				  dma_addr_t *iova_out);
+				  dma_addr_t *iova_out,
+				  struct iommu_domain **domain_out,
+				  size_t *iova_size_out,
+				  bool *iommu_mapped_out);
 static int rk_rga_job_map_import(struct rk_rga_job *job,
 				 struct rk_rga_import *import,
 				 struct device *dev,
@@ -2565,9 +2830,13 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 
 	if (import->type == RK_RGA_IMPORT_USERPTR) {
 		dma_addr_t mapped_iova;
+		struct iommu_domain *domain;
+		size_t iova_size;
+		bool iommu_mapped;
 
 		ret = rk_rga_map_userptr_sgt(import, dev, &sgt,
-					     &mapped_iova);
+					     &mapped_iova, &domain,
+					     &iova_size, &iommu_mapped);
 		if (ret)
 			return ret;
 
@@ -2575,8 +2844,12 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 			.import = import,
 			.dev = get_device(dev),
 			.sgt = sgt,
+			.domain = domain,
 			.iova = mapped_iova,
+			.iova_size = iova_size,
+			.page_offset = import->page_offset,
 			.userptr = true,
+			.iommu_mapped = iommu_mapped,
 		};
 		*iova = job->mappings[job->mapping_count].iova;
 		job->mapping_count = count;
@@ -2594,14 +2867,21 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 		return PTR_ERR(sgt);
 	}
 
+	ret = rk_rga_check_dma_sgt(sgt, "dma-buf remap", import->size, iova,
+				   true);
+	if (ret) {
+		dma_buf_unmap_attachment(attach, sgt, DMA_BIDIRECTIONAL);
+		dma_buf_detach(import->dmabuf, attach);
+		return ret;
+	}
+
 	job->mappings[job->mapping_count] = (struct rk_rga_job_mapping) {
 		.import = import,
 		.dev = get_device(dev),
 		.attach = attach,
 		.sgt = sgt,
-		.iova = sg_dma_address(sgt->sgl),
+		.iova = *iova,
 	};
-	*iova = job->mappings[job->mapping_count].iova;
 	job->mapping_count = count;
 
 	return 0;
@@ -16602,13 +16882,90 @@ static int rk_rga_import_buffer_size(const struct rga_external_buffer *buffer,
 	return 0;
 }
 
+static int rk_rga_map_userptr_sgt_iommu(struct rk_rga_import *import,
+					struct device *dev,
+					struct sg_table *sgt,
+					dma_addr_t *iova_out,
+					struct iommu_domain **domain_out,
+					size_t *iova_size_out)
+{
+	struct iommu_domain *domain = iommu_get_domain_for_dev(dev);
+	struct sg_table aligned_sgt;
+	size_t data_size;
+	size_t map_size;
+	dma_addr_t iova;
+	ssize_t mapped;
+	int prot;
+	int ret;
+
+	if (!domain || !(domain->type & __IOMMU_DOMAIN_PAGING))
+		return -EOPNOTSUPP;
+
+	memset(&aligned_sgt, 0, sizeof(aligned_sgt));
+	ret = rk_rga_alloc_aligned_sgt(sgt, &aligned_sgt, &data_size,
+				       &map_size);
+	if (ret)
+		return ret;
+
+	ret = rk_rga_alloc_iommu_iova(domain, dev, map_size, &iova);
+	if (ret)
+		goto err_free_aligned_sgt;
+
+	prot = rk_rga_iommu_prot(dev, DMA_BIDIRECTIONAL);
+	if (!prot) {
+		ret = -EINVAL;
+		goto err_free_iova;
+	}
+
+	mapped = iommu_map_sg(domain, iova, aligned_sgt.sgl,
+			      aligned_sgt.orig_nents, prot, GFP_KERNEL);
+	if (mapped < 0) {
+		ret = mapped;
+		goto err_free_iova;
+	}
+	if ((size_t)mapped < map_size) {
+		if (mapped)
+			iommu_unmap(domain, iova, mapped);
+		ret = -EIO;
+		goto err_free_iova;
+	}
+
+	*iova_out = iova + import->page_offset;
+	ret = rk_rga_check_iova_span(*iova_out, data_size,
+				     "driver-owned userptr IOMMU", true);
+	if (ret)
+		goto err_unmap_iova;
+
+	sg_free_table(&aligned_sgt);
+	*domain_out = domain;
+	*iova_size_out = map_size;
+
+	return 0;
+
+err_unmap_iova:
+	iommu_unmap(domain, iova, map_size);
+err_free_iova:
+	rk_rga_free_iommu_iova(domain, iova, map_size);
+err_free_aligned_sgt:
+	sg_free_table(&aligned_sgt);
+	return ret;
+}
+
 static int rk_rga_map_userptr_sgt(struct rk_rga_import *import,
 				  struct device *dev,
 				  struct sg_table **sgt_out,
-				  dma_addr_t *iova_out)
+				  dma_addr_t *iova_out,
+				  struct iommu_domain **domain_out,
+				  size_t *iova_size_out,
+				  bool *iommu_mapped_out)
 {
 	struct sg_table *sgt;
 	int ret;
+
+	*sgt_out = NULL;
+	*domain_out = NULL;
+	*iova_size_out = 0;
+	*iommu_mapped_out = false;
 
 	sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
 	if (!sgt)
@@ -16625,8 +16982,25 @@ static int rk_rga_map_userptr_sgt(struct rk_rga_import *import,
 	if (ret)
 		goto err_free_table;
 
+	ret = rk_rga_check_dma_sgt(sgt, "userptr", import->size, iova_out,
+				   false);
+	if (!ret) {
+		*sgt_out = sgt;
+		return 0;
+	}
+
+	dma_unmap_sgtable(dev, sgt, DMA_BIDIRECTIONAL, 0);
+	rk_rga_reset_sgt_dma_state(sgt);
+	if (ret != -EOPNOTSUPP && ret != -EOVERFLOW)
+		goto err_free_table;
+
+	ret = rk_rga_map_userptr_sgt_iommu(import, dev, sgt, iova_out,
+					   domain_out, iova_size_out);
+	if (ret)
+		goto err_free_table;
+
 	*sgt_out = sgt;
-	*iova_out = sg_dma_address(sgt->sgl);
+	*iommu_mapped_out = true;
 
 	return 0;
 
@@ -16645,6 +17019,8 @@ static int rk_rga_import_dmabuf(struct rga_external_buffer *buffer,
 	struct dma_buf_attachment *attach;
 	struct sg_table *sgt;
 	struct device *dev;
+	dma_addr_t iova;
+	int ret;
 
 	dev = rk_rga_get_map_dev();
 	if (!dev)
@@ -16671,6 +17047,16 @@ static int rk_rga_import_dmabuf(struct rga_external_buffer *buffer,
 		return PTR_ERR(sgt);
 	}
 
+	ret = rk_rga_check_dma_sgt(sgt, "dma-buf", dmabuf->size, &iova,
+				   true);
+	if (ret) {
+		dma_buf_unmap_attachment(attach, sgt, DMA_BIDIRECTIONAL);
+		dma_buf_detach(dmabuf, attach);
+		dma_buf_put(dmabuf);
+		put_device(dev);
+		return ret;
+	}
+
 	import = kzalloc(sizeof(*import), GFP_KERNEL);
 	if (!import) {
 		dma_buf_unmap_attachment(attach, sgt, DMA_BIDIRECTIONAL);
@@ -16687,7 +17073,7 @@ static int rk_rga_import_dmabuf(struct rga_external_buffer *buffer,
 	import->dmabuf = dmabuf;
 	import->attach = attach;
 	import->sgt = sgt;
-	import->iova = sg_dma_address(sgt->sgl);
+	import->iova = iova;
 	import->size = dmabuf->size;
 
 	*import_out = import;
@@ -16770,7 +17156,10 @@ static int rk_rga_import_userptr(struct rga_external_buffer *buffer,
 	import->pinned_pages = page_count;
 	import->page_offset = page_offset;
 
-	ret = rk_rga_map_userptr_sgt(import, dev, &import->sgt, &import->iova);
+	ret = rk_rga_map_userptr_sgt(import, dev, &import->sgt,
+				     &import->iova, &import->domain,
+				     &import->iova_size,
+				     &import->iommu_mapped);
 	if (ret) {
 		rk_rga_import_put(import);
 		return ret;
@@ -17295,6 +17684,19 @@ static int rk_rga_hw_probe(struct platform_device *pdev)
 	hw->dev = dev;
 	hw->type = match->type;
 	hw->match = match;
+
+	if (hw->type == RK_RGA_HW_RGA3) {
+		ret = dma_set_mask(dev, DMA_BIT_MASK(40));
+		if (ret)
+			return ret;
+
+		ret = dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
+		if (ret)
+			return ret;
+
+		rk_rga_set_iommu_dma_limit(dev);
+	}
+
 	refcount_set(&hw->refs, 1);
 	init_waitqueue_head(&hw->idle);
 	spin_lock_init(&hw->job_lock);
