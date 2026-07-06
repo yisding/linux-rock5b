@@ -607,7 +607,7 @@ static irqreturn_t rk_iommu_irq(int irq, void *dev_id)
 		goto out;
 
 	for (i = 0; i < iommu->num_mmu; i++) {
-		bool notified = false;
+		bool fault_reported = false;
 
 		int_status = rk_iommu_read(iommu->bases[i], RK_MMU_INT_STATUS);
 		if (int_status == 0)
@@ -648,7 +648,7 @@ static irqreturn_t rk_iommu_irq(int irq, void *dev_id)
 				if (fault_ret)
 					report_iommu_fault(iommu->domain, iommu->dev, iova,
 							   flags);
-				notified = true;
+				fault_reported = true;
 			}
 
 			rk_iommu_base_command(iommu->bases[i], RK_MMU_CMD_ZAP_CACHE);
@@ -659,7 +659,7 @@ static irqreturn_t rk_iommu_irq(int irq, void *dev_id)
 
 		if (int_status & RK_MMU_IRQ_BUS_ERROR) {
 			dev_err(iommu->dev, "BUS_ERROR occurred at %pad\n", &iova);
-			if (!notified && iommu->domain != &rk_identity_domain) {
+			if (!fault_reported && iommu->domain != &rk_identity_domain) {
 				int handler_flags = ROCKCHIP_IOMMU_FAULT_BUS_ERROR;
 				int fault_ret;
 
@@ -1235,9 +1235,10 @@ static struct iommu_device *rk_iommu_probe_device(struct device *dev)
 				     DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME);
 
 	/*
-	 * RGA and other Rockchip multimedia clients can depend on dma_map_sg()
-	 * returning a single contiguous IOVA span for an imported buffer. Allow
-	 * the DMA layer to merge the full 32-bit IOMMU aperture into one segment.
+	 * Rockchip media engines consume base-address-plus-offset register
+	 * state. Let iommu-dma merge a mapped buffer into one full-aperture
+	 * segment when the IOMMU can represent it; individual clients still
+	 * validate the returned DMA span before programming hardware.
 	 */
 	if (!dev->dma_parms)
 		dev->dma_parms = devm_kzalloc(dev, sizeof(*dev->dma_parms),
@@ -1400,9 +1401,9 @@ int rockchip_iommu_force_reset(struct device *dev)
 	}
 
 	clk_bulk_disable(iommu->num_clocks, iommu->clocks);
+
 out_pm_put:
 	pm_runtime_put(iommu->dev);
-
 	return ret;
 }
 EXPORT_SYMBOL_GPL(rockchip_iommu_force_reset);
