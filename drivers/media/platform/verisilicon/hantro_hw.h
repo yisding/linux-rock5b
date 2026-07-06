@@ -28,6 +28,7 @@
 #define FMT_MIN_WIDTH		48
 #define FMT_MIN_HEIGHT		48
 #define FMT_HD_WIDTH		1280
+
 #define FMT_HD_HEIGHT		720
 #define FMT_FHD_WIDTH		1920
 #define FMT_FHD_HEIGHT		1088
