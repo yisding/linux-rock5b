@@ -9742,6 +9742,63 @@ static void rk_rga_bitblt_hw_type_mask_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, type_mask, 0U);
 }
 
+static void rk_rga_task_core_invalid_mask_kunit(struct kunit *test)
+{
+	const u32 invalid_core = RK_RGA_CORE_MASK | BIT(4);
+	u32 type_mask;
+	struct rga_req task;
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+	};
+
+	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					 RK_RGA_FORMAT_BGRA_8888);
+	task.core = invalid_core;
+	job.import_count = 2;
+	type_mask = U32_MAX;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, type_mask, 0U);
+
+	task = rk_rga_fill_task(invalid_core);
+	job.import_count = 1;
+	type_mask = U32_MAX;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, type_mask, 0U);
+
+	task = (struct rga_req) {
+		.render_mode = RK_RGA_RENDER_COLOR_PALETTE,
+		.core = invalid_core,
+		.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_YCBCR_400,
+					1280, 720),
+		.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_RGBA_8888,
+					1280, 720),
+		.pat = rk_rga_kunit_img(0x30000000, RK_RGA_FORMAT_RGBA_8888,
+					16, 16),
+		.palette_mode = 3,
+	};
+	job.import_count = 3;
+	type_mask = U32_MAX;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, type_mask, 0U);
+
+	task = (struct rga_req) {
+		.render_mode = RK_RGA_RENDER_UPDATE_PALETTE,
+		.core = invalid_core,
+		.pat = rk_rga_kunit_img(0x30000000, RK_RGA_FORMAT_RGBA_8888,
+					16, 16),
+		.palette_mode = 3,
+	};
+	job.import_count = 1;
+	type_mask = U32_MAX;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, type_mask, 0U);
+}
+
 static void rk_rga_find_best_hw_for_job_kunit(struct kunit *test)
 {
 	struct rga_req *task;
@@ -13448,6 +13505,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_mixed_task_hw_type_kunit),
 	KUNIT_CASE(rk_rga_mixed_task_core_handoff_kunit),
 	KUNIT_CASE(rk_rga_bitblt_hw_type_mask_kunit),
+	KUNIT_CASE(rk_rga_task_core_invalid_mask_kunit),
 	KUNIT_CASE(rk_rga_find_best_hw_for_job_kunit),
 	KUNIT_CASE(rk_rga_core_counter_kunit),
 	KUNIT_CASE(rk_rga_priority_enqueue_kunit),
