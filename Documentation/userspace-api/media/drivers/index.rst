@@ -34,6 +34,7 @@ For more details see the file COPYING in the source distribution of Linux.
 	imx-uapi
 	mali-c55
 	max2175
+	v4l2-usage-metrics
 	npcm-video
 	omap3isp-uapi
 	thp7312
