@@ -134,8 +134,8 @@ struct rk_iommudata {
 static const struct rk_iommu_ops *rk_ops;
 static struct iommu_domain rk_identity_domain;
 
-static bool rk_iommu_call_fault_handler(struct rk_iommu *iommu,
-					dma_addr_t iova, int flags);
+static int rk_iommu_call_fault_handler(struct rk_iommu *iommu,
+				       dma_addr_t iova, int flags);
 
 static inline void rk_table_flush(struct rk_iommu_domain *dom, dma_addr_t dma,
 				  unsigned int count)
@@ -615,6 +615,8 @@ static irqreturn_t rk_iommu_irq(int irq, void *dev_id)
 		goto out;
 
 	for (i = 0; i < iommu->num_mmu; i++) {
+		bool fault_reported = false;
+
 		int_status = rk_iommu_read(iommu->bases[i], RK_MMU_INT_STATUS);
 		if (int_status == 0)
 			continue;
@@ -642,16 +644,32 @@ static irqreturn_t rk_iommu_irq(int irq, void *dev_id)
 			 */
 			if (iommu->domain == &rk_identity_domain)
 				dev_err(iommu->dev, "Page fault while iommu not attached to domain?\n");
-			else if (!rk_iommu_call_fault_handler(iommu, iova, flags))
-				report_iommu_fault(iommu->domain, iommu->dev, iova,
-						   flags);
+			else {
+				int fault_ret;
+
+				fault_ret = rk_iommu_call_fault_handler(iommu, iova, flags);
+				if (fault_ret)
+					report_iommu_fault(iommu->domain, iommu->dev, iova,
+							   flags);
+				fault_reported = true;
+			}
 
 			rk_iommu_base_command(iommu->bases[i], RK_MMU_CMD_ZAP_CACHE);
 			rk_iommu_base_command(iommu->bases[i], RK_MMU_CMD_PAGE_FAULT_DONE);
 		}
 
-		if (int_status & RK_MMU_IRQ_BUS_ERROR)
+		if (int_status & RK_MMU_IRQ_BUS_ERROR) {
 			dev_err(iommu->dev, "BUS_ERROR occurred at %pad\n", &iova);
+			if (!fault_reported && iommu->domain != &rk_identity_domain) {
+				int fault_ret;
+
+				fault_ret = rk_iommu_call_fault_handler(iommu, iova,
+									IOMMU_FAULT_READ);
+				if (fault_ret)
+					report_iommu_fault(iommu->domain, iommu->dev, iova,
+							   IOMMU_FAULT_READ);
+			}
+		}
 
 		if (int_status & ~RK_MMU_IRQ_MASK)
 			dev_err(iommu->dev, "unexpected int_status: %#08x\n",
@@ -959,8 +977,8 @@ static struct rk_iommu *rk_iommu_from_dev(struct device *dev)
 	return data ? data->iommu : NULL;
 }
 
-static bool rk_iommu_call_fault_handler(struct rk_iommu *iommu,
-					dma_addr_t iova, int flags)
+static int rk_iommu_call_fault_handler(struct rk_iommu *iommu,
+				       dma_addr_t iova, int flags)
 {
 	iommu_fault_handler_t handler;
 	unsigned long irq_flags;
@@ -972,11 +990,9 @@ static bool rk_iommu_call_fault_handler(struct rk_iommu *iommu,
 	spin_unlock_irqrestore(&iommu->fault_lock, irq_flags);
 
 	if (!handler || iommu->domain == &rk_identity_domain)
-		return false;
+		return -EOPNOTSUPP;
 
-	handler(iommu->domain, iommu->dev, iova, flags, token);
-
-	return true;
+	return handler(iommu->domain, iommu->dev, iova, flags, token);
 }
 
 int rockchip_iommu_set_fault_handler(struct device *dev,
@@ -1242,6 +1258,24 @@ static struct iommu_device *rk_iommu_probe_device(struct device *dev)
 	data->link = device_link_add(dev, iommu->dev,
 				     DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME);
 
+	/*
+	 * Rockchip media engines consume base-address-plus-offset register
+	 * state. Let iommu-dma merge a mapped buffer into one full-aperture
+	 * segment when the IOMMU can represent it; individual clients still
+	 * validate the returned DMA span before programming hardware.
+	 */
+	if (!dev->dma_parms)
+		dev->dma_parms = devm_kzalloc(dev, sizeof(*dev->dma_parms),
+					      GFP_KERNEL);
+	if (!dev->dma_parms) {
+		if (data->link)
+			device_link_del(data->link);
+		data->link = NULL;
+		return ERR_PTR(-ENOMEM);
+	}
+
+	dma_set_max_seg_size(dev, DMA_BIT_MASK(32));
+
 	return &iommu->iommu;
 }
 
@@ -1249,7 +1283,10 @@ static void rk_iommu_release_device(struct device *dev)
 {
 	struct rk_iommudata *data = dev_iommu_priv_get(dev);
 
-	device_link_del(data->link);
+	if (data->link) {
+		device_link_del(data->link);
+		data->link = NULL;
+	}
 }
 
 static int rk_iommu_of_xlate(struct device *dev,
