@@ -122,7 +122,11 @@ Implemented
   at dispatch time, so direct
   ``wrapbuffer_fd()`` submissions can target a non-default RGA core.  Minimal
   debugfs counters report scheduled, dispatched, and hardware-started work per
-  public core-mask bit so RK3588 board validation can confirm load balancing,
+  public core-mask bit, plus Route B userptr IOMMU fallback attempts,
+  successes, live mappings, and a force-remap knob under ``route_b/``.  The
+  Route B counters are development evidence only, not ABI; they let validation
+  distinguish a real scattered-userptr fallback pass from a workload that stayed
+  on the normal DMA segment path.  RK3588 board validation can confirm load balancing,
   equal-load tie rotation, and forced-core routing without carrying the BSP
   debugger ABI.
 * Runtime PM and clock-bulk sequencing around the backend dispatch boundary.
