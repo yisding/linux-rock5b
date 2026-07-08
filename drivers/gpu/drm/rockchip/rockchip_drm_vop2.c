@@ -868,6 +868,27 @@ static void vop2_core_clks_disable_unprepare(struct vop2 *vop2)
 	clk_disable_unprepare(vop2->hclk);
 }
 
+static void vop2_reset_assert_deassert(struct vop2 *vop2,
+				       struct reset_control *rstc)
+{
+	int ret;
+
+	if (!rstc)
+		return;
+
+	ret = reset_control_assert(rstc);
+	if (ret < 0) {
+		drm_warn(vop2->drm, "failed to assert reset: %d\n", ret);
+		return;
+	}
+
+	udelay(10);
+
+	ret = reset_control_deassert(rstc);
+	if (ret < 0)
+		drm_err(vop2->drm, "failed to deassert reset: %d\n", ret);
+}
+
 static void rk3588_vop2_power_domain_enable_all(struct vop2 *vop2)
 {
 	u32 pd;
@@ -954,6 +975,8 @@ err_put_pm:
 
 static void vop2_disable(struct vop2 *vop2)
 {
+	vop2_reset_assert_deassert(vop2, vop2->axi_rst);
+
 	rockchip_drm_dma_detach_device(vop2->drm, vop2->dev);
 
 	pm_runtime_put_sync(vop2->dev);
@@ -1778,26 +1801,6 @@ static int us_to_vertical_line(struct drm_display_mode *mode, int us)
 	return us * mode->clock / mode->htotal / 1000;
 }
 
-static int vop2_clk_reset(struct vop2_video_port *vp)
-{
-	struct reset_control *rstc = vp->dclk_rst;
-	struct vop2 *vop2 = vp->vop2;
-	int ret;
-
-	if (!rstc)
-		return 0;
-
-	ret = reset_control_assert(rstc);
-	if (ret < 0)
-		drm_warn(vop2->drm, "failed to assert reset\n");
-	udelay(10);
-	ret = reset_control_deassert(rstc);
-	if (ret < 0)
-		drm_warn(vop2->drm, "failed to deassert reset\n");
-
-	return ret;
-}
-
 static void vop2_crtc_atomic_enable(struct drm_crtc *crtc,
 				    struct drm_atomic_commit *state)
 {
@@ -2002,7 +2005,7 @@ static void vop2_crtc_atomic_enable(struct drm_crtc *crtc,
 
 	vop2_crtc_atomic_try_set_gamma(vop2, vp, crtc, crtc_state);
 
-	vop2_clk_reset(vp);
+	vop2_reset_assert_deassert(vop2, vp->dclk_rst);
 
 	drm_crtc_vblank_on(crtc);
 
@@ -2614,16 +2617,16 @@ static int vop2_create_crtcs(struct vop2 *vop2)
 		vp->data = vp_data;
 
 		snprintf(dclk_name, sizeof(dclk_name), "dclk_vp%d", vp->id);
-		vp->dclk_rst = devm_reset_control_get_optional(vop2->dev, dclk_name);
-		if (IS_ERR(vp->dclk_rst)) {
-			drm_err(vop2->drm, "failed to get %s reset\n", dclk_name);
-			return PTR_ERR(vp->dclk_rst);
-		}
-
 		vp->dclk = devm_clk_get(vop2->dev, dclk_name);
 		if (IS_ERR(vp->dclk))
 			return dev_err_probe(drm->dev, PTR_ERR(vp->dclk),
 					     "failed to get %s\n", dclk_name);
+
+		vp->dclk_rst = devm_reset_control_get_optional_exclusive(vop2->dev,
+								 dclk_name);
+		if (IS_ERR(vp->dclk_rst))
+			return dev_err_probe(drm->dev, PTR_ERR(vp->dclk_rst),
+					     "failed to get %s reset\n", dclk_name);
 
 		np = of_graph_get_remote_node(dev->of_node, i, -1);
 		if (!np) {
@@ -2983,6 +2986,11 @@ static int vop2_bind(struct device *dev, struct device *master, void *data)
 	if (IS_ERR(vop2->pll_hdmiphy1))
 		return dev_err_probe(drm->dev, PTR_ERR(vop2->pll_hdmiphy1),
 				     "failed to get pll_hdmiphy1\n");
+
+	vop2->axi_rst = devm_reset_control_get_optional_exclusive(vop2->dev, "axi");
+	if (IS_ERR(vop2->axi_rst))
+		return dev_err_probe(drm->dev, PTR_ERR(vop2->axi_rst),
+				     "failed to get axi reset\n");
 
 	vop2->irq = platform_get_irq(pdev, 0);
 	if (vop2->irq < 0)
