@@ -1657,8 +1657,8 @@
 			 <&cru SRST_D_VOP1>,
 			 <&cru SRST_D_VOP2>,
 			 <&cru SRST_D_VOP3>;
-		reset-names = "aclk",
-			      "hclk",
+		reset-names = "axi",
+			      "ahb",
 			      "dclk_vp0",
 			      "dclk_vp1",
 			      "dclk_vp2",
