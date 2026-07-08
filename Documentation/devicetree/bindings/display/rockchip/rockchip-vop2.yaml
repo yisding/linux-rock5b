@@ -84,6 +84,7 @@ properties:
 
   resets:
     minItems: 5
+    maxItems: 6
     items:
       - description: AXI clock reset.
       - description: AHB clock reset.
@@ -95,8 +96,8 @@ properties:
   reset-names:
     minItems: 5
     items:
-      - const: aclk
-      - const: hclk
+      - const: axi
+      - const: ahb
       - const: dclk_vp0
       - const: dclk_vp1
       - const: dclk_vp2
@@ -168,6 +169,12 @@ allOf:
         clock-names:
           maxItems: 5
 
+        resets:
+          maxItems: 5
+
+        reset-names:
+          maxItems: 5
+
         interrupts:
           maxItems: 1
 
@@ -213,6 +220,12 @@ allOf:
             - {}
             - {}
             - const: pll_hdmiphy0
+
+        resets:
+          maxItems: 5
+
+        reset-names:
+          maxItems: 5
 
         interrupts:
           minItems: 4
@@ -266,6 +279,12 @@ allOf:
             - const: pll_hdmiphy0
             - const: pll_hdmiphy1
 
+        resets:
+          minItems: 6
+
+        reset-names:
+          minItems: 6
+
         interrupts:
           maxItems: 1
 
@@ -314,19 +333,19 @@ examples:
                               "dclk_vp0",
                               "dclk_vp1",
                               "dclk_vp2";
+                iommus = <&vop_mmu>;
+                power-domains = <&power RK3568_PD_VO>;
                 resets = <&cru SRST_A_VOP>,
                          <&cru SRST_H_VOP>,
                          <&cru SRST_VOP0>,
                          <&cru SRST_VOP1>,
                          <&cru SRST_VOP2>;
-                reset-names = "aclk",
-                              "hclk",
+                reset-names = "axi",
+                              "ahb",
                               "dclk_vp0",
                               "dclk_vp1",
                               "dclk_vp2";
-                power-domains = <&power RK3568_PD_VO>;
                 rockchip,grf = <&grf>;
-                iommus = <&vop_mmu>;
                 vop_out: ports {
                     #address-cells = <1>;
                     #size-cells = <0>;
