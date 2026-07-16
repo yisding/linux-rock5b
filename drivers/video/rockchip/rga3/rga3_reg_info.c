@@ -2146,16 +2146,18 @@ static int rga3_set_reg(struct rga_job *job, struct rga_scheduler_t *scheduler)
 	rga_write(m_RGA3_INT_FRM_DONE | m_RGA3_INT_CMD_LINE_FINISH | m_RGA3_INT_ERROR_MASK,
 		  RGA3_INT_EN, scheduler);
 
+	sys_ctrl = m_RGA3_SYS_CTRL_RGA_LGC_CLK_ON;
+
 	if (master_mode_en) {
 		/* master mode */
-		sys_ctrl = s_RGA3_SYS_CTRL_CMD_MODE(1);
+		sys_ctrl |= s_RGA3_SYS_CTRL_CMD_MODE(1);
 
 		rga_write(job->cmd_buf->dma_addr, RGA3_CMD_ADDR, scheduler);
 		rga_write(sys_ctrl, RGA3_SYS_CTRL, scheduler);
 		rga_write(m_RGA3_CMD_CTRL_CMD_LINE_ST_P, RGA3_CMD_CTRL, scheduler);
 	} else {
 		/* slave mode */
-		sys_ctrl = s_RGA3_SYS_CTRL_CMD_MODE(0) | m_RGA3_SYS_CTRL_RGA_SART;
+		sys_ctrl |= s_RGA3_SYS_CTRL_CMD_MODE(0) | m_RGA3_SYS_CTRL_RGA_SART;
 
 		for (i = 0; i <= 50; i++)
 			rga_write(cmd[i], 0x100 + i * 4, scheduler);
