@@ -10,9 +10,9 @@ maintainers:
   - Heiko Stuebner <heiko@sntech.de>
 
 description: |+
-  A Rockchip DRM iommu translates io virtual addresses to physical addresses for
-  its master device. Each slave device is bound to a single master device and
-  shares its clocks, power domain and irq.
+  A Rockchip IOMMU translates I/O virtual addresses to physical addresses for
+  its master device. Each peripheral is normally bound to one IOMMU provider
+  and shares its clocks, power domain and IRQ.
 
   For information on assigning IOMMU controller to its peripheral devices,
   see generic IOMMU bindings.
@@ -41,6 +41,10 @@ properties:
       - description: interruption for MMU instance 1
     minItems: 1
 
+  interrupt-names:
+    minItems: 1
+    maxItems: 2
+
   clocks:
     items:
       - description: Core clock
@@ -63,6 +67,15 @@ properties:
       Do not use the mmu reset operation.
       Some mmu instances may produce unexpected results
       when the reset operation is used.
+
+  rockchip,shared-domain-owner:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: |
+      IOMMU provider whose singleton group owns the default DMA domain for
+      masters associated with this provider. Use this only when multiple
+      hardware masters are one isolation unit and require the same IOVA to
+      address shared data, such as the cooperating decoder cores in a cluster.
+      The referenced root provider must not contain this property.
 
 required:
   - compatible
