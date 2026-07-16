@@ -942,7 +942,11 @@ static void RGA2_set_reg_src_info(u8 *base, struct rga2_req *msg)
 		*bRGA_SRC_ACT_INFO = (msg->src.act_w - 1) | ((msg->src.act_h - 1) << 16);
 	} else {
 		*bRGA_SRC_BASE0 = (u32)(msg->src.yrgb_addr + yrgb_offset);
-		if (disable_uv_channel_en == 1) {
+		if (msg->src.rd_mode == RGA_TILE4x4_MODE) {
+			/* Hardware requires tile4x4 input base1/base2 to be zero. */
+			*bRGA_SRC_BASE1 = 0;
+			*bRGA_SRC_BASE2 = 0;
+		} else if (disable_uv_channel_en == 1) {
 			/*
 			 * When Y400 as the input format, because the current RGA does
 			 * not support closing the access of the UV channel, the address
