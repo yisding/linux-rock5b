@@ -13,20 +13,44 @@ Implemented
 * Modern ``RGA_IOC_GET_HW_VERSION`` and ``RGA_IOC_GET_DRVIER_VERSION``.
   Hardware version queries report the RK3588-compatible RGA2E
   ``3.2.63318`` and RGA3 ``3.0.76831`` tuples used by current ``librga``
-  capability probing.
+  capability probing.  Probe powers each core long enough to decode its actual
+  version register and admits only those exact implemented profiles; the
+  generic BSP-compatible strings therefore cannot expose this RK3588-specific
+  command/capability profile on another RGA revision.  Version ioctls are
+  populated from the validated hardware value rather than the compatible's
+  expected tuple.
 * Native and compat ioctl entry points share the same fixed-width RGA parser,
   matching the BSP RGA3 compat entry behavior for current ``librga``.
 * RGA2/RGA3 platform-driver binding for RK3588 BSP and mainline compatibles,
-  with devm-managed MMIO, IRQ, clock, and reset discovery.
+  with devm-managed MMIO, IRQ, clock, and reset discovery.  Every executable
+  RGA node requires an IRQ and at least one discovered clock; a missing IRQ is
+  propagated as a probe error, and an empty clock list fails with ``-EINVAL``
+  instead of registering hardware that cannot complete jobs or allowing
+  unclocked MMIO access.  Probe also verifies that the primary register resource
+  covers every fixed direct access used by the backend: at least ``0x90`` bytes
+  for RGA2 (through the full-CSC coefficient window) and ``0x44`` bytes for RGA3
+  (through command state).  Missing or truncated windows fail before IRQ
+  registration or job dispatch; the standard RK3588 BSP nodes provide
+  ``0x1000`` bytes.  After runtime PM is enabled, probe reads RGA2 offset
+  ``0x28`` or RGA3 offset ``0x18`` with the clocks enabled and fails with
+  ``-ENODEV`` when the decoded version is not RGA2E ``3.2.63318`` or RGA3
+  ``3.0.76831`` respectively.  When reset controls are described, probe first
+  asserts the complete reset array, waits one microsecond, and deasserts it;
+  failures abort probe rather than inheriting an asserted or stale bootloader
+  state.
 * ``RGA_IOC_IMPORT_BUFFER`` and ``RGA_IOC_RELEASE_BUFFER`` for dma-buf fd and
   userspace virtual-address imports owned by the open file session.  Imported
   dma-bufs are attached and mapped against a bound RGA hardware device through
-  public dma-buf APIs.  Virtual-address imports pin user pages, build
-  sg_tables through ``sg_alloc_table_from_pages()``, map them with the public
-  DMA API, and synchronize them around hardware execution for the common
-  CPU-buffer ``librga`` sample paths.  The rewrite prefers an RGA3 node for
-  imports because that is the first executable hardware backend; RGA2 fallback
-  jobs create job-owned remaps against the selected RGA2 device.
+  public dma-buf APIs.  A dma-buf value must be losslessly representable as a
+  nonnegative ``int`` fd; upper-bit aliases are rejected with ``-EINVAL``
+  instead of being truncated to another descriptor.  Virtual-address imports
+  pin user pages, build sg_tables through ``sg_alloc_table_from_pages()``, map
+  them with the public DMA API, and synchronize them around hardware execution
+  for the common CPU-buffer ``librga`` sample paths.  The rewrite prefers an
+  available RGA3 node for imports because that is the first executable hardware
+  backend; RGA2 fallback jobs create job-owned remaps against the selected RGA2
+  device.  A core quarantined after an unsuccessful recovery reset is no longer
+  used as an import mapping device.
 * ``RGA_IOC_REQUEST_CREATE``, ``RGA_IOC_REQUEST_CONFIG``, and
   ``RGA_IOC_REQUEST_CANCEL`` request lifetime management.
   ``RGA_IOC_REQUEST_CONFIG`` is a staging operation: it copies the userspace
@@ -75,21 +99,38 @@ Implemented
   status that the submit path returns.  If userspace drops a pending async job
   before completion, cleanup signals the release fence with ``-EFAULT`` like
   the BSP request teardown path.
+* Race-free release-fence fd publication.  Async submit reserves the descriptor
+  and creates its ``sync_file``, copies the descriptor number to userspace, and
+  installs the file only after that copy succeeds.  A usercopy fault drops the
+  still-private ``sync_file`` and descriptor reservation, so rollback cannot
+  close an unrelated file if another thread races fd close/reuse.
 * File-close ownership for submitted jobs.  The open file session tracks every
   submitted sync/async job until completion.  ``release()`` marks the session
   closing, rejects newly tracked jobs, cancels unsignaled acquire-fence
   callbacks for jobs that have not reached hardware yet, completes those jobs
-  and their release fences with ``-EFAULT``, removes queued jobs owned by the
-  closing session before they can reach hardware, resets active jobs owned by
-  that session through the normal recovery path, then waits for the session job
-  list to drain before dropping configured requests and imported buffers.
+  and their release fences with ``-EFAULT``, and waits for acquire workers or
+  successful multi-task IRQ handoffs that already committed to dispatch to
+  publish their queue state before sweeping hardware.  It removes queued jobs
+  owned by the closing session before they can reach hardware, resets active
+  jobs owned by that session through the normal recovery path, then waits for
+  the session job list to drain before dropping configured requests and
+  imported buffers.
 * Async pending-acquire handling for modern submit and legacy blit paths.  If
   an async job is blocked by an unsignaled acquire fence, the ioctl exports the
   release-fence fd, arms ``dma_fence`` callbacks, queues dispatch work when the
   acquire fences have signaled on the high-priority system workqueue like the
   forward port, and signals the release fence with the eventual backend result.
   Negative acquire-fence status is preserved as the submit/completion result;
-  already-signaled success fences do not force the async pending path.
+  already-signaled success fences do not force the async pending path.  Abort
+  and callback paths atomically claim each waiter, callback status is read with
+  the fence lock already held, and completion waits for the pending-callback
+  count (including the callback-arming sentinel) to drain.  Last-core removal
+  racing callback setup therefore cannot release the shared work reference
+  before later callbacks are armed.  Pending-acquire ownership is published as
+  one session-locked state instead of being inferred from scheduler fields
+  owned by other locks.  After callback arming, submit rechecks hardware
+  availability and completes the exported fence with ``-ENODEV`` if the last
+  core disappeared before that state was published.
 * Ready async jobs for supported hardware profiles now export the release-fence
   fd, queue the prepared job, and return without waiting for IRQ/timeout
   completion.  The queued job owns its own lifetime reference until completion
@@ -104,7 +145,16 @@ Implemented
   Hardware removal stops new dispatch, completes queued and active jobs with
   ``-ENODEV``, signals any exported async release fence with that result, and
   when the last RGA core disappears also completes async jobs still blocked on
-  unsignaled acquire fences with ``-ENODEV``.
+  unsignaled acquire fences with ``-ENODEV``.  The removal transition is
+  published under the same per-core job lock used by queue admission and the
+  abort sweep, so a selected-core race is either rejected or swept.  Reprobe
+  assigns the first vacant public core-mask bit for the hardware class rather
+  than deriving a duplicate bit from the number of surviving peers.  Recovery
+  reset failure similarly quarantines the affected core until reprobe: routing
+  skips it, an admission race completes with ``-EIO``, jobs already queued on
+  it are drained with ``-EIO``, and loss of the last usable core aborts async
+  jobs still blocked on acquire fences.  The first quarantine transition is
+  exposed as ``recovery_failure_count`` in debugfs.
 * Backend-aware core selection for prepared jobs.  The scheduler checks the
   same supported-operation profile used by command generation, selects the
   least-loaded compatible RGA core for the current hardware-backed profile,
@@ -122,7 +172,10 @@ Implemented
   at dispatch time, so direct
   ``wrapbuffer_fd()`` submissions can target a non-default RGA core.  Minimal
   debugfs counters report scheduled, dispatched, and hardware-started work per
-  public core-mask bit, plus Route B userptr IOMMU fallback attempts,
+  public core-mask bit.  ``import_count`` is a live imported-mapping gauge that
+  remains nonzero while a configured request or job retains the mapping and
+  returns to zero after its final reference is released.  Additional Route B
+  counters report userptr IOMMU fallback attempts,
   successes, live mappings, and a force-remap knob under ``route_b/``.  The
   Route B counters are development evidence only, not ABI; they let validation
   distinguish a real scattered-userptr fallback pass from a workload that stayed
@@ -137,6 +190,12 @@ Implemented
   signal fences, release runtime PM/clocks, and dispatch the next queued job.
   The top half decodes RGA2/RGA3 done and error interrupt status, clears handled
   bits, and propagates hardware error status to the job completion result.
+  Error bits take precedence when hardware reports DONE and ERROR together.
+  Every error completion resets the core before clocks and runtime PM are
+  released, matching the forward-port recovery requirement instead of sending
+  the next queued job into error-contaminated state.
+  Synchronous waiters acquire the completion flag published after the stored
+  result, rather than racing plain ``done``/``result`` accesses.
 * Master-mode RGA2/RGA3 hardware start helpers for generated command buffers.
   Accepted jobs enable done/error interrupts, program the selected core's command
   DMA address, start command execution, and arm a per-core timeout worker.
@@ -144,14 +203,44 @@ Implemented
   RGA2/RGA3 status registers, reset the selected core with the BSP-style
   soft-reset helper plus reset-controller fallback when present, ask the public
   IOMMU layer to flush the core's attached domain, complete with ``-EBUSY``,
-  release runtime PM/clocks, and dispatch the next queued job.
+  release runtime PM/clocks, and dispatch the next queued job.  Recovery
+  fallback pulses the reset array through explicit
+  assert/delay/deassert calls because Rockchip's reset provider does not
+  implement the one-shot ``reset_control_reset()`` operation.  Timeout, fault,
+  session-abort, and removal recovery disable the registered core IRQ and drain
+  its hard handler before status readback, reset, or runtime suspend, preventing
+  the top half from touching MMIO while recovery powers the core down.  Each
+  timeout owns a reference to the exact job it watches; a stale running worker
+  cannot claim a replacement slot, and replacement start rearms the shared
+  delayed work even while that stale invocation exits.  IOMMU refresh and
+  redispatch now require either a successful soft reset or a successful reset
+  controller fallback.  If both are unavailable or fail, the core is
+  quarantined rather than pretending recovery succeeded.  Its IRQ remains
+  disabled so a stuck interrupt cannot re-enter the hard handler after clocks
+  and runtime PM have been released.
 * Public IOMMU fault callback registration for bound RGA cores.  A fault
   records ``iommu_fault_count`` in debugfs, logs the IOVA/status, marks the
   active job for immediate recovery through the same serialized reset path,
   refreshes the attached IOMMU domain after reset, completes the job with
   ``-EIO``, and signals any exported async release fence with that result.
+  Fault recovery uses a dedicated work item carrying the activation generation
+  observed under the active-job lock.  The worker only claims that generation
+  and cancels the normal timeout after a match, so a delayed fault cannot abort
+  a replacement job or consume its watchdog.
+  Registration uses the Rockchip provider-local hook rather than the generic
+  set-once DMA-domain handler; an attached-domain core fails probe if that hook
+  is unavailable, while genuine no-IOMMU operation remains valid.  A provider
+  source must match the exact RGA master or physical IOMMU inside a shared
+  domain, so an unknown source is not redirected to the first peer.  Removal
+  unlists the core, clears its provider callback independently of shared-domain
+  peers, and waits for any provider IRQ callback already in flight before the
+  driver or devm state can be released.
 * Per-job DMA-coherent command-buffer allocation and lifetime, sized for the
-  selected RGA2/RGA3 core and released through normal job teardown.
+  selected RGA2/RGA3 core and released through normal job teardown.  Probe
+  applies the BSP address limits: RGA2 uses 32-bit streaming and coherent DMA
+  masks, while RGA3 uses a 40-bit streaming mask and a 32-bit coherent mask.
+  The complete command-buffer DMA span is checked before its 32-bit base is
+  programmed, so a high allocation is rejected instead of being truncated.
 * RGA3 command-buffer generation path for validated raster and AFBC16x16
   bitblits.  The no-blend profile normally maps source to WIN0 and destination
   to WR; non-overlapping same-buffer, same-format, no-scale raster mirror copies
@@ -397,7 +486,9 @@ Implemented
 * Legacy ``RGA_CACHE_FLUSH``, ``RGA_FLUSH``, ``RGA2_FLUSH``,
   ``RGA_GET_RESULT``, and ``RGA2_GET_RESULT`` as BSP-compatible no-ops.
 * Optional ``ROCKCHIP_RGA_REWRITE_KUNIT_TEST`` coverage for rewrite-local ABI
-  normalization helpers, including the RGA2 ``rotate_mode``/``sina``/``cosa``
+  normalization helpers, including required clock-count and per-generation MMIO
+  aperture validation, the RGA2
+  ``rotate_mode``/``sina``/``cosa``
   decoder, transformed destination-corner selection, color-fill core-mask
   dispatch, BSP request task-count limits and return codes, legacy/modern
   version-query strings, positive success returns, and absent-RGA2 failure,
@@ -416,7 +507,10 @@ Implemented
   back through ``rga_req.out_fence_fd`` before deferred dispatch,
   modern request-submit async acquire-fence ioctls that return a release-fence
   fd before deferred dispatch and signal it with the eventual backend result,
-  import-buffer ioctl physical-address rejection and malformed-pool returns,
+  release-fence descriptor reservation staying invisible until publication and
+  safe abort of an uninstalled reservation,
+  import-buffer ioctl upper-bit dma-buf fd alias rejection,
+  physical-address rejection, and malformed-pool returns,
   release-buffer ioctl handle removal and malformed-pool returns,
   ``librga`` virtual-address import sizing and physical import rejection,
   direct physical-address submit rejection after temporary import rollback,
@@ -436,13 +530,17 @@ Implemented
   update and color-palette command
   emission,
   acquire-fence fd ownership merging, acquire-fence pending/success/error
-  status propagation, async acquire-callback error completion,
+  status propagation, lock-safe async acquire-callback error completion and
+  abort-during-callback-arming lifetime,
   queued hardware-removal abort completion and release-fence signaling,
   last-hardware pending-acquire abort completion and release-fence signaling,
   selected-core removal race completion and release-fence signaling,
-  RGA2-Pro RFBC64x4/AFBC32x8 source profile rejection, IOMMU fault target
-  matching,
-  post-reset IOMMU refresh accounting, scheduler priority enqueue/aging,
+  RGA2-Pro RFBC64x4/AFBC32x8 source profile rejection, exact shared-domain
+  IOMMU fault-source matching, exact IOMMU-fault activation attribution and
+  replacement-watchdog preservation, exact timeout-job targeting and
+  stale-worker replacement rearming, hot-reprobe core-slot preservation,
+  post-reset IOMMU refresh accounting, 32-bit IOVA/command-buffer span bounds,
+  scheduler priority enqueue/aging,
   scheduler core-counter and per-core timing mapping,
   RGA3 tile8x8 raster/tile round-trip and tile-to-tile command emission,
   RGA2 ``librga`` full-CSC RGB-to-YUV dispatch/emission,
