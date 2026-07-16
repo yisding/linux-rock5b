@@ -8,6 +8,7 @@
 struct device;
 
 #if IS_REACHABLE(CONFIG_ROCKCHIP_IOMMU)
+/* Passing NULL unregisters and waits for in-flight provider IRQ callbacks. */
 int rockchip_iommu_set_fault_handler(struct device *dev,
 				     iommu_fault_handler_t handler, void *token);
 #else
