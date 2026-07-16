@@ -123,6 +123,7 @@ struct rk_iommu {
 	iommu_fault_handler_t fault_handler;
 	void *fault_handler_token;
 	struct iommu_device iommu;
+	struct rk_iommu *shared_domain_owner;
 	struct list_head node; /* entry in rk_iommu_domain.iommus */
 	struct iommu_domain *domain; /* domain to which iommu is attached */
 };
@@ -981,6 +982,31 @@ static struct rk_iommu *rk_iommu_from_dev(struct device *dev)
 	return data ? data->iommu : NULL;
 }
 
+static struct iommu_group *rk_iommu_device_group(struct device *dev)
+{
+	struct rk_iommu *iommu = rk_iommu_from_dev(dev);
+	struct iommu_device *group_iommu;
+	struct iommu_group *group;
+
+	if (!iommu || !iommu->shared_domain_owner)
+		return ERR_PTR(-ENODEV);
+
+	/*
+	 * The IOMMU core serializes this callback.  Keep the group's owning
+	 * reference on the designated provider, matching
+	 * generic_single_device_group() and iommu_device_unregister().
+	 */
+	group_iommu = &iommu->shared_domain_owner->iommu;
+	if (!group_iommu->singleton_group) {
+		group = iommu_group_alloc();
+		if (IS_ERR(group))
+			return group;
+		group_iommu->singleton_group = group;
+	}
+
+	return iommu_group_ref_get(group_iommu->singleton_group);
+}
+
 static int rk_iommu_call_fault_handler(struct rk_iommu *iommu,
 				       dma_addr_t iova, int flags)
 {
@@ -1290,7 +1316,7 @@ static const struct iommu_ops rk_iommu_ops = {
 	.domain_alloc_paging = rk_iommu_domain_alloc_paging,
 	.probe_device = rk_iommu_probe_device,
 	.release_device = rk_iommu_release_device,
-	.device_group = generic_single_device_group,
+	.device_group = rk_iommu_device_group,
 	.of_xlate = rk_iommu_of_xlate,
 		.default_domain_ops = &(const struct iommu_domain_ops) {
 			.attach_dev	= rk_iommu_attach_device,
@@ -1476,7 +1502,9 @@ int rockchip_iommu_set_fault_handler(struct device *dev,
 				     iommu_fault_handler_t handler, void *token)
 {
 	struct rk_iommu *iommu = rk_iommu_from_dev_checked(dev);
+	struct platform_device *pdev;
 	unsigned long flags;
+	int i;
 
 	if (!iommu)
 		return -ENODEV;
@@ -1486,9 +1514,90 @@ int rockchip_iommu_set_fault_handler(struct device *dev,
 	iommu->fault_handler_token = token;
 	spin_unlock_irqrestore(&iommu->fault_lock, flags);
 
+	if (!handler) {
+		pdev = to_platform_device(iommu->dev);
+		for (i = 0; i < iommu->num_irq; i++) {
+			int irq = platform_get_irq(pdev, i);
+
+			if (irq >= 0)
+				synchronize_irq(irq);
+		}
+	}
+
 	return 0;
 }
 EXPORT_SYMBOL_GPL(rockchip_iommu_set_fault_handler);
+
+static int rk_iommu_resolve_shared_domain_owner(struct rk_iommu *iommu)
+{
+	struct device *dev = iommu->dev;
+	struct platform_device *owner_pdev;
+	struct device_node *owner_np;
+	struct rk_iommu *owner;
+	int ret = 0;
+
+	if (!of_find_property(dev->of_node,
+			      "rockchip,shared-domain-owner", NULL))
+		return 0;
+
+	owner_np = of_parse_phandle(dev->of_node,
+				    "rockchip,shared-domain-owner", 0);
+	if (!owner_np)
+		return dev_err_probe(dev, -EINVAL,
+				     "invalid rockchip,shared-domain-owner\n");
+
+	if (owner_np == dev->of_node) {
+		ret = -EINVAL;
+		goto err_put_node;
+	}
+	/* Reject chains before probe so cyclic references cannot defer forever. */
+	if (!of_match_node(dev->driver->of_match_table, owner_np) ||
+	    of_find_property(owner_np, "rockchip,shared-domain-owner", NULL)) {
+		ret = -EINVAL;
+		goto err_put_node;
+	}
+
+	owner_pdev = of_find_device_by_node(owner_np);
+	of_node_put(owner_np);
+	if (!owner_pdev)
+		return dev_err_probe(dev, -EPROBE_DEFER,
+				     "waiting for shared-domain owner\n");
+
+	if (!owner_pdev->dev.driver) {
+		ret = -EPROBE_DEFER;
+		goto err_put_device;
+	}
+	if (owner_pdev->dev.driver != dev->driver) {
+		ret = -EINVAL;
+		goto err_put_device;
+	}
+
+	owner = platform_get_drvdata(owner_pdev);
+	if (!owner || !READ_ONCE(owner->iommu.ready)) {
+		ret = -EPROBE_DEFER;
+		goto err_put_device;
+	}
+	if (owner->shared_domain_owner != owner) {
+		ret = -EINVAL;
+		goto err_put_device;
+	}
+
+	iommu->shared_domain_owner = owner;
+	dev_info(dev, "sharing default DMA domain with %s\n",
+		 dev_name(owner->dev));
+
+err_put_device:
+	platform_device_put(owner_pdev);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "failed to resolve shared-domain owner\n");
+	return 0;
+
+err_put_node:
+	of_node_put(owner_np);
+	return dev_err_probe(dev, ret,
+			     "shared-domain owner must be another root provider\n");
+}
 
 static int rk_iommu_probe(struct platform_device *pdev)
 {
@@ -1505,8 +1614,8 @@ static int rk_iommu_probe(struct platform_device *pdev)
 
 	iommu->domain = &rk_identity_domain;
 
-	platform_set_drvdata(pdev, iommu);
 	iommu->dev = dev;
+	iommu->shared_domain_owner = iommu;
 	iommu->num_mmu = 0;
 	spin_lock_init(&iommu->fault_lock);
 
@@ -1520,6 +1629,12 @@ static int rk_iommu_probe(struct platform_device *pdev)
 	 */
 	if (WARN_ON(rk_ops != ops))
 		return -EINVAL;
+
+	err = rk_iommu_resolve_shared_domain_owner(iommu);
+	if (err)
+		return err;
+
+	platform_set_drvdata(pdev, iommu);
 
 	iommu->bases = devm_kcalloc(dev, num_res, sizeof(*iommu->bases),
 				    GFP_KERNEL);

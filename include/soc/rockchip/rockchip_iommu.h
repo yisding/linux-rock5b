@@ -21,6 +21,7 @@ int rockchip_iommu_force_reset(struct device *dev);
 void rockchip_iommu_mask_irq(struct device *dev);
 void rockchip_iommu_unmask_irq(struct device *dev);
 int rockchip_pagefault_done(struct device *dev);
+/* Passing NULL unregisters and waits for in-flight provider IRQ callbacks. */
 int rockchip_iommu_set_fault_handler(struct device *dev,
 				     iommu_fault_handler_t handler, void *token);
 #else
