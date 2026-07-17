@@ -2845,11 +2845,36 @@ int rga_mm_session_release_buffer(struct rga_session *session)
 	mutex_lock(&mm->lock);
 
 	idr_for_each_entry(&mm->memory_idr, buffer, i) {
-		if (session == buffer->session) {
+		if (session != buffer->session)
+			continue;
+
+		/*
+		 * Imports are de-duplicated across the whole memory_idr
+		 * (rga_mm_lookup_external() has no session filter), and a
+		 * running job also holds a reference (rga_mm_get_buffer()).
+		 * So a buffer owned by the exiting session may still be
+		 * referenced elsewhere. Drop only this session's reference
+		 * through the normal kref path instead of forcibly unmapping
+		 * and freeing, so a surviving reference is never left pointing
+		 * at freed memory.
+		 */
+		if (kref_read(&buffer->refcount) > 1) {
+			rga_err("[tgid:%d] handle[%d] still referenced at exit (refcount=%u), dropping session reference only\n",
+			       session->tgid, buffer->handle,
+			       kref_read(&buffer->refcount));
+			/*
+			 * The session is going away; detach it so the surviving
+			 * reference does not dereference the freed session and a
+			 * future session reusing this address is not mistaken
+			 * for the owner here.
+			 */
+			buffer->session = NULL;
+		} else {
 			rga_err("[tgid:%d] Destroy handle[%d] when the user exits\n",
 			       session->tgid, buffer->handle);
-			rga_mm_force_releaser_buffer(buffer);
 		}
+
+		kref_put(&buffer->refcount, rga_mm_kref_release_buffer);
 	}
 
 	mutex_unlock(&mm->lock);
