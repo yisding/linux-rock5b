@@ -247,7 +247,7 @@ static int rockchip_pwm_capture_probe(struct platform_device *pdev)
 	int ret;
 
 	/* Set our (still unset) OF node to the parent MFD device's OF node */
-	pdev->dev.parent->of_node_reused = true;
+	dev_set_of_node_reused(&pdev->dev);
 	device_set_node(&pdev->dev,
 			of_fwnode_handle(no_free_ptr(pdev->dev.parent->of_node)));
 
