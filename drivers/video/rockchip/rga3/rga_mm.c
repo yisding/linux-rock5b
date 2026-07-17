@@ -5,6 +5,8 @@
  * Author: Cerf Yu <cerf.yu@rock-chips.com>
  */
 
+#include <linux/overflow.h>
+
 #include "rga.h"
 #include "rga_job.h"
 #include "rga_mm.h"
@@ -356,16 +358,23 @@ static int rga_get_user_pages(struct page **pages, unsigned long Memory,
 
 static int rga_get_phys_addr_pages(struct page **pages, phys_addr_t phys_addr, uint32_t page_count)
 {
-	int i;
+	u32 i;
 	phys_addr_t addr;
-
-	if (WARN_ON_ONCE(!pfn_valid(PHYS_PFN(phys_addr))))
-		return -EINVAL;
 
 	addr = phys_addr;
 	for (i = 0; i < page_count; i++) {
+		/*
+		 * pfn_valid() only proves that a struct page exists.  It can be
+		 * true for sparse-memory holes and no-map ranges which cannot be
+		 * passed to dma_map_sg().
+		 */
+		if (!virt_addr_valid(phys_to_virt(addr)))
+			return -EINVAL;
+
 		pages[i] = phys_to_page(addr);
-		addr += PAGE_SIZE;
+		if (i + 1 < page_count &&
+		    check_add_overflow(addr, (phys_addr_t)PAGE_SIZE, &addr))
+			return -EOVERFLOW;
 	}
 
 	return 0;
@@ -557,11 +566,6 @@ static int rga_mm_check_range_sgt(struct sg_table *sgt)
 	}
 
 	return 1;
-}
-
-static inline int rga_mm_check_range_phys_addr(phys_addr_t paddr, size_t size)
-{
-	return ((paddr + size) <= 0xffffffff);
 }
 
 static inline bool rga_mm_check_contiguous_sgt(struct sg_table *sgt)
@@ -912,6 +916,7 @@ static int rga_mm_map_phys_addr(struct rga_external_buffer *external_buffer,
 	size_t offset;
 	uint32_t mm_flag = 0;
 	uint32_t page_count;
+	phys_addr_t phys_addr_end;
 	phys_addr_t phys_addr, phys_addr_aligned;
 	struct page **pages = NULL;
 	struct sg_table *sgt = NULL;
@@ -940,8 +945,15 @@ static int rga_mm_map_phys_addr(struct rga_external_buffer *external_buffer,
 	}
 
 	phys_addr = external_buffer->memory;
+	if (check_add_overflow(phys_addr, (phys_addr_t)buffer_size - 1,
+			       &phys_addr_end)) {
+		rga_err("physical address range overflows: address = 0x%llx, size = %d\n",
+			(unsigned long long)phys_addr, buffer_size);
+		return -EOVERFLOW;
+	}
+
 	mm_flag |= RGA_MEM_PHYSICAL_CONTIGUOUS;
-	if (rga_mm_check_range_phys_addr(phys_addr, buffer_size))
+	if (phys_addr <= U32_MAX && phys_addr_end <= U32_MAX)
 		mm_flag |= RGA_MEM_UNDER_4G;
 
 	if (!rga_mm_check_memory_limit(scheduler, mm_flag)) {
