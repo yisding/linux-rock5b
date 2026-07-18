@@ -98,7 +98,7 @@ static int rkcif_interface_subdev_link_setup(struct media_entity *entity,
 	struct v4l2_subdev *sd = media_entity_to_v4l2_subdev(entity);
 	struct rkcif_interface *interface = to_rkcif_interface(sd);
 	struct media_link *link;
-	u16 other_source_pad_index; 
+	u16 other_source_pad_index;
 
 	dev_dbg(interface->rkcif->dev, "link setup %s -> %s\n",
 		local_pad->entity->name, remote_pad->entity->name);

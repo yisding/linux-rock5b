@@ -727,7 +727,7 @@ static int rkisp2_subdev_link_setup(struct media_entity *entity,
 	struct v4l2_subdev *sd = media_entity_to_v4l2_subdev(entity);
 	struct rkisp2_isp *isp = to_rkisp2_isp(sd);
 	struct media_link *link;
-	u16 other_sink_pad_index; 
+	u16 other_sink_pad_index;
 
 	dev_dbg(isp->rkisp2->dev, "link setup %s -> %s\n", remote_pad->entity->name,
 		local_pad->entity->name);
