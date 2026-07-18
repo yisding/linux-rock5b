@@ -179,7 +179,16 @@ Implemented
   successes, live mappings, and a force-remap knob under ``route_b/``.  The
   Route B counters are development evidence only, not ABI; they let validation
   distinguish a real scattered-userptr fallback pass from a workload that stayed
-  on the normal DMA segment path.  RK3588 board validation can confirm load balancing,
+  on the normal DMA segment path.  Every userptr DMA mapping also owns independent
+  cache-line boundary shadows for an unaligned first or last page.  Before device
+  access the active bytes are copied into those pages; after device access only
+  the active bytes are copied back.  This keeps cache maintenance and any DMA
+  bounce handling away from adjacent userspace bytes, including per-core rebound
+  mappings and Route B.  Cross-core task handoff synchronizes the mapping that
+  actually ran before preparing the next core, so an inactive shadow cannot copy
+  stale data over a result.  The ``shadow_*`` debugfs counters expose live head and
+  tail views, setup failures, and copy byte totals for hardware attribution.
+  RK3588 board validation can confirm load balancing,
   equal-load tie rotation, and forced-core routing without carrying the BSP
   debugger ABI.
 * Runtime PM and clock-bulk sequencing around the backend dispatch boundary.
@@ -190,6 +199,10 @@ Implemented
   signal fences, release runtime PM/clocks, and dispatch the next queued job.
   The top half decodes RGA2/RGA3 done and error interrupt status, clears handled
   bits, and propagates hardware error status to the job completion result.
+  RGA2 config/parser error bit 25 is enabled and terminal, with its companion
+  status word at ``0x024`` captured before clear and returned as ``-EACCES``.
+  Raw interrupt/status values, a config-error counter, and decoded rectangle,
+  overlay-bound, and odd-alignment causes are retained for diagnostics.
   Error bits take precedence when hardware reports DONE and ERROR together.
   Every error completion resets the core before clocks and runtime PM are
   released, matching the forward-port recovery requirement instead of sending
@@ -198,7 +211,10 @@ Implemented
   result, rather than racing plain ``done``/``result`` accesses.
 * Master-mode RGA2/RGA3 hardware start helpers for generated command buffers.
   Accepted jobs enable done/error interrupts, program the selected core's command
-  DMA address, start command execution, and arm a per-core timeout worker.
+  DMA address, start command execution, and arm a per-core timeout worker.  Match
+  data carries the two RK3588 low-voltage quirks: RGA3 keeps its logic clock on
+  through command issue, while RGA2E ``3.2.63318`` omits the unreliable
+  frame-end automatic-reset bit.
 * Per-core timeout completion for accepted hardware jobs.  Timed-out jobs read
   RGA2/RGA3 status registers, reset the selected core with the BSP-style
   soft-reset helper plus reset-controller fallback when present, ask the public
@@ -257,6 +273,11 @@ Implemented
   unsupported pattern operations, and supports the 8-bit RGB/YUV plus
   semiplanar 10-bit YUV formats exposed by common ``librga`` and
   ``ffmpeg-rockchip`` blit/scale/convert users.
+  For RGB-to-YUV BT.709 limited conversion, RGA3 accepts the exact
+  ``full_csc`` enable flag current ``librga`` also supplies for its RGA2E
+  workaround, ignores the coefficient block, and emits RGA3's native direct
+  CSC mode.  Other flags, standards, and custom full-CSC requests remain
+  rejected on RGA3.
   This also covers the current JeffyCN ``gstreamer-rockchip`` MPP plugin's
   legacy ``c_RkRgaBlit()`` conversions: malloc-backed RGB-family input to
   dma-buf NV12 for encoder preprocessing, MPP-frame NV12/NV21-style dma-buf
@@ -540,10 +561,15 @@ Implemented
   replacement-watchdog preservation, exact timeout-job targeting and
   stale-worker replacement rearming, hot-reprobe core-slot preservation,
   post-reset IOMMU refresh accounting, 32-bit IOVA/command-buffer span bounds,
+  RK3588 RGA2/RGA3 low-voltage start-word quirks, RGA2 config-error mask/result
+  precedence and parse-status coverage, userptr shadow boundary/layout overflow
+  cases and active-byte copy integrity,
   scheduler priority enqueue/aging,
   scheduler core-counter and per-core timing mapping,
   RGA3 tile8x8 raster/tile round-trip and tile-to-tile command emission,
   RGA2 ``librga`` full-CSC RGB-to-YUV dispatch/emission,
+  RGA3 BT.709-limited direct-CSC dispatch/emission with the narrow ignored
+  ``librga`` full-CSC compatibility flag,
   RGA2 ``librga`` gray256 RGB-to-Y400 color-conversion dispatch/emission,
   RGA2 ``librga`` Y400 UV-downsampling resize dispatch/emission,
   RGA2 ``librga`` Y4/Y8 compact/full-CSC dither-output dispatch/emission,
