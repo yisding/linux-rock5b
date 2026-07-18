@@ -1475,6 +1475,7 @@ static int mpp_process_request(struct mpp_session *session,
 			mpp_session_clear_pending(session);
 			mpp_iommu_down_write(mpp->iommu_info);
 			ret = mpp_dma_session_destroy(session->dma);
+			session->dma = NULL;
 			mpp_iommu_up_write(mpp->iommu_info);
 		}
 		return ret;
