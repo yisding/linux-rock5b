@@ -12,6 +12,7 @@
 #include <linux/atomic.h>
 #include <linux/bitfield.h>
 #include <linux/bits.h>
+#include <linux/cache.h>
 #include <linux/clk.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
@@ -22,6 +23,7 @@
 #include <linux/fdtable.h>
 #include <linux/file.h>
 #include <linux/fs.h>
+#include <linux/highmem.h>
 #include <linux/idr.h>
 #include <linux/io.h>
 #include <linux/iommu.h>
@@ -34,6 +36,7 @@
 #include <kunit/test.h>
 #endif
 #include <linux/list.h>
+#include <linux/log2.h>
 #include <linux/math64.h>
 #include <linux/miscdevice.h>
 #include <linux/mm.h>
@@ -68,6 +71,9 @@
 #define RK_RGA_IOMMU_DMA_LIMIT		(DMA_BIT_MASK(32) - SZ_512M)
 #define RK_RGA_FULL_CSC_ENABLE		BIT(0)
 
+#define RK_RGA_QUIRK_RGA3_LOGIC_CLK_ON	BIT(0)
+#define RK_RGA_QUIRK_RGA2_DISABLE_AUTO_RST	BIT(1)
+
 #define RK_RGA2_SYS_CTRL	0x000
 #define RK_RGA2_CMD_CTRL	0x004
 #define RK_RGA2_CMD_BASE	0x008
@@ -75,6 +81,7 @@
 #define RK_RGA2_INT		0x010
 #define RK_RGA2_STATUS2		0x01c
 #define RK_RGA2_WORK_CNT	0x020
+#define RK_RGA2_INTR_STATUS2	0x024
 #define RK_RGA2_VERSION_NUM	0x028
 #define RK_RGA2_MIN_REG_SIZE	0x090
 
@@ -89,6 +96,9 @@
 #define RK_RGA2_SYS_CTRL_CMD_MODE		BIT(1)
 #define RK_RGA2_SYS_CTRL_CMD_OP_ST		BIT(0)
 #define RK_RGA2_CMD_CTRL_CMD_LINE_ST		BIT(0)
+#define RK_RGA2_INT_CONFIG_ERR_CLEAR		BIT(27)
+#define RK_RGA2_INT_CONFIG_ERR_EN		BIT(26)
+#define RK_RGA2_INT_CONFIG_ERR			BIT(25)
 #define RK_RGA2_INT_FBCIN_DEC_ERROR_CLEAR	BIT(24)
 #define RK_RGA2_INT_FBCIN_DEC_ERROR_EN		BIT(23)
 #define RK_RGA2_INT_FBCIN_DEC_ERROR		BIT(22)
@@ -116,21 +126,33 @@
 	(RK_RGA2_INT_CUR_CMD_DONE_INT_FLAG | RK_RGA2_INT_ALL_CMD_DONE_INT_FLAG)
 #define RK_RGA2_INT_ERROR_MASK \
 	(RK_RGA2_INT_MMU_INT_FLAG | RK_RGA2_INT_ERROR_INT_FLAG | \
-	 RK_RGA2_INT_SCL_ERROR_INTR | RK_RGA2_INT_FBCIN_DEC_ERROR)
+	 RK_RGA2_INT_SCL_ERROR_INTR | RK_RGA2_INT_FBCIN_DEC_ERROR | \
+	 RK_RGA2_INT_CONFIG_ERR)
 #define RK_RGA2_INT_LINE_MASK \
 	(RK_RGA2_INT_READ_CNT_FLAG | RK_RGA2_INT_WRITE_CNT_FLAG)
 #define RK_RGA2_INT_CLEAR_MASK \
 	(RK_RGA2_INT_MMU_INT_CLEAR | RK_RGA2_INT_ERROR_INT_CLEAR | \
 	 RK_RGA2_INT_SCL_ERROR_CLEAR | RK_RGA2_INT_FBCIN_DEC_ERROR_CLEAR | \
+	 RK_RGA2_INT_CONFIG_ERR_CLEAR | \
 	 RK_RGA2_INT_ALL_CMD_DONE_INT_CLEAR | \
 	 RK_RGA2_INT_NOW_CMD_DONE_INT_CLEAR | RK_RGA2_INT_LINE_RD_CLEAR | \
 	 RK_RGA2_INT_LINE_WR_CLEAR)
 #define RK_RGA2_INT_ENABLE_MASK \
 	(RK_RGA2_INT_MMU_INT_EN | RK_RGA2_INT_ERROR_INT_EN | \
 	 RK_RGA2_INT_SCL_ERROR_EN | RK_RGA2_INT_FBCIN_DEC_ERROR_EN | \
+	 RK_RGA2_INT_CONFIG_ERR_EN | \
 	 RK_RGA2_INT_ALL_CMD_DONE_INT_EN)
-#define RK_RGA2_STATUS2_RPP_ERROR		BIT(2)
+#define RK_RGA2_STATUS2_RPP_ERROR		BIT(0)
 #define RK_RGA2_STATUS2_BUS_ERROR		BIT(1)
+#define RK_RGA2_PARSE_SRC_DST_RECT_NOT_EQUAL	BIT(0)
+#define RK_RGA2_PARSE_SRC1_HORI_BND_ERR		BIT(1)
+#define RK_RGA2_PARSE_SRC1_VERT_BND_ERR		BIT(2)
+#define RK_RGA2_PARSE_SRC1_ODD_VIOLATION	BIT(3)
+#define RK_RGA2_PARSE_KNOWN_MASK \
+	(RK_RGA2_PARSE_SRC_DST_RECT_NOT_EQUAL | \
+	 RK_RGA2_PARSE_SRC1_HORI_BND_ERR | \
+	 RK_RGA2_PARSE_SRC1_VERT_BND_ERR | \
+	 RK_RGA2_PARSE_SRC1_ODD_VIOLATION)
 #define RK_RGA2_READ_LINE_CNT			0x030
 #define RK_RGA2_WRITE_LINE_CNT			0x034
 #define RK_RGA2_SYS_CTRL_HOLD_MODE_EN		BIT(9)
@@ -343,6 +365,7 @@
 
 #define RK_RGA3_SYS_CTRL_CCLK_SRESET	BIT(4)
 #define RK_RGA3_SYS_CTRL_ACLK_SRESET	BIT(3)
+#define RK_RGA3_SYS_CTRL_RGA_LGC_CLK_ON	BIT(2)
 #define RK_RGA3_SYS_CTRL_CMD_MODE	BIT(1)
 #define RK_RGA3_RO_SRST_RST_DONE	GENMASK(5, 0)
 #define RK_RGA3_CMD_CTRL_LINE_START	BIT(0)
@@ -1023,6 +1046,35 @@ static_assert(RGA2_GET_VERSION == 0x601b);
 static_assert(RGA_IMPORT_DMA == 0x601d);
 static_assert(RGA_RELEASE_DMA == 0x601e);
 
+struct rk_rga_userptr_shadow_page {
+	struct page *original;
+	struct page *shadow;
+	u32 page_index;
+	size_t offset;
+	size_t length;
+};
+
+struct rk_rga_userptr_shadow_layout {
+	u32 head_index;
+	u32 tail_index;
+	size_t head_offset;
+	size_t head_length;
+	size_t tail_offset;
+	size_t tail_length;
+	bool head;
+	bool tail;
+	bool collapsed;
+};
+
+struct rk_rga_userptr_view {
+	struct page **pages;
+	struct rk_rga_userptr_shadow_page shadows[2];
+	u32 page_count;
+	u8 shadow_count;
+	bool shadow_head;
+	bool shadow_tail;
+};
+
 struct rk_rga_import {
 	refcount_t refs;
 	enum rk_rga_import_type type;
@@ -1032,6 +1084,7 @@ struct rk_rga_import {
 	struct dma_buf_attachment *attach;
 	struct sg_table *sgt;
 	struct page **pages;
+	struct rk_rga_userptr_view *userptr_view;
 	struct iommu_domain *domain;
 	dma_addr_t iova;
 	size_t iova_size;
@@ -1048,6 +1101,7 @@ struct rk_rga_job_mapping {
 	struct device *dev;
 	struct dma_buf_attachment *attach;
 	struct sg_table *sgt;
+	struct rk_rga_userptr_view *userptr_view;
 	struct iommu_domain *domain;
 	dma_addr_t iova;
 	size_t iova_size;
@@ -1119,6 +1173,7 @@ struct rk_rga_job {
 	u32 hw_status;
 	u32 cmd_status;
 	u32 work_cycle;
+	u32 parse_status;
 	u64 hw_start_ns;
 	u64 hw_elapsed_ns;
 	__u32 sync_mode;
@@ -1130,6 +1185,7 @@ struct rk_rga_job {
 	bool session_linked;
 	bool cmd_ready;
 	bool irq_seen;
+	bool userptr_device_owned;
 	bool waiting_acquire;
 	bool done;
 };
@@ -1141,6 +1197,7 @@ struct rk_rga_hw_match {
 	__u32 version_minor;
 	__u32 version_revision;
 	u32 min_reg_size;
+	u32 quirks;
 };
 
 struct rk_rga_hw {
@@ -1227,6 +1284,9 @@ struct rk_rga_service {
 	atomic_t irq_thread_count;
 	atomic_t irq_error_count;
 	atomic_t irq_spurious_count;
+	atomic_t rga2_config_error_count;
+	atomic_t rga2_last_config_intr;
+	atomic_t rga2_last_parse_status;
 	atomic_t timeout_count;
 	atomic_t iommu_fault_count;
 	atomic_t iommu_refresh_count;
@@ -1235,6 +1295,11 @@ struct rk_rga_service {
 	atomic_t route_b_attempt_count;
 	atomic_t route_b_ok_count;
 	atomic_t route_b_active_count;
+	atomic_t shadow_head_active_count;
+	atomic_t shadow_tail_active_count;
+	atomic_t shadow_setup_failure_count;
+	atomic64_t shadow_copy_to_bytes;
+	atomic64_t shadow_copy_from_bytes;
 	bool route_b_force_remap;
 };
 
@@ -1770,24 +1835,6 @@ static int rk_rga_check_dma_sgt(struct sg_table *sgt, const char *source,
 				      log_errors);
 }
 
-static void rk_rga_reset_sgt_dma_state(struct sg_table *sgt)
-{
-	struct scatterlist *sg;
-	unsigned int i;
-
-	for_each_sg(sgt->sgl, sg, sgt->orig_nents, i) {
-		sg_dma_address(sg) = DMA_MAPPING_ERROR;
-#ifdef CONFIG_NEED_SG_DMA_LENGTH
-		sg_dma_len(sg) = 0;
-#endif
-#ifdef CONFIG_NEED_SG_DMA_FLAGS
-		sg->dma_flags &= ~(SG_DMA_BUS_ADDRESS | SG_DMA_SWIOTLB);
-#endif
-	}
-
-	sgt->nents = sgt->orig_nents;
-}
-
 static int rk_rga_iommu_prot(struct device *dev, enum dma_data_direction dir)
 {
 	int prot = dev_is_dma_coherent(dev) ? IOMMU_CACHE : 0;
@@ -1925,6 +1972,214 @@ err_free_table:
 	return ret;
 }
 
+static int
+rk_rga_userptr_shadow_layout(unsigned int page_offset, size_t size,
+			     unsigned int page_count, size_t cache_align,
+			     size_t min_dma_align,
+			     struct rk_rga_userptr_shadow_layout *layout)
+{
+	size_t active_end;
+	size_t capacity;
+	size_t short_tail_limit;
+	size_t tail_length;
+	u32 tail_index;
+
+	memset(layout, 0, sizeof(*layout));
+	if (!size || !page_count || page_offset >= PAGE_SIZE || !cache_align ||
+	    !is_power_of_2(cache_align))
+		return -EINVAL;
+	if (check_mul_overflow((size_t)page_count, (size_t)PAGE_SIZE,
+			       &capacity) ||
+	    check_add_overflow((size_t)page_offset, size, &active_end) ||
+	    active_end > capacity)
+		return -EOVERFLOW;
+	if (check_mul_overflow(min_dma_align, (size_t)2,
+			       &short_tail_limit))
+		return -EOVERFLOW;
+
+	tail_index = (active_end - 1) >> PAGE_SHIFT;
+	tail_length = offset_in_page(active_end);
+	if (!tail_length)
+		tail_length = PAGE_SIZE;
+
+	layout->head = !IS_ALIGNED(page_offset, cache_align);
+	layout->tail = !IS_ALIGNED(active_end, cache_align) ||
+		       tail_length < short_tail_limit;
+	layout->head_index = 0;
+	layout->tail_index = tail_index;
+	layout->head_offset = page_offset;
+	layout->head_length = min_t(size_t, PAGE_SIZE - page_offset, size);
+	layout->tail_offset = 0;
+	layout->tail_length = tail_length;
+	layout->collapsed = tail_index == 0 &&
+			    (layout->head || layout->tail);
+	if (layout->collapsed)
+		layout->head_length = size;
+
+	return 0;
+}
+
+static gfp_t rk_rga_userptr_shadow_gfp(struct device *dev)
+{
+	struct iommu_domain *domain = iommu_get_domain_for_dev(dev);
+	gfp_t gfp = GFP_KERNEL;
+
+	if (dma_get_mask(dev) <= DMA_BIT_MASK(32) &&
+	    (!domain || !(domain->type & __IOMMU_DOMAIN_PAGING)))
+		gfp |= GFP_DMA32;
+
+	return gfp;
+}
+
+static int rk_rga_add_userptr_shadow(struct rk_rga_userptr_view *view,
+				     u32 page_index, size_t offset,
+				     size_t length, gfp_t gfp)
+{
+	struct rk_rga_userptr_shadow_page *shadow;
+
+	if (view->shadow_count >= ARRAY_SIZE(view->shadows) ||
+	    page_index >= view->page_count || !length)
+		return -EINVAL;
+
+	shadow = &view->shadows[view->shadow_count];
+	shadow->shadow = alloc_page(gfp);
+	if (!shadow->shadow)
+		return -ENOMEM;
+
+	shadow->original = view->pages[page_index];
+	shadow->page_index = page_index;
+	shadow->offset = offset;
+	shadow->length = length;
+	view->pages[page_index] = shadow->shadow;
+	view->shadow_count++;
+
+	return 0;
+}
+
+static void rk_rga_userptr_view_release(struct rk_rga_userptr_view *view)
+{
+	if (!view)
+		return;
+
+	for (u32 i = 0; i < view->shadow_count; i++)
+		__free_page(view->shadows[i].shadow);
+	if (view->shadow_head)
+		atomic_dec(&rk_rga.shadow_head_active_count);
+	if (view->shadow_tail)
+		atomic_dec(&rk_rga.shadow_tail_active_count);
+	kfree(view->pages);
+	kfree(view);
+}
+
+static int rk_rga_userptr_view_create(struct rk_rga_import *import,
+				      struct device *dev,
+				      struct rk_rga_userptr_view **view_out)
+{
+	struct rk_rga_userptr_shadow_layout layout;
+	struct rk_rga_userptr_view *view;
+	gfp_t gfp = rk_rga_userptr_shadow_gfp(dev);
+	size_t pages_size;
+	int ret;
+
+	*view_out = NULL;
+	ret = rk_rga_userptr_shadow_layout(import->page_offset, import->size,
+					   import->page_count,
+					   dma_get_cache_alignment(),
+					   ARCH_DMA_MINALIGN, &layout);
+	if (ret)
+		goto err_count;
+
+	view = kzalloc(sizeof(*view), GFP_KERNEL);
+	if (!view) {
+		ret = -ENOMEM;
+		goto err_count;
+	}
+	view->page_count = import->page_count;
+	pages_size = array_size(view->page_count, sizeof(*view->pages));
+	if (pages_size == SIZE_MAX) {
+		ret = -EOVERFLOW;
+		goto err_release;
+	}
+	view->pages = kmemdup(import->pages, pages_size, GFP_KERNEL);
+	if (!view->pages) {
+		ret = -ENOMEM;
+		goto err_release;
+	}
+
+	if (layout.collapsed) {
+		ret = rk_rga_add_userptr_shadow(view, layout.head_index,
+						layout.head_offset,
+						layout.head_length, gfp);
+		if (ret)
+			goto err_release;
+	} else {
+		if (layout.head) {
+			ret = rk_rga_add_userptr_shadow(view,
+							layout.head_index,
+							layout.head_offset,
+							layout.head_length, gfp);
+			if (ret)
+				goto err_release;
+		}
+		if (layout.tail) {
+			ret = rk_rga_add_userptr_shadow(view,
+							layout.tail_index,
+							layout.tail_offset,
+							layout.tail_length, gfp);
+			if (ret)
+				goto err_release;
+		}
+	}
+
+	view->shadow_head = layout.head;
+	view->shadow_tail = layout.tail;
+	if (view->shadow_head)
+		atomic_inc(&rk_rga.shadow_head_active_count);
+	if (view->shadow_tail)
+		atomic_inc(&rk_rga.shadow_tail_active_count);
+	*view_out = view;
+
+	return 0;
+
+err_release:
+	for (u32 i = 0; i < view->shadow_count; i++)
+		__free_page(view->shadows[i].shadow);
+	kfree(view->pages);
+	kfree(view);
+err_count:
+	atomic_inc(&rk_rga.shadow_setup_failure_count);
+	return ret;
+}
+
+static void rk_rga_userptr_view_copy(struct rk_rga_userptr_view *view,
+				     bool to_shadow)
+{
+	if (!view)
+		return;
+
+	for (u32 i = 0; i < view->shadow_count; i++) {
+		struct rk_rga_userptr_shadow_page *shadow = &view->shadows[i];
+		void *original = kmap_local_page(shadow->original);
+		void *copy = kmap_local_page(shadow->shadow);
+
+		if (to_shadow)
+			memcpy(copy + shadow->offset,
+			       original + shadow->offset, shadow->length);
+		else
+			memcpy(original + shadow->offset,
+			       copy + shadow->offset, shadow->length);
+		kunmap_local(copy);
+		kunmap_local(original);
+
+		if (to_shadow)
+			atomic64_add(shadow->length,
+				     &rk_rga.shadow_copy_to_bytes);
+		else
+			atomic64_add(shadow->length,
+				     &rk_rga.shadow_copy_from_bytes);
+	}
+}
+
 static void rk_rga_unmap_userptr_iommu(struct iommu_domain *domain,
 				       dma_addr_t iova, size_t iova_size,
 				       unsigned int page_offset)
@@ -1945,6 +2200,7 @@ static void rk_rga_unmap_userptr_iommu(struct iommu_domain *domain,
 }
 
 static void rk_rga_unmap_userptr_sgt(struct device *dev, struct sg_table *sgt,
+				     struct rk_rga_userptr_view *view,
 				     struct iommu_domain *domain,
 				     dma_addr_t iova, size_t iova_size,
 				     unsigned int page_offset,
@@ -1956,11 +2212,11 @@ static void rk_rga_unmap_userptr_sgt(struct device *dev, struct sg_table *sgt,
 	if (iommu_mapped)
 		rk_rga_unmap_userptr_iommu(domain, iova, iova_size,
 					   page_offset);
-	else
-		dma_unmap_sgtable(dev, sgt, DMA_BIDIRECTIONAL, 0);
+	dma_unmap_sgtable(dev, sgt, DMA_BIDIRECTIONAL, 0);
 
 	sg_free_table(sgt);
 	kfree(sgt);
+	rk_rga_userptr_view_release(view);
 }
 
 static void rk_rga_import_destroy(struct rk_rga_import *import)
@@ -1975,6 +2231,7 @@ static void rk_rga_import_destroy(struct rk_rga_import *import)
 			dma_buf_put(import->dmabuf);
 	} else if (import->type == RK_RGA_IMPORT_USERPTR) {
 		rk_rga_unmap_userptr_sgt(import->dev, import->sgt,
+					 import->userptr_view,
 					 import->domain, import->iova,
 					 import->iova_size,
 					 import->page_offset,
@@ -2819,13 +3076,17 @@ static void rk_rga_put_import_array(struct rk_rga_import **imports,
 	kfree(imports);
 }
 
-static void rk_rga_sync_userptr_sgt(struct device *dev, struct sg_table *sgt,
-				    bool for_device)
+static void
+rk_rga_sync_userptr_sgt(struct device *dev, struct sg_table *sgt,
+			struct rk_rga_userptr_view *view, bool for_device)
 {
-	if (for_device)
+	if (for_device) {
+		rk_rga_userptr_view_copy(view, true);
 		dma_sync_sgtable_for_device(dev, sgt, DMA_BIDIRECTIONAL);
-	else
+	} else {
 		dma_sync_sgtable_for_cpu(dev, sgt, DMA_BIDIRECTIONAL);
+		rk_rga_userptr_view_copy(view, false);
+	}
 }
 
 static void rk_rga_job_sync_userptr_for_device(struct rk_rga_job *job,
@@ -2836,32 +3097,37 @@ static void rk_rga_job_sync_userptr_for_device(struct rk_rga_job *job,
 
 		if (import->type == RK_RGA_IMPORT_USERPTR &&
 		    import->dev == dev && import->sgt)
-			rk_rga_sync_userptr_sgt(dev, import->sgt, true);
+			rk_rga_sync_userptr_sgt(dev, import->sgt,
+						import->userptr_view, true);
 	}
 
 	for (u32 i = 0; i < job->mapping_count; i++) {
 		struct rk_rga_job_mapping *mapping = &job->mappings[i];
 
 		if (mapping->userptr && mapping->dev == dev && mapping->sgt)
-			rk_rga_sync_userptr_sgt(dev, mapping->sgt, true);
+			rk_rga_sync_userptr_sgt(dev, mapping->sgt,
+						mapping->userptr_view, true);
 	}
 }
 
-static void rk_rga_job_sync_userptr_for_cpu(struct rk_rga_job *job)
+static void rk_rga_job_sync_userptr_for_cpu(struct rk_rga_job *job,
+					    struct device *dev)
 {
 	for (u32 i = 0; i < job->import_count; i++) {
 		struct rk_rga_import *import = job->imports[i];
 
-		if (import->type == RK_RGA_IMPORT_USERPTR && import->sgt)
-			rk_rga_sync_userptr_sgt(import->dev, import->sgt, false);
+		if (import->type == RK_RGA_IMPORT_USERPTR &&
+		    import->dev == dev && import->sgt)
+			rk_rga_sync_userptr_sgt(import->dev, import->sgt,
+						import->userptr_view, false);
 	}
 
 	for (u32 i = 0; i < job->mapping_count; i++) {
 		struct rk_rga_job_mapping *mapping = &job->mappings[i];
 
-		if (mapping->userptr && mapping->sgt)
+		if (mapping->userptr && mapping->dev == dev && mapping->sgt)
 			rk_rga_sync_userptr_sgt(mapping->dev, mapping->sgt,
-						false);
+						mapping->userptr_view, false);
 	}
 }
 
@@ -2872,6 +3138,7 @@ static void rk_rga_job_clear_mappings(struct rk_rga_job *job)
 
 		if (mapping->sgt && mapping->userptr) {
 			rk_rga_unmap_userptr_sgt(mapping->dev, mapping->sgt,
+						 mapping->userptr_view,
 						 mapping->domain,
 						 mapping->iova,
 						 mapping->iova_size,
@@ -2970,6 +3237,7 @@ static int rk_rga_job_alloc_cmd(struct rk_rga_job *job, struct rk_rga_hw *hw)
 static int rk_rga_map_userptr_sgt(struct rk_rga_import *import,
 				  struct device *dev,
 				  struct sg_table **sgt_out,
+				  struct rk_rga_userptr_view **view_out,
 				  dma_addr_t *iova_out,
 				  struct iommu_domain **domain_out,
 				  size_t *iova_size_out,
@@ -3014,10 +3282,12 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 	if (import->type == RK_RGA_IMPORT_USERPTR) {
 		dma_addr_t mapped_iova;
 		struct iommu_domain *domain;
+		struct rk_rga_userptr_view *view;
 		size_t iova_size;
 		bool iommu_mapped;
 
 		ret = rk_rga_map_userptr_sgt(import, dev, &sgt,
+					     &view,
 					     &mapped_iova, &domain,
 					     &iova_size, &iommu_mapped);
 		if (ret)
@@ -3027,6 +3297,7 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 			.import = import,
 			.dev = get_device(dev),
 			.sgt = sgt,
+			.userptr_view = view,
 			.domain = domain,
 			.iova = mapped_iova,
 			.iova_size = iova_size,
@@ -3076,6 +3347,10 @@ static struct rk_rga_import *rk_rga_job_find_import_by_iova(
 	for (u32 i = 0; i < job->import_count; i++) {
 		if (job->imports[i]->iova == iova)
 			return job->imports[i];
+	}
+	for (u32 i = 0; i < job->mapping_count; i++) {
+		if (job->mappings[i].iova == iova)
+			return job->mappings[i].import;
 	}
 
 	return NULL;
@@ -3871,7 +4146,10 @@ static void rk_rga_job_complete(struct rk_rga_job *job, int result)
 
 	rk_rga_job_note_hw_done(job);
 	rk_rga_job_record_hw_stats(job);
-	rk_rga_job_sync_userptr_for_cpu(job);
+	if (hw && job->userptr_device_owned) {
+		rk_rga_job_sync_userptr_for_cpu(job, hw->dev);
+		job->userptr_device_owned = false;
+	}
 	WRITE_ONCE(job->result, result);
 	/* Publish the result before waking synchronous waiters. */
 	smp_store_release(&job->done, true);
@@ -3986,6 +4264,7 @@ static void rk_rga2_read_irq_status(struct rk_rga_hw *hw,
 	job->hw_status = rk_rga_read(hw, RK_RGA2_STATUS2);
 	job->cmd_status = rk_rga_read(hw, RK_RGA2_STATUS1);
 	job->work_cycle = rk_rga_read(hw, RK_RGA2_WORK_CNT);
+	job->parse_status = rk_rga_read(hw, RK_RGA2_INTR_STATUS2);
 }
 
 static void rk_rga3_read_irq_status(struct rk_rga_hw *hw,
@@ -3995,6 +4274,7 @@ static void rk_rga3_read_irq_status(struct rk_rga_hw *hw,
 	job->hw_status = rk_rga_read(hw, RK_RGA3_STATUS0);
 	job->cmd_status = rk_rga_read(hw, RK_RGA3_CMD_STATE);
 	job->work_cycle = 0;
+	job->parse_status = 0;
 }
 
 static void rk_rga2_clear_irq(struct rk_rga_hw *hw)
@@ -4116,15 +4396,41 @@ failed:
 	return ret;
 }
 
-static void rk_rga2_start_hw(struct rk_rga_hw *hw, struct rk_rga_job *job)
+static u32 rk_rga2_start_sys_ctrl(const struct rk_rga_hw_match *match)
+{
+	u32 sys_ctrl = RK_RGA2_SYS_CTRL_AUTO_CKG |
+		       RK_RGA2_SYS_CTRL_CMD_MODE;
+
+	if (!(match->quirks & RK_RGA_QUIRK_RGA2_DISABLE_AUTO_RST))
+		sys_ctrl |= RK_RGA2_SYS_CTRL_AUTO_RST;
+
+	return sys_ctrl;
+}
+
+static u32 rk_rga3_start_sys_ctrl(const struct rk_rga_hw_match *match)
+{
+	u32 sys_ctrl = RK_RGA3_SYS_CTRL_CMD_MODE;
+
+	if (match->quirks & RK_RGA_QUIRK_RGA3_LOGIC_CLK_ON)
+		sys_ctrl |= RK_RGA3_SYS_CTRL_RGA_LGC_CLK_ON;
+
+	return sys_ctrl;
+}
+
+static int rk_rga2_start_hw(struct rk_rga_hw *hw, struct rk_rga_job *job)
 {
 	const struct rga_pre_intr_info *intr =
 		&job->tasks[job->current_task].pre_intr_info;
-	u32 sys_ctrl = RK_RGA2_SYS_CTRL_AUTO_CKG |
-		       RK_RGA2_SYS_CTRL_AUTO_RST |
-		       RK_RGA2_SYS_CTRL_CMD_MODE;
+	u32 sys_ctrl = rk_rga2_start_sys_ctrl(hw->match);
 	u32 int_enable = RK_RGA2_INT_ENABLE_MASK |
 			 rk_rga2_pre_intr_int_enable(intr);
+	int ret;
+
+	if (hw->match->quirks & RK_RGA_QUIRK_RGA2_DISABLE_AUTO_RST) {
+		ret = rk_rga2_soft_reset(hw);
+		if (ret)
+			return ret;
+	}
 
 	rk_rga2_clear_irq(hw);
 	rk_rga2_write_full_csc(hw, &job->tasks[job->current_task]);
@@ -4144,16 +4450,20 @@ static void rk_rga2_start_hw(struct rk_rga_hw *hw, struct rk_rga_job *job)
 	rk_rga_write(hw, sys_ctrl, RK_RGA2_SYS_CTRL);
 	rk_rga_write(hw, rk_rga_read(hw, RK_RGA2_CMD_CTRL) |
 		     RK_RGA2_CMD_CTRL_CMD_LINE_ST, RK_RGA2_CMD_CTRL);
+
+	return 0;
 }
 
-static void rk_rga3_start_hw(struct rk_rga_hw *hw, struct rk_rga_job *job)
+static int rk_rga3_start_hw(struct rk_rga_hw *hw, struct rk_rga_job *job)
 {
 	rk_rga3_clear_irq(hw);
 	rk_rga_write(hw, RK_RGA3_INT_DONE_MASK | RK_RGA3_INT_ERROR_MASK,
 		     RK_RGA3_INT_EN);
 	rk_rga_write(hw, lower_32_bits(job->cmd_dma), RK_RGA3_CMD_ADDR);
-	rk_rga_write(hw, RK_RGA3_SYS_CTRL_CMD_MODE, RK_RGA3_SYS_CTRL);
+	rk_rga_write(hw, rk_rga3_start_sys_ctrl(hw->match), RK_RGA3_SYS_CTRL);
 	rk_rga_write(hw, RK_RGA3_CMD_CTRL_LINE_START, RK_RGA3_CMD_CTRL);
+
+	return 0;
 }
 
 static struct rk_rga_job *rk_rga_hw_take_timeout_job(struct rk_rga_hw *hw)
@@ -4206,24 +4516,32 @@ static void rk_rga_hw_schedule_timeout(struct rk_rga_hw *hw,
 			 msecs_to_jiffies(RK_RGA_JOB_TIMEOUT_MS));
 }
 
-static void rk_rga_hw_start(struct rk_rga_hw *hw, struct rk_rga_job *job)
+static int rk_rga_hw_start(struct rk_rga_hw *hw, struct rk_rga_job *job)
 {
+	int ret;
+
 	job->irq_result = 0;
 	job->irq_seen = false;
 	job->hw_start_ns = ktime_get_ns();
 
 	if (hw->type == RK_RGA_HW_RGA3)
-		rk_rga3_start_hw(hw, job);
+		ret = rk_rga3_start_hw(hw, job);
 	else
-		rk_rga2_start_hw(hw, job);
+		ret = rk_rga2_start_hw(hw, job);
+	if (ret)
+		return ret;
 
 	atomic_inc(&rk_rga.started_job_count);
 	rk_rga_count_core(rk_rga.started_core_count, hw);
 	rk_rga_hw_schedule_timeout(hw, job);
+
+	return 0;
 }
 
 static int rk_rga2_irq_result(const struct rk_rga_job *job)
 {
+	if (job->intr_status & RK_RGA2_INT_CONFIG_ERR)
+		return -EACCES;
 	if (job->intr_status & RK_RGA2_INT_ERROR_INT_FLAG)
 		return -EFAULT;
 	if (job->intr_status & RK_RGA2_INT_MMU_INT_FLAG)
@@ -4237,6 +4555,32 @@ static int rk_rga2_irq_result(const struct rk_rga_job *job)
 		return -EFAULT;
 
 	return -EFAULT;
+}
+
+static void rk_rga2_log_parse_error(struct rk_rga_hw *hw,
+				    const struct rk_rga_job *job)
+{
+	u32 status = job->parse_status;
+
+	dev_err_ratelimited(hw->dev,
+			    "RGA2 config error: intr=%#x parse_status=%#x\n",
+			    job->intr_status, status);
+	if (status & RK_RGA2_PARSE_SRC_DST_RECT_NOT_EQUAL)
+		dev_err_ratelimited(hw->dev,
+				    "RGA2 parser: source and destination rectangles differ\n");
+	if (status & RK_RGA2_PARSE_SRC1_HORI_BND_ERR)
+		dev_err_ratelimited(hw->dev,
+				    "RGA2 parser: source-1 horizontal overlay bounds violation\n");
+	if (status & RK_RGA2_PARSE_SRC1_VERT_BND_ERR)
+		dev_err_ratelimited(hw->dev,
+				    "RGA2 parser: source-1 vertical overlay bounds violation\n");
+	if (status & RK_RGA2_PARSE_SRC1_ODD_VIOLATION)
+		dev_err_ratelimited(hw->dev,
+				    "RGA2 parser: source-1 odd-alignment violation\n");
+	if (status & ~RK_RGA2_PARSE_KNOWN_MASK)
+		dev_err_ratelimited(hw->dev,
+				    "RGA2 parser: unknown status bits %#x\n",
+				    (u32)(status & ~RK_RGA2_PARSE_KNOWN_MASK));
 }
 
 static int rk_rga3_irq_result(const struct rk_rga_job *job)
@@ -4291,6 +4635,13 @@ static irqreturn_t rk_rga_hw_irq_status(struct rk_rga_hw *hw,
 			return IRQ_NONE;
 		}
 		job->irq_seen = true;
+		if (job->intr_status & RK_RGA2_INT_CONFIG_ERR) {
+			atomic_inc(&rk_rga.rga2_config_error_count);
+			atomic_set(&rk_rga.rga2_last_config_intr,
+				   job->intr_status);
+			atomic_set(&rk_rga.rga2_last_parse_status,
+				   job->parse_status);
+		}
 		rk_rga2_clear_irq(hw);
 	}
 	job->irq_result = rk_rga_irq_completion_result(hw->type, job);
@@ -10364,6 +10715,117 @@ static void rk_rga_recovery_failed_dispatch_kunit(struct kunit *test)
 	rk_rga_job_put(job1);
 }
 
+static void rk_rga_start_quirks_kunit(struct kunit *test)
+{
+	struct rk_rga_hw_match match = { };
+
+	KUNIT_EXPECT_EQ(test, rk_rga2_start_sys_ctrl(&match),
+			RK_RGA2_SYS_CTRL_AUTO_CKG |
+			RK_RGA2_SYS_CTRL_AUTO_RST |
+			RK_RGA2_SYS_CTRL_CMD_MODE);
+	KUNIT_EXPECT_EQ(test, rk_rga3_start_sys_ctrl(&match),
+			RK_RGA3_SYS_CTRL_CMD_MODE);
+
+	match.quirks = RK_RGA_QUIRK_RGA2_DISABLE_AUTO_RST;
+	KUNIT_EXPECT_EQ(test, rk_rga2_start_sys_ctrl(&match),
+			RK_RGA2_SYS_CTRL_AUTO_CKG |
+			RK_RGA2_SYS_CTRL_CMD_MODE);
+	match.quirks = RK_RGA_QUIRK_RGA3_LOGIC_CLK_ON;
+	KUNIT_EXPECT_EQ(test, rk_rga3_start_sys_ctrl(&match),
+			RK_RGA3_SYS_CTRL_CMD_MODE |
+			RK_RGA3_SYS_CTRL_RGA_LGC_CLK_ON);
+}
+
+static void rk_rga_userptr_shadow_layout_kunit(struct kunit *test)
+{
+	struct rk_rga_userptr_shadow_layout layout;
+
+	KUNIT_ASSERT_EQ(test,
+			rk_rga_userptr_shadow_layout(0, PAGE_SIZE, 1, 64, 64,
+						     &layout), 0);
+	KUNIT_EXPECT_FALSE(test, layout.head);
+	KUNIT_EXPECT_FALSE(test, layout.tail);
+	KUNIT_EXPECT_FALSE(test, layout.collapsed);
+
+	KUNIT_ASSERT_EQ(test,
+			rk_rga_userptr_shadow_layout(1, PAGE_SIZE - 1, 1, 64,
+						     64, &layout), 0);
+	KUNIT_EXPECT_TRUE(test, layout.head);
+	KUNIT_EXPECT_FALSE(test, layout.tail);
+	KUNIT_EXPECT_TRUE(test, layout.collapsed);
+	KUNIT_EXPECT_EQ(test, layout.head_offset, (size_t)1);
+	KUNIT_EXPECT_EQ(test, layout.head_length, (size_t)PAGE_SIZE - 1);
+
+	KUNIT_ASSERT_EQ(test,
+			rk_rga_userptr_shadow_layout(0, 65, 1, 64, 64,
+						     &layout), 0);
+	KUNIT_EXPECT_FALSE(test, layout.head);
+	KUNIT_EXPECT_TRUE(test, layout.tail);
+	KUNIT_EXPECT_TRUE(test, layout.collapsed);
+
+	KUNIT_ASSERT_EQ(test,
+			rk_rga_userptr_shadow_layout(1, PAGE_SIZE, 2, 64, 64,
+						     &layout), 0);
+	KUNIT_EXPECT_TRUE(test, layout.head);
+	KUNIT_EXPECT_TRUE(test, layout.tail);
+	KUNIT_EXPECT_FALSE(test, layout.collapsed);
+	KUNIT_EXPECT_EQ(test, layout.head_index, 0U);
+	KUNIT_EXPECT_EQ(test, layout.tail_index, 1U);
+	KUNIT_EXPECT_EQ(test, layout.head_length, (size_t)PAGE_SIZE - 1);
+	KUNIT_EXPECT_EQ(test, layout.tail_length, (size_t)1);
+
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_userptr_shadow_layout(PAGE_SIZE - 1, SIZE_MAX,
+						     1, 64, 64, &layout),
+			-EOVERFLOW);
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_userptr_shadow_layout(0, 1, 1, 48, 64,
+						     &layout),
+			-EINVAL);
+}
+
+static void rk_rga_userptr_shadow_copy_kunit(struct kunit *test)
+{
+	struct rk_rga_userptr_view view = { .shadow_count = 1 };
+	struct rk_rga_userptr_shadow_page *shadow = &view.shadows[0];
+	u8 *original;
+	u8 *copy;
+
+	shadow->original = alloc_page(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, shadow->original);
+	shadow->shadow = alloc_page(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, shadow->shadow);
+	shadow->offset = 17;
+	shadow->length = 31;
+
+	original = kmap_local_page(shadow->original);
+	memset(original, 0xa5, PAGE_SIZE);
+	kunmap_local(original);
+	copy = kmap_local_page(shadow->shadow);
+	memset(copy, 0x5a, PAGE_SIZE);
+	kunmap_local(copy);
+
+	rk_rga_userptr_view_copy(&view, true);
+	copy = kmap_local_page(shadow->shadow);
+	KUNIT_EXPECT_EQ(test, copy[16], (u8)0x5a);
+	KUNIT_EXPECT_EQ(test, copy[17], (u8)0xa5);
+	KUNIT_EXPECT_EQ(test, copy[47], (u8)0xa5);
+	KUNIT_EXPECT_EQ(test, copy[48], (u8)0x5a);
+	memset(copy + shadow->offset, 0xc3, shadow->length);
+	kunmap_local(copy);
+
+	rk_rga_userptr_view_copy(&view, false);
+	original = kmap_local_page(shadow->original);
+	KUNIT_EXPECT_EQ(test, original[16], (u8)0xa5);
+	KUNIT_EXPECT_EQ(test, original[17], (u8)0xc3);
+	KUNIT_EXPECT_EQ(test, original[47], (u8)0xc3);
+	KUNIT_EXPECT_EQ(test, original[48], (u8)0xa5);
+	kunmap_local(original);
+
+	__free_page(shadow->shadow);
+	__free_page(shadow->original);
+}
+
 static void rk_rga_irq_completion_result_kunit(struct kunit *test)
 {
 	struct rk_rga_job job = { };
@@ -10386,6 +10848,19 @@ static void rk_rga_irq_completion_result_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test,
 			rk_rga_irq_completion_result(RK_RGA_HW_RGA2, &job),
 			-EACCES);
+	job.intr_status = RK_RGA2_INT_ALL_CMD_DONE_INT_FLAG |
+			  RK_RGA2_INT_CONFIG_ERR;
+	job.parse_status = RK_RGA2_PARSE_SRC1_ODD_VIOLATION;
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_irq_completion_result(RK_RGA_HW_RGA2, &job),
+			-EACCES);
+	KUNIT_EXPECT_TRUE(test, RK_RGA2_INT_ERROR_MASK &
+			  RK_RGA2_INT_CONFIG_ERR);
+	KUNIT_EXPECT_TRUE(test, RK_RGA2_INT_CLEAR_MASK &
+			  RK_RGA2_INT_CONFIG_ERR_CLEAR);
+	KUNIT_EXPECT_TRUE(test, RK_RGA2_INT_ENABLE_MASK &
+			  RK_RGA2_INT_CONFIG_ERR_EN);
+	KUNIT_EXPECT_EQ(test, RK_RGA2_PARSE_KNOWN_MASK, GENMASK(3, 0));
 	KUNIT_EXPECT_EQ(test,
 			rk_rga_irq_completion_result((enum rk_rga_hw_type)-1,
 						     &job),
@@ -12618,7 +13093,7 @@ static void rk_rga2_librga_y4_dither_emit_kunit(struct kunit *test)
 
 static void rk_rga2_librga_full_csc_emit_kunit(struct kunit *test)
 {
-	u32 cmd[RK_RGA2_CMD_REG_COUNT] = { };
+	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
 	enum rk_rga_hw_type type = 0;
 	struct rga_req task =
 		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
@@ -12631,6 +13106,7 @@ static void rk_rga2_librga_full_csc_emit_kunit(struct kunit *test)
 		.cmd_size = sizeof(cmd),
 	};
 	u32 dst_info;
+	u32 rd_ctrl;
 
 	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
 				    1280, 720);
@@ -12670,6 +13146,22 @@ static void rk_rga2_librga_full_csc_emit_kunit(struct kunit *test)
 
 	task.core = RK_RGA_CORE_RGA3_MASK;
 	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+
+	memset(cmd, 0, sizeof(cmd));
+	job.cmd_ready = false;
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	rd_ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
+	KUNIT_EXPECT_TRUE(test, rd_ctrl & RK_RGA3_WIN0_R2Y_EN);
+	KUNIT_EXPECT_EQ(test, rd_ctrl & RK_RGA3_WIN0_CSC_MODE,
+			FIELD_PREP(RK_RGA3_WIN0_CSC_MODE, 1));
+
+	task.full_csc.flag = RK_RGA_FULL_CSC_ENABLE | BIT(1);
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), -EOPNOTSUPP);
+	task.full_csc.flag = RK_RGA_FULL_CSC_ENABLE;
+	task.yuv2rgb_mode = 1 << 2;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), -EOPNOTSUPP);
 }
 
@@ -14566,6 +15058,9 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_queue_on_removing_hw_kunit),
 	KUNIT_CASE(rk_rga_queue_on_recovery_failed_hw_kunit),
 	KUNIT_CASE(rk_rga_recovery_failed_dispatch_kunit),
+	KUNIT_CASE(rk_rga_start_quirks_kunit),
+	KUNIT_CASE(rk_rga_userptr_shadow_layout_kunit),
+	KUNIT_CASE(rk_rga_userptr_shadow_copy_kunit),
 	KUNIT_CASE(rk_rga_irq_completion_result_kunit),
 	KUNIT_CASE(rk_rga_mixed_task_hw_type_kunit),
 	KUNIT_CASE(rk_rga_mixed_task_core_handoff_kunit),
@@ -15058,9 +15553,22 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 	return 0;
 }
 
+static bool
+rk_rga3_full_csc_is_r2y_bt709l_compat(const struct rga_req *task,
+				      const struct rk_rga3_format_info *src_fmt,
+				      const struct rk_rga3_format_info *dst_fmt)
+{
+	return task->full_csc.flag == RK_RGA_FULL_CSC_ENABLE &&
+	       task->yuv2rgb_mode == (3 << 2) &&
+	       src_fmt->rgb && dst_fmt->yuv;
+}
+
 static int rk_rga3_validate_bitblt(const struct rga_req *task,
 				   struct rk_rga3_bitblt_profile *profile)
 {
+	bool full_csc_candidate =
+		task->full_csc.flag == RK_RGA_FULL_CSC_ENABLE &&
+		task->yuv2rgb_mode == (3 << 2);
 	bool has_pat = rk_rga_img_has_addr(&task->pat);
 	int ret;
 
@@ -15072,7 +15580,8 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 		return -EOPNOTSUPP;
 	if (!rk_rga_in_place_bitblt_allowed(task))
 		return -EOPNOTSUPP;
-	if (task->full_csc.flag || task->mosaic_info.enable ||
+	if ((task->full_csc.flag && !full_csc_candidate) ||
+	    task->mosaic_info.enable ||
 	    task->osd_info.enable || task->pre_intr_info.enable ||
 	    task->gauss_config.size)
 		return -EOPNOTSUPP;
@@ -15162,6 +15671,10 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 				  &profile->dst_fmt);
 	if (ret)
 		return ret;
+	if (task->full_csc.flag &&
+	    !rk_rga3_full_csc_is_r2y_bt709l_compat(task, &profile->src_fmt,
+						      &profile->dst_fmt))
+		return -EOPNOTSUPP;
 	if (profile->dst_mode == 1 &&
 	    !rk_rga3_fbc_format_supported(task->dst.format, true))
 		return -EOPNOTSUPP;
@@ -17384,6 +17897,7 @@ static int rk_rga_backend_start(struct rk_rga_hw *hw, struct rk_rga_job *job)
 		return ret;
 
 	rk_rga_job_sync_userptr_for_device(job, hw->dev);
+	job->userptr_device_owned = true;
 
 	ret = rk_rga_hw_power_on(hw);
 	if (ret)
@@ -17407,7 +17921,11 @@ static int rk_rga_backend_start(struct rk_rga_hw *hw, struct rk_rga_job *job)
 		return -EOPNOTSUPP;
 	}
 
-	rk_rga_hw_start(hw, job);
+	ret = rk_rga_hw_start(hw, job);
+	if (ret) {
+		rk_rga_hw_power_off(hw);
+		return ret;
+	}
 
 	return RK_RGA_BACKEND_QUEUED;
 }
@@ -17457,6 +17975,9 @@ static irqreturn_t rk_rga_irq_thread(int irq, void *data)
 	rk_rga_hw_cancel_timeout(hw);
 	result = job->irq_result;
 	rk_rga_job_note_hw_done(job);
+	if (hw->type == RK_RGA_HW_RGA2 &&
+	    (job->intr_status & RK_RGA2_INT_CONFIG_ERR))
+		rk_rga2_log_parse_error(hw, job);
 	if (result) {
 		reset_ret = rk_rga_hw_reset_for_recovery(hw);
 		/* Prevent a failed reset from retriggering on powered-off MMIO. */
@@ -17464,6 +17985,10 @@ static irqreturn_t rk_rga_irq_thread(int irq, void *data)
 			rk_rga_hw_quarantine_irq(hw);
 	}
 	rk_rga_hw_power_off(hw);
+	if (job->userptr_device_owned) {
+		rk_rga_job_sync_userptr_for_cpu(job, hw->dev);
+		job->userptr_device_owned = false;
+	}
 
 	if (rk_rga_job_advance_task(job, result)) {
 		dispatch_session = READ_ONCE(job->session);
@@ -18336,25 +18861,34 @@ err_free_aligned_sgt:
 static int rk_rga_map_userptr_sgt(struct rk_rga_import *import,
 				  struct device *dev,
 				  struct sg_table **sgt_out,
+				  struct rk_rga_userptr_view **view_out,
 				  dma_addr_t *iova_out,
 				  struct iommu_domain **domain_out,
 				  size_t *iova_size_out,
 				  bool *iommu_mapped_out)
 {
+	struct rk_rga_userptr_view *view;
 	struct sg_table *sgt;
 	bool force_iommu;
 	int ret;
 
 	*sgt_out = NULL;
+	*view_out = NULL;
 	*domain_out = NULL;
 	*iova_size_out = 0;
 	*iommu_mapped_out = false;
 
-	sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
-	if (!sgt)
-		return -ENOMEM;
+	ret = rk_rga_userptr_view_create(import, dev, &view);
+	if (ret)
+		return ret;
 
-	ret = sg_alloc_table_from_pages(sgt, import->pages,
+	sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
+	if (!sgt) {
+		ret = -ENOMEM;
+		goto err_release_view;
+	}
+
+	ret = sg_alloc_table_from_pages(sgt, view->pages,
 					import->page_count,
 					import->page_offset,
 					import->size, GFP_KERNEL);
@@ -18370,32 +18904,36 @@ static int rk_rga_map_userptr_sgt(struct rk_rga_import *import,
 				   false);
 	if (!ret && !force_iommu) {
 		*sgt_out = sgt;
+		*view_out = view;
 		return 0;
 	}
 
-	dma_unmap_sgtable(dev, sgt, DMA_BIDIRECTIONAL, 0);
-	rk_rga_reset_sgt_dma_state(sgt);
 	if (ret && ret != -EOPNOTSUPP && ret != -EOVERFLOW)
-		goto err_free_table;
+		goto err_unmap_dma;
 
 	atomic_inc(&rk_rga.route_b_attempt_count);
 	ret = rk_rga_map_userptr_sgt_iommu(import, dev, sgt, iova_out,
 					   domain_out, iova_size_out);
 	if (ret)
-		goto err_free_table;
+		goto err_unmap_dma;
 
 	atomic_inc(&rk_rga.route_b_ok_count);
 	atomic_inc(&rk_rga.route_b_active_count);
 
 	*sgt_out = sgt;
+	*view_out = view;
 	*iommu_mapped_out = true;
 
 	return 0;
 
+err_unmap_dma:
+	dma_unmap_sgtable(dev, sgt, DMA_BIDIRECTIONAL, 0);
 err_free_table:
 	sg_free_table(sgt);
 err_free_sgt:
 	kfree(sgt);
+err_release_view:
+	rk_rga_userptr_view_release(view);
 	return ret;
 }
 
@@ -18550,6 +19088,7 @@ static int rk_rga_import_userptr(struct rga_external_buffer *buffer,
 	import->page_offset = page_offset;
 
 	ret = rk_rga_map_userptr_sgt(import, dev, &import->sgt,
+				     &import->userptr_view,
 				     &import->iova, &import->domain,
 				     &import->iova_size,
 				     &import->iommu_mapped);
@@ -19027,6 +19566,7 @@ static const struct rk_rga_hw_match rk_rga2_match = {
 	.version_minor = 2,
 	.version_revision = 0x63318,
 	.min_reg_size = RK_RGA2_MIN_REG_SIZE,
+	.quirks = RK_RGA_QUIRK_RGA2_DISABLE_AUTO_RST,
 };
 
 static const struct rk_rga_hw_match rk_rga3_match = {
@@ -19036,6 +19576,7 @@ static const struct rk_rga_hw_match rk_rga3_match = {
 	.version_minor = 0,
 	.version_revision = 0x76831,
 	.min_reg_size = RK_RGA3_MIN_REG_SIZE,
+	.quirks = RK_RGA_QUIRK_RGA3_LOGIC_CLK_ON,
 };
 
 static const struct of_device_id rk_rga_of_match[] = {
@@ -19442,6 +19983,15 @@ static int __init rk_rga_init(void)
 				&rk_rga.irq_error_count);
 	debugfs_create_atomic_t("irq_spurious_count", 0444, rk_rga.debugfs_root,
 				&rk_rga.irq_spurious_count);
+	debugfs_create_atomic_t("rga2_config_error_count", 0444,
+				rk_rga.debugfs_root,
+				&rk_rga.rga2_config_error_count);
+	debugfs_create_atomic_t("rga2_last_config_intr", 0444,
+				rk_rga.debugfs_root,
+				&rk_rga.rga2_last_config_intr);
+	debugfs_create_atomic_t("rga2_last_parse_status", 0444,
+				rk_rga.debugfs_root,
+				&rk_rga.rga2_last_parse_status);
 	debugfs_create_atomic_t("timeout_count", 0444, rk_rga.debugfs_root,
 				&rk_rga.timeout_count);
 	debugfs_create_atomic_t("iommu_fault_count", 0444,
@@ -19454,6 +20004,19 @@ static int __init rk_rga_init(void)
 				rk_rga.debugfs_root,
 				&rk_rga.recovery_failure_count);
 	rk_rga_debugfs_create_route_b();
+	debugfs_create_atomic_t("shadow_head_active_count", 0444,
+				rk_rga.debugfs_root,
+				&rk_rga.shadow_head_active_count);
+	debugfs_create_atomic_t("shadow_tail_active_count", 0444,
+				rk_rga.debugfs_root,
+				&rk_rga.shadow_tail_active_count);
+	debugfs_create_atomic_t("shadow_setup_failure_count", 0444,
+				rk_rga.debugfs_root,
+				&rk_rga.shadow_setup_failure_count);
+	rk_rga_debugfs_create_atomic64("shadow_copy_to_bytes",
+				       &rk_rga.shadow_copy_to_bytes);
+	rk_rga_debugfs_create_atomic64("shadow_copy_from_bytes",
+				       &rk_rga.shadow_copy_from_bytes);
 	debugfs_create_atomic_t("unsupported_count", 0444, rk_rga.debugfs_root,
 				&rk_rga.unsupported_count);
 
