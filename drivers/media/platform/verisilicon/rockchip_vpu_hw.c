@@ -426,8 +426,6 @@ static irqreturn_t rk3588_vpu981_irq(int irq, void *dev_id)
 	struct hantro_ctx *ctx =
 		v4l2_m2m_get_curr_priv(vpu->m2m_dev);
 	enum vb2_buffer_state state;
-	struct hantro_ctx *ctx =
-		v4l2_m2m_get_curr_priv(vpu->m2m_dev);
 	u32 status;
 	u32 cycles;
 
