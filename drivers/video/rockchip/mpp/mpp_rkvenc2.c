@@ -2056,6 +2056,9 @@ static int rkvenc_dump_session(struct mpp_session *session, struct seq_file *seq
 	int i;
 	struct rkvenc2_session_priv *priv = session->priv;
 
+	if (!priv)
+		return 0;
+
 	down_read(&priv->rw_sem);
 	/* item name */
 	seq_puts(seq, "------------------------------------------------------");
