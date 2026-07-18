@@ -444,14 +444,6 @@ static void mpp_session_deinit_default(struct mpp_session *session)
 		}
 	}
 
-	if (session->srv) {
-		struct mpp_service *srv = session->srv;
-
-		mutex_lock(&srv->session_lock);
-		list_del_init(&session->service_link);
-		mutex_unlock(&srv->session_lock);
-	}
-
 	list_del_init(&session->session_link);
 }
 
@@ -459,6 +451,20 @@ void mpp_session_deinit(struct mpp_session *session)
 {
 	mpp_dbg_session("session %d:%d task %d deinit\n", session->pid,
 			session->index, atomic_read(&session->task_count));
+
+	/*
+	 * Procfs walks the service list under session_lock and may inspect the
+	 * device-private and DMA state.  Remove the session from that list before
+	 * a device deinit callback can free either object.  Taking the mutex also
+	 * waits for an in-progress procfs reader to finish using the session.
+	 */
+	if (session->srv) {
+		struct mpp_service *srv = session->srv;
+
+		mutex_lock(&srv->session_lock);
+		list_del_init(&session->service_link);
+		mutex_unlock(&srv->session_lock);
+	}
 
 	if (likely(session->deinit))
 		session->deinit(session);
