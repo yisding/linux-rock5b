@@ -2715,6 +2715,7 @@ static int rkvenc2_wait_result(struct mpp_session *session,
 	union rkvenc2_slice_len_info slice_info;
 	u32 task_id;
 	bool got_slice;
+	bool aborted;
 	int ret = 0;
 
 	mutex_lock(&session->pending_lock);
@@ -2748,8 +2749,15 @@ task_done_ret:
 			}
 		}
 
+		/*
+		 * Sample the abort flag before default_process: it pops the
+		 * task off the pending list and drops the reference that can
+		 * free the task, so reading task->state afterwards is a
+		 * use-after-free once the hardware worker's ref is already gone.
+		 */
+		aborted = test_bit(TASK_STATE_ABORT, &task->state);
 		ret = rkvenc2_task_default_process(mpp, task);
-		if (!ret && test_bit(TASK_STATE_ABORT, &task->state))
+		if (!ret && aborted)
 			ret = -EIO;
 
 		return ret;
