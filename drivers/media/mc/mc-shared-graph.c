@@ -176,7 +176,7 @@ static struct media_device *__media_device_shared_create(struct device *dev)
 	// TODO figure out how to reconcile this with multiple members
 	mds->mdev.dev = dev;
 
-	devv_dbg(dev, "%s: Allocated media device with %pfwf at %p\n",
+	dev_dbg(dev, "%s: Allocated media device with %pfwf at %p\n",
 		 __func__, fwnode, &mds->mdev);
 	return &mds->mdev;
 
