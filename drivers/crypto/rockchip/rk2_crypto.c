@@ -743,4 +743,3 @@ MODULE_DESCRIPTION("Rockchip Crypto Engine cryptographic offloader");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Corentin Labbe <clabbe@baylibre.com>");
 MODULE_AUTHOR("Dawid Olesinski <dawidro@gmail.com>");
-

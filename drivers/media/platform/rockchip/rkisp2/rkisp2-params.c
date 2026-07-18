@@ -357,7 +357,7 @@ static void rkisp2_params_lsc(struct rkisp2_params *params,
 		rkisp2_write(rkisp2, ISP3X_LSC_TABLE_SEL, arg->active_table ? 1 : 0);
 
 	/*
-	 * - No need to disable the lsc before writing the table 
+	 * - No need to disable the lsc before writing the table
 	 * - Table 0 starts at 0, table 1 starts at 153.
 	 * - TABLE_SEL selects which table is active, but programming the tables
 	 *   is done by just writing to the right address.
