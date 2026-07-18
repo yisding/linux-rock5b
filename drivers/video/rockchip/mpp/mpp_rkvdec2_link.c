@@ -1571,13 +1571,6 @@ void rkvdec2_link_session_deinit(struct mpp_session *session)
 		mpp_iommu_up_write(mpp->iommu_info);
 		session->dma = NULL;
 	}
-	if (session->srv) {
-		struct mpp_service *srv = session->srv;
-
-		mutex_lock(&srv->session_lock);
-		list_del_init(&session->service_link);
-		mutex_unlock(&srv->session_lock);
-	}
 	list_del_init(&session->session_link);
 
 	mpp_dbg_session("session %d release\n", session->index);
