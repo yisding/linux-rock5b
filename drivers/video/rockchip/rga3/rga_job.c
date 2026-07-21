@@ -58,7 +58,6 @@ static int rga_job_cleanup(struct rga_job *job)
 static int rga_job_judgment_support_core(struct rga_job *job, struct rga_req *req)
 {
 	int ret = 0;
-	uint32_t mm_flag;
 	struct rga_mm *mm;
 
 	mm = rga_drvdata->mm;
@@ -69,40 +68,39 @@ static int rga_job_judgment_support_core(struct rga_job *job, struct rga_req *re
 
 	mutex_lock(&mm->lock);
 
+	/*
+	 * A buffer only disqualifies the RGA2 MMU cores when it can neither
+	 * be addressed below 4G directly nor be remapped below 4G by a
+	 * per-job DMA mapping of the 32-bit RGA2 device.
+	 */
 	if (likely(req->src.yrgb_addr > 0)) {
-		ret = rga_mm_lookup_flag(mm, req->src.yrgb_addr);
+		ret = rga_mm_lookup_rga2_support(mm, req->src.yrgb_addr);
 		if (ret < 0)
 			goto out_finish;
-		else
-			mm_flag = (uint32_t)ret;
 
-		if (~mm_flag & RGA_MEM_UNDER_4G) {
+		if (!ret) {
 			job->flags |= RGA_JOB_UNSUPPORT_RGA_MMU;
 			goto out_finish;
 		}
 	}
 
 	if (likely(req->dst.yrgb_addr > 0)) {
-		ret = rga_mm_lookup_flag(mm, req->dst.yrgb_addr);
+		ret = rga_mm_lookup_rga2_support(mm, req->dst.yrgb_addr);
 		if (ret < 0)
 			goto out_finish;
-		else
-			mm_flag = (uint32_t)ret;
 
-		if (~mm_flag & RGA_MEM_UNDER_4G) {
+		if (!ret) {
 			job->flags |= RGA_JOB_UNSUPPORT_RGA_MMU;
 			goto out_finish;
 		}
 	}
 
 	if (req->pat.yrgb_addr > 0) {
-		ret = rga_mm_lookup_flag(mm, req->pat.yrgb_addr);
+		ret = rga_mm_lookup_rga2_support(mm, req->pat.yrgb_addr);
 		if (ret < 0)
 			goto out_finish;
-		else
-			mm_flag = (uint32_t)ret;
 
-		if (~mm_flag & RGA_MEM_UNDER_4G) {
+		if (!ret) {
 			job->flags |= RGA_JOB_UNSUPPORT_RGA_MMU;
 			goto out_finish;
 		}
