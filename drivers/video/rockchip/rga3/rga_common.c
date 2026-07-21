@@ -720,6 +720,28 @@ void rga_convert_addr(struct rga_img_info_t *img, bool before_vir_get_channel)
 	 * need to consider whether fbc case
 	 */
 	if (img->rd_mode != RGA_FBC_MODE || before_vir_get_channel) {
+		if (rga_is_yuv10bit_format(img->format)) {
+			/*
+			 * 10-bit semi-planar rows are byte-literal: incompact
+			 * P010/P210 rows carry 16-bit containers (2 bytes per
+			 * pixel), compact NV15/NV20 rows pack 10 bits per
+			 * pixel. The 1 byte/pixel offset below would place the
+			 * UV plane inside the Y plane.
+			 */
+			uint64_t y_bytes;
+
+			if (img->compact_mode == RGA_10BIT_INCOMPACT)
+				y_bytes = (uint64_t)img->vir_w * img->vir_h * 2;
+			else
+				y_bytes =
+					(uint64_t)img->vir_w * img->vir_h * 10 / 8;
+
+			img->uv_addr = img->yrgb_addr + y_bytes;
+			/* All 10-bit formats are semi-planar: no third plane. */
+			img->v_addr = 0;
+			return;
+		}
+
 		img->uv_addr = img->yrgb_addr + (img->vir_w * img->vir_h);
 
 		//warning: rga3 may need /2 for all
