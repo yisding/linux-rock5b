@@ -317,6 +317,7 @@ static int rga_task_assign(struct rga_job *job, struct rga_req *rga_base)
 	int feature;
 	int optional_cores = RGA_NONE_CORE;
 	int specified_cores = RGA_NONE_CORE;
+	int mem_excluded_cores = RGA_NONE_CORE;
 	int i;
 	int need_swap = false;
 
@@ -348,6 +349,7 @@ static int rga_task_assign(struct rga_job *job, struct rga_req *rga_base)
 		    job->flags & RGA_JOB_UNSUPPORT_RGA_MMU) {
 			if (DEBUGGER_EN(MSG))
 				rga_job_log(job, "RGA2 only support under 4G memory!\n");
+			mem_excluded_cores |= scheduler->core;
 			continue;
 		}
 
@@ -477,8 +479,21 @@ static int rga_task_assign(struct rga_job *job, struct rga_req *rga_base)
 	}
 
 	if (optional_cores == 0) {
+		/*
+		 * When a core was skipped because the job's memory sits above
+		 * the RGA2 4G limit, the caller may succeed by retrying with
+		 * below-4G (e.g. CMA/DMA32) buffers — report that explicitly
+		 * instead of a generic assignment failure.
+		 */
+		if (mem_excluded_cores != RGA_NONE_CORE) {
+			rga_job_err(job,
+				    "no core match: core[%#x] skipped by the under-4G memory limit; retry with below-4G (e.g. CMA/DMA32) buffers\n",
+				    mem_excluded_cores);
+			return -EOPNOTSUPP;
+		}
+
 		rga_job_err(job, "no core match\n");
-		return -1;
+		return -EINVAL;
 	}
 
 	return optional_cores;

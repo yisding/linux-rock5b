@@ -397,7 +397,7 @@ static struct rga_scheduler_t *rga_job_schedule(struct rga_job *job)
 		job->core = rga_job_assign(job);
 		if (job->core <= 0) {
 			rga_job_err(job, "job assign failed");
-			return ERR_PTR(-EINVAL);
+			return ERR_PTR(job->core < 0 ? job->core : -EINVAL);
 		}
 	} else {
 		job->core = rga_drvdata->scheduler[0]->core;
