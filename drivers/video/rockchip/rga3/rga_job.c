@@ -660,26 +660,38 @@ int rga_request_check(struct rga_user_request *req)
 	return 0;
 }
 
+/*
+ * A channel carries a buffer when either address slot is set: handles and
+ * physical addresses arrive in yrgb_addr, while the legacy blit path puts
+ * user virtual addresses in uv_addr with yrgb_addr left at zero.
+ */
+static bool rga_request_channel_has_buffer(const struct rga_img_info_t *img)
+{
+	return img->yrgb_addr > 0 || img->uv_addr > 0;
+}
+
 static int rga_request_task_check(const struct rga_req *task)
 {
 	switch (task->render_mode) {
 	case BITBLT_MODE:
 	case COLOR_PALETTE_MODE:
-		if (!task->src.yrgb_addr || !task->dst.yrgb_addr)
+		if (!rga_request_channel_has_buffer(&task->src) ||
+		    !rga_request_channel_has_buffer(&task->dst))
 			return -EINVAL;
 
-		if (task->bsfilter_flag && !task->pat.yrgb_addr)
+		if (task->bsfilter_flag &&
+		    !rga_request_channel_has_buffer(&task->pat))
 			return -EINVAL;
 
 		break;
 	case COLOR_FILL_MODE:
-		if (!task->dst.yrgb_addr)
+		if (!rga_request_channel_has_buffer(&task->dst))
 			return -EINVAL;
 
 		break;
 	case UPDATE_PALETTE_TABLE_MODE:
 	case UPDATE_PATTEN_BUF_MODE:
-		if (!task->pat.yrgb_addr)
+		if (!rga_request_channel_has_buffer(&task->pat))
 			return -EINVAL;
 
 		break;
