@@ -40,6 +40,7 @@ void rga_request_scheduler_shutdown(struct rga_scheduler_t *scheduler);
 void rga_request_scheduler_abort(struct rga_scheduler_t *scheduler);
 void rga_request_session_destroy_abort(struct rga_session *session);
 int rga_request_put(struct rga_request *request);
+void rga_request_release_ref(struct rga_request *request);
 void rga_request_get(struct rga_request *request);
 int rga_request_free(struct rga_request *request);
 int rga_request_alloc(uint32_t flags, struct rga_session *session);
