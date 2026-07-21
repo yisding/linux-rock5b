@@ -348,6 +348,23 @@ static void RGA3_set_reg_win0_info(u8 *base, struct rga3_req *msg)
 
 	switch (msg->win0.rd_mode) {
 	case 0: /* raster */
+		if (yuv10) {
+			/*
+			 * The stride registers are byte-literal (in 4-byte
+			 * units): incompact P010/P210 rows carry 16-bit
+			 * containers (2 bytes/pixel), compact NV15/NV20
+			 * rows pack 10 bits/pixel. The Y and UV planes of
+			 * both semi-planar layouts have equal row bytes.
+			 * The legacy 1 byte/pixel programming corrupts
+			 * every 10-bit raster access.
+			 */
+			if (msg->win0.is_10b_compact)
+				stride = (((msg->win0.vir_w * 10 / 8) + 15) & ~15) >> 2;
+			else
+				stride = (((msg->win0.vir_w * 2) + 15) & ~15) >> 2;
+			uv_stride = stride;
+			break;
+		}
 		stride = (((msg->win0.vir_w * pixel_width) + 15) & ~15) >> 2;
 		if (rga_is_yuv420_semi_planar_format(msg->win0.format))
 			uv_stride = ((msg->win0.vir_w + 15) & ~15) >> 2;
@@ -733,6 +750,15 @@ static void RGA3_set_reg_win1_info(u8 *base, struct rga3_req *msg)
 
 	switch (msg->win1.rd_mode) {
 	case 0: /* raster */
+		if (yuv10) {
+			/* See the win0 raster comment: 10-bit strides are byte-literal. */
+			if (msg->win1.is_10b_compact)
+				stride = (((msg->win1.vir_w * 10 / 8) + 15) & ~15) >> 2;
+			else
+				stride = (((msg->win1.vir_w * 2) + 15) & ~15) >> 2;
+			uv_stride = stride;
+			break;
+		}
 		stride = (((msg->win1.vir_w * pixel_width) + 15) & ~15) >> 2;
 		if (rga_is_yuv420_semi_planar_format(msg->win1.format))
 			uv_stride = ((msg->win1.vir_w + 15) & ~15) >> 2;
@@ -984,8 +1010,17 @@ static void RGA3_set_reg_wr_info(u8 *base, struct rga3_req *msg)
 
 	switch (msg->wr.rd_mode) {
 	case 0: /* raster */
-		stride = (((msg->wr.vir_w * pixel_width) + 15) & ~15) >> 2;
-		uv_stride = ((msg->wr.vir_w + 15) & ~15) >> 2;
+		if (yuv10) {
+			/* See the win0 raster comment: 10-bit strides are byte-literal. */
+			if (msg->wr.is_10b_compact)
+				stride = (((msg->wr.vir_w * 10 / 8) + 15) & ~15) >> 2;
+			else
+				stride = (((msg->wr.vir_w * 2) + 15) & ~15) >> 2;
+			uv_stride = stride;
+		} else {
+			stride = (((msg->wr.vir_w * pixel_width) + 15) & ~15) >> 2;
+			uv_stride = ((msg->wr.vir_w + 15) & ~15) >> 2;
+		}
 
 		*bRGA3_WR_U_BASE = (u32) msg->wr.uv_addr;
 
