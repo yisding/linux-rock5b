@@ -58,6 +58,10 @@ struct rga_mmu_base {
 	int32_t back;
 	int32_t size;
 	int32_t curr;
+
+	/* streaming DMA mapping of buf_virtual against the RGA2 device */
+	struct device *map_dev;
+	dma_addr_t dma_addr;
 };
 
 int rga_user_memory_check(struct page **pages, u32 w, u32 h, u32 format, int flag);
@@ -66,7 +70,7 @@ int rga_set_mmu_base(struct rga_job *job,
 		     struct rga2_req *req);
 unsigned int *rga_mmu_buf_get(struct rga_mmu_base *mmu_base, uint32_t size);
 
-struct rga_mmu_base *rga_mmu_base_init(size_t size);
+struct rga_mmu_base *rga_mmu_base_init(struct device *map_dev, size_t size);
 void rga_mmu_base_free(struct rga_mmu_base **mmu_base);
 
 int rga_iommu_detach(struct rga_iommu_info *info);
