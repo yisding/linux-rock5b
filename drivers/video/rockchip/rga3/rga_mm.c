@@ -1618,6 +1618,33 @@ static int rga_mm_set_mmu_base(struct rga_job *job,
 		rga_convert_addr(img, false);
 	}
 
+	/*
+	 * The hardware reads the CPU-filled table through DMA, so give the
+	 * table a proper streaming mapping of the RGA2 device: per-job
+	 * handle tables are mapped here (the mapping itself publishes the
+	 * entries) and unmapped at put; ring windows borrow the persistent
+	 * mapping made at bind time and are synced before each job.
+	 */
+	if (job->flags & RGA_JOB_USE_HANDLE) {
+		job_buf->page_table_dma =
+			dma_map_single(job->scheduler->dev, page_table,
+				       page_count * sizeof(*page_table),
+				       DMA_TO_DEVICE);
+		if (dma_mapping_error(job->scheduler->dev, job_buf->page_table_dma)) {
+			rga_job_err(job, "can not DMA-map page_table for RGA2\n");
+			ret = -EFAULT;
+			goto err_free_page_table;
+		}
+		job_buf->page_table_dev = job->scheduler->dev;
+		job_buf->page_table_mapped = true;
+	} else {
+		job_buf->page_table_dma = rga_drvdata->mmu_base->dma_addr +
+			(page_table - rga_drvdata->mmu_base->buf_virtual) *
+			sizeof(*page_table);
+		job_buf->page_table_dev = rga_drvdata->mmu_base->map_dev;
+		job_buf->page_table_mapped = false;
+	}
+
 	job_buf->page_table = page_table;
 	job_buf->order = order;
 	job_buf->page_count = page_count;
@@ -1905,8 +1932,15 @@ static void rga_mm_put_channel_handle_info(struct rga_mm *mm,
 	if (job_buf->v_addr)
 		rga_mm_put_buffer(mm, job, job_buf->v_addr, dir);
 
-	if (job_buf->page_table)
+	if (job_buf->page_table) {
+		if (job_buf->page_table_mapped)
+			dma_unmap_single(job_buf->page_table_dev,
+					 job_buf->page_table_dma,
+					 job_buf->page_count *
+					 sizeof(*job_buf->page_table),
+					 DMA_TO_DEVICE);
 		free_pages((unsigned long)job_buf->page_table, job_buf->order);
+	}
 }
 
 static int rga_mm_get_channel_handle_info(struct rga_mm *mm,

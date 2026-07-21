@@ -52,32 +52,38 @@ int rga_user_memory_check(struct page **pages, u32 w, u32 h, u32 format, int fla
 	return 0;
 }
 
+static uint32_t rga_job_buffer_mmu_base(struct rga_job_buffer *job_buf)
+{
+	/*
+	 * The page table is a streaming DMA buffer of the RGA2 device (the
+	 * shared ring is mapped at bind time, per-job handle tables at fill
+	 * time); publish the CPU-filled entries to the device and program
+	 * the retained DMA address.
+	 */
+	dma_sync_single_for_device(job_buf->page_table_dev,
+				   job_buf->page_table_dma,
+				   job_buf->page_count *
+				   sizeof(*job_buf->page_table),
+				   DMA_TO_DEVICE);
+
+	return (uint32_t)job_buf->page_table_dma;
+}
+
 int rga_set_mmu_base(struct rga_job *job,
 		     struct rga_job_task_buffers *task_buffers,
 		     struct rga2_req *req)
 {
-	if (task_buffers->src_buffer.page_table) {
-		rga_dma_sync_flush_range(task_buffers->src_buffer.page_table,
-					 (task_buffers->src_buffer.page_table +
-					  task_buffers->src_buffer.page_count),
-					 job->scheduler);
-		req->mmu_info.src0_base_addr = virt_to_phys(task_buffers->src_buffer.page_table);
-	}
+	if (task_buffers->src_buffer.page_table)
+		req->mmu_info.src0_base_addr =
+			rga_job_buffer_mmu_base(&task_buffers->src_buffer);
 
-	if (task_buffers->src1_buffer.page_table) {
-		rga_dma_sync_flush_range(task_buffers->src1_buffer.page_table,
-					 (task_buffers->src1_buffer.page_table +
-					  task_buffers->src1_buffer.page_count),
-					 job->scheduler);
-		req->mmu_info.src1_base_addr = virt_to_phys(task_buffers->src1_buffer.page_table);
-	}
+	if (task_buffers->src1_buffer.page_table)
+		req->mmu_info.src1_base_addr =
+			rga_job_buffer_mmu_base(&task_buffers->src1_buffer);
 
 	if (task_buffers->dst_buffer.page_table) {
-		rga_dma_sync_flush_range(task_buffers->dst_buffer.page_table,
-					 (task_buffers->dst_buffer.page_table +
-					  task_buffers->dst_buffer.page_count),
-					 job->scheduler);
-		req->mmu_info.dst_base_addr = virt_to_phys(task_buffers->dst_buffer.page_table);
+		req->mmu_info.dst_base_addr =
+			rga_job_buffer_mmu_base(&task_buffers->dst_buffer);
 
 		if (((req->alpha_rop_flag & 1) == 1) && (req->bitblt_mode == 0)) {
 			req->mmu_info.src1_base_addr = req->mmu_info.dst_base_addr;
@@ -85,13 +91,9 @@ int rga_set_mmu_base(struct rga_job *job,
 		}
 	}
 
-	if (task_buffers->els_buffer.page_table) {
-		rga_dma_sync_flush_range(task_buffers->els_buffer.page_table,
-					 (task_buffers->els_buffer.page_table +
-					  task_buffers->els_buffer.page_count),
-					 job->scheduler);
-		req->mmu_info.els_base_addr = virt_to_phys(task_buffers->els_buffer.page_table);
-	}
+	if (task_buffers->els_buffer.page_table)
+		req->mmu_info.els_base_addr =
+			rga_job_buffer_mmu_base(&task_buffers->els_buffer);
 
 	return 0;
 }
@@ -156,7 +158,7 @@ unsigned int *rga_mmu_buf_get(struct rga_mmu_base *mmu_base, uint32_t size)
 	return buf;
 }
 
-struct rga_mmu_base *rga_mmu_base_init(size_t size)
+struct rga_mmu_base *rga_mmu_base_init(struct device *map_dev, size_t size)
 {
 	int order = 0;
 	struct rga_mmu_base *mmu_base;
@@ -187,11 +189,30 @@ struct rga_mmu_base *rga_mmu_base_init(size_t size)
 	}
 	mmu_base->pages_order = order;
 
+	/*
+	 * The page-table ring is CPU-filled and device-read for the whole
+	 * driver lifetime, so own it as a streaming DMA mapping of the RGA2
+	 * device and sync the touched range on each job instead of touching
+	 * unmapped memory behind the DMA API's back.
+	 */
+	mmu_base->dma_addr = dma_map_single(map_dev, mmu_base->buf_virtual,
+					    size * 3 * sizeof(*mmu_base->buf_virtual),
+					    DMA_TO_DEVICE);
+	if (dma_mapping_error(map_dev, mmu_base->dma_addr)) {
+		pr_err("Can not map mmu_page_table for device\n");
+		goto err_free_pages;
+	}
+	mmu_base->map_dev = map_dev;
+
 	mmu_base->front = 0;
 	mmu_base->back = RGA2_PHY_PAGE_SIZE * 3;
 	mmu_base->size = RGA2_PHY_PAGE_SIZE * 3;
 
 	return mmu_base;
+
+err_free_pages:
+	free_pages((unsigned long)mmu_base->pages, mmu_base->pages_order);
+	mmu_base->pages_order = 0;
 
 err_free_buf_virtual:
 	free_pages((unsigned long)mmu_base->buf_virtual, mmu_base->buf_order);
@@ -206,6 +227,14 @@ err_free_mmu_base:
 void rga_mmu_base_free(struct rga_mmu_base **mmu_base)
 {
 	struct rga_mmu_base *base = *mmu_base;
+
+	if (base->map_dev != NULL) {
+		dma_unmap_single(base->map_dev, base->dma_addr,
+				 base->size * sizeof(*base->buf_virtual),
+				 DMA_TO_DEVICE);
+		base->map_dev = NULL;
+		base->dma_addr = 0;
+	}
 
 	if (base->buf_virtual != NULL) {
 		free_pages((unsigned long)base->buf_virtual, base->buf_order);
@@ -469,7 +498,8 @@ int rga_iommu_bind(void)
 			if (rga_drvdata->mmu_base != NULL)
 				continue;
 
-			rga_drvdata->mmu_base = rga_mmu_base_init(RGA2_PHY_PAGE_SIZE);
+			rga_drvdata->mmu_base = rga_mmu_base_init(scheduler->dev,
+								  RGA2_PHY_PAGE_SIZE);
 			if (IS_ERR(rga_drvdata->mmu_base)) {
 				dev_err(scheduler->dev, "rga mmu base init failed!\n");
 				ret = PTR_ERR(rga_drvdata->mmu_base);
