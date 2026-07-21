@@ -1519,6 +1519,14 @@ static int rga_drv_probe(struct platform_device *pdev)
 	pm_runtime_put_sync(dev);
 #endif /* #ifndef RGA_DISABLE_PM */
 
+	/*
+	 * RGA cores read images through page tables or an IOMMU, so a
+	 * contiguous import may span arbitrarily long sg segments; without
+	 * this the DMA API's default 64 KiB segment limit is exceeded by any
+	 * contiguous buffer larger than 64 KiB (e.g. CMA dma-buf imports).
+	 */
+	dma_set_max_seg_size(dev, DMA_BIT_MASK(32));
+
 	if (scheduler->data->mmu == RGA_IOMMU) {
 		scheduler->iommu_info = rga_iommu_probe(dev);
 		if (IS_ERR(scheduler->iommu_info)) {
@@ -1532,6 +1540,14 @@ static int rga_drv_probe(struct platform_device *pdev)
 	} else {
 		dma_set_mask(dev, DMA_BIT_MASK(32));
 		dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
+
+		if (scheduler->data->mmu == RGA_MMU)
+			/*
+			 * The RGA2 MMU consumes page-granular entries, so a
+			 * bounced (swiotlb) mapping must preserve the page
+			 * offset of the original address.
+			 */
+			dma_set_min_align_mask(dev, PAGE_SIZE - 1);
 	}
 
 	platform_set_drvdata(pdev, scheduler);

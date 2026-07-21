@@ -282,6 +282,14 @@ struct rga_job_buffer {
 	uint32_t *page_table;
 	int order;
 	int page_count;
+	/*
+	 * DMA address of page_table for the RGA2 device: an offset into the
+	 * persistently mapped ring for non-handle jobs, or a per-job
+	 * dma_map_single() mapping (unmapped at put) for handle jobs.
+	 */
+	dma_addr_t page_table_dma;
+	struct device *page_table_dev;
+	bool page_table_mapped;
 };
 
 struct rga_job_task_buffers {
