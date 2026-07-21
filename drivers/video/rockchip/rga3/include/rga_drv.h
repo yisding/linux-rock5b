@@ -432,6 +432,12 @@ struct rga_request {
 
 	spinlock_t lock;
 	struct kref refcount;
+	/*
+	 * Set once the initial reference taken by rga_request_alloc() has been
+	 * dropped, so the several paths that retire a request cannot drop it
+	 * twice. Guarded by the pending-request-manager lock.
+	 */
+	bool release_ref_dropped;
 
 	pid_t pid;
 
