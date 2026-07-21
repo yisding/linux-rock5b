@@ -889,7 +889,8 @@ static long rga_ioctl_request_cancel(unsigned long arg)
 		return -EINVAL;
 	}
 
-	rga_request_put(request);
+	/* Retire the request's initial reference (idempotent). */
+	rga_request_release_ref(request);
 
 	mutex_unlock(&request_manager->lock);
 
