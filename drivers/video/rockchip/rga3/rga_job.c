@@ -919,8 +919,8 @@ static void rga_request_release_abort(struct rga_request *request, int err_code)
 	rga_dma_fence_signal(request->release_fence, err_code);
 
 	mutex_lock(&request_manager->lock);
-	/* current submit request put */
-	rga_request_put(request);
+	/* Retire the request's initial reference (idempotent). */
+	rga_request_release_ref(request);
 	mutex_unlock(&request_manager->lock);
 }
 
@@ -942,7 +942,7 @@ void rga_request_session_destroy_abort(struct rga_session *session)
 		if (session == request->session) {
 			rga_req_err(request, "destroy when the user exits, current refcount = %d\n",
 				kref_read(&request->refcount));
-			rga_request_put(request);
+			rga_request_release_ref(request);
 		}
 	}
 
@@ -1153,9 +1153,9 @@ int rga_request_release_signal(struct rga_scheduler_t *scheduler, struct rga_job
 		if (DEBUGGER_EN(MSG))
 			rga_job_log(job, "finished %d failed %d\n", finished_count, failed_count);
 
-		/* current submit request put */
+		/* Retire the request's initial reference (idempotent). */
 		mutex_lock(&request_manager->lock);
-		rga_request_put(request);
+		rga_request_release_ref(request);
 		mutex_unlock(&request_manager->lock);
 	}
 
@@ -1623,6 +1623,34 @@ int rga_request_alloc(uint32_t flags, struct rga_session *session)
 int rga_request_put(struct rga_request *request)
 {
 	return kref_put(&request->refcount, rga_request_kref_release);
+}
+
+/*
+ * Drop the initial reference taken by rga_request_alloc() exactly once.
+ *
+ * A request is retired from any of four paths -- async completion
+ * (rga_request_release_signal()), explicit cancel, submit-time abort, and
+ * owning-session close (rga_request_session_destroy_abort()) -- and two of
+ * them can run concurrently: a job completing in the RGA IRQ thread while the
+ * owning session closes. Without coordination both paths call
+ * rga_request_put() on the same initial reference, so it is dropped twice; the
+ * second put frees the request out from under the first, which then touches
+ * request->finished_wq in wake_up() (KASAN slab-use-after-free) and underflows
+ * the refcount. All four paths hold the pending-request-manager lock while
+ * retiring, so a plain flag under that lock makes the drop idempotent.
+ */
+void rga_request_release_ref(struct rga_request *request)
+{
+	struct rga_pending_request_manager *request_manager =
+		rga_drvdata->pend_request_manager;
+
+	WARN_ON(!mutex_is_locked(&request_manager->lock));
+
+	if (request->release_ref_dropped)
+		return;
+
+	request->release_ref_dropped = true;
+	rga_request_put(request);
 }
 
 void rga_request_get(struct rga_request *request)
