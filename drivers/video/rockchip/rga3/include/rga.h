@@ -27,6 +27,7 @@
 #define RGA_GET_VERSION			0x501b
 #define RGA_CACHE_FLUSH			0x501c
 
+#define RGA2_GET_RESULT			0x601a
 #define RGA2_GET_VERSION		0x601b
 #define RGA_IMPORT_DMA			0x601d
 #define RGA_RELEASE_DMA			0x601e
