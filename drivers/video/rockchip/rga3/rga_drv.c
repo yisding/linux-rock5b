@@ -1023,6 +1023,7 @@ static long rga_ioctl(struct file *file, uint32_t cmd, unsigned long arg)
 	case RGA_CACHE_FLUSH:
 	case RGA_FLUSH:
 	case RGA_GET_RESULT:
+	case RGA2_GET_RESULT:
 		break;
 	case RGA_GET_VERSION:
 		sscanf(rga->scheduler[i]->version.str, "%x.%x.%*x",
