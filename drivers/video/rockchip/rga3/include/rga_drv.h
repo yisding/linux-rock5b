@@ -290,6 +290,15 @@ struct rga_job_buffer {
 	dma_addr_t page_table_dma;
 	struct device *page_table_dev;
 	bool page_table_mapped;
+
+	/*
+	 * Transient per-job RGA2 mappings of over-4G handle buffers (the
+	 * DMA API bounces them below 4G); one per y/uv/v channel at most,
+	 * released when the job's buffers are put.
+	 */
+	struct rga_dma_buffer *rga2_bounce[3];
+	struct rga_internal_buffer *rga2_bounce_origin[3];
+	int rga2_bounce_count;
 };
 
 struct rga_job_task_buffers {

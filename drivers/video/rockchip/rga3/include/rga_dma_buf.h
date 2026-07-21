@@ -42,12 +42,19 @@ int rga_dma_memory_check(struct rga_dma_buffer *rga_dma_buffer, struct rga_img_i
 
 int rga_dma_map_sgt(struct sg_table *sgt, struct rga_dma_buffer *buffer,
 		    enum dma_data_direction dir, struct device *map_dev);
+int rga_dma_map_sgt_pages(struct sg_table *sgt, struct rga_dma_buffer *buffer,
+			  enum dma_data_direction dir, struct device *map_dev);
 void rga_dma_unmap_sgt(struct rga_dma_buffer *buffer);
 
 int rga_dma_map_buf(struct dma_buf *dma_buf, struct rga_dma_buffer *rga_dma_buffer,
 		    enum dma_data_direction dir, struct device *map_dev);
+int rga_dma_map_buf_pages(struct dma_buf *dma_buf,
+			  struct rga_dma_buffer *rga_dma_buffer,
+			  enum dma_data_direction dir, struct device *map_dev);
 int rga_dma_map_fd(int fd, struct rga_dma_buffer *rga_dma_buffer,
 		   enum dma_data_direction dir, struct device *map_dev);
+int rga_dma_map_fd_pages(int fd, struct rga_dma_buffer *rga_dma_buffer,
+			 enum dma_data_direction dir, struct device *map_dev);
 void rga_dma_unmap_buf(struct rga_dma_buffer *rga_dma_buffer);
 
 
