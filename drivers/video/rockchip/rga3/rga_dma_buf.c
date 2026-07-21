@@ -315,22 +315,64 @@ static void rga_dma_unmap_sgt_iommu(struct rga_dma_buffer *buffer)
 				buffer->iova_size);
 }
 
+/*
+ * Page-granular consumers (the RGA2 MMU walks per-page table entries) do
+ * not need one contiguous DMA span; every segment only has to fit the
+ * 32-bit register format on its own.
+ */
+static int rga_dma_check_page_granular_contract(struct sg_table *sgt,
+						const char *source)
+{
+	struct scatterlist *sg;
+	unsigned int i;
+	int ret;
+
+	if (!sgt || !sgt->sgl || !sgt->nents) {
+		rga_err("reject %s DMA mapping: empty sg table\n", source);
+		return -EINVAL;
+	}
+
+	for_each_sgtable_dma_sg(sgt, sg, i) {
+		ret = rga_dma_check_iova_span(sg_dma_address(sg),
+					      sg_dma_len(sg), source, true);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 static int rga_dma_set_buffer_mapping(struct sg_table *sgt,
 				      struct rga_dma_buffer *buffer,
 				      enum dma_data_direction dir,
 				      struct device *map_dev,
-				      const char *source)
+				      const char *source,
+				      bool page_granular)
 {
+	struct scatterlist *sg;
+	unsigned int i;
+	size_t size = 0;
 	int ret;
 
-	ret = rga_dma_check_iova_contract(sgt, source, true);
-	if (ret)
-		return ret;
+	if (page_granular) {
+		ret = rga_dma_check_page_granular_contract(sgt, source);
+		if (ret)
+			return ret;
+
+		for_each_sgtable_dma_sg(sgt, sg, i)
+			size += sg_dma_len(sg);
+	} else {
+		ret = rga_dma_check_iova_contract(sgt, source, true);
+		if (ret)
+			return ret;
+
+		size = sg_dma_len(sgt->sgl);
+	}
 
 	buffer->sgt = sgt;
 	buffer->dma_addr = sg_dma_address(sgt->sgl);
 	buffer->dir = dir;
-	buffer->size = sg_dma_len(sgt->sgl);
+	buffer->size = size;
 	buffer->map_dev = map_dev;
 	buffer->offset = 0;
 	buffer->iova_size = 0;
@@ -406,8 +448,9 @@ int rga_dma_memory_check(struct rga_dma_buffer *rga_dma_buffer, struct rga_img_i
 	return ret;
 }
 
-int rga_dma_map_sgt(struct sg_table *sgt, struct rga_dma_buffer *buffer,
-		    enum dma_data_direction dir, struct device *map_dev)
+static int rga_dma_do_map_sgt(struct sg_table *sgt, struct rga_dma_buffer *buffer,
+			      enum dma_data_direction dir, struct device *map_dev,
+			      bool page_granular)
 {
 	int ret = 0;
 
@@ -417,6 +460,18 @@ int rga_dma_map_sgt(struct sg_table *sgt, struct rga_dma_buffer *buffer,
 		return ret < 0 ? ret : -EINVAL;
 	}
 	sgt->nents = ret;
+
+	if (page_granular) {
+		ret = rga_dma_set_buffer_mapping(sgt, buffer, dir, map_dev,
+						 "sg_table", true);
+		if (ret) {
+			dma_unmap_sg(map_dev, sgt->sgl, sgt->orig_nents, dir);
+			rga_dma_reset_sgt_dma_state(sgt);
+			return ret;
+		}
+
+		return 0;
+	}
 
 	ret = rga_dma_check_iova_contract(sgt, "sg_table", false);
 	if (ret) {
@@ -434,13 +489,25 @@ int rga_dma_map_sgt(struct sg_table *sgt, struct rga_dma_buffer *buffer,
 	}
 
 	ret = rga_dma_set_buffer_mapping(sgt, buffer, dir, map_dev,
-					 "sg_table");
+					 "sg_table", false);
 	if (ret) {
 		dma_unmap_sg(map_dev, sgt->sgl, sgt->orig_nents, dir);
 		return ret;
 	}
 
 	return 0;
+}
+
+int rga_dma_map_sgt(struct sg_table *sgt, struct rga_dma_buffer *buffer,
+		    enum dma_data_direction dir, struct device *map_dev)
+{
+	return rga_dma_do_map_sgt(sgt, buffer, dir, map_dev, false);
+}
+
+int rga_dma_map_sgt_pages(struct sg_table *sgt, struct rga_dma_buffer *buffer,
+			  enum dma_data_direction dir, struct device *map_dev)
+{
+	return rga_dma_do_map_sgt(sgt, buffer, dir, map_dev, true);
 }
 
 void rga_dma_unmap_sgt(struct rga_dma_buffer *buffer)
@@ -459,25 +526,21 @@ void rga_dma_unmap_sgt(struct rga_dma_buffer *buffer)
 		     buffer->dir);
 }
 
-int rga_dma_map_buf(struct dma_buf *dma_buf, struct rga_dma_buffer *rga_dma_buffer,
-		    enum dma_data_direction dir, struct device *map_dev)
+static int rga_dma_do_map_buf(struct dma_buf *dma_buf,
+			      struct rga_dma_buffer *rga_dma_buffer,
+			      enum dma_data_direction dir,
+			      struct device *map_dev,
+			      const char *source, bool page_granular)
 {
 	struct dma_buf_attachment *attach = NULL;
 	struct sg_table *sgt = NULL;
 	int ret = 0;
 
-	if (dma_buf != NULL) {
-		get_dma_buf(dma_buf);
-	} else {
-		rga_err("dma_buf is invalid[%p]\n", dma_buf);
-		return -EINVAL;
-	}
-
 	attach = dma_buf_attach(dma_buf, map_dev);
 	if (IS_ERR(attach)) {
 		ret = PTR_ERR(attach);
 		rga_err("Failed to attach dma_buf, ret[%d]\n", ret);
-		goto err_get_attach;
+		return ret;
 	}
 
 	sgt = dma_buf_map_attachment_unlocked(attach, dir);
@@ -487,33 +550,70 @@ int rga_dma_map_buf(struct dma_buf *dma_buf, struct rga_dma_buffer *rga_dma_buff
 		goto err_get_sgt;
 	}
 
-	ret = rga_dma_set_buffer_mapping(sgt, rga_dma_buffer, dir, map_dev, "dma_buf");
+	ret = rga_dma_set_buffer_mapping(sgt, rga_dma_buffer, dir, map_dev,
+					 source, page_granular);
 	if (ret)
 		goto err_map_attachment;
 
 	rga_dma_buffer->dma_buf = dma_buf;
 	rga_dma_buffer->attach = attach;
 
-	return ret;
+	return 0;
 
 err_map_attachment:
 	dma_buf_unmap_attachment_unlocked(attach, sgt, dir);
 err_get_sgt:
-	if (attach)
-		dma_buf_detach(dma_buf, attach);
-err_get_attach:
-	if (dma_buf)
+	dma_buf_detach(dma_buf, attach);
+
+	return ret;
+}
+
+int rga_dma_map_buf(struct dma_buf *dma_buf, struct rga_dma_buffer *rga_dma_buffer,
+		    enum dma_data_direction dir, struct device *map_dev)
+{
+	int ret;
+
+	if (dma_buf != NULL) {
+		get_dma_buf(dma_buf);
+	} else {
+		rga_err("dma_buf is invalid[%p]\n", dma_buf);
+		return -EINVAL;
+	}
+
+	ret = rga_dma_do_map_buf(dma_buf, rga_dma_buffer, dir, map_dev,
+				 "dma_buf", false);
+	if (ret)
 		dma_buf_put(dma_buf);
 
 	return ret;
 }
 
-int rga_dma_map_fd(int fd, struct rga_dma_buffer *rga_dma_buffer,
-		   enum dma_data_direction dir, struct device *map_dev)
+int rga_dma_map_buf_pages(struct dma_buf *dma_buf,
+			  struct rga_dma_buffer *rga_dma_buffer,
+			  enum dma_data_direction dir, struct device *map_dev)
+{
+	int ret;
+
+	if (dma_buf != NULL) {
+		get_dma_buf(dma_buf);
+	} else {
+		rga_err("dma_buf is invalid[%p]\n", dma_buf);
+		return -EINVAL;
+	}
+
+	ret = rga_dma_do_map_buf(dma_buf, rga_dma_buffer, dir, map_dev,
+				 "dma_buf", true);
+	if (ret)
+		dma_buf_put(dma_buf);
+
+	return ret;
+}
+
+static int rga_dma_do_map_fd(int fd, struct rga_dma_buffer *rga_dma_buffer,
+			     enum dma_data_direction dir,
+			     struct device *map_dev, bool page_granular)
 {
 	struct dma_buf *dma_buf = NULL;
-	struct dma_buf_attachment *attach = NULL;
-	struct sg_table *sgt = NULL;
 	int ret = 0;
 
 	dma_buf = dma_buf_get(fd);
@@ -523,39 +623,24 @@ int rga_dma_map_fd(int fd, struct rga_dma_buffer *rga_dma_buffer,
 		return ret;
 	}
 
-	attach = dma_buf_attach(dma_buf, map_dev);
-	if (IS_ERR(attach)) {
-		ret = PTR_ERR(attach);
-		rga_err("Failed to attach dma_buf, ret[%d]\n", ret);
-		goto err_get_attach;
-	}
-
-	sgt = dma_buf_map_attachment_unlocked(attach, dir);
-	if (IS_ERR(sgt)) {
-		ret = PTR_ERR(sgt);
-		rga_err("Failed to map attachment, ret[%d]\n", ret);
-		goto err_get_sgt;
-	}
-
-	ret = rga_dma_set_buffer_mapping(sgt, rga_dma_buffer, dir, map_dev, "dma_buf_fd");
+	ret = rga_dma_do_map_buf(dma_buf, rga_dma_buffer, dir, map_dev,
+				 "dma_buf_fd", page_granular);
 	if (ret)
-		goto err_map_attachment;
-
-	rga_dma_buffer->dma_buf = dma_buf;
-	rga_dma_buffer->attach = attach;
-
-	return ret;
-
-err_map_attachment:
-	dma_buf_unmap_attachment_unlocked(attach, sgt, dir);
-err_get_sgt:
-	if (attach)
-		dma_buf_detach(dma_buf, attach);
-err_get_attach:
-	if (dma_buf)
 		dma_buf_put(dma_buf);
 
 	return ret;
+}
+
+int rga_dma_map_fd(int fd, struct rga_dma_buffer *rga_dma_buffer,
+		   enum dma_data_direction dir, struct device *map_dev)
+{
+	return rga_dma_do_map_fd(fd, rga_dma_buffer, dir, map_dev, false);
+}
+
+int rga_dma_map_fd_pages(int fd, struct rga_dma_buffer *rga_dma_buffer,
+			 enum dma_data_direction dir, struct device *map_dev)
+{
+	return rga_dma_do_map_fd(fd, rga_dma_buffer, dir, map_dev, true);
 }
 
 void rga_dma_unmap_buf(struct rga_dma_buffer *rga_dma_buffer)

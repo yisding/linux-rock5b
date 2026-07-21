@@ -542,9 +542,18 @@ static inline bool rga_mm_check_memory_limit(struct rga_scheduler_t *scheduler, 
 	if (!scheduler)
 		return false;
 
+	/*
+	 * The RGA2 MMU consumes 32-bit page addresses. Over-4G memory is
+	 * still usable when it goes through the MMU page tables backed by a
+	 * DMA mapping of the 32-bit RGA2 device (the DMA API places or
+	 * swiotlb-bounces it below 4G); only memory the hardware must
+	 * address directly — physically contiguous buffers bypass the MMU —
+	 * has a hard under-4G requirement.
+	 */
 	if (scheduler->data->mmu == RGA_MMU &&
+	    (mm_flag & RGA_MEM_PHYSICAL_CONTIGUOUS) &&
 	    !(mm_flag & RGA_MEM_UNDER_4G)) {
-		rga_err("%s unsupported memory larger than 4G!\n",
+		rga_err("%s unsupported contiguous memory larger than 4G!\n",
 		       rga_get_mmu_type_str(scheduler->data->mmu));
 		return false;
 	}
@@ -636,14 +645,31 @@ static int rga_mm_map_dma_buffer(struct rga_external_buffer *external_buffer,
 	map_dev = scheduler->iommu_info ? scheduler->iommu_info->default_dev : scheduler->dev;
 	switch (external_buffer->type) {
 	case RGA_DMA_BUFFER:
-		ret = rga_dma_map_fd((int)external_buffer->memory,
-				     buffer, DMA_BIDIRECTIONAL,
-				     map_dev);
+		if (scheduler->data->mmu == RGA_MMU)
+			/*
+			 * The RGA2 MMU consumes the mapping page by page, so
+			 * a multi-segment DMA mapping (including swiotlb
+			 * bounces of over-4G pages) is acceptable.
+			 */
+			ret = rga_dma_map_fd_pages((int)external_buffer->memory,
+						   buffer, DMA_BIDIRECTIONAL,
+						   map_dev);
+		else
+			ret = rga_dma_map_fd((int)external_buffer->memory,
+					     buffer, DMA_BIDIRECTIONAL,
+					     map_dev);
 		break;
 	case RGA_DMA_BUFFER_PTR:
-		ret = rga_dma_map_buf((struct dma_buf *)u64_to_user_ptr(external_buffer->memory),
-				      buffer, DMA_BIDIRECTIONAL,
-				      map_dev);
+		if (scheduler->data->mmu == RGA_MMU)
+			ret = rga_dma_map_buf_pages((struct dma_buf *)
+						    u64_to_user_ptr(external_buffer->memory),
+						    buffer, DMA_BIDIRECTIONAL,
+						    map_dev);
+		else
+			ret = rga_dma_map_buf((struct dma_buf *)
+					      u64_to_user_ptr(external_buffer->memory),
+					      buffer, DMA_BIDIRECTIONAL,
+					      map_dev);
 		break;
 	default:
 		ret = -EFAULT;
@@ -858,7 +884,12 @@ static int rga_mm_map_virt_addr(struct rga_external_buffer *external_buffer,
 	 * and not IOMMU for devices without iommu_info ptr.
 	 */
 	map_dev = scheduler->iommu_info ? scheduler->iommu_info->default_dev : scheduler->dev;
-	ret = rga_dma_map_sgt(sgt, buffer, DMA_BIDIRECTIONAL, map_dev);
+	if (scheduler->data->mmu == RGA_MMU)
+		/* Page-granular consumer: multi-segment mappings are fine. */
+		ret = rga_dma_map_sgt_pages(sgt, buffer, DMA_BIDIRECTIONAL,
+					    map_dev);
+	else
+		ret = rga_dma_map_sgt(sgt, buffer, DMA_BIDIRECTIONAL, map_dev);
 	if (ret < 0) {
 		rga_err("%s core[%d] rga map sgt failed! va = 0x%lx, orig_nents = %d\n",
 			__func__, scheduler->core,
@@ -1245,6 +1276,41 @@ int rga_mm_lookup_flag(struct rga_mm *mm_session, uint64_t handle)
 	return output_buffer->mm_flag;
 }
 
+int rga_mm_lookup_rga2_support(struct rga_mm *mm_session, uint64_t handle)
+{
+	struct rga_internal_buffer *buffer;
+
+	buffer = rga_mm_lookup_handle(mm_session, handle);
+	if (buffer == NULL) {
+		rga_err("This handle[%ld] is illegal.\n", (unsigned long)handle);
+		return -EINVAL;
+	}
+
+	if (buffer->mm_flag & RGA_MEM_UNDER_4G)
+		return true;
+
+	/* Over-4G contiguous memory is addressed directly, bypassing the MMU. */
+	if (buffer->mm_flag & RGA_MEM_PHYSICAL_CONTIGUOUS)
+		return false;
+
+	/*
+	 * Over-4G memory is servable through the RGA2 MMU when a transient
+	 * per-job DMA mapping of the 32-bit RGA2 device can bounce it below
+	 * 4G: dma-buf imports re-attach, virtual imports re-map their pages.
+	 */
+	switch (buffer->type) {
+	case RGA_DMA_BUFFER:
+	case RGA_DMA_BUFFER_PTR:
+		return buffer->dma_buffer != NULL &&
+		       buffer->dma_buffer->dma_buf != NULL;
+	case RGA_VIRTUAL_ADDRESS:
+		return buffer->virt_addr != NULL &&
+		       buffer->virt_addr->pages != NULL;
+	default:
+		return false;
+	}
+}
+
 dma_addr_t rga_mm_lookup_iova(struct rga_internal_buffer *buffer)
 {
 	if (rga_mm_is_invalid_dma_buffer(buffer->dma_buffer))
@@ -1479,9 +1545,172 @@ static int rga_mm_sgt_to_page_table(struct sg_table *sg,
 	return 0;
 }
 
+static bool rga_mm_buffer_uses_dma_address(struct rga_job *job,
+					   struct rga_internal_buffer *buffer)
+{
+	/*
+	 * A buffer mapped directly against the executing RGA2 device (the
+	 * per-job mapping path) already carries device-usable DMA addresses:
+	 * below-4G pages map 1:1 and over-4G pages are swiotlb-bounced by
+	 * the 32-bit DMA mask.
+	 */
+	return buffer->dma_buffer != NULL &&
+	       !buffer->dma_buffer->iommu_mapped &&
+	       buffer->dma_buffer->map_dev == job->scheduler->dev;
+}
+
+static void rga_mm_put_rga2_bounce(struct rga_job *job,
+				   struct rga_job_buffer *job_buf)
+{
+	int i;
+
+	for (i = 0; i < job_buf->rga2_bounce_count; i++) {
+		struct rga_dma_buffer *bounce = job_buf->rga2_bounce[i];
+		struct rga_internal_buffer *origin = job_buf->rga2_bounce_origin[i];
+
+		if (bounce->attach) {
+			rga_dma_unmap_buf(bounce);
+		} else {
+			rga_dma_unmap_sgt(bounce);
+			rga_free_sgt(&bounce->sgt);
+		}
+
+		/*
+		 * The bounce copy-back dirties the origin pages through the
+		 * kernel mapping; clean them to the point of coherency via
+		 * the origin's persistent mapping so that a later cache
+		 * invalidate (exporter sync, FORCE_FLUSH put) cannot discard
+		 * the copied-back data. This applies regardless of how the
+		 * persistent mapping is made (the default map core is
+		 * IOMMU-backed and its sync_for_cpu still invalidates); only
+		 * read-only bounces have nothing copied back. A raw sync is
+		 * used on purpose: the shadow-page logic of
+		 * rga_mm_sync_dma_sg_for_device() must not run here, it
+		 * would overwrite device output.
+		 */
+		if (bounce->dir != DMA_TO_DEVICE &&
+		    origin != NULL && origin->dma_buffer != NULL &&
+		    origin->dma_buffer->sgt != NULL &&
+		    origin->dma_buffer->map_dev != NULL)
+			dma_sync_sg_for_device(origin->dma_buffer->map_dev,
+					       origin->dma_buffer->sgt->sgl,
+					       origin->dma_buffer->sgt->orig_nents,
+					       DMA_TO_DEVICE);
+
+		kfree(bounce);
+		job_buf->rga2_bounce[i] = NULL;
+		job_buf->rga2_bounce_origin[i] = NULL;
+	}
+	job_buf->rga2_bounce_count = 0;
+}
+
+/*
+ * Return the sg table an RGA2 page table for @buffer should be built from,
+ * and whether to consume sg_dma_address() (device-usable, possibly bounced
+ * below 4G) or sg_phys(). Over-4G buffers that are only mapped for another
+ * core get a transient per-job mapping against the RGA2 device here.
+ */
+static struct sg_table *rga_mm_get_rga2_sgt(struct rga_job *job,
+					    struct rga_job_buffer *job_buf,
+					    struct rga_internal_buffer *buffer,
+					    enum dma_data_direction dir,
+					    int32_t *use_dma_address)
+{
+	struct rga_dma_buffer *bounce;
+	struct sg_table *sgt;
+	int ret;
+
+	*use_dma_address = false;
+
+	if (buffer == NULL)
+		return NULL;
+
+	if (rga_mm_buffer_uses_dma_address(job, buffer)) {
+		*use_dma_address = true;
+		return rga_mm_lookup_sgt(buffer);
+	}
+
+	if (buffer->mm_flag & RGA_MEM_UNDER_4G)
+		return rga_mm_lookup_sgt(buffer);
+
+	if (job_buf->rga2_bounce_count >= ARRAY_SIZE(job_buf->rga2_bounce))
+		return ERR_PTR(-EOPNOTSUPP);
+
+	bounce = kzalloc(sizeof(*bounce), GFP_KERNEL);
+	if (bounce == NULL)
+		return ERR_PTR(-ENOMEM);
+
+	/*
+	 * The channel get-side @dir is DMA_TO_DEVICE for every channel
+	 * (including the write channel, whose put side uses
+	 * DMA_FROM_DEVICE), so it must not choose the bounce mapping
+	 * direction: swiotlb only copies a bounce back to the origin on
+	 * unmap for DMA_FROM_DEVICE/DMA_BIDIRECTIONAL, and a
+	 * DMA_TO_DEVICE-mapped write channel would silently discard the
+	 * device output. Map bidirectionally, like the persistent
+	 * mappings; the map-time forward copy also preserves
+	 * destination pixels the job does not write.
+	 */
+	switch (buffer->type) {
+	case RGA_DMA_BUFFER:
+	case RGA_DMA_BUFFER_PTR:
+		if (buffer->dma_buffer == NULL ||
+		    buffer->dma_buffer->dma_buf == NULL) {
+			ret = -EOPNOTSUPP;
+			break;
+		}
+
+		ret = rga_dma_map_buf_pages(buffer->dma_buffer->dma_buf,
+					    bounce, DMA_BIDIRECTIONAL,
+					    job->scheduler->dev);
+		break;
+	case RGA_VIRTUAL_ADDRESS:
+		if (buffer->virt_addr == NULL ||
+		    buffer->virt_addr->pages == NULL) {
+			ret = -EOPNOTSUPP;
+			break;
+		}
+
+		sgt = rga_alloc_sgt(buffer->virt_addr->pages,
+				    buffer->virt_addr->page_count, 0,
+				    (size_t)buffer->virt_addr->page_count << PAGE_SHIFT,
+				    GFP_KERNEL);
+		if (IS_ERR(sgt)) {
+			ret = PTR_ERR(sgt);
+			break;
+		}
+
+		ret = rga_dma_map_sgt_pages(sgt, bounce, DMA_BIDIRECTIONAL,
+					    job->scheduler->dev);
+		if (ret < 0)
+			rga_free_sgt(&sgt);
+		break;
+	default:
+		/* Physical addresses cannot be remapped below 4G. */
+		ret = -EOPNOTSUPP;
+		break;
+	}
+
+	if (ret < 0) {
+		kfree(bounce);
+		rga_job_err(job,
+			    "RGA2: can not map over-4G buffer below 4G (%d); use below-4G (e.g. CMA/DMA32) buffers\n",
+			    ret);
+		return ERR_PTR(-EOPNOTSUPP);
+	}
+
+	job_buf->rga2_bounce[job_buf->rga2_bounce_count] = bounce;
+	job_buf->rga2_bounce_origin[job_buf->rga2_bounce_count] = buffer;
+	job_buf->rga2_bounce_count++;
+
+	*use_dma_address = true;
+	return bounce->sgt;
+}
+
 static int rga_mm_set_mmu_base(struct rga_job *job,
 			       struct rga_img_info_t *img,
-			       struct rga_job_buffer *job_buf)
+			       struct rga_job_buffer *job_buf,
+			       enum dma_data_direction dir)
 {
 	int ret;
 	int yrgb_count = 0;
@@ -1489,6 +1718,7 @@ static int rga_mm_set_mmu_base(struct rga_job *job,
 	int v_count = 0;
 	int page_count = 0;
 	int order = 0;
+	int32_t use_dma_address = false;
 	uint32_t *page_table = NULL;
 	struct sg_table *sgt = NULL;
 
@@ -1547,29 +1777,33 @@ static int rga_mm_set_mmu_base(struct rga_job *job,
 			mutex_unlock(&rga_drvdata->lock);
 		}
 
-		sgt = rga_mm_lookup_sgt(job_buf->y_addr);
-		if (sgt == NULL) {
+		sgt = rga_mm_get_rga2_sgt(job, job_buf, job_buf->y_addr, dir,
+					  &use_dma_address);
+		if (IS_ERR_OR_NULL(sgt)) {
 			rga_job_err(job, "rga2 cannot get sgt from internal buffer!\n");
-			ret = -EINVAL;
+			ret = sgt ? PTR_ERR(sgt) : -EINVAL;
 			goto err_free_page_table;
 		}
-		rga_mm_sgt_to_page_table(sgt, page_table, yrgb_count, false);
+		rga_mm_sgt_to_page_table(sgt, page_table, yrgb_count, use_dma_address);
 
-		sgt = rga_mm_lookup_sgt(job_buf->uv_addr);
-		if (sgt == NULL) {
+		sgt = rga_mm_get_rga2_sgt(job, job_buf, job_buf->uv_addr, dir,
+					  &use_dma_address);
+		if (IS_ERR_OR_NULL(sgt)) {
 			rga_job_err(job, "rga2 cannot get sgt from internal buffer!\n");
-			ret = -EINVAL;
+			ret = sgt ? PTR_ERR(sgt) : -EINVAL;
 			goto err_free_page_table;
 		}
-		rga_mm_sgt_to_page_table(sgt, page_table + yrgb_count, uv_count, false);
+		rga_mm_sgt_to_page_table(sgt, page_table + yrgb_count, uv_count, use_dma_address);
 
-		sgt = rga_mm_lookup_sgt(job_buf->v_addr);
-		if (sgt == NULL) {
+		sgt = rga_mm_get_rga2_sgt(job, job_buf, job_buf->v_addr, dir,
+					  &use_dma_address);
+		if (IS_ERR_OR_NULL(sgt)) {
 			rga_job_err(job, "rga2 cannot get sgt from internal buffer!\n");
-			ret = -EINVAL;
+			ret = sgt ? PTR_ERR(sgt) : -EINVAL;
 			goto err_free_page_table;
 		}
-		rga_mm_sgt_to_page_table(sgt, page_table + yrgb_count + uv_count, v_count, false);
+		rga_mm_sgt_to_page_table(sgt, page_table + yrgb_count + uv_count, v_count,
+					 use_dma_address);
 
 		img->yrgb_addr = yrgb_offset;
 		img->uv_addr = (yrgb_count << PAGE_SHIFT) + uv_offset;
@@ -1606,13 +1840,14 @@ static int rga_mm_set_mmu_base(struct rga_job *job,
 			mutex_unlock(&rga_drvdata->lock);
 		}
 
-		sgt = rga_mm_lookup_sgt(job_buf->addr);
-		if (sgt == NULL) {
+		sgt = rga_mm_get_rga2_sgt(job, job_buf, job_buf->addr, dir,
+					  &use_dma_address);
+		if (IS_ERR_OR_NULL(sgt)) {
 			rga_job_err(job, "rga2 cannot get sgt from internal buffer!\n");
-			ret = -EINVAL;
+			ret = sgt ? PTR_ERR(sgt) : -EINVAL;
 			goto err_free_page_table;
 		}
-		rga_mm_sgt_to_page_table(sgt, page_table, page_count, false);
+		rga_mm_sgt_to_page_table(sgt, page_table, page_count, use_dma_address);
 
 		img->yrgb_addr = img_offset;
 		rga_convert_addr(img, false);
@@ -1652,6 +1887,7 @@ static int rga_mm_set_mmu_base(struct rga_job *job,
 	return 0;
 
 err_free_page_table:
+	rga_mm_put_rga2_bounce(job, job_buf);
 	if (job->flags & RGA_JOB_USE_HANDLE)
 		free_pages((unsigned long)page_table, order);
 	return ret;
@@ -1925,6 +2161,13 @@ static void rga_mm_put_channel_handle_info(struct rga_mm *mm,
 					   struct rga_job_buffer *job_buf,
 					   enum dma_data_direction dir)
 {
+	/*
+	 * Release transient RGA2 bounce mappings first: their unmap copies
+	 * bounced data back and the post-clean below needs the origin
+	 * buffers still mapped and not yet invalidated.
+	 */
+	rga_mm_put_rga2_bounce(job, job_buf);
+
 	if (job_buf->y_addr)
 		rga_mm_put_buffer(mm, job, job_buf->y_addr, dir);
 	if (job_buf->uv_addr)
@@ -2010,7 +2253,7 @@ static int rga_mm_get_channel_handle_info(struct rga_mm *mm,
 
 	if (job->scheduler->data->mmu == RGA_MMU &&
 	    rga_mm_is_need_mmu(job, job_buf->addr)) {
-		ret = rga_mm_set_mmu_base(job, img, job_buf);
+		ret = rga_mm_set_mmu_base(job, img, job_buf, dir);
 		if (ret < 0) {
 			rga_job_err(job, "Can't set RGA2 MMU_BASE from handle!\n");
 
@@ -2272,6 +2515,8 @@ static void rga_mm_unmap_channel_job_buffer(struct rga_job *job,
 					    struct rga_job_buffer *job_buffer,
 					    enum dma_data_direction dir)
 {
+	rga_mm_put_rga2_bounce(job, job_buffer);
+
 	if (job_buffer->addr->mm_flag & RGA_MEM_FORCE_FLUSH_CACHE && dir != DMA_NONE)
 		if (rga_mm_sync_dma_sg_for_cpu(job_buffer->addr, job, dir))
 			rga_job_err(job, "sync sgt for cpu error!\n");
@@ -2335,7 +2580,7 @@ static int rga_mm_map_channel_job_buffer(struct rga_job *job,
 
 	if (job->scheduler->data->mmu == RGA_MMU &&
 	    rga_mm_is_need_mmu(job, job_buffer->addr)) {
-		ret = rga_mm_set_mmu_base(job, img, job_buffer);
+		ret = rga_mm_set_mmu_base(job, img, job_buffer, dir);
 		if (ret < 0) {
 			rga_job_err(job, "Can't set RGA2 MMU_BASE!\n");
 			job_buffer->addr = NULL;
@@ -2515,7 +2760,7 @@ static int rga_mm_alloc_channel_fake_buffer(struct rga_job *job,
 
 	if (job->scheduler->data->mmu == RGA_MMU &&
 	    rga_mm_is_need_mmu(job, job_buffer->addr)) {
-		ret = rga_mm_set_mmu_base(job, img, job_buffer);
+		ret = rga_mm_set_mmu_base(job, img, job_buffer, dir);
 		if (ret < 0) {
 			job_buffer->addr = NULL;
 			goto error_free_dma_buf;
