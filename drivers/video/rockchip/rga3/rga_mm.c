@@ -2191,21 +2191,30 @@ static void rga_mm_put_channel_handle_info(struct rga_mm *mm,
 	 */
 	rga_mm_put_rga2_bounce(job, job_buf);
 
-	if (job_buf->y_addr)
+	if (job_buf->y_addr) {
 		rga_mm_put_buffer(mm, job, job_buf->y_addr, dir);
-	if (job_buf->uv_addr)
+		job_buf->y_addr = NULL;
+	}
+	if (job_buf->uv_addr) {
 		rga_mm_put_buffer(mm, job, job_buf->uv_addr, dir);
-	if (job_buf->v_addr)
+		job_buf->uv_addr = NULL;
+	}
+	if (job_buf->v_addr) {
 		rga_mm_put_buffer(mm, job, job_buf->v_addr, dir);
+		job_buf->v_addr = NULL;
+	}
 
 	if (job_buf->page_table) {
-		if (job_buf->page_table_mapped)
+		if (job_buf->page_table_mapped) {
 			dma_unmap_single(job_buf->page_table_dev,
 					 job_buf->page_table_dma,
 					 job_buf->page_count *
 					 sizeof(*job_buf->page_table),
 					 DMA_TO_DEVICE);
+			job_buf->page_table_mapped = false;
+		}
 		free_pages((unsigned long)job_buf->page_table, job_buf->order);
+		job_buf->page_table = NULL;
 	}
 }
 
@@ -2288,6 +2297,10 @@ static int rga_mm_get_channel_handle_info(struct rga_mm *mm,
 	return 0;
 }
 
+static void rga_mm_put_handle_info(struct rga_job *job,
+				   struct rga_job_task_buffers *buffers,
+				   struct rga_req *req);
+
 static int rga_mm_get_handle_info(struct rga_job *job,
 				  struct rga_job_task_buffers *buffers,
 				  struct rga_req *req)
@@ -2351,7 +2364,7 @@ static int rga_mm_get_handle_info(struct rga_job *job,
 						     DMA_TO_DEVICE);
 		if (ret < 0) {
 			rga_job_err(job, "Can't get src buffer info from handle!\n");
-			return ret;
+			goto err_put_handle_info;
 		}
 	}
 
@@ -2361,7 +2374,7 @@ static int rga_mm_get_handle_info(struct rga_job *job,
 						     DMA_TO_DEVICE);
 		if (ret < 0) {
 			rga_job_err(job, "Can't get dst buffer info from handle!\n");
-			return ret;
+			goto err_put_handle_info;
 		}
 	}
 
@@ -2382,13 +2395,17 @@ static int rga_mm_get_handle_info(struct rga_job *job,
 		}
 		if (ret < 0) {
 			rga_job_err(job, "Can't get pat buffer info from handle!\n");
-			return ret;
+			goto err_put_handle_info;
 		}
 	}
 
 	rga_mm_set_mmu_flag(job, buffers, req);
 
 	return 0;
+
+err_put_handle_info:
+	rga_mm_put_handle_info(job, buffers, req);
+	return ret;
 }
 
 static void rga_mm_put_handle_info(struct rga_job *job,
