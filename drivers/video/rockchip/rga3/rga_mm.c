@@ -1738,11 +1738,11 @@ static int rga_mm_set_mmu_base(struct rga_job *job,
 
 	/* using third-address */
 	if (job_buf->uv_addr) {
-		if (job_buf->y_addr->virt_addr != NULL)
+		if (job_buf->y_addr && job_buf->y_addr->virt_addr != NULL)
 			yrgb_offset = job_buf->y_addr->virt_addr->offset;
-		if (job_buf->uv_addr->virt_addr != NULL)
+		if (job_buf->uv_addr && job_buf->uv_addr->virt_addr != NULL)
 			uv_offset = job_buf->uv_addr->virt_addr->offset;
-		if (job_buf->v_addr->virt_addr != NULL)
+		if (job_buf->v_addr && job_buf->v_addr->virt_addr != NULL)
 			v_offset = job_buf->v_addr->virt_addr->offset;
 
 		yrgb_count = RGA_GET_PAGE_COUNT(yrgb_size + yrgb_offset);
@@ -1754,6 +1754,19 @@ static int rga_mm_set_mmu_base(struct rga_job *job,
 			rga_job_err(job, "page count cal error! yrba = %d, uv = %d, v = %d\n",
 				yrgb_count, uv_count, v_count);
 			return -EFAULT;
+		}
+
+		/*
+		 * Plane counts come from the format, while plane buffers are
+		 * populated only for non-zero handles. Reject missing required
+		 * planes before building an incomplete RGA MMU page table.
+		 */
+		if ((yrgb_count && !job_buf->y_addr) ||
+		    (uv_count && !job_buf->uv_addr) ||
+		    (v_count && !job_buf->v_addr)) {
+			rga_job_err(job,
+				    "multi-plane format missing a plane buffer\n");
+			return -EINVAL;
 		}
 
 		if (job->flags & RGA_JOB_USE_HANDLE) {
@@ -1777,33 +1790,42 @@ static int rga_mm_set_mmu_base(struct rga_job *job,
 			mutex_unlock(&rga_drvdata->lock);
 		}
 
-		sgt = rga_mm_get_rga2_sgt(job, job_buf, job_buf->y_addr, dir,
-					  &use_dma_address);
-		if (IS_ERR_OR_NULL(sgt)) {
-			rga_job_err(job, "rga2 cannot get sgt from internal buffer!\n");
-			ret = sgt ? PTR_ERR(sgt) : -EINVAL;
-			goto err_free_page_table;
+		if (job_buf->y_addr) {
+			sgt = rga_mm_get_rga2_sgt(job, job_buf, job_buf->y_addr,
+						  dir, &use_dma_address);
+			if (IS_ERR_OR_NULL(sgt)) {
+				rga_job_err(job, "rga2 cannot get sgt from internal buffer!\n");
+				ret = sgt ? PTR_ERR(sgt) : -EINVAL;
+				goto err_free_page_table;
+			}
+			rga_mm_sgt_to_page_table(sgt, page_table, yrgb_count,
+						 use_dma_address);
 		}
-		rga_mm_sgt_to_page_table(sgt, page_table, yrgb_count, use_dma_address);
 
-		sgt = rga_mm_get_rga2_sgt(job, job_buf, job_buf->uv_addr, dir,
-					  &use_dma_address);
-		if (IS_ERR_OR_NULL(sgt)) {
-			rga_job_err(job, "rga2 cannot get sgt from internal buffer!\n");
-			ret = sgt ? PTR_ERR(sgt) : -EINVAL;
-			goto err_free_page_table;
+		if (job_buf->uv_addr) {
+			sgt = rga_mm_get_rga2_sgt(job, job_buf, job_buf->uv_addr,
+						  dir, &use_dma_address);
+			if (IS_ERR_OR_NULL(sgt)) {
+				rga_job_err(job, "rga2 cannot get sgt from internal buffer!\n");
+				ret = sgt ? PTR_ERR(sgt) : -EINVAL;
+				goto err_free_page_table;
+			}
+			rga_mm_sgt_to_page_table(sgt, page_table + yrgb_count,
+						 uv_count, use_dma_address);
 		}
-		rga_mm_sgt_to_page_table(sgt, page_table + yrgb_count, uv_count, use_dma_address);
 
-		sgt = rga_mm_get_rga2_sgt(job, job_buf, job_buf->v_addr, dir,
-					  &use_dma_address);
-		if (IS_ERR_OR_NULL(sgt)) {
-			rga_job_err(job, "rga2 cannot get sgt from internal buffer!\n");
-			ret = sgt ? PTR_ERR(sgt) : -EINVAL;
-			goto err_free_page_table;
+		if (job_buf->v_addr) {
+			sgt = rga_mm_get_rga2_sgt(job, job_buf, job_buf->v_addr,
+						  dir, &use_dma_address);
+			if (IS_ERR_OR_NULL(sgt)) {
+				rga_job_err(job, "rga2 cannot get sgt from internal buffer!\n");
+				ret = sgt ? PTR_ERR(sgt) : -EINVAL;
+				goto err_free_page_table;
+			}
+			rga_mm_sgt_to_page_table(sgt,
+						 page_table + yrgb_count + uv_count,
+						 v_count, use_dma_address);
 		}
-		rga_mm_sgt_to_page_table(sgt, page_table + yrgb_count + uv_count, v_count,
-					 use_dma_address);
 
 		img->yrgb_addr = yrgb_offset;
 		img->uv_addr = (yrgb_count << PAGE_SHIFT) + uv_offset;
