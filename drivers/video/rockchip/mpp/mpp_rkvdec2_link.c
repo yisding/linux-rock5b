@@ -2843,7 +2843,7 @@ static int rkvdec2_hard_ccu_enqueue(struct rkvdec2_ccu *ccu,
 			struct rkvdec2_dev *dec = to_rkvdec2_dev(core);
 			struct rkvdec_link_dev *link_dec = dec->link_dec;
 
-			if (mpp->disable)
+			if (core->disable)
 				continue;
 			work_mode |= dec->core_mask;
 			rkvdec2_ccu_link_fix_rcb_regs(dec);
