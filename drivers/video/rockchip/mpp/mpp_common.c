@@ -1569,6 +1569,19 @@ static int mpp_process_request(struct mpp_session *session,
 		u32 count;
 		u32 data[MPP_MAX_REG_TRANS_NUM];
 
+		/*
+		 * Reject before touching session->dma: it is NULL until
+		 * MPP_CMD_INIT_CLIENT_TYPE binds a device, and again after
+		 * MPP_CMD_RESET_SESSION destroys it (session->mpp stays set in
+		 * that case, so a session->mpp check is not enough). Either way
+		 * mpp_dma_release_fd() would oops dereferencing dma->dev.
+		 */
+		if (!session->dma) {
+			mpp_err("pid %d release fd on session %d with no dma\n",
+				session->pid, session->device_type);
+			return -EINVAL;
+		}
+
 		if (req->size <= 0 ||
 		    req->size > sizeof(data))
 			return -EINVAL;
