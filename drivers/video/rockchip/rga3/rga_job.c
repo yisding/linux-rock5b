@@ -756,6 +756,7 @@ void rga_request_scheduler_shutdown(struct rga_scheduler_t *scheduler)
 {
 	struct rga_job *job, *job_q;
 	unsigned long flags;
+	LIST_HEAD(list_to_free);
 
 	rga_power_enable(scheduler);
 
@@ -787,15 +788,21 @@ void rga_request_scheduler_shutdown(struct rga_scheduler_t *scheduler)
 		 */
 		rga_power_disable(scheduler);
 	} else {
-		/* Clean up the jobs in the todo list that need to be free. */
+		/* Move the todo jobs that need to be freed to a local list. */
 		list_for_each_entry_safe(job, job_q, &scheduler->todo_list, head) {
+			list_move(&job->head, &list_to_free);
+			scheduler->job_count--;
+		}
+
+		spin_unlock_irqrestore(&scheduler->irq_lock, flags);
+
+		/* Clean up outside the lock since the callees may sleep. */
+		list_for_each_entry_safe(job, job_q, &list_to_free, head) {
 			rga_mm_unmap_job_info(job);
 
 			job->ret = -EBUSY;
 			rga_request_release_signal(scheduler, job);
 		}
-
-		spin_unlock_irqrestore(&scheduler->irq_lock, flags);
 	}
 
 finish:
