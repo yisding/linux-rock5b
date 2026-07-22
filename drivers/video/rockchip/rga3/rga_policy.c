@@ -354,7 +354,7 @@ static int rga_task_assign(struct rga_job *job, struct rga_req *rga_base)
 		}
 
 		if (feature > 0) {
-			if (!(feature & data->feature)) {
+			if ((feature & data->feature) != feature) {
 				if (DEBUGGER_EN(MSG))
 					rga_job_log(job, "%s(%#x), break on feature\n",
 						rga_get_core_name(scheduler->core),
