@@ -349,6 +349,10 @@ int mpp_set_rcbbuf(struct mpp_dev *mpp, struct mpp_session *session,
 		for (i = 0; i < rcb_inf->cnt; i++) {
 			reg_idx = rcb_inf->elem[i].index;
 			rcb_size = rcb_inf->elem[i].size;
+			if (reg_idx >= RKVDEC_REG_NUM) {
+				mpp_err("invalid rcb reg index %u\n", reg_idx);
+				continue;
+			}
 			if ((rcb_offset + rcb_size) > dec->rcb_size) {
 				mpp_debug(DEBUG_SRAM_INFO,
 					  "rcb: reg %d use original buffer\n", reg_idx);
@@ -356,6 +360,7 @@ int mpp_set_rcbbuf(struct mpp_dev *mpp, struct mpp_session *session,
 			}
 			mpp_debug(DEBUG_SRAM_INFO, "rcb: reg %d offset %d, size %d\n",
 				  reg_idx, rcb_offset, rcb_size);
+			reg_idx = array_index_nospec(reg_idx, RKVDEC_REG_NUM);
 			task->reg[reg_idx] = dec->rcb_iova + rcb_offset;
 			rcb_offset += rcb_size;
 		}
