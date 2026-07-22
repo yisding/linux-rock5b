@@ -1988,7 +1988,7 @@ mpp_task_attach_fd(struct mpp_task *task, int fd)
 	if (fd <= 0 || !dma || !mpp)
 		return ERR_PTR(-EINVAL);
 
-	if (task->mem_count > mem_num) {
+	if (task->mem_count >= mem_num) {
 		mpp_err("mem_count %d must less than %d\n", task->mem_count, mem_num);
 		return ERR_PTR(-ENOMEM);
 	}
@@ -2123,14 +2123,25 @@ int mpp_extract_reg_offset_info(struct reg_offset_info *off_inf,
 {
 	int max_size = ARRAY_SIZE(off_inf->elem);
 	int cnt = req->size / sizeof(off_inf->elem[0]);
+	u32 size = cnt * sizeof(off_inf->elem[0]);
 
+	/*
+	 * Reject a byte count that is not a whole number of elements: the
+	 * check below floors to complete elements, but the copy used the raw
+	 * req->size, so a non-multiple size (e.g. 647 -> cnt 80) copied up to
+	 * seven bytes past the 80-element array into adjacent task fields.
+	 */
+	if (req->size != size) {
+		mpp_err("invalid reg offset size %u\n", req->size);
+		return -EINVAL;
+	}
 	if ((cnt + off_inf->cnt) > max_size) {
 		mpp_err("count %d, total %d, max_size %d\n",
 			cnt, off_inf->cnt, max_size);
 		return -EINVAL;
 	}
 	if (copy_from_user(&off_inf->elem[off_inf->cnt],
-			   req->data, req->size)) {
+			   req->data, size)) {
 		mpp_err("copy_from_user failed\n");
 		return -EINVAL;
 	}
