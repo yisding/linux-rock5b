@@ -2166,6 +2166,13 @@ int rkvdec2_free_rcbbuf(struct platform_device *pdev, struct rkvdec2_dev *dec)
 	struct mpp_iommu_info *info = dec->mpp.iommu_info;
 	struct iommu_domain *domain = info ? info->domain : NULL;
 
+	/*
+	 * Remove the IOMMU mapping before returning the pages to the
+	 * allocator; otherwise reused pages remain reachable through the
+	 * still-live IOVA and hardware DMA can land in another owner's memory.
+	 */
+	if (dec->rcb_iova && domain)
+		iommu_unmap(domain, dec->rcb_iova, dec->rcb_size);
 	if (dec->rcb_page) {
 		size_t page_size = PAGE_ALIGN(dec->rcb_size - dec->sram_size);
 		int order = min(get_order(page_size), MAX_PAGE_ORDER);
@@ -2173,8 +2180,6 @@ int rkvdec2_free_rcbbuf(struct platform_device *pdev, struct rkvdec2_dev *dec)
 		__free_pages(dec->rcb_page, order);
 		dec->rcb_page = NULL;
 	}
-	if (dec->rcb_iova && domain)
-		iommu_unmap(domain, dec->rcb_iova, dec->rcb_size);
 	if (dec->rcb_iova && info)
 		mpp_iommu_unreserve_iova(info, dec->rcb_iova, dec->rcb_size);
 	if (dec->rcb_iova && dec->ccu)
