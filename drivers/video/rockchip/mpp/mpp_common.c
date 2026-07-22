@@ -103,7 +103,13 @@ static int
 mpp_taskqueue_pop_pending(struct mpp_taskqueue *queue,
 			  struct mpp_task *task)
 {
-	if (!task->session || !task->session->mpp)
+	/*
+	 * Only the session backpointer is needed to unlink and drop the task.
+	 * A task whose session has no bound device (session->mpp == NULL) must
+	 * still be removable here -- otherwise an orphaned task becomes
+	 * unremovable and the worker's abort path spins on it forever.
+	 */
+	if (!task->session)
 		return -EINVAL;
 
 	mutex_lock(&queue->pending_lock);
@@ -565,12 +571,18 @@ void mpp_free_task(struct kref *ref)
 		       task->state, atomic_read(&task->abort_request));
 
 	mpp = mpp_get_task_used_device(task, session);
-	if (mpp->dev_ops->free_task)
+	/*
+	 * An orphaned task (session never bound a device, so both task->mpp
+	 * and session->mpp are NULL) must still be freeable without
+	 * dereferencing the missing device.
+	 */
+	if (mpp && mpp->dev_ops->free_task)
 		mpp->dev_ops->free_task(session, task);
 
 	/* Decrease reference count */
 	atomic_dec(&session->task_count);
-	atomic_dec(&mpp->task_count);
+	if (mpp)
+		atomic_dec(&mpp->task_count);
 }
 
 static void mpp_task_timeout_work(struct work_struct *work_s)
@@ -957,6 +969,8 @@ static void try_process_running_task(struct mpp_dev *mpp)
 	/* try process running task */
 	list_for_each_entry_safe(mpp_task, n, &queue->running_list, queue_link) {
 		mpp = mpp_get_task_used_device(mpp_task, mpp_task->session);
+		if (unlikely(!mpp))
+			continue;
 		disable_irq(mpp->irq);
 		if (!test_bit(TASK_STATE_HANDLE, &mpp_task->state)) {
 			enable_irq(mpp->irq);
@@ -1000,7 +1014,23 @@ again:
 	}
 
 	/* get device for current task */
-	mpp = task->session->mpp;
+	mpp = mpp_get_task_used_device(task, task->session);
+	if (unlikely(!mpp)) {
+		/*
+		 * The task's session has no bound device (client never
+		 * completed init, or its state was corrupted after a decode
+		 * error). The submit path guards this same dereference
+		 * (mpp_process_task_default); the worker must too, or it
+		 * oopses on a NULL device pointer -- the fatal rk_vcodec
+		 * paging fault observed on the VP9 show_existing_frame
+		 * vector. Drop the orphaned task so the queue makes progress
+		 * instead of dereferencing NULL.
+		 */
+		mpp_err("session %d:%d task has no device, dropping\n",
+			task->session->device_type, task->session->index);
+		mpp_taskqueue_pop_pending(queue, task);
+		goto again;
+	}
 
 	/*
 	 * In the link table mode, the prepare function of the device
