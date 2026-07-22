@@ -291,6 +291,8 @@ static struct mpp_task_msgs *get_task_msgs(struct mpp_session *session)
 	spin_unlock_irqrestore(&session->lock_msgs, flags);
 
 	msgs = kzalloc(sizeof(*msgs), GFP_KERNEL);
+	if (!msgs)
+		return NULL;
 	task_msgs_init(msgs, session);
 	INIT_LIST_HEAD(&msgs->list_session);
 
@@ -1739,7 +1741,11 @@ next:
 		/* switch session */
 		session = fd_file(f)->private_data;
 		msgs = get_task_msgs(session);
-
+		if (!msgs) {
+			/* alloc failed: release the held fd, don't deref NULL */
+			fdput(f);
+			return -ENOMEM;
+		}
 		if (fd_file(f)->private_data == session)
 			msgs->ext_fd = bat_msg.fd;
 
