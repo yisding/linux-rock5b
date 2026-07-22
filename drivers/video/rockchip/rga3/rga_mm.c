@@ -2124,7 +2124,7 @@ static int rga_mm_get_buffer(struct rga_mm *mm,
 	if (ret < 0) {
 		rga_job_err(job, "handle[%ld] failed to get internal buffer info!\n",
 			(unsigned long)handle);
-		return ret;
+		goto put_internal_buffer;
 	}
 
 	if (internal_buffer->size < require_size) {
@@ -2155,6 +2155,7 @@ put_internal_buffer:
 	kref_put(&internal_buffer->refcount, rga_mm_kref_release_buffer);
 	mutex_unlock(&mm->lock);
 
+	*buf = NULL;
 	return ret;
 
 }
