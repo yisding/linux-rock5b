@@ -611,6 +611,7 @@ static int rga_request_add_acquire_fence_callback(int acquire_fence_fd,
 #endif
 #else
 		rga_req_err(request, "Please update the driver to v1.2.28 to prevent acquire_fence_fd leaks.");
+		rga_dma_fence_put(acquire_fence);
 		return -EFAULT;
 #endif
 	}
@@ -620,9 +621,11 @@ static int rga_request_add_acquire_fence_callback(int acquire_fence_fd,
 	if (ret < 0) {
 		rga_req_err(request, "%s: Current acquire fence unexpectedly has error status before signal\n",
 		       __func__);
+		rga_dma_fence_put(acquire_fence);
 		return ret;
 	} else if (ret > 0) {
 		/* has been signaled */
+		rga_dma_fence_put(acquire_fence);
 		return ret;
 	}
 
@@ -645,6 +648,10 @@ static int rga_request_add_acquire_fence_callback(int acquire_fence_fd,
 		mutex_lock(&request_manager->lock);
 		rga_request_put(request);
 		mutex_unlock(&request_manager->lock);
+
+		/* The callback was not registered, so release our fence ref. */
+		rga_dma_fence_put(acquire_fence);
+
 		return ret;
 	}
 
@@ -1111,6 +1118,8 @@ static void rga_request_acquire_fence_signaled_cb(struct dma_fence *fence,
 
 	queue_work(system_highpri_wq, &request->fence_work);
 	kfree(waiter);
+
+	dma_fence_put(fence);
 }
 
 int rga_request_release_signal(struct rga_scheduler_t *scheduler, struct rga_job *job)
