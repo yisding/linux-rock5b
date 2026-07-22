@@ -1738,6 +1738,17 @@ next:
 			msgs = NULL;
 		}
 
+		/* validate the fd actually refers to an mpp device file */
+		if (fd_file(f)->f_op != &rockchip_mpp_fops) {
+			int ret = -EBADF;
+
+			mpp_err("fd %d is not an mpp session\n", bat_msg.fd);
+			fdput(f);
+			if (copy_to_user(&usr_cmd->ret, &ret, sizeof(usr_cmd->ret)))
+				mpp_err("copy_to_user failed.\n");
+			goto session_switch_done;
+		}
+
 		/* switch session */
 		session = fd_file(f)->private_data;
 		msgs = get_task_msgs(session);
@@ -1746,9 +1757,7 @@ next:
 			fdput(f);
 			return -ENOMEM;
 		}
-		if (fd_file(f)->private_data == session)
-			msgs->ext_fd = bat_msg.fd;
-
+		msgs->ext_fd = bat_msg.fd;
 		msgs->f = f;
 
 		mpp_debug(DEBUG_IOCTL, "fd %d, session %d msg_cnt %d\n",
