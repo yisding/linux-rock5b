@@ -1080,6 +1080,19 @@ static int mpp_wait_result_default(struct mpp_session *session,
 		return -EIO;
 	}
 	mpp = mpp_get_task_used_device(task, session);
+	if (unlikely(!mpp)) {
+		/*
+		 * The task's session has no bound device, so it can never be
+		 * completed; fail it here instead of dereferencing a NULL
+		 * device in the result path below. This is the synchronous
+		 * twin of the worker NULL-deref guarded alongside this change;
+		 * drop the dead task so it does not linger in the pending list.
+		 */
+		mpp_err("session %d:%d task has no device\n",
+			session->device_type, session->index);
+		mpp_session_pop_pending(session, task);
+		return -EIO;
+	}
 
 	if (msgs->flags & MPP_FLAGS_POLL_NON_BLOCK) {
 		if (!test_bit(TASK_STATE_DONE, &task->state))
