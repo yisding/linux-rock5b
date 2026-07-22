@@ -962,6 +962,11 @@ static int rkvenc_extract_task_msg(struct mpp_session *session,
 					mpp_err("alloc class msg %d fail.\n", j);
 					goto fail;
 				}
+				if (task->w_req_cnt >= MPP_MAX_MSG_NUM) {
+					mpp_err("w_req_cnt %d overflow\n", task->w_req_cnt);
+					ret = -EINVAL;
+					goto fail;
+				}
 				wreq = &task->w_reqs[task->w_req_cnt];
 				rkvenc_update_req(task, j, req, wreq);
 				data = rkvenc_get_class_reg(task, wreq->offset);
@@ -989,6 +994,11 @@ static int rkvenc_extract_task_msg(struct mpp_session *session,
 				ret = rkvenc_alloc_class_msg(task, j);
 				if (ret) {
 					mpp_err("alloc class msg reg %d fail.\n", j);
+					goto fail;
+				}
+				if (task->r_req_cnt >= MPP_MAX_MSG_NUM) {
+					mpp_err("r_req_cnt %d overflow\n", task->r_req_cnt);
+					ret = -EINVAL;
 					goto fail;
 				}
 				rreq = &task->r_reqs[task->r_req_cnt];
