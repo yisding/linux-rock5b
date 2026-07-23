@@ -1423,6 +1423,18 @@ static int mpp_process_request(struct mpp_session *session,
 		if (!mpp)
 			return -EINVAL;
 
+		/*
+		 * INIT_CLIENT_TYPE binds the session to a device exactly once.
+		 * A second call would re-create session->dma (leaking the
+		 * first) and re-run mpp_session_attach_workqueue(), which
+		 * list_add_tail()s the already-linked session->session_link and
+		 * corrupts queue->session_attach (a DEBUG_LIST "list_add double
+		 * add", reachable from an unprivileged /dev/mpp_service fd).
+		 * Reject re-init.
+		 */
+		if (session->mpp)
+			return -EBUSY;
+
 		session->device_type = (enum MPP_DEVICE_TYPE)client_type;
 		session->dma = mpp_dma_session_create(mpp->dev, mpp->session_max_buffers);
 		session->mpp = mpp;
