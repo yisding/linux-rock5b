@@ -2341,6 +2341,20 @@ static int rk_rga_layout_size(size_t pixels, size_t multiplier,
 	return 0;
 }
 
+static int rk_rga_yuv10_y_bytes(const struct rga_img_info_t *img,
+				size_t pixels, size_t *size)
+{
+	/*
+	 * 10-bit semi-planar rows are byte-literal: incompact P010/P210 rows
+	 * carry 16-bit containers (2 bytes per pixel), compact NV15/NV20 rows
+	 * pack 10 bits per pixel. A 1 byte/pixel Y size would place the UV
+	 * plane inside the Y plane.
+	 */
+	if (img->compact_mode == RK_RGA_10BIT_INCOMPACT)
+		return rk_rga_layout_size(pixels, 2, 1, size);
+	return rk_rga_layout_size(pixels, 10, 8, size);
+}
+
 static int rk_rga_bpp_layout_size(const struct rga_img_info_t *img,
 				  u8 shift, size_t *size)
 {
@@ -2564,11 +2578,17 @@ static int rk_rga_img_layout(const struct rga_img_info_t *img,
 		break;
 	case RK_RGA_FORMAT_YCBCR_422_SP:
 	case RK_RGA_FORMAT_YCRCB_422_SP:
-	case RK_RGA_FORMAT_YCBCR_422_SP_10B:
-	case RK_RGA_FORMAT_YCRCB_422_SP_10B:
 		layout->yrgb_size = pixels;
 		layout->uv_size = pixels;
 		ret = 0;
+		break;
+	case RK_RGA_FORMAT_YCBCR_422_SP_10B:
+	case RK_RGA_FORMAT_YCRCB_422_SP_10B:
+		ret = rk_rga_yuv10_y_bytes(img, pixels, &layout->yrgb_size);
+		if (ret)
+			break;
+		/* 422 chroma plane is byte-for-byte the size of the Y plane. */
+		layout->uv_size = layout->yrgb_size;
 		break;
 	case RK_RGA_FORMAT_YCBCR_422_P:
 	case RK_RGA_FORMAT_YCRCB_422_P:
@@ -2579,11 +2599,17 @@ static int rk_rga_img_layout(const struct rga_img_info_t *img,
 		break;
 	case RK_RGA_FORMAT_YCBCR_420_SP:
 	case RK_RGA_FORMAT_YCRCB_420_SP:
-	case RK_RGA_FORMAT_YCBCR_420_SP_10B:
-	case RK_RGA_FORMAT_YCRCB_420_SP_10B:
 		layout->yrgb_size = pixels;
 		layout->uv_size = pixels >> 1;
 		ret = 0;
+		break;
+	case RK_RGA_FORMAT_YCBCR_420_SP_10B:
+	case RK_RGA_FORMAT_YCRCB_420_SP_10B:
+		ret = rk_rga_yuv10_y_bytes(img, pixels, &layout->yrgb_size);
+		if (ret)
+			break;
+		/* 420 chroma plane is half the Y plane. */
+		layout->uv_size = layout->yrgb_size >> 1;
 		break;
 	case RK_RGA_FORMAT_YCBCR_420_P:
 	case RK_RGA_FORMAT_YCRCB_420_P:
@@ -2674,39 +2700,43 @@ static int rk_rga_materialize_img_import(struct rga_img_info_t *img,
 	struct rk_rga_img_layout layout;
 	int ret;
 
+	__u64 yrgb_addr = import->iova;
+	__u64 uv_addr = 0;
+	__u64 v_addr = 0;
+
 	ret = rk_rga_img_layout(img, &layout);
 	if (ret)
 		return ret;
 	if (import->size < layout.total_size)
 		return -EINVAL;
 
+	/*
+	 * Resolve every plane address before taking ownership of the import.
+	 * The caller drops its own reference to the import on our error return,
+	 * so appending it to imports[] up front would let that reference be
+	 * released twice once the plane arithmetic below fails.
+	 */
+	if (rk_rga_img_single_buffer_compressed(img)) {
+		uv_addr = yrgb_addr;
+	} else if (layout.uv_size) {
+		ret = rk_rga_addr_add_size(yrgb_addr, layout.yrgb_size,
+					   &uv_addr);
+		if (ret)
+			return ret;
+		if (layout.v_size) {
+			ret = rk_rga_addr_add_size(uv_addr, layout.uv_size,
+						   &v_addr);
+			if (ret)
+				return ret;
+		}
+	}
+
 	imports[*import_count] = import;
 	(*import_count)++;
 
-	img->yrgb_addr = import->iova;
-	if (rk_rga_img_single_buffer_compressed(img)) {
-		img->uv_addr = img->yrgb_addr;
-		img->v_addr = 0;
-		return 0;
-	}
-	if (!layout.uv_size) {
-		img->uv_addr = 0;
-		img->v_addr = 0;
-		return 0;
-	}
-
-	ret = rk_rga_addr_add_size(img->yrgb_addr, layout.yrgb_size,
-				   &img->uv_addr);
-	if (ret)
-		return ret;
-	if (layout.v_size) {
-		ret = rk_rga_addr_add_size(img->uv_addr, layout.uv_size,
-					   &img->v_addr);
-		if (ret)
-			return ret;
-	} else {
-		img->v_addr = 0;
-	}
+	img->yrgb_addr = yrgb_addr;
+	img->uv_addr = uv_addr;
+	img->v_addr = v_addr;
 
 	return 0;
 }
@@ -3159,10 +3189,19 @@ static void rk_rga_job_clear_mappings(struct rk_rga_job *job)
 	job->mapping_count = 0;
 }
 
-static void rk_rga_job_cancel_acquire_callbacks(struct rk_rga_job *job)
+/*
+ * Cancel any still-pending acquire callbacks. Returns true when this cancel
+ * drove pending_acquire_count to zero, i.e. it (not a racing callback) is the
+ * party responsible for queuing the acquire work. Only the caller whose own
+ * decrement crosses zero may queue, so the zero-crossing right is held by
+ * exactly one of the callback path and the cancel path.
+ */
+static bool rk_rga_job_cancel_acquire_callbacks(struct rk_rga_job *job)
 {
+	bool crossed = false;
+
 	if (!job->acquire_waiters)
-		return;
+		return false;
 
 	for (u32 i = 0; i < job->acquire_fence_count; i++) {
 		struct rk_rga_fence_waiter *waiter = &job->acquire_waiters[i];
@@ -3175,9 +3214,12 @@ static void rk_rga_job_cancel_acquire_callbacks(struct rk_rga_job *job)
 					  &waiter->cb);
 		/* Removal and callback claim the waiter exactly once. */
 		owner = xchg(&waiter->job, NULL);
-		if (owner)
-			atomic_dec(&owner->pending_acquire_count);
+		if (owner &&
+		    atomic_dec_and_test(&owner->pending_acquire_count))
+			crossed = true;
 	}
+
+	return crossed;
 }
 
 static size_t rk_rga_cmd_size(struct rk_rga_hw *hw)
@@ -3479,6 +3521,8 @@ static void rk_rga_job_get(struct rk_rga_job *job)
 
 static void rk_rga_job_put(struct rk_rga_job *job)
 {
+	if (!job)
+		return;
 	if (refcount_dec_and_test(&job->refs))
 		rk_rga_job_free(job);
 }
@@ -4001,8 +4045,13 @@ static void rk_rga_job_abort_pending_acquire(struct rk_rga_job *job,
 					     int result)
 {
 	rk_rga_job_abort_acquire_state(job, result);
-	rk_rga_job_cancel_acquire_callbacks(job);
-	if (!atomic_read(&job->pending_acquire_count))
+	/*
+	 * Queue only if this cancel is the decrement that reached zero. Reading
+	 * the count instead would let a concurrent callback's decrement be
+	 * observed here, so both parties would call into the job after the
+	 * acquire work had already run and dropped the last reference.
+	 */
+	if (rk_rga_job_cancel_acquire_callbacks(job))
 		rk_rga_job_queue_acquire_work(job);
 }
 
@@ -10383,6 +10432,92 @@ static void rk_rga_acquire_abort_during_arming_kunit(struct kunit *test)
 	rk_rga_job_put(job);
 }
 
+/*
+ * When a cancel decrements the last pending acquire callback, that cancel owns
+ * the zero-crossing and must be the party that queues the acquire work.
+ */
+static void rk_rga_acquire_abort_queues_last_kunit(struct kunit *test)
+{
+	struct rk_rga_job *job;
+	struct dma_fence *fence;
+	int ret;
+
+	job = kzalloc_obj(*job, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+	rk_rga_job_init(job);
+
+	job->acquire_fences = kcalloc(1, sizeof(*job->acquire_fences),
+				      GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job->acquire_fences);
+	job->acquire_waiters = kcalloc(1, sizeof(*job->acquire_waiters),
+				       GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job->acquire_waiters);
+	job->acquire_fence_count = 1;
+	fence = rk_rga_kunit_alloc_fence();
+	KUNIT_ASSERT_NOT_NULL(test, fence);
+	job->acquire_fences[0] = fence;
+
+	/* One pending callback, bias already dropped. */
+	atomic_set(&job->pending_acquire_count, 1);
+	atomic_set(&job->acquire_work_queued, 0);
+	WRITE_ONCE(job->result, 0);
+	WRITE_ONCE(job->waiting_acquire, true);
+	rk_rga_job_get(job);
+	job->acquire_waiters[0].job = job;
+	ret = dma_fence_add_callback(fence, &job->acquire_waiters[0].cb,
+				     rk_rga_job_acquire_cb);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	rk_rga_job_abort_pending_acquire(job, -ECANCELED);
+	KUNIT_EXPECT_EQ(test, atomic_read(&job->acquire_work_queued), 1);
+	KUNIT_EXPECT_PTR_EQ(test, job->acquire_waiters[0].job, NULL);
+
+	flush_work(&job->acquire_work);
+	KUNIT_EXPECT_TRUE(test, job->done);
+	KUNIT_EXPECT_EQ(test, job->result, -ECANCELED);
+	KUNIT_EXPECT_EQ(test, refcount_read(&job->refs), 1);
+
+	rk_rga_fence_signal(fence, 0);
+	rk_rga_job_put(job);
+}
+
+/*
+ * 10-bit semi-planar Y/UV plane sizes are byte-literal: incompact rows carry
+ * 16-bit containers (2 bytes/pixel), compact rows pack 10 bits/pixel. A
+ * 1 byte/pixel Y size would drop the UV plane inside the Y plane.
+ */
+static void rk_rga_layout_yuv10_kunit(struct kunit *test)
+{
+	struct rga_img_info_t img = {};
+	struct rk_rga_img_layout layout;
+	size_t pixels = (size_t)64 * 64;
+
+	img.vir_w = 64;
+	img.vir_h = 64;
+
+	img.format = RK_RGA_FORMAT_YCBCR_420_SP_10B;
+	img.compact_mode = RK_RGA_10BIT_INCOMPACT;
+	KUNIT_ASSERT_EQ(test, rk_rga_img_layout(&img, &layout), 0);
+	KUNIT_EXPECT_EQ(test, layout.yrgb_size, pixels * 2);
+	KUNIT_EXPECT_EQ(test, layout.uv_size, pixels);
+	KUNIT_EXPECT_EQ(test, layout.total_size, pixels * 3);
+	/* Regression guard against the old 1 byte/pixel Y size. */
+	KUNIT_EXPECT_NE(test, layout.yrgb_size, pixels);
+
+	img.compact_mode = 0;
+	KUNIT_ASSERT_EQ(test, rk_rga_img_layout(&img, &layout), 0);
+	KUNIT_EXPECT_EQ(test, layout.yrgb_size, pixels * 10 / 8);
+	KUNIT_EXPECT_EQ(test, layout.uv_size, pixels * 10 / 8 / 2);
+
+	img.format = RK_RGA_FORMAT_YCBCR_422_SP_10B;
+	img.compact_mode = RK_RGA_10BIT_INCOMPACT;
+	KUNIT_ASSERT_EQ(test, rk_rga_img_layout(&img, &layout), 0);
+	KUNIT_EXPECT_EQ(test, layout.yrgb_size, pixels * 2);
+	/* 422 chroma plane is byte-for-byte the size of the Y plane. */
+	KUNIT_EXPECT_EQ(test, layout.uv_size, pixels * 2);
+	KUNIT_EXPECT_EQ(test, layout.v_size, (size_t)0);
+}
+
 static void rk_rga_session_dispatch_close_handoff_kunit(struct kunit *test)
 {
 	struct rk_rga_session dispatch_session = { };
@@ -15051,6 +15186,8 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_acquire_fence_status_kunit),
 	KUNIT_CASE(rk_rga_acquire_callbacks_result_kunit),
 	KUNIT_CASE(rk_rga_acquire_abort_during_arming_kunit),
+	KUNIT_CASE(rk_rga_acquire_abort_queues_last_kunit),
+	KUNIT_CASE(rk_rga_layout_yuv10_kunit),
 	KUNIT_CASE(rk_rga_session_dispatch_close_handoff_kunit),
 	KUNIT_CASE(rk_rga_job_free_release_fence_kunit),
 	KUNIT_CASE(rk_rga_release_fence_fd_state_kunit),
@@ -19671,6 +19808,15 @@ static int rk_rga_hw_probe(struct platform_device *pdev)
 	ret = dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
 	if (ret)
 		return ret;
+
+	/*
+	 * Contiguous dma-buf imports routinely exceed the 64 KiB default
+	 * segment size; leaving it in place makes dma_map_sgtable() refuse to
+	 * merge a multi-entry table into the single IOVA span the import path
+	 * requires (and trips DMA-debug on any single span above 64 KiB).
+	 * Advertise a 4 GiB segment ceiling instead.
+	 */
+	dma_set_max_seg_size(dev, DMA_BIT_MASK(32));
 
 	if (hw->type == RK_RGA_HW_RGA3)
 		rk_rga_set_iommu_dma_limit(dev);
