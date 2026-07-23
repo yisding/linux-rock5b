@@ -52,6 +52,7 @@
 #include <linux/scatterlist.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/sort.h>
 #include <linux/stddef.h>
 #include <linux/sync_file.h>
 #include <linux/uaccess.h>
@@ -516,6 +517,9 @@
 
 #define RK_RGA3_FACTOR_MAX			(2 << 15)
 #define RK_RGA3_SIZE_MASK			0x1fff
+#define RK_RGA3_INPUT_MAX_SIZE			8176
+#define RK_RGA3_OUTPUT_MAX_SIZE			8128
+#define RK_RGA_MAX_BYTE_STRIDE			32768
 #define RK_RGA_RASTER_MODE			BIT(0)
 #define RK_RGA_FBC_MODE			BIT(1)
 #define RK_RGA_TILE_MODE			BIT(2)
@@ -1075,47 +1079,103 @@ struct rk_rga_userptr_view {
 	bool shadow_tail;
 };
 
+struct rk_rga_userptr_extent {
+	struct page *page;
+	u32 offset;
+	u32 length;
+};
+
+struct rk_rga_dmabuf_extent {
+	phys_addr_t start;
+	u32 logical_offset;
+	u32 length;
+};
+
 struct rk_rga_import {
+	struct list_head service_node;
+	struct mutex map_lock;
 	refcount_t refs;
 	enum rk_rga_import_type type;
 	int fd;
+	struct rk_rga_hw *map_hw;
 	struct device *dev;
 	struct dma_buf *dmabuf;
 	struct dma_buf_attachment *attach;
 	struct sg_table *sgt;
 	struct page **pages;
 	struct rk_rga_userptr_view *userptr_view;
+	struct rk_rga_userptr_extent *userptr_extents;
 	struct iommu_domain *domain;
 	dma_addr_t iova;
 	size_t iova_size;
 	size_t size;
 	unsigned int page_count;
 	unsigned int pinned_pages;
+	unsigned int userptr_extent_count;
 	unsigned int page_offset;
 	bool iommu_mapped;
+	bool mapping_invalidated;
 	bool counted;
+	bool service_linked;
 };
 
 struct rk_rga_job_mapping {
 	struct rk_rga_import *import;
+	struct rk_rga_hw *hw;
 	struct device *dev;
 	struct dma_buf_attachment *attach;
 	struct sg_table *sgt;
 	struct rk_rga_userptr_view *userptr_view;
+	struct rk_rga_dmabuf_extent *dmabuf_extents;
 	struct iommu_domain *domain;
 	dma_addr_t iova;
 	size_t iova_size;
+	unsigned int dmabuf_extent_count;
 	unsigned int page_offset;
+	enum dma_data_direction dma_dir;
 	bool userptr;
 	bool iommu_mapped;
 };
 
 struct rk_rga_img_layout {
+	size_t yrgb_stride;
+	size_t uv_stride;
+	size_t v_stride;
 	size_t yrgb_size;
 	size_t uv_size;
 	size_t v_size;
 	size_t total_size;
 };
+
+struct rk_rga_img_imports {
+	struct rk_rga_import *yrgb;
+	struct rk_rga_import *uv;
+	struct rk_rga_import *v;
+};
+
+struct rk_rga_task_imports {
+	struct rk_rga_img_imports src;
+	struct rk_rga_img_imports dst;
+	struct rk_rga_img_imports pat;
+};
+
+static void
+rk_rga_img_use_import_identities(struct rga_img_info_t *img,
+				 const struct rk_rga_img_imports *imports)
+{
+	img->yrgb_addr = (__u64)(unsigned long)imports->yrgb;
+	img->uv_addr = (__u64)(unsigned long)imports->uv;
+	img->v_addr = (__u64)(unsigned long)imports->v;
+}
+
+static void
+rk_rga_task_use_import_identities(struct rga_req *task,
+				  const struct rk_rga_task_imports *imports)
+{
+	rk_rga_img_use_import_identities(&task->src, &imports->src);
+	rk_rga_img_use_import_identities(&task->dst, &imports->dst);
+	rk_rga_img_use_import_identities(&task->pat, &imports->pat);
+}
 
 struct rk_rga_request {
 	__u32 flags;
@@ -1125,6 +1185,7 @@ struct rk_rga_request {
 	__s32 acquire_fence_fd;
 	__s32 release_fence_fd;
 	struct rga_req *tasks;
+	struct rk_rga_task_imports *task_imports;
 	struct rk_rga_import **imports;
 	struct dma_fence **acquire_fences;
 	u32 *gauss_coeffs;
@@ -1151,12 +1212,14 @@ struct rk_rga_job {
 	struct work_struct acquire_work;
 	refcount_t refs;
 	struct rga_req *tasks;
+	struct rk_rga_task_imports *task_imports;
 	struct rk_rga_import **imports;
 	struct rk_rga_job_mapping *mappings;
 	struct dma_fence **acquire_fences;
 	u32 *gauss_coeffs;
 	struct rk_rga_fence_waiter *acquire_waiters;
 	struct dma_fence *release_fence;
+	struct rk_rga_hw *cmd_hw;
 	struct device *cmd_dev;
 	void *cmd_vaddr;
 	dma_addr_t cmd_dma;
@@ -1189,6 +1252,20 @@ struct rk_rga_job {
 	bool waiting_acquire;
 	bool done;
 };
+
+static const struct rga_req *
+rk_rga_job_validation_task(const struct rk_rga_job *job, u32 task_index,
+			   struct rga_req *validation_task)
+{
+	if (!job->task_imports)
+		return &job->tasks[task_index];
+
+	*validation_task = job->tasks[task_index];
+	rk_rga_task_use_import_identities(validation_task,
+					  &job->task_imports[task_index]);
+
+	return validation_task;
+}
 
 struct rk_rga_hw_match {
 	enum rk_rga_hw_type type;
@@ -1252,9 +1329,11 @@ struct rk_rga_service {
 	struct miscdevice miscdev;
 	struct dentry *debugfs_root;
 	struct mutex hw_lock;
+	struct mutex import_lock;
 	struct mutex session_lock;
 	spinlock_t fault_lock; /* protects fault_hws in fault handler context */
 	struct list_head hw_list;
+	struct list_head imports;
 	struct list_head sessions;
 	struct list_head fault_hws;
 	struct rga_hw_versions_t hw_versions;
@@ -1306,6 +1385,8 @@ struct rk_rga_service {
 static struct rk_rga_service rk_rga;
 
 static int rk_rga_release(struct inode *inode, struct file *file);
+static int rk_rga_task_hw_type_mask(struct rk_rga_job *job, u32 task_index,
+				    u32 *type_mask);
 
 static void rk_rga_session_init(struct rk_rga_session *session)
 {
@@ -1727,48 +1808,71 @@ static bool rk_rga_hw_accepting_jobs(const struct rk_rga_hw *hw)
 	       !READ_ONCE(hw->recovery_failed);
 }
 
-static struct device *rk_rga_get_map_dev(void)
+static struct rk_rga_hw *rk_rga_get_map_hw(void)
 {
+	struct rk_rga_hw *candidate = NULL;
 	struct rk_rga_hw *hw;
-	struct device *dev = NULL;
 
 	mutex_lock(&rk_rga.hw_lock);
 	list_for_each_entry(hw, &rk_rga.hw_list, node) {
 		if (!rk_rga_hw_accepting_jobs(hw))
 			continue;
 		if (hw->type == RK_RGA_HW_RGA3) {
-			dev = get_device(hw->dev);
+			candidate = hw;
 			break;
 		}
 	}
 	list_for_each_entry(hw, &rk_rga.hw_list, node) {
-		if (dev)
+		if (candidate)
 			break;
 		if (!rk_rga_hw_accepting_jobs(hw))
 			continue;
-		dev = get_device(hw->dev);
+		candidate = hw;
 		break;
 	}
+	if (candidate)
+		refcount_inc(&candidate->refs);
 	mutex_unlock(&rk_rga.hw_lock);
 
-	return dev;
+	return candidate;
 }
 
-static bool rk_rga_has_available_hw(void)
+/*
+ * Return a hardware reference with import_lock held. Rechecking the removal
+ * state under import_lock closes the gap between selection and registration:
+ * removal marks/delists under hw_lock before taking import_lock to detach the
+ * mappings it owns.
+ */
+static struct rk_rga_hw *rk_rga_get_map_hw_for_import(void)
 {
 	struct rk_rga_hw *hw;
-	bool available = false;
+
+	for (;;) {
+		hw = rk_rga_get_map_hw();
+		if (!hw)
+			return NULL;
+
+		mutex_lock(&rk_rga.import_lock);
+		if (rk_rga_hw_accepting_jobs(hw))
+			return hw;
+		mutex_unlock(&rk_rga.import_lock);
+		rk_rga_hw_put(hw);
+	}
+}
+
+static u32 rk_rga_available_core_mask(void)
+{
+	struct rk_rga_hw *hw;
+	u32 core_mask = 0;
 
 	mutex_lock(&rk_rga.hw_lock);
 	list_for_each_entry(hw, &rk_rga.hw_list, node) {
-		if (rk_rga_hw_accepting_jobs(hw)) {
-			available = true;
-			break;
-		}
+		if (rk_rga_hw_accepting_jobs(hw))
+			core_mask |= hw->core_mask;
 	}
 	mutex_unlock(&rk_rga.hw_lock);
 
-	return available;
+	return core_mask;
 }
 
 static int rk_rga_check_iova_span(dma_addr_t iova, size_t size,
@@ -2219,16 +2323,45 @@ static void rk_rga_unmap_userptr_sgt(struct device *dev, struct sg_table *sgt,
 	rk_rga_userptr_view_release(view);
 }
 
-static void rk_rga_import_destroy(struct rk_rga_import *import)
+static void rk_rga_import_init(struct rk_rga_import *import,
+			       enum rk_rga_import_type type)
 {
+	INIT_LIST_HEAD(&import->service_node);
+	mutex_init(&import->map_lock);
+	refcount_set(&import->refs, 1);
+	import->type = type;
+	import->fd = -1;
+}
+
+static void rk_rga_import_register_locked(struct rk_rga_import *import)
+{
+	list_add_tail(&import->service_node, &rk_rga.imports);
+	import->service_linked = true;
+}
+
+static void rk_rga_import_detach_map_locked(struct rk_rga_import *import)
+{
+	struct rk_rga_hw *map_hw = import->map_hw;
+
+	if (!map_hw)
+		return;
+
 	if (import->type == RK_RGA_IMPORT_DMABUF) {
 		if (import->sgt)
-			dma_buf_unmap_attachment(import->attach, import->sgt,
-						 DMA_BIDIRECTIONAL);
+			dma_buf_unmap_attachment_unlocked(import->attach,
+							  import->sgt,
+							  DMA_TO_DEVICE);
 		if (import->attach)
 			dma_buf_detach(import->dmabuf, import->attach);
-		if (import->dmabuf)
-			dma_buf_put(import->dmabuf);
+		import->sgt = NULL;
+		import->attach = NULL;
+		/*
+		 * An exporter may move the backing store once its attachment is
+		 * unmapped. Permanently reject this import so a prepared job
+		 * cannot execute after the mapping that pinned its backing was
+		 * destroyed.
+		 */
+		WRITE_ONCE(import->mapping_invalidated, true);
 	} else if (import->type == RK_RGA_IMPORT_USERPTR) {
 		rk_rga_unmap_userptr_sgt(import->dev, import->sgt,
 					 import->userptr_view,
@@ -2236,15 +2369,45 @@ static void rk_rga_import_destroy(struct rk_rga_import *import)
 					 import->iova_size,
 					 import->page_offset,
 					 import->iommu_mapped);
+		import->sgt = NULL;
+		import->userptr_view = NULL;
+		import->domain = NULL;
+		import->iova_size = 0;
+		import->iommu_mapped = false;
+	}
+
+	if (import->dev)
+		put_device(import->dev);
+	import->dev = NULL;
+	import->map_hw = NULL;
+	rk_rga_hw_put(map_hw);
+}
+
+static void rk_rga_import_destroy(struct rk_rga_import *import)
+{
+	mutex_lock(&rk_rga.import_lock);
+	if (import->service_linked) {
+		list_del_init(&import->service_node);
+		import->service_linked = false;
+	}
+	mutex_unlock(&rk_rga.import_lock);
+
+	mutex_lock(&import->map_lock);
+	rk_rga_import_detach_map_locked(import);
+	mutex_unlock(&import->map_lock);
+
+	if (import->type == RK_RGA_IMPORT_DMABUF) {
+		if (import->dmabuf)
+			dma_buf_put(import->dmabuf);
+	} else if (import->type == RK_RGA_IMPORT_USERPTR) {
 		if (import->pages) {
 			unpin_user_pages_dirty_lock(import->pages,
 						    import->pinned_pages,
 						    true);
 			kfree(import->pages);
 		}
+		kfree(import->userptr_extents);
 	}
-	if (import->dev)
-		put_device(import->dev);
 	if (import->counted)
 		atomic_dec(&rk_rga.import_count);
 	kfree(import);
@@ -2254,6 +2417,20 @@ static void rk_rga_import_put(struct rk_rga_import *import)
 {
 	if (refcount_dec_and_test(&import->refs))
 		rk_rga_import_destroy(import);
+}
+
+static void rk_rga_detach_hw_imports(struct rk_rga_hw *hw)
+{
+	struct rk_rga_import *import;
+
+	mutex_lock(&rk_rga.import_lock);
+	list_for_each_entry(import, &rk_rga.imports, service_node) {
+		mutex_lock(&import->map_lock);
+		if (import->map_hw == hw)
+			rk_rga_import_detach_map_locked(import);
+		mutex_unlock(&import->map_lock);
+	}
+	mutex_unlock(&rk_rga.import_lock);
 }
 
 static int rk_rga_import_dmabuf_fd(const struct rga_external_buffer *buffer,
@@ -2269,8 +2446,12 @@ static int rk_rga_import_dmabuf_fd(const struct rga_external_buffer *buffer,
 
 static int rk_rga_import_dmabuf(struct rga_external_buffer *buffer,
 				struct rk_rga_import **import_out);
+static int rk_rga_import_dmabuf_object(struct dma_buf *dmabuf, int fd,
+				       struct rk_rga_import **import_out);
 static int rk_rga_import_userptr(struct rga_external_buffer *buffer,
 				 struct rk_rga_import **import_out);
+static int rk_rga_import_buffer_size(const struct rga_external_buffer *buffer,
+				     size_t *size);
 
 static void rk_rga_request_clear_imports(struct rk_rga_request *request)
 {
@@ -2307,6 +2488,7 @@ static void rk_rga_request_free(void *ptr)
 {
 	struct rk_rga_request *request = ptr;
 
+	kfree(request->task_imports);
 	rk_rga_request_clear_imports(request);
 	rk_rga_request_clear_fences(request);
 	rk_rga_request_clear_gauss(request);
@@ -2328,42 +2510,51 @@ static bool rk_rga_request_remove_free(struct rk_rga_session *session, __u32 id)
 	return true;
 }
 
-static int rk_rga_layout_size(size_t pixels, size_t multiplier,
-			      size_t divisor, size_t *size)
+static int rk_rga_row_layout(u32 width, u32 height, size_t multiplier,
+			     size_t divisor, size_t *stride, size_t *size)
 {
 	size_t bytes;
 
-	if (check_mul_overflow(pixels, multiplier, &bytes))
+	if (!width || !height || !divisor)
+		return -EINVAL;
+	if (check_mul_overflow((size_t)width, multiplier, &bytes))
 		return -EOVERFLOW;
 
-	*size = bytes / divisor;
+	*stride = DIV_ROUND_UP(bytes, divisor);
+	if (!*stride)
+		return -EINVAL;
+	if (check_mul_overflow(*stride, (size_t)height, size))
+		return -EOVERFLOW;
 
 	return 0;
 }
 
-static int rk_rga_yuv10_y_bytes(const struct rga_img_info_t *img,
-				size_t pixels, size_t *size)
+static int rk_rga_yuv10_plane_layout(const struct rga_img_info_t *img,
+				     u32 height, size_t *stride, size_t *size)
 {
 	/*
 	 * 10-bit semi-planar rows are byte-literal: incompact P010/P210 rows
 	 * carry 16-bit containers (2 bytes per pixel), compact NV15/NV20 rows
-	 * pack 10 bits per pixel. A 1 byte/pixel Y size would place the UV
-	 * plane inside the Y plane.
+	 * pack 10 bits per pixel. Round each row independently so fractional
+	 * bytes cannot make the following plane overlap the last row.
 	 */
 	if (img->compact_mode == RK_RGA_10BIT_INCOMPACT)
-		return rk_rga_layout_size(pixels, 2, 1, size);
-	return rk_rga_layout_size(pixels, 10, 8, size);
+		return rk_rga_row_layout(img->vir_w, height, 2, 1,
+					 stride, size);
+	return rk_rga_row_layout(img->vir_w, height, 10, 8,
+				 stride, size);
 }
 
 static int rk_rga_bpp_layout_size(const struct rga_img_info_t *img,
-				  u8 shift, size_t *size)
+				  u8 shift, size_t *stride, size_t *size)
 {
-	size_t stride;
+	size_t bytes;
 
-	stride = ALIGN((u32)img->vir_w >> shift, 4);
-	if (!stride)
+	bytes = DIV_ROUND_UP((u32)img->vir_w, 1U << shift);
+	*stride = ALIGN(bytes, 4);
+	if (!*stride)
 		return -EINVAL;
-	if (check_mul_overflow(stride, (size_t)img->vir_h, size))
+	if (check_mul_overflow(*stride, (size_t)img->vir_h, size))
 		return -EOVERFLOW;
 
 	if (!*size)
@@ -2517,15 +2708,12 @@ static bool rk_rga_img_single_buffer_compressed(const struct rga_img_info_t *img
 static int rk_rga_img_layout(const struct rga_img_info_t *img,
 			     struct rk_rga_img_layout *layout)
 {
-	size_t pixels;
 	size_t total;
+	u32 chroma_h;
 	int ret;
 
 	if (!img->vir_w || !img->vir_h)
 		return -EINVAL;
-	if (check_mul_overflow((size_t)img->vir_w, (size_t)img->vir_h,
-			       &pixels))
-		return -EOVERFLOW;
 
 	memset(layout, 0, sizeof(*layout));
 
@@ -2545,11 +2733,15 @@ static int rk_rga_img_layout(const struct rga_img_info_t *img,
 	case RK_RGA_FORMAT_XRGB_8888:
 	case RK_RGA_FORMAT_ABGR_8888:
 	case RK_RGA_FORMAT_XBGR_8888:
-		ret = rk_rga_layout_size(pixels, 4, 1, &layout->yrgb_size);
+		ret = rk_rga_row_layout(img->vir_w, img->vir_h, 4, 1,
+					&layout->yrgb_stride,
+					&layout->yrgb_size);
 		break;
 	case RK_RGA_FORMAT_RGB_888:
 	case RK_RGA_FORMAT_BGR_888:
-		ret = rk_rga_layout_size(pixels, 3, 1, &layout->yrgb_size);
+		ret = rk_rga_row_layout(img->vir_w, img->vir_h, 3, 1,
+					&layout->yrgb_stride,
+					&layout->yrgb_size);
 		break;
 	case RK_RGA_FORMAT_RGB_565:
 	case RK_RGA_FORMAT_RGBA_5551:
@@ -2569,76 +2761,120 @@ static int rk_rga_img_layout(const struct rga_img_info_t *img,
 	case RK_RGA_FORMAT_VYUY_420:
 	case RK_RGA_FORMAT_YUYV_420:
 	case RK_RGA_FORMAT_UYVY_420:
-		ret = rk_rga_layout_size(pixels, 2, 1, &layout->yrgb_size);
+		ret = rk_rga_row_layout(img->vir_w, img->vir_h, 2, 1,
+					&layout->yrgb_stride,
+					&layout->yrgb_size);
 		break;
 	case RK_RGA_FORMAT_YCBCR_444_SP:
 	case RK_RGA_FORMAT_YCRCB_444_SP:
-		layout->yrgb_size = pixels;
-		ret = rk_rga_layout_size(pixels, 2, 1, &layout->uv_size);
+		ret = rk_rga_row_layout(img->vir_w, img->vir_h, 1, 1,
+					&layout->yrgb_stride,
+					&layout->yrgb_size);
+		if (ret)
+			break;
+		ret = rk_rga_row_layout(img->vir_w, img->vir_h, 2, 1,
+					&layout->uv_stride, &layout->uv_size);
 		break;
 	case RK_RGA_FORMAT_YCBCR_422_SP:
 	case RK_RGA_FORMAT_YCRCB_422_SP:
-		layout->yrgb_size = pixels;
-		layout->uv_size = pixels;
-		ret = 0;
+		ret = rk_rga_row_layout(img->vir_w, img->vir_h, 1, 1,
+					&layout->yrgb_stride,
+					&layout->yrgb_size);
+		if (ret)
+			break;
+		ret = rk_rga_row_layout(img->vir_w, img->vir_h, 1, 1,
+					&layout->uv_stride, &layout->uv_size);
 		break;
 	case RK_RGA_FORMAT_YCBCR_422_SP_10B:
 	case RK_RGA_FORMAT_YCRCB_422_SP_10B:
-		ret = rk_rga_yuv10_y_bytes(img, pixels, &layout->yrgb_size);
+		ret = rk_rga_yuv10_plane_layout(img, img->vir_h,
+						&layout->yrgb_stride,
+						&layout->yrgb_size);
 		if (ret)
 			break;
 		/* 422 chroma plane is byte-for-byte the size of the Y plane. */
+		layout->uv_stride = layout->yrgb_stride;
 		layout->uv_size = layout->yrgb_size;
 		break;
 	case RK_RGA_FORMAT_YCBCR_422_P:
 	case RK_RGA_FORMAT_YCRCB_422_P:
-		layout->yrgb_size = pixels;
-		layout->uv_size = pixels >> 1;
+		ret = rk_rga_row_layout(img->vir_w, img->vir_h, 1, 1,
+					&layout->yrgb_stride,
+					&layout->yrgb_size);
+		if (ret)
+			break;
+		ret = rk_rga_row_layout(img->vir_w, img->vir_h, 1, 2,
+					&layout->uv_stride, &layout->uv_size);
+		if (ret)
+			break;
+		layout->v_stride = layout->uv_stride;
 		layout->v_size = layout->uv_size;
-		ret = 0;
 		break;
 	case RK_RGA_FORMAT_YCBCR_420_SP:
 	case RK_RGA_FORMAT_YCRCB_420_SP:
-		layout->yrgb_size = pixels;
-		layout->uv_size = pixels >> 1;
-		ret = 0;
+		chroma_h = DIV_ROUND_UP((u32)img->vir_h, 2);
+		ret = rk_rga_row_layout(img->vir_w, img->vir_h, 1, 1,
+					&layout->yrgb_stride,
+					&layout->yrgb_size);
+		if (ret)
+			break;
+		ret = rk_rga_row_layout(img->vir_w, chroma_h, 1, 1,
+					&layout->uv_stride, &layout->uv_size);
 		break;
 	case RK_RGA_FORMAT_YCBCR_420_SP_10B:
 	case RK_RGA_FORMAT_YCRCB_420_SP_10B:
-		ret = rk_rga_yuv10_y_bytes(img, pixels, &layout->yrgb_size);
+		chroma_h = DIV_ROUND_UP((u32)img->vir_h, 2);
+		ret = rk_rga_yuv10_plane_layout(img, img->vir_h,
+						&layout->yrgb_stride,
+						&layout->yrgb_size);
 		if (ret)
 			break;
-		/* 420 chroma plane is half the Y plane. */
-		layout->uv_size = layout->yrgb_size >> 1;
+		ret = rk_rga_yuv10_plane_layout(img, chroma_h,
+						&layout->uv_stride,
+						&layout->uv_size);
 		break;
 	case RK_RGA_FORMAT_YCBCR_420_P:
 	case RK_RGA_FORMAT_YCRCB_420_P:
-		layout->yrgb_size = pixels;
-		layout->uv_size = pixels >> 2;
+		chroma_h = DIV_ROUND_UP((u32)img->vir_h, 2);
+		ret = rk_rga_row_layout(img->vir_w, img->vir_h, 1, 1,
+					&layout->yrgb_stride,
+					&layout->yrgb_size);
+		if (ret)
+			break;
+		ret = rk_rga_row_layout(img->vir_w, chroma_h, 1, 2,
+					&layout->uv_stride, &layout->uv_size);
+		if (ret)
+			break;
+		layout->v_stride = layout->uv_stride;
 		layout->v_size = layout->uv_size;
-		ret = 0;
 		break;
 	case RK_RGA_FORMAT_BPP8:
-		ret = rk_rga_bpp_layout_size(img, 0, &layout->yrgb_size);
+		ret = rk_rga_bpp_layout_size(img, 0, &layout->yrgb_stride,
+					     &layout->yrgb_size);
 		break;
 	case RK_RGA_FORMAT_YCBCR_400:
 	case RK_RGA_FORMAT_A8:
 	case RK_RGA_FORMAT_Y8:
-		layout->yrgb_size = pixels;
-		ret = 0;
+		ret = rk_rga_row_layout(img->vir_w, img->vir_h, 1, 1,
+					&layout->yrgb_stride,
+					&layout->yrgb_size);
 		break;
 	case RK_RGA_FORMAT_BPP4:
-		ret = rk_rga_bpp_layout_size(img, 1, &layout->yrgb_size);
+		ret = rk_rga_bpp_layout_size(img, 1, &layout->yrgb_stride,
+					     &layout->yrgb_size);
 		break;
 	case RK_RGA_FORMAT_Y4:
-		layout->yrgb_size = pixels >> 1;
-		ret = 0;
+		ret = rk_rga_row_layout(img->vir_w, img->vir_h, 1, 2,
+					&layout->yrgb_stride,
+					&layout->yrgb_size);
 		break;
 	case RK_RGA_FORMAT_BPP2:
-		ret = rk_rga_bpp_layout_size(img, 2, &layout->yrgb_size);
+		ret = rk_rga_bpp_layout_size(img, 2, &layout->yrgb_stride,
+					     &layout->yrgb_size);
 		break;
 	case RK_RGA_FORMAT_BPP1:
-		ret = rk_rga_bpp_layout_size(img, 3, &layout->yrgb_size);
+		ret = rk_rga_bpp_layout_size(img, 3, &layout->yrgb_stride,
+					     &layout->yrgb_size);
 		break;
 	default:
 		return -EINVAL;
@@ -2656,6 +2892,30 @@ static int rk_rga_img_layout(const struct rga_img_info_t *img,
 	return 0;
 }
 
+static int
+rk_rga_validate_virtual_row_strides(const struct rga_img_info_t *img)
+{
+	struct rga_img_info_t raster = *img;
+	struct rk_rga_img_layout layout;
+	int ret;
+
+	/*
+	 * The capability is an uncompressed byte-row limit even when the
+	 * selected storage mode is FBC or TILE.
+	 */
+	raster.rd_mode = RK_RGA_RASTER_MODE;
+	ret = rk_rga_img_layout(&raster, &layout);
+	if (ret)
+		return ret;
+
+	if (layout.yrgb_stride > RK_RGA_MAX_BYTE_STRIDE ||
+	    layout.uv_stride > RK_RGA_MAX_BYTE_STRIDE ||
+	    layout.v_stride > RK_RGA_MAX_BYTE_STRIDE)
+		return -EINVAL;
+
+	return 0;
+}
+
 static int rk_rga_addr_add_size(__u64 base, size_t offset, __u64 *addr)
 {
 	if (check_add_overflow(base, (__u64)offset, addr))
@@ -2664,6 +2924,22 @@ static int rk_rga_addr_add_size(__u64 base, size_t offset, __u64 *addr)
 	return 0;
 }
 
+static struct rk_rga_import *
+rk_rga_find_dmabuf_object_import(struct rk_rga_import **imports,
+				 u32 import_count,
+				 const struct dma_buf *dmabuf);
+static struct rk_rga_import *
+rk_rga_find_dmabuf_import(struct rk_rga_import **imports, u32 import_count,
+			  const struct rk_rga_import *candidate);
+static int
+rk_rga_find_userptr_import(struct rk_rga_import **imports, u32 import_count,
+			   const struct rk_rga_import *candidate,
+			   struct rk_rga_import **import_out);
+static int
+rk_rga_check_alias_provenance(struct rk_rga_import **imports,
+			      u32 import_count,
+			      const struct rk_rga_import *candidate);
+
 static int rk_rga_resolve_handle_locked(struct rk_rga_session *session,
 					__u64 handle, size_t required_size,
 					__u64 *addr,
@@ -2671,6 +2947,8 @@ static int rk_rga_resolve_handle_locked(struct rk_rga_session *session,
 					u32 *import_count)
 {
 	struct rk_rga_import *import;
+	struct rk_rga_import *canonical = NULL;
+	int ret;
 
 	if (!handle)
 		return 0;
@@ -2681,13 +2959,35 @@ static int rk_rga_resolve_handle_locked(struct rk_rga_session *session,
 	import = idr_find(&session->imports, (int)handle);
 	if (!import)
 		return -EINVAL;
+	mutex_lock(&import->map_lock);
+	if (import->mapping_invalidated) {
+		mutex_unlock(&import->map_lock);
+		return -ENODEV;
+	}
+	mutex_unlock(&import->map_lock);
 	if (required_size && import->size < required_size)
 		return -EINVAL;
 
-	refcount_inc(&import->refs);
-	imports[*import_count] = import;
+	ret = rk_rga_check_alias_provenance(imports, *import_count, import);
+	if (ret)
+		return ret;
+
+	if (import->type == RK_RGA_IMPORT_DMABUF) {
+		canonical = rk_rga_find_dmabuf_import(imports, *import_count,
+						      import);
+	} else if (import->type == RK_RGA_IMPORT_USERPTR) {
+		ret = rk_rga_find_userptr_import(imports, *import_count,
+						 import, &canonical);
+		if (ret)
+			return ret;
+	}
+	if (!canonical)
+		canonical = import;
+
+	refcount_inc(&canonical->refs);
+	imports[*import_count] = canonical;
 	(*import_count)++;
-	*addr = import->iova;
+	*addr = canonical->iova;
 
 	return 0;
 }
@@ -2741,6 +3041,472 @@ static int rk_rga_materialize_img_import(struct rga_img_info_t *img,
 	return 0;
 }
 
+static struct rk_rga_import *
+rk_rga_find_dmabuf_object_import(struct rk_rga_import **imports,
+				 u32 import_count,
+				 const struct dma_buf *dmabuf)
+{
+	u32 i;
+
+	for (i = 0; i < import_count; i++) {
+		if (imports[i]->type == RK_RGA_IMPORT_DMABUF &&
+		    imports[i]->dmabuf == dmabuf)
+			return imports[i];
+	}
+
+	return NULL;
+}
+
+static int rk_rga_dmabuf_extent_cmp(const void *left, const void *right)
+{
+	const struct rk_rga_dmabuf_extent *a = left;
+	const struct rk_rga_dmabuf_extent *b = right;
+
+	if (a->start != b->start)
+		return a->start < b->start ? -1 : 1;
+	if (a->logical_offset != b->logical_offset)
+		return a->logical_offset < b->logical_offset ? -1 : 1;
+	if (a->length != b->length)
+		return a->length < b->length ? -1 : 1;
+
+	return 0;
+}
+
+static bool
+rk_rga_dmabuf_extents_self_overlap(
+	const struct rk_rga_dmabuf_extent *extents,
+	unsigned int extent_count)
+{
+	unsigned int i;
+
+	for (i = 1; i < extent_count; i++) {
+		const struct rk_rga_dmabuf_extent *previous = &extents[i - 1];
+		const struct rk_rga_dmabuf_extent *current_extent = &extents[i];
+		u64 previous_end = (u64)previous->start + previous->length;
+
+		if (previous_end > current_extent->start)
+			return true;
+	}
+
+	return false;
+}
+
+static int
+rk_rga_dmabuf_build_extents(struct device *dev, dma_addr_t iova, size_t size,
+			    struct rk_rga_dmabuf_extent **extents_out,
+			    unsigned int *extent_count_out)
+{
+	struct rk_rga_dmabuf_extent *extents;
+	struct iommu_domain *domain;
+	size_t remaining;
+	size_t logical = 0;
+	size_t capacity;
+	size_t span;
+	u32 count = 0;
+
+	if (!dev || !size || !extents_out || !extent_count_out)
+		return -EINVAL;
+	*extents_out = NULL;
+	*extent_count_out = 0;
+
+	/*
+	 * Record the targets of the exact attachment used by this job. They
+	 * remain stable until that attachment is unmapped, so they are sound
+	 * for detecting hardware-visible aliases between this job's mappings.
+	 * They are deliberately not retained as DMA-BUF object provenance:
+	 * another attachment can use a different IOVA, bounce buffer, or
+	 * exporter-specific staging allocation for the same logical object.
+	 */
+	domain = iommu_get_domain_for_dev(dev);
+	if (!domain) {
+		if (size > U32_MAX)
+			return -EOVERFLOW;
+		extents = kvmalloc(sizeof(*extents), GFP_KERNEL);
+		if (!extents)
+			return -ENOMEM;
+		extents[0] = (struct rk_rga_dmabuf_extent) {
+			.start = iova,
+			.logical_offset = 0,
+			.length = size,
+		};
+		*extents_out = extents;
+		*extent_count_out = 1;
+		return 0;
+	}
+
+	if (check_add_overflow((size_t)offset_in_page(iova), size, &span))
+		return -EOVERFLOW;
+	capacity = DIV_ROUND_UP(span, PAGE_SIZE);
+	if (!capacity || capacity > UINT_MAX)
+		return -EOVERFLOW;
+	extents = kvmalloc_array(capacity, sizeof(*extents), GFP_KERNEL);
+	if (!extents)
+		return -ENOMEM;
+
+	remaining = size;
+	while (remaining) {
+		dma_addr_t target_iova = iova + logical;
+		phys_addr_t phys = iommu_iova_to_phys(domain, target_iova);
+		size_t length;
+
+		/* Zero is the IOMMU API's unmapped result. */
+		if (!phys)
+			goto unsupported;
+		length = min3(remaining,
+			      (size_t)PAGE_SIZE - offset_in_page(target_iova),
+			      (size_t)PAGE_SIZE - offset_in_page(phys));
+		if (!length || logical > U32_MAX || length > U32_MAX)
+			goto invalid;
+
+		if (count &&
+		    (u64)extents[count - 1].start +
+			    extents[count - 1].length == phys &&
+		    (u64)extents[count - 1].logical_offset +
+			    extents[count - 1].length == logical &&
+		    length <= U32_MAX - extents[count - 1].length) {
+			extents[count - 1].length += length;
+		} else {
+			if (WARN_ON_ONCE(count >= capacity))
+				goto invalid;
+			extents[count++] = (struct rk_rga_dmabuf_extent) {
+				.start = phys,
+				.logical_offset = logical,
+				.length = length,
+			};
+		}
+		logical += length;
+		remaining -= length;
+	}
+
+	sort(extents, count, sizeof(*extents),
+	     rk_rga_dmabuf_extent_cmp, NULL);
+	if (rk_rga_dmabuf_extents_self_overlap(extents, count))
+		goto unsupported;
+
+	*extents_out = extents;
+	*extent_count_out = count;
+
+	return 0;
+
+invalid:
+	kvfree(extents);
+	return -EINVAL;
+unsupported:
+	kvfree(extents);
+	return -EOPNOTSUPP;
+}
+
+static bool
+rk_rga_dmabuf_extents_overlap(const struct rk_rga_dmabuf_extent *a_extents,
+			      unsigned int a_count,
+			      const struct rk_rga_dmabuf_extent *b_extents,
+			      unsigned int b_count)
+{
+	unsigned int a_index = 0;
+	unsigned int b_index = 0;
+
+	while (a_index < a_count && b_index < b_count) {
+		const struct rk_rga_dmabuf_extent *a_extent =
+			&a_extents[a_index];
+		const struct rk_rga_dmabuf_extent *b_extent =
+			&b_extents[b_index];
+		u64 a_end = (u64)a_extent->start + a_extent->length;
+		u64 b_end = (u64)b_extent->start + b_extent->length;
+
+		if (a_end <= b_extent->start) {
+			a_index++;
+			continue;
+		}
+		if (b_end <= a_extent->start) {
+			b_index++;
+			continue;
+		}
+
+		return true;
+	}
+
+	return false;
+}
+
+static struct rk_rga_import *
+rk_rga_find_dmabuf_import(struct rk_rga_import **imports, u32 import_count,
+			  const struct rk_rga_import *candidate)
+{
+	u32 i;
+
+	for (i = 0; i < import_count; i++) {
+		if (imports[i]->type != RK_RGA_IMPORT_DMABUF)
+			continue;
+		if (imports[i]->dmabuf == candidate->dmabuf)
+			return imports[i];
+	}
+
+	return NULL;
+}
+
+static int rk_rga_userptr_extent_cmp(const void *left, const void *right)
+{
+	const struct rk_rga_userptr_extent *a = left;
+	const struct rk_rga_userptr_extent *b = right;
+	unsigned long a_page = (unsigned long)a->page;
+	unsigned long b_page = (unsigned long)b->page;
+
+	if (a_page != b_page)
+		return a_page < b_page ? -1 : 1;
+	if (a->offset != b->offset)
+		return a->offset < b->offset ? -1 : 1;
+	if (a->length != b->length)
+		return a->length < b->length ? -1 : 1;
+
+	return 0;
+}
+
+static bool
+rk_rga_physical_extents_self_overlap(
+	const struct rk_rga_userptr_extent *extents,
+	unsigned int extent_count)
+{
+	unsigned int i;
+
+	for (i = 1; i < extent_count; i++) {
+		const struct rk_rga_userptr_extent *previous = &extents[i - 1];
+		const struct rk_rga_userptr_extent *current_extent = &extents[i];
+		u64 previous_end;
+
+		if (previous->page != current_extent->page)
+			continue;
+
+		previous_end = (u64)previous->offset + previous->length;
+		if (previous_end > current_extent->offset)
+			return true;
+	}
+
+	return false;
+}
+
+static int rk_rga_userptr_build_extents(struct rk_rga_import *import)
+{
+	struct rk_rga_userptr_extent *extents;
+	size_t remaining;
+	u32 offset;
+	u32 i;
+
+	if (import->type != RK_RGA_IMPORT_USERPTR || !import->pages ||
+	    !import->page_count || !import->size ||
+	    import->page_offset >= PAGE_SIZE || import->userptr_extents ||
+	    import->userptr_extent_count)
+		return -EINVAL;
+
+	extents = kcalloc(import->page_count, sizeof(*extents), GFP_KERNEL);
+	if (!extents)
+		return -ENOMEM;
+
+	remaining = import->size;
+	offset = import->page_offset;
+	for (i = 0; i < import->page_count; i++) {
+		size_t length;
+
+		if (!remaining)
+			goto invalid;
+		length = min_t(size_t, remaining, PAGE_SIZE - offset);
+		if (!length)
+			goto invalid;
+
+		extents[i].page = import->pages[i];
+		extents[i].offset = offset;
+		extents[i].length = length;
+		remaining -= length;
+		offset = 0;
+	}
+	if (remaining)
+		goto invalid;
+
+	sort(extents, import->page_count, sizeof(*extents),
+	     rk_rga_userptr_extent_cmp, NULL);
+	if (rk_rga_physical_extents_self_overlap(extents,
+						 import->page_count)) {
+		kfree(extents);
+		return -EOPNOTSUPP;
+	}
+	import->userptr_extents = extents;
+	import->userptr_extent_count = import->page_count;
+
+	return 0;
+
+invalid:
+	kfree(extents);
+	return -EINVAL;
+}
+
+static bool
+rk_rga_userptr_backing_equal(const struct rk_rga_import *a,
+			     const struct rk_rga_import *b)
+{
+	u32 i;
+
+	if (a->size != b->size || a->page_offset != b->page_offset ||
+	    a->page_count != b->page_count)
+		return false;
+
+	for (i = 0; i < a->page_count; i++) {
+		if (a->pages[i] != b->pages[i])
+			return false;
+	}
+
+	return true;
+}
+
+static bool
+rk_rga_physical_extents_overlap(const struct rk_rga_userptr_extent *a_extents,
+				unsigned int a_extent_count,
+				const struct rk_rga_userptr_extent *b_extents,
+				unsigned int b_extent_count)
+{
+	unsigned int a_index = 0;
+	unsigned int b_index = 0;
+
+	while (a_index < a_extent_count && b_index < b_extent_count) {
+		const struct rk_rga_userptr_extent *a_extent =
+			&a_extents[a_index];
+		const struct rk_rga_userptr_extent *b_extent =
+			&b_extents[b_index];
+		unsigned long a_page = (unsigned long)a_extent->page;
+		unsigned long b_page = (unsigned long)b_extent->page;
+		u32 a_end;
+		u32 b_end;
+
+		if (a_page < b_page) {
+			a_index++;
+			continue;
+		}
+		if (a_page > b_page) {
+			b_index++;
+			continue;
+		}
+
+		a_end = a_extent->offset + a_extent->length;
+		b_end = b_extent->offset + b_extent->length;
+		if (a_end <= b_extent->offset) {
+			a_index++;
+			continue;
+		}
+		if (b_end <= a_extent->offset) {
+			b_index++;
+			continue;
+		}
+
+		return true;
+	}
+
+	return false;
+}
+
+static bool
+rk_rga_userptr_backing_overlaps(const struct rk_rga_import *a,
+				const struct rk_rga_import *b)
+{
+	return rk_rga_physical_extents_overlap(a->userptr_extents,
+					       a->userptr_extent_count,
+					       b->userptr_extents,
+					       b->userptr_extent_count);
+}
+
+static int
+rk_rga_check_alias_provenance(struct rk_rga_import **imports,
+			      u32 import_count,
+			      const struct rk_rga_import *candidate)
+{
+	u32 i;
+
+	if (!candidate)
+		return -EINVAL;
+
+	for (i = 0; i < import_count; i++) {
+		struct rk_rga_import *import = imports[i];
+
+		if (!import)
+			return -EINVAL;
+		if (import->type == candidate->type) {
+			if (candidate->type != RK_RGA_IMPORT_DMABUF ||
+			    import->dmabuf == candidate->dmabuf)
+				continue;
+			/*
+			 * Distinct DMA-BUF objects do not have a generic,
+			 * exporter-independent backing identity. Their exact
+			 * per-job device mappings are checked before execution.
+			 */
+			continue;
+		}
+
+		/*
+		 * DMA-BUF deliberately hides the attachment's struct pages from
+		 * importers, so mixed DMA-BUF/USERPTR physical aliasing cannot be
+		 * established through the public API. Fail closed for mixed
+		 * provenance. Same-type aliases are handled by exact per-job
+		 * DMA targets or the explicitly pinned USERPTR page lists.
+		 */
+		return -EOPNOTSUPP;
+	}
+
+	return 0;
+}
+
+static int
+rk_rga_find_userptr_import(struct rk_rga_import **imports, u32 import_count,
+			   const struct rk_rga_import *candidate,
+			   struct rk_rga_import **import_out)
+{
+	u32 i;
+
+	*import_out = NULL;
+	if (!candidate || candidate->type != RK_RGA_IMPORT_USERPTR ||
+	    !candidate->pages || !candidate->userptr_extents ||
+	    !candidate->page_count || !candidate->userptr_extent_count)
+		return -EINVAL;
+
+	for (i = 0; i < import_count; i++) {
+		struct rk_rga_import *import = imports[i];
+
+		if (import->type != RK_RGA_IMPORT_USERPTR)
+			continue;
+		if (!import->pages || !import->userptr_extents ||
+		    !import->page_count || !import->userptr_extent_count)
+			return -EINVAL;
+
+		if (rk_rga_userptr_backing_equal(import, candidate)) {
+			*import_out = import;
+			return 0;
+		}
+		if (rk_rga_userptr_backing_overlaps(import, candidate))
+			return -EOPNOTSUPP;
+	}
+
+	return 0;
+}
+
+static int
+rk_rga_materialize_existing_import(struct rga_img_info_t *img,
+				   struct rk_rga_import *import,
+				   struct rk_rga_import **imports,
+				   u32 *import_count)
+{
+	int ret;
+
+	mutex_lock(&import->map_lock);
+	if (import->mapping_invalidated) {
+		mutex_unlock(&import->map_lock);
+		return -ENODEV;
+	}
+	refcount_inc(&import->refs);
+	mutex_unlock(&import->map_lock);
+	ret = rk_rga_materialize_img_import(img, import, imports,
+					    import_count);
+	if (ret)
+		rk_rga_import_put(import);
+
+	return ret;
+}
+
 static bool rk_rga_direct_img_uses_mmu(const struct rga_req *task,
 				       const struct rga_img_info_t *img)
 {
@@ -2786,7 +3552,10 @@ static int rk_rga_resolve_direct_img(struct rga_req *task,
 				     bool required)
 {
 	struct rga_external_buffer buffer = {};
-	struct rk_rga_import *import;
+	struct rk_rga_import *import = NULL;
+	struct rk_rga_import *canonical = NULL;
+	struct dma_buf *dmabuf;
+	int fd;
 	int ret;
 
 	switch (rk_rga_classify_direct_img(task, img)) {
@@ -2808,12 +3577,77 @@ static int rk_rga_resolve_direct_img(struct rga_req *task,
 	buffer.memory_parm.height = img->vir_h;
 	buffer.memory_parm.format = img->format;
 
-	if (buffer.type == RGA_DMA_BUFFER)
-		ret = rk_rga_import_dmabuf(&buffer, &import);
-	else
+	if (buffer.type == RGA_DMA_BUFFER) {
+		ret = rk_rga_import_dmabuf_fd(&buffer, &fd);
+		if (ret)
+			return ret;
+		dmabuf = dma_buf_get(fd);
+		if (IS_ERR(dmabuf))
+			return PTR_ERR(dmabuf);
+
+		import = rk_rga_find_dmabuf_object_import(imports,
+							  *import_count,
+							  dmabuf);
+		if (import) {
+			dma_buf_put(dmabuf);
+			ret = rk_rga_check_alias_provenance(imports,
+							    *import_count,
+							    import);
+			if (ret)
+				return ret;
+			return rk_rga_materialize_existing_import(img, import,
+								  imports,
+								  import_count);
+		}
+
+		/*
+		 * The object importer consumes the dma-buf reference on both
+		 * success and failure. Comparing acquired objects, rather than
+		 * fd numbers, also closes the close/reuse race on an fd slot.
+		 */
+		ret = rk_rga_import_dmabuf_object(dmabuf, fd, &import);
+	} else {
+		if ((u64)(unsigned long)buffer.memory != buffer.memory)
+			return -EINVAL;
 		ret = rk_rga_import_userptr(&buffer, &import);
+		if (ret)
+			return ret;
+		ret = rk_rga_check_alias_provenance(imports, *import_count,
+						    import);
+		if (ret) {
+			rk_rga_import_put(import);
+			return ret;
+		}
+		ret = rk_rga_find_userptr_import(imports, *import_count,
+						 import, &canonical);
+		if (ret) {
+			rk_rga_import_put(import);
+			return ret;
+		}
+		if (canonical) {
+			rk_rga_import_put(import);
+			return rk_rga_materialize_existing_import(img, canonical,
+								  imports,
+								  import_count);
+		}
+	}
 	if (ret)
 		return ret;
+	if (buffer.type == RGA_DMA_BUFFER) {
+		ret = rk_rga_check_alias_provenance(imports, *import_count,
+						    import);
+		if (ret) {
+			rk_rga_import_put(import);
+			return ret;
+		}
+		canonical = rk_rga_find_dmabuf_import(imports, *import_count,
+						      import);
+		if (canonical) {
+			rk_rga_import_put(import);
+			return rk_rga_materialize_existing_import(
+				img, canonical, imports, import_count);
+		}
+	}
 
 	ret = rk_rga_materialize_img_import(img, import, imports, import_count);
 	if (ret) {
@@ -2834,6 +3668,7 @@ static int rk_rga_resolve_img_handles_locked(struct rk_rga_session *session,
 	__u64 yrgb_handle = img->yrgb_addr;
 	__u64 uv_handle = img->uv_addr;
 	__u64 v_handle = img->v_addr;
+	u32 plane_import_start;
 	int ret;
 
 	if (!yrgb_handle)
@@ -2857,6 +3692,7 @@ static int rk_rga_resolve_img_handles_locked(struct rk_rga_session *session,
 		if (layout.v_size && !v_handle)
 			return -EINVAL;
 
+		plane_import_start = *import_count;
 		ret = rk_rga_resolve_handle_locked(session, yrgb_handle,
 						   layout.yrgb_size,
 						   &img->yrgb_addr, imports,
@@ -2869,6 +3705,9 @@ static int rk_rga_resolve_img_handles_locked(struct rk_rga_session *session,
 						   import_count);
 		if (ret)
 			return ret;
+		if (imports[plane_import_start] ==
+		    imports[plane_import_start + 1])
+			return -EOPNOTSUPP;
 		if (v_handle) {
 			ret = rk_rga_resolve_handle_locked(session, v_handle,
 							   layout.v_size,
@@ -2877,6 +3716,11 @@ static int rk_rga_resolve_img_handles_locked(struct rk_rga_session *session,
 							   import_count);
 			if (ret)
 				return ret;
+			if (imports[plane_import_start] ==
+			    imports[plane_import_start + 2] ||
+			    imports[plane_import_start + 1] ==
+			    imports[plane_import_start + 2])
+				return -EOPNOTSUPP;
 		}
 
 		return 0;
@@ -2914,48 +3758,207 @@ static int rk_rga_resolve_img_handles_locked(struct rk_rga_session *session,
 	return 0;
 }
 
+static int
+rk_rga_capture_img_imports(const struct rga_img_info_t *img,
+			   struct rk_rga_import **imports,
+			   u32 import_start, u32 import_count,
+			   bool explicit_planes, bool explicit_v,
+			   struct rk_rga_img_imports *img_imports)
+{
+	struct rk_rga_img_layout layout;
+	u32 expected_count = explicit_planes ? 2 + explicit_v : 1;
+	int ret;
+
+	if (!img_imports || import_count < import_start ||
+	    import_count - import_start != expected_count)
+		return -EINVAL;
+
+	ret = rk_rga_img_layout(img, &layout);
+	if (ret)
+		return ret;
+
+	memset(img_imports, 0, sizeof(*img_imports));
+	img_imports->yrgb = imports[import_start];
+	if (explicit_planes) {
+		img_imports->uv = imports[import_start + 1];
+		if (explicit_v)
+			img_imports->v = imports[import_start + 2];
+	} else {
+		if (rk_rga_img_single_buffer_compressed(img) || layout.uv_size)
+			img_imports->uv = imports[import_start];
+		if (layout.v_size)
+			img_imports->v = imports[import_start];
+	}
+
+	return 0;
+}
+
+static int
+rk_rga_resolve_img_handles_with_imports_locked(
+	struct rk_rga_session *session, struct rga_img_info_t *img,
+	struct rk_rga_import **imports, u32 *import_count,
+	struct rk_rga_img_imports *img_imports, bool required)
+{
+	bool explicit_planes = img->uv_addr || img->v_addr;
+	bool explicit_v = img->v_addr;
+	u32 import_start = *import_count;
+	int ret;
+
+	ret = rk_rga_resolve_img_handles_locked(session, img, imports,
+						import_count, required);
+	if (ret)
+		return ret;
+
+	return rk_rga_capture_img_imports(img, imports, import_start,
+					  *import_count, explicit_planes,
+					  explicit_v, img_imports);
+}
+
+static int
+rk_rga_resolve_direct_img_with_imports(
+	struct rga_req *task, struct rga_img_info_t *img,
+	struct rk_rga_import **imports, u32 *import_count,
+	struct rk_rga_img_imports *img_imports, bool required)
+{
+	u32 import_start = *import_count;
+	int ret;
+
+	ret = rk_rga_resolve_direct_img(task, img, imports, import_count,
+					required);
+	if (ret)
+		return ret;
+
+	return rk_rga_capture_img_imports(img, imports, import_start,
+					  *import_count, false, false,
+					  img_imports);
+}
+
+static bool
+rk_rga_img_imports_intersect(const struct rk_rga_img_imports *a,
+			     const struct rk_rga_img_imports *b)
+{
+	struct rk_rga_import *a_planes[] = { a->yrgb, a->uv, a->v };
+	struct rk_rga_import *b_planes[] = { b->yrgb, b->uv, b->v };
+
+	for (u32 i = 0; i < ARRAY_SIZE(a_planes); i++) {
+		if (!a_planes[i])
+			continue;
+		for (u32 j = 0; j < ARRAY_SIZE(b_planes); j++) {
+			if (a_planes[i] == b_planes[j])
+				return true;
+		}
+	}
+
+	return false;
+}
+
+static bool
+rk_rga_img_imports_equal(const struct rk_rga_img_imports *a,
+			 const struct rk_rga_img_imports *b)
+{
+	return a->yrgb == b->yrgb && a->uv == b->uv && a->v == b->v;
+}
+
+static bool
+rk_rga_dmabuf_destination_copyback_safe(
+	const struct rk_rga_img_imports *dst)
+{
+	struct rk_rga_import *planes[] = { dst->yrgb, dst->uv, dst->v };
+	struct rk_rga_import *first = NULL;
+
+	for (u32 i = 0; i < ARRAY_SIZE(planes); i++) {
+		struct rk_rga_import *import = planes[i];
+
+		if (!import || import->type != RK_RGA_IMPORT_DMABUF)
+			continue;
+		if (!first) {
+			first = import;
+			continue;
+		}
+		if (import != first)
+			return false;
+	}
+
+	return true;
+}
+
+static int
+rk_rga_validate_task_import_aliases(const struct rga_req *task,
+				    const struct rk_rga_task_imports *imports)
+{
+	/*
+	 * Distinct DMA-BUF objects have no generic backing identity. Even when
+	 * their device targets are disjoint bounce/staging buffers, unmapping
+	 * multiple writable destination planes can copy stale full-buffer data
+	 * back onto overlapping logical backing. A single object (including
+	 * duplicated fds canonicalized to it) has one mapping and copyback.
+	 */
+	if (!rk_rga_dmabuf_destination_copyback_safe(&imports->dst))
+		return -EOPNOTSUPP;
+
+	if (task->render_mode != RK_RGA_RENDER_BITBLT &&
+	    task->render_mode != RK_RGA_RENDER_COLOR_PALETTE)
+		return 0;
+
+	/*
+	 * A supported in-place operation must use the same backing for every
+	 * plane. Partial or cross-plane read/write aliases are not represented
+	 * by the backends' Y-base overlap controls and could silently corrupt
+	 * chroma or packed data.
+	 */
+	if (rk_rga_img_imports_intersect(&imports->src, &imports->dst) &&
+	    !rk_rga_img_imports_equal(&imports->src, &imports->dst))
+		return -EOPNOTSUPP;
+
+	/* Pattern data is read while the destination is written. */
+	if (imports->pat.yrgb &&
+	    rk_rga_img_imports_intersect(&imports->pat, &imports->dst))
+		return -EOPNOTSUPP;
+
+	return 0;
+}
+
 static int rk_rga_resolve_task_handles_locked(struct rk_rga_session *session,
 					      struct rga_req *task,
 					      struct rk_rga_import **imports,
-					      u32 *import_count)
+					      u32 *import_count,
+					      struct rk_rga_task_imports *task_imports)
 {
 	int ret;
 
 	switch (task->render_mode) {
 	case RK_RGA_RENDER_BITBLT:
 	case RK_RGA_RENDER_COLOR_PALETTE:
-		ret = rk_rga_resolve_img_handles_locked(session, &task->src,
-							imports, import_count,
-							true);
+		ret = rk_rga_resolve_img_handles_with_imports_locked(
+			session, &task->src, imports, import_count,
+			&task_imports->src, true);
 		if (ret)
 			return ret;
-		ret = rk_rga_resolve_img_handles_locked(session, &task->dst,
-							imports, import_count,
-							true);
+		ret = rk_rga_resolve_img_handles_with_imports_locked(
+			session, &task->dst, imports, import_count,
+			&task_imports->dst, true);
 		if (ret)
 			return ret;
 		if (task->pat.yrgb_addr || task->bsfilter_flag) {
-			ret = rk_rga_resolve_img_handles_locked(session,
-								&task->pat,
-								imports,
-								import_count,
-								task->bsfilter_flag);
+			ret = rk_rga_resolve_img_handles_with_imports_locked(
+				session, &task->pat, imports, import_count,
+				&task_imports->pat, task->bsfilter_flag);
 			if (ret)
 				return ret;
 		}
 		break;
 	case RK_RGA_RENDER_COLOR_FILL:
-		ret = rk_rga_resolve_img_handles_locked(session, &task->dst,
-							imports, import_count,
-							true);
+		ret = rk_rga_resolve_img_handles_with_imports_locked(
+			session, &task->dst, imports, import_count,
+			&task_imports->dst, true);
 		if (ret)
 			return ret;
 		break;
 	case RK_RGA_RENDER_UPDATE_PALETTE:
 	case RK_RGA_RENDER_UPDATE_PATTERN:
-		ret = rk_rga_resolve_img_handles_locked(session, &task->pat,
-							imports, import_count,
-							true);
+		ret = rk_rga_resolve_img_handles_with_imports_locked(
+			session, &task->pat, imports, import_count,
+			&task_imports->pat, true);
 		if (ret)
 			return ret;
 		break;
@@ -2970,39 +3973,44 @@ static int rk_rga_resolve_task_handles_locked(struct rk_rga_session *session,
 
 static int rk_rga_resolve_task_direct_buffers(struct rga_req *task,
 					      struct rk_rga_import **imports,
-					      u32 *import_count)
+					      u32 *import_count,
+					      struct rk_rga_task_imports *task_imports)
 {
 	int ret;
 
 	switch (task->render_mode) {
 	case RK_RGA_RENDER_BITBLT:
 	case RK_RGA_RENDER_COLOR_PALETTE:
-		ret = rk_rga_resolve_direct_img(task, &task->src, imports,
-						import_count, true);
+		ret = rk_rga_resolve_direct_img_with_imports(
+			task, &task->src, imports, import_count,
+			&task_imports->src, true);
 		if (ret)
 			return ret;
-		ret = rk_rga_resolve_direct_img(task, &task->dst, imports,
-						import_count, true);
+		ret = rk_rga_resolve_direct_img_with_imports(
+			task, &task->dst, imports, import_count,
+			&task_imports->dst, true);
 		if (ret)
 			return ret;
 		if (task->bsfilter_flag) {
-			ret = rk_rga_resolve_direct_img(task, &task->pat,
-							imports,
-							import_count, true);
+			ret = rk_rga_resolve_direct_img_with_imports(
+				task, &task->pat, imports, import_count,
+				&task_imports->pat, true);
 			if (ret)
 				return ret;
 		}
 		break;
 	case RK_RGA_RENDER_COLOR_FILL:
-		ret = rk_rga_resolve_direct_img(task, &task->dst, imports,
-						import_count, true);
+		ret = rk_rga_resolve_direct_img_with_imports(
+			task, &task->dst, imports, import_count,
+			&task_imports->dst, true);
 		if (ret)
 			return ret;
 		break;
 	case RK_RGA_RENDER_UPDATE_PALETTE:
 	case RK_RGA_RENDER_UPDATE_PATTERN:
-		ret = rk_rga_resolve_direct_img(task, &task->pat, imports,
-						import_count, true);
+		ret = rk_rga_resolve_direct_img_with_imports(
+			task, &task->pat, imports, import_count,
+			&task_imports->pat, true);
 		if (ret)
 			return ret;
 		break;
@@ -3125,10 +4133,12 @@ static void rk_rga_job_sync_userptr_for_device(struct rk_rga_job *job,
 	for (u32 i = 0; i < job->import_count; i++) {
 		struct rk_rga_import *import = job->imports[i];
 
+		mutex_lock(&import->map_lock);
 		if (import->type == RK_RGA_IMPORT_USERPTR &&
 		    import->dev == dev && import->sgt)
 			rk_rga_sync_userptr_sgt(dev, import->sgt,
 						import->userptr_view, true);
+		mutex_unlock(&import->map_lock);
 	}
 
 	for (u32 i = 0; i < job->mapping_count; i++) {
@@ -3146,10 +4156,12 @@ static void rk_rga_job_sync_userptr_for_cpu(struct rk_rga_job *job,
 	for (u32 i = 0; i < job->import_count; i++) {
 		struct rk_rga_import *import = job->imports[i];
 
+		mutex_lock(&import->map_lock);
 		if (import->type == RK_RGA_IMPORT_USERPTR &&
 		    import->dev == dev && import->sgt)
 			rk_rga_sync_userptr_sgt(import->dev, import->sgt,
 						import->userptr_view, false);
+		mutex_unlock(&import->map_lock);
 	}
 
 	for (u32 i = 0; i < job->mapping_count; i++) {
@@ -3175,13 +4187,16 @@ static void rk_rga_job_clear_mappings(struct rk_rga_job *job)
 						 mapping->page_offset,
 						 mapping->iommu_mapped);
 		} else if (mapping->sgt) {
-			dma_buf_unmap_attachment(mapping->attach, mapping->sgt,
-						 DMA_BIDIRECTIONAL);
+			dma_buf_unmap_attachment_unlocked(mapping->attach,
+							  mapping->sgt,
+							  mapping->dma_dir);
 		}
+		kvfree(mapping->dmabuf_extents);
 		if (mapping->attach)
 			dma_buf_detach(mapping->import->dmabuf, mapping->attach);
 		if (mapping->dev)
 			put_device(mapping->dev);
+		rk_rga_hw_put(mapping->hw);
 	}
 
 	kfree(job->mappings);
@@ -3238,6 +4253,8 @@ static void rk_rga_job_free_cmd(struct rk_rga_job *job)
 	dma_free_coherent(job->cmd_dev, job->cmd_size, job->cmd_vaddr,
 			  job->cmd_dma);
 	put_device(job->cmd_dev);
+	rk_rga_hw_put(job->cmd_hw);
+	job->cmd_hw = NULL;
 	job->cmd_dev = NULL;
 	job->cmd_vaddr = NULL;
 	job->cmd_dma = 0;
@@ -3248,7 +4265,7 @@ static int rk_rga_job_alloc_cmd(struct rk_rga_job *job, struct rk_rga_hw *hw)
 {
 	size_t size = rk_rga_cmd_size(hw);
 
-	if (job->cmd_vaddr && job->cmd_dev == hw->dev &&
+	if (job->cmd_vaddr && job->cmd_hw == hw &&
 	    job->cmd_size >= size)
 		return 0;
 
@@ -3264,6 +4281,8 @@ static int rk_rga_job_alloc_cmd(struct rk_rga_job *job, struct rk_rga_hw *hw)
 		job->cmd_size = 0;
 		return -ENOMEM;
 	}
+	refcount_inc(&hw->refs);
+	job->cmd_hw = hw;
 	if (rk_rga_check_iova_span(job->cmd_dma, job->cmd_size,
 				   "command buffer", true)) {
 		rk_rga_job_free_cmd(job);
@@ -3286,25 +4305,36 @@ static int rk_rga_map_userptr_sgt(struct rk_rga_import *import,
 				  bool *iommu_mapped_out);
 static int rk_rga_job_map_import(struct rk_rga_job *job,
 				 struct rk_rga_import *import,
-				 struct device *dev,
+				 struct rk_rga_hw *hw,
 				 dma_addr_t *iova)
 {
+	struct rk_rga_dmabuf_extent *dmabuf_extents = NULL;
 	struct dma_buf_attachment *attach;
 	struct rk_rga_job_mapping *mappings;
+	struct device *dev = hw->dev;
 	struct sg_table *sgt;
 	size_t bytes;
+	unsigned int dmabuf_extent_count = 0;
+	enum dma_data_direction dma_dir;
 	u32 count;
 	int ret;
 
-	if (import->dev == dev) {
+	mutex_lock(&import->map_lock);
+	if (import->mapping_invalidated) {
+		mutex_unlock(&import->map_lock);
+		return -ENODEV;
+	}
+	if (import->type == RK_RGA_IMPORT_USERPTR && import->map_hw == hw) {
 		*iova = import->iova;
+		mutex_unlock(&import->map_lock);
 		return 0;
 	}
+	mutex_unlock(&import->map_lock);
 
 	for (u32 i = 0; i < job->mapping_count; i++) {
 		struct rk_rga_job_mapping *mapping = &job->mappings[i];
 
-		if (mapping->import == import && mapping->dev == dev) {
+		if (mapping->import == import && mapping->hw == hw) {
 			*iova = mapping->iova;
 			return 0;
 		}
@@ -3320,6 +4350,7 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 	if (!mappings)
 		return -ENOMEM;
 	job->mappings = mappings;
+	refcount_inc(&hw->refs);
 
 	if (import->type == RK_RGA_IMPORT_USERPTR) {
 		dma_addr_t mapped_iova;
@@ -3332,11 +4363,14 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 					     &view,
 					     &mapped_iova, &domain,
 					     &iova_size, &iommu_mapped);
-		if (ret)
+		if (ret) {
+			rk_rga_hw_put(hw);
 			return ret;
+		}
 
 		job->mappings[job->mapping_count] = (struct rk_rga_job_mapping) {
 			.import = import,
+			.hw = hw,
 			.dev = get_device(dev),
 			.sgt = sgt,
 			.userptr_view = view,
@@ -3353,140 +4387,180 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 		return 0;
 	}
 
-	attach = dma_buf_attach(import->dmabuf, dev);
-	if (IS_ERR(attach))
-		return PTR_ERR(attach);
+	dma_dir = DMA_TO_DEVICE;
+	if (job->task_imports && job->current_task < job->task_count) {
+		struct rk_rga_img_imports *dst =
+			&job->task_imports[job->current_task].dst;
 
-	sgt = dma_buf_map_attachment(attach, DMA_BIDIRECTIONAL);
+		/*
+		 * RGA may read destination pixels for blending and overlap
+		 * handling, so every destination mapping is bidirectional.
+		 * Source-only mappings must not copy a stale bounce buffer back
+		 * over a destination that aliases through another DMA-BUF.
+		 */
+		if (dst->yrgb == import || dst->uv == import || dst->v == import)
+			dma_dir = DMA_BIDIRECTIONAL;
+	}
+
+	/*
+	 * Serialize the secondary attachment with core-removal invalidation.
+	 * Once mapped, this job-owned attachment pins the same backing that
+	 * was covered by alias validation until the job releases it.
+	 */
+	mutex_lock(&import->map_lock);
+	if (import->mapping_invalidated) {
+		mutex_unlock(&import->map_lock);
+		rk_rga_hw_put(hw);
+		return -ENODEV;
+	}
+	attach = dma_buf_attach(import->dmabuf, dev);
+	if (IS_ERR(attach)) {
+		mutex_unlock(&import->map_lock);
+		rk_rga_hw_put(hw);
+		return PTR_ERR(attach);
+	}
+
+	sgt = dma_buf_map_attachment_unlocked(attach, dma_dir);
 	if (IS_ERR(sgt)) {
 		dma_buf_detach(import->dmabuf, attach);
+		mutex_unlock(&import->map_lock);
+		rk_rga_hw_put(hw);
 		return PTR_ERR(sgt);
 	}
 
 	ret = rk_rga_check_dma_sgt(sgt, "dma-buf remap", import->size, iova,
 				   true);
 	if (ret) {
-		dma_buf_unmap_attachment(attach, sgt, DMA_BIDIRECTIONAL);
+		dma_buf_unmap_attachment_unlocked(attach, sgt,
+						  dma_dir);
 		dma_buf_detach(import->dmabuf, attach);
+		mutex_unlock(&import->map_lock);
+		rk_rga_hw_put(hw);
 		return ret;
 	}
 
-	job->mappings[job->mapping_count] = (struct rk_rga_job_mapping) {
-		.import = import,
-		.dev = get_device(dev),
-		.attach = attach,
-		.sgt = sgt,
-		.iova = *iova,
-	};
-	job->mapping_count = count;
-
-	return 0;
-}
-
-static struct rk_rga_import *rk_rga_job_find_import_by_iova(
-	struct rk_rga_job *job, dma_addr_t iova)
-{
-	for (u32 i = 0; i < job->import_count; i++) {
-		if (job->imports[i]->iova == iova)
-			return job->imports[i];
+	ret = rk_rga_dmabuf_build_extents(dev, *iova, import->size,
+					  &dmabuf_extents,
+					  &dmabuf_extent_count);
+	if (ret) {
+		dma_buf_unmap_attachment_unlocked(attach, sgt, dma_dir);
+		dma_buf_detach(import->dmabuf, attach);
+		mutex_unlock(&import->map_lock);
+		rk_rga_hw_put(hw);
+		return ret;
 	}
-	for (u32 i = 0; i < job->mapping_count; i++) {
-		if (job->mappings[i].iova == iova)
-			return job->mappings[i].import;
-	}
-
-	return NULL;
-}
-
-static int rk_rga_job_rebase_iova_to_hw(struct rk_rga_job *job,
-					dma_addr_t old_iova,
-					struct device *dev,
-					dma_addr_t *new_iova)
-{
-	struct rk_rga_import *import;
-
-	import = rk_rga_job_find_import_by_iova(job, old_iova);
-	if (!import)
-		return -EINVAL;
-
-	return rk_rga_job_map_import(job, import, dev, new_iova);
-}
-
-static int rk_rga_job_rebase_img_to_hw(struct rk_rga_job *job,
-				       struct rga_img_info_t *img,
-				       struct device *dev)
-{
-	struct rk_rga_img_layout layout;
-	struct rk_rga_import *import;
-	__u64 old_y = img->yrgb_addr;
-	__u64 old_uv = img->uv_addr;
-	__u64 old_v = img->v_addr;
-	dma_addr_t iova;
-	int ret;
 
 	for (u32 i = 0; i < job->mapping_count; i++) {
 		struct rk_rga_job_mapping *mapping = &job->mappings[i];
 
-		if (mapping->dev == dev && mapping->iova == img->yrgb_addr)
-			return 0;
+		if (mapping->userptr || mapping->hw != hw ||
+		    mapping->import->dmabuf == import->dmabuf)
+			continue;
+		if (rk_rga_dmabuf_extents_overlap(
+			    mapping->dmabuf_extents,
+			    mapping->dmabuf_extent_count,
+			    dmabuf_extents, dmabuf_extent_count)) {
+			ret = -EOPNOTSUPP;
+			goto err_unmap_dmabuf;
+		}
 	}
 
-	import = rk_rga_job_find_import_by_iova(job, img->yrgb_addr);
-	if (!import) {
-		if (job->import_count == 1)
-			import = job->imports[0];
-		else
-			return -EINVAL;
-	}
+	job->mappings[job->mapping_count] = (struct rk_rga_job_mapping) {
+		.import = import,
+		.hw = hw,
+		.dev = get_device(dev),
+		.attach = attach,
+		.sgt = sgt,
+		.dmabuf_extents = dmabuf_extents,
+		.iova = *iova,
+		.dmabuf_extent_count = dmabuf_extent_count,
+		.dma_dir = dma_dir,
+	};
+	job->mapping_count = count;
+	mutex_unlock(&import->map_lock);
 
-	ret = rk_rga_job_map_import(job, import, dev, &iova);
-	if (ret)
-		return ret;
+	return 0;
 
+err_unmap_dmabuf:
+	kvfree(dmabuf_extents);
+	dma_buf_unmap_attachment_unlocked(attach, sgt, dma_dir);
+	dma_buf_detach(import->dmabuf, attach);
+	mutex_unlock(&import->map_lock);
+	rk_rga_hw_put(hw);
+	return ret;
+}
+
+static int rk_rga_job_rebase_img_to_hw(struct rk_rga_job *job,
+				       struct rga_img_info_t *img,
+				       const struct rk_rga_img_imports *img_imports,
+				       struct rk_rga_hw *hw)
+{
+	struct rk_rga_img_layout layout;
+	dma_addr_t iova;
+	int ret;
+
+	if (!img_imports || !img_imports->yrgb)
+		return -EINVAL;
 	ret = rk_rga_img_layout(img, &layout);
 	if (ret)
 		return ret;
 
+	ret = rk_rga_job_map_import(job, img_imports->yrgb, hw, &iova);
+	if (ret)
+		return ret;
 	img->yrgb_addr = iova;
 	if (rk_rga_img_single_buffer_compressed(img)) {
+		if (img_imports->uv != img_imports->yrgb || img_imports->v)
+			return -EINVAL;
 		img->uv_addr = img->yrgb_addr;
 		img->v_addr = 0;
 		return 0;
 	}
 	if (!layout.uv_size) {
+		if (img_imports->uv || img_imports->v)
+			return -EINVAL;
 		img->uv_addr = 0;
 		img->v_addr = 0;
 		return 0;
 	}
+	if (!img_imports->uv)
+		return -EINVAL;
 
-	if (!old_uv || old_uv == old_y + layout.yrgb_size) {
+	if (img_imports->uv == img_imports->yrgb) {
 		ret = rk_rga_addr_add_size(img->yrgb_addr, layout.yrgb_size,
 					   &img->uv_addr);
 		if (ret)
 			return ret;
 	} else {
-		ret = rk_rga_job_rebase_iova_to_hw(job, old_uv, dev, &iova);
+		ret = rk_rga_job_map_import(job, img_imports->uv, hw, &iova);
 		if (ret)
 			return ret;
 		img->uv_addr = iova;
 	}
 
 	if (layout.v_size) {
-		if (!old_v || old_v == old_uv + layout.uv_size ||
-		    old_v == old_y + layout.yrgb_size + layout.uv_size) {
+		if (!img_imports->v)
+			return -EINVAL;
+		if (img_imports->v == img_imports->yrgb) {
+			if (img_imports->uv != img_imports->yrgb)
+				return -EINVAL;
 			ret = rk_rga_addr_add_size(img->uv_addr,
 						   layout.uv_size,
 						   &img->v_addr);
 			if (ret)
 				return ret;
 		} else {
-			ret = rk_rga_job_rebase_iova_to_hw(job, old_v, dev,
-							   &iova);
+			if (img_imports->v == img_imports->uv)
+				return -EINVAL;
+			ret = rk_rga_job_map_import(job, img_imports->v, hw,
+						    &iova);
 			if (ret)
 				return ret;
 			img->v_addr = iova;
 		}
 	} else {
+		if (img_imports->v)
+			return -EINVAL;
 		img->v_addr = 0;
 	}
 
@@ -3506,6 +4580,7 @@ static void rk_rga_job_free(struct rk_rga_job *job)
 	rk_rga_job_cancel_acquire_callbacks(job);
 	rk_rga_job_free_cmd(job);
 	rk_rga_job_clear_mappings(job);
+	kfree(job->task_imports);
 	rk_rga_put_import_array(job->imports, job->import_count);
 	rk_rga_put_fence_array(job->acquire_fences, job->acquire_fence_count);
 	kfree(job->acquire_waiters);
@@ -3681,6 +4756,7 @@ static int rk_rga_prepare_tasks_locked(struct rk_rga_session *session,
 				       __s32 acquire_fence_fd,
 				       struct rk_rga_import ***imports_out,
 				       u32 *import_count_out,
+				       struct rk_rga_task_imports **task_imports_out,
 				       struct dma_fence ***fences_out,
 				       u32 *fence_count_out,
 				       struct rk_rga_acquire_fd *acquire_fds,
@@ -3688,10 +4764,12 @@ static int rk_rga_prepare_tasks_locked(struct rk_rga_session *session,
 {
 	struct dma_fence **fences;
 	struct rk_rga_import **imports;
+	struct rk_rga_task_imports *task_imports;
 	u32 fence_count = 0;
 	u32 import_count = 0;
 	size_t fence_bytes;
 	size_t import_bytes;
+	size_t task_import_bytes;
 	int ret;
 
 	import_bytes = array_size(task_count, 9 * sizeof(*imports));
@@ -3700,13 +4778,23 @@ static int rk_rga_prepare_tasks_locked(struct rk_rga_session *session,
 	fence_bytes = array_size(task_count + 1, sizeof(*fences));
 	if (fence_bytes == SIZE_MAX)
 		return -EOVERFLOW;
+	task_import_bytes = array_size(task_count, sizeof(*task_imports));
+	if (task_import_bytes == SIZE_MAX)
+		return -EOVERFLOW;
 
 	imports = kzalloc(import_bytes, GFP_KERNEL);
 	if (!imports)
 		return -ENOMEM;
 
+	task_imports = kzalloc(task_import_bytes, GFP_KERNEL);
+	if (!task_imports) {
+		kfree(imports);
+		return -ENOMEM;
+	}
+
 	fences = kzalloc(fence_bytes, GFP_KERNEL);
 	if (!fences) {
+		kfree(task_imports);
 		kfree(imports);
 		return -ENOMEM;
 	}
@@ -3733,22 +4821,31 @@ static int rk_rga_prepare_tasks_locked(struct rk_rga_session *session,
 		if (task->handle_flag & 1)
 			ret = rk_rga_resolve_task_handles_locked(session, task,
 								 imports,
-								 &import_count);
+								 &import_count,
+								 &task_imports[i]);
 		else
 			ret = rk_rga_resolve_task_direct_buffers(task, imports,
-								&import_count);
+								&import_count,
+								&task_imports[i]);
+		if (ret)
+			goto err_put_resources;
+
+		ret = rk_rga_validate_task_import_aliases(task,
+							 &task_imports[i]);
 		if (ret)
 			goto err_put_resources;
 	}
 
 	*imports_out = imports;
 	*import_count_out = import_count;
+	*task_imports_out = task_imports;
 	*fences_out = fences;
 	*fence_count_out = fence_count;
 
 	return 0;
 
 err_put_resources:
+	kfree(task_imports);
 	rk_rga_put_import_array(imports, import_count);
 	rk_rga_put_fence_array(fences, fence_count);
 	rk_rga_close_kernel_acquire_fds(acquire_fds, *acquire_fd_count);
@@ -3812,7 +4909,7 @@ static int rk_rga_job_clone_request_locked(struct rk_rga_request *request,
 	struct rk_rga_job *job;
 	size_t bytes;
 
-	if (!request->configured)
+	if (!request->configured || !request->task_imports)
 		return -EINVAL;
 
 	job = kzalloc(sizeof(*job), GFP_KERNEL);
@@ -3829,6 +4926,17 @@ static int rk_rga_job_clone_request_locked(struct rk_rga_request *request,
 	job->tasks = kmemdup(request->tasks, bytes, GFP_KERNEL);
 	if (!job->tasks) {
 		kfree(job);
+		return -ENOMEM;
+	}
+
+	bytes = array_size(request->task_count, sizeof(*job->task_imports));
+	if (bytes == SIZE_MAX) {
+		rk_rga_job_free(job);
+		return -EOVERFLOW;
+	}
+	job->task_imports = kmemdup(request->task_imports, bytes, GFP_KERNEL);
+	if (!job->task_imports) {
+		rk_rga_job_free(job);
 		return -ENOMEM;
 	}
 
@@ -3900,6 +5008,7 @@ static int rk_rga_job_clone_request_locked(struct rk_rga_request *request,
 }
 
 static int rk_rga_job_take_prepared(struct rga_req *tasks, u32 task_count,
+				    struct rk_rga_task_imports *task_imports,
 				    __u32 sync_mode,
 				    struct rk_rga_import **imports,
 				    u32 import_count,
@@ -3916,6 +5025,7 @@ static int rk_rga_job_take_prepared(struct rga_req *tasks, u32 task_count,
 	rk_rga_job_init(job);
 
 	job->tasks = tasks;
+	job->task_imports = task_imports;
 	job->task_count = task_count;
 	job->sync_mode = sync_mode;
 	job->imports = imports;
@@ -4085,20 +5195,228 @@ static void rk_rga_session_abort_pending_acquire_jobs(
 	}
 }
 
-static void rk_rga_abort_all_pending_acquire_jobs(int result)
+static bool rk_rga_pending_job_can_run_on_core_mask(
+	struct rk_rga_job *job, u32 available_core_mask)
+{
+	/*
+	 * A pending-acquire job has not dispatched, and every later task must
+	 * also be runnable after its predecessor completes. The task array and
+	 * imported-resource count remain immutable while a job reference is
+	 * held.
+	 */
+	if (!job->tasks || !job->task_count)
+		return false;
+
+	for (u32 i = 0; i < job->task_count; i++) {
+		const struct rga_req *task = &job->tasks[i];
+		u32 eligible_core_mask = 0;
+		u32 type_mask;
+
+		if (rk_rga_task_hw_type_mask(job, i, &type_mask))
+			return false;
+
+		if (type_mask & RK_RGA_HW_TYPE_MASK_RGA3)
+			eligible_core_mask |= RK_RGA_CORE_RGA3_MASK;
+		if (type_mask & RK_RGA_HW_TYPE_MASK_RGA2)
+			eligible_core_mask |= RK_RGA_CORE_RGA2_MASK;
+
+		if (task->core)
+			eligible_core_mask &= task->core;
+		if (!(eligible_core_mask & available_core_mask))
+			return false;
+	}
+
+	return true;
+}
+
+static struct rk_rga_job *
+rk_rga_session_take_incompatible_pending_acquire_job(
+	struct rk_rga_session *session, u32 available_core_mask, int result)
+{
+	struct rk_rga_job *job;
+	unsigned long flags;
+
+	spin_lock_irqsave(&session->job_lock, flags);
+	list_for_each_entry(job, &session->jobs, session_node) {
+		if (!rk_rga_job_is_pending_acquire(job))
+			continue;
+
+		/*
+		 * This path is used only when the snapshot allocation fails.
+		 * rk_rga_pending_job_can_run_on_core_mask() and its task-profile
+		 * validators only read immutable job/task fields and perform no
+		 * allocation, locking, or sleeping, so validation is safe under
+		 * job_lock.
+		 */
+		if (rk_rga_pending_job_can_run_on_core_mask(
+			    job, available_core_mask))
+			continue;
+
+		rk_rga_job_set_acquire_result(job, result);
+		job->waiting_acquire = false;
+		rk_rga_job_get(job);
+		spin_unlock_irqrestore(&session->job_lock, flags);
+		return job;
+	}
+	spin_unlock_irqrestore(&session->job_lock, flags);
+
+	return NULL;
+}
+
+static void
+rk_rga_session_abort_incompatible_pending_acquire_jobs_slow(
+	struct rk_rga_session *session, u32 available_core_mask, int result)
+{
+	struct rk_rga_job *job;
+
+	for (;;) {
+		job = rk_rga_session_take_incompatible_pending_acquire_job(
+			session, available_core_mask, result);
+		if (!job)
+			return;
+
+		rk_rga_job_abort_pending_acquire(job, result);
+		rk_rga_job_put(job);
+	}
+}
+
+static void
+rk_rga_session_abort_incompatible_pending_acquire_jobs(
+	struct rk_rga_session *session, u32 available_core_mask, int result)
+{
+	struct rk_rga_job **jobs;
+	struct rk_rga_job *job;
+	unsigned long flags;
+	size_t capacity = 0;
+	size_t count = 0;
+
+	spin_lock_irqsave(&session->job_lock, flags);
+	list_for_each_entry(job, &session->jobs, session_node) {
+		if (rk_rga_job_is_pending_acquire(job))
+			capacity++;
+	}
+	spin_unlock_irqrestore(&session->job_lock, flags);
+	if (!capacity)
+		return;
+
+	jobs = kcalloc(capacity, sizeof(*jobs), GFP_KERNEL);
+	if (!jobs) {
+		/* Topology loss must not leave impossible fences pinned. */
+		rk_rga_session_abort_incompatible_pending_acquire_jobs_slow(
+			session, available_core_mask, result);
+		return;
+	}
+
+	spin_lock_irqsave(&session->job_lock, flags);
+	list_for_each_entry(job, &session->jobs, session_node) {
+		if (count == capacity)
+			break;
+		if (!rk_rga_job_is_pending_acquire(job))
+			continue;
+
+		rk_rga_job_get(job);
+		jobs[count++] = job;
+	}
+	spin_unlock_irqrestore(&session->job_lock, flags);
+
+	for (size_t i = 0; i < count; i++) {
+		job = jobs[i];
+		if (READ_ONCE(job->waiting_acquire) &&
+		    !rk_rga_pending_job_can_run_on_core_mask(
+			    job, available_core_mask))
+			rk_rga_job_abort_pending_acquire(job, result);
+		rk_rga_job_put(job);
+	}
+	kfree(jobs);
+}
+
+static void rk_rga_abort_incompatible_pending_acquire_jobs(int result)
+{
+	struct rk_rga_session *session;
+	u32 available_core_mask = rk_rga_available_core_mask();
+
+	mutex_lock(&rk_rga.session_lock);
+	list_for_each_entry(session, &rk_rga.sessions, service_node)
+		rk_rga_session_abort_incompatible_pending_acquire_jobs(
+			session, available_core_mask, result);
+	mutex_unlock(&rk_rga.session_lock);
+}
+
+static bool
+rk_rga_pending_job_has_invalidated_import(const struct rk_rga_job *job)
+{
+	/*
+	 * Pending-acquire jobs keep their import array and every referenced
+	 * import immutable and pinned. Detachment publishes invalidation before
+	 * this scan, so the flag is safe to test while holding job_lock.
+	 */
+	for (u32 i = 0; i < job->import_count; i++) {
+		if (READ_ONCE(job->imports[i]->mapping_invalidated))
+			return true;
+	}
+
+	return false;
+}
+
+static void
+rk_rga_job_abort_invalidated_pending_acquire(struct rk_rga_job *job,
+					      int result)
+{
+	if (READ_ONCE(job->waiting_acquire) &&
+	    rk_rga_pending_job_has_invalidated_import(job))
+		rk_rga_job_abort_pending_acquire(job, result);
+}
+
+static struct rk_rga_job *
+rk_rga_session_take_invalidated_pending_acquire_job(
+	struct rk_rga_session *session, int result)
+{
+	struct rk_rga_job *job;
+	unsigned long flags;
+
+	spin_lock_irqsave(&session->job_lock, flags);
+	list_for_each_entry(job, &session->jobs, session_node) {
+		if (!rk_rga_job_is_pending_acquire(job) ||
+		    !rk_rga_pending_job_has_invalidated_import(job))
+			continue;
+
+		rk_rga_job_set_acquire_result(job, result);
+		job->waiting_acquire = false;
+		rk_rga_job_get(job);
+		spin_unlock_irqrestore(&session->job_lock, flags);
+		return job;
+	}
+	spin_unlock_irqrestore(&session->job_lock, flags);
+
+	return NULL;
+}
+
+static void
+rk_rga_session_abort_invalidated_pending_acquire_jobs(
+	struct rk_rga_session *session, int result)
+{
+	struct rk_rga_job *job;
+
+	for (;;) {
+		job = rk_rga_session_take_invalidated_pending_acquire_job(
+			session, result);
+		if (!job)
+			return;
+
+		rk_rga_job_abort_pending_acquire(job, result);
+		rk_rga_job_put(job);
+	}
+}
+
+static void rk_rga_abort_invalidated_pending_acquire_jobs(int result)
 {
 	struct rk_rga_session *session;
 
 	mutex_lock(&rk_rga.session_lock);
 	list_for_each_entry(session, &rk_rga.sessions, service_node)
-		rk_rga_session_abort_pending_acquire_jobs(session, result);
+		rk_rga_session_abort_invalidated_pending_acquire_jobs(
+			session, result);
 	mutex_unlock(&rk_rga.session_lock);
-}
-
-static void rk_rga_abort_pending_if_no_hw(int result)
-{
-	if (!rk_rga_has_available_hw())
-		rk_rga_abort_all_pending_acquire_jobs(result);
 }
 
 static void rk_rga_job_acquire_cb(struct dma_fence *fence,
@@ -4120,6 +5438,22 @@ static void rk_rga_job_acquire_cb(struct dma_fence *fence,
 		rk_rga_job_queue_acquire_work(job);
 }
 
+static void
+rk_rga_job_publish_armed_acquire_callbacks(struct rk_rga_job *job)
+{
+	/*
+	 * The initial count is an arming sentinel: callbacks may run while later
+	 * entries are initialized, but none can reach zero before every waiter is
+	 * either registered or retired. Publish waiting_acquire only after that
+	 * point, so abort paths never remove an uninitialized callback. Dropping
+	 * the sentinel then gives exactly one callback, abort, or this path the
+	 * zero-crossing right to queue acquire_work.
+	 */
+	rk_rga_job_set_waiting_acquire(job, true);
+	if (atomic_dec_and_test(&job->pending_acquire_count))
+		rk_rga_job_queue_acquire_work(job);
+}
+
 static int rk_rga_job_arm_acquire_callbacks(struct rk_rga_job *job)
 {
 	struct rk_rga_fence_waiter *waiters;
@@ -4134,7 +5468,6 @@ static int rk_rga_job_arm_acquire_callbacks(struct rk_rga_job *job)
 	atomic_set(&job->pending_acquire_count, 1);
 	atomic_set(&job->acquire_work_queued, 0);
 	WRITE_ONCE(job->result, 0);
-	rk_rga_job_set_waiting_acquire(job, true);
 
 	for (u32 i = 0; i < job->acquire_fence_count; i++) {
 		struct dma_fence *fence = job->acquire_fences[i];
@@ -4167,8 +5500,7 @@ static int rk_rga_job_arm_acquire_callbacks(struct rk_rga_job *job)
 		}
 	}
 
-	if (atomic_dec_and_test(&job->pending_acquire_count))
-		rk_rga_job_queue_acquire_work(job);
+	rk_rga_job_publish_armed_acquire_callbacks(job);
 
 	return 0;
 }
@@ -4199,6 +5531,11 @@ static void rk_rga_job_complete(struct rk_rga_job *job, int result)
 		rk_rga_job_sync_userptr_for_cpu(job, hw->dev);
 		job->userptr_device_owned = false;
 	}
+	/*
+	 * DMA-BUF unmap performs any required bounce-buffer copyback. Finish
+	 * it before publishing completion or signaling the release fence.
+	 */
+	rk_rga_job_clear_mappings(job);
 	WRITE_ONCE(job->result, result);
 	/* Publish the result before waking synchronous waiters. */
 	smp_store_release(&job->done, true);
@@ -5656,10 +6993,65 @@ static void rk_rga_cmd_write(struct rk_rga_job *job, u32 offset, u32 value)
 	cmd[offset / sizeof(*cmd)] = value;
 }
 
-static int rk_rga3_validate_image(const struct rga_img_info_t *img)
+static int rk_rga3_validate_raster_strides(const struct rga_img_info_t *img)
 {
+	struct rk_rga_img_layout layout;
+	size_t y_stride;
+	size_t uv_stride = 0;
+	u32 aligned_w;
+	int ret;
+
+	if (img->rd_mode && img->rd_mode != RK_RGA_RASTER_MODE)
+		return 0;
+
+	ret = rk_rga_img_layout(img, &layout);
+	if (ret)
+		return ret;
+
+	aligned_w = ALIGN((u32)img->vir_w, 16);
+	if (rk_rga_format_is_yuv10(img->format)) {
+		size_t bytes;
+
+		if (rk_rga_img_yuv10_compact(img)) {
+			if (check_mul_overflow((size_t)aligned_w, (size_t)10,
+					       &bytes))
+				return -EOVERFLOW;
+			y_stride = DIV_ROUND_UP(bytes, 8);
+		} else {
+			if (check_mul_overflow((size_t)aligned_w, (size_t)2,
+					       &y_stride))
+				return -EOVERFLOW;
+		}
+		uv_stride = y_stride;
+	} else {
+		y_stride = ALIGN(layout.yrgb_stride, 16);
+		if (layout.uv_stride)
+			uv_stride = aligned_w;
+	}
+
+	/*
+	 * The ABI carries a virtual width, not a byte stride. Accept raster
+	 * images only when their tightly packed rows already satisfy RGA3's
+	 * physical row alignment; otherwise its implicit padding would cross
+	 * the next row or plane in a tightly sized import.
+	 */
+	if (layout.yrgb_stride != y_stride)
+		return -EINVAL;
+	if (layout.uv_stride && layout.uv_stride != uv_stride)
+		return -EINVAL;
+	if (layout.v_stride && layout.v_stride != uv_stride)
+		return -EINVAL;
+
+	return 0;
+}
+
+static int rk_rga3_validate_image(const struct rga_img_info_t *img, bool write)
+{
+	u32 max_size = write ? RK_RGA3_OUTPUT_MAX_SIZE :
+			      RK_RGA3_INPUT_MAX_SIZE;
 	u32 width;
 	u32 height;
+	int ret;
 
 	if (!img->act_w || !img->act_h || !img->vir_w || !img->vir_h)
 		return -EINVAL;
@@ -5670,10 +7062,91 @@ static int rk_rga3_validate_image(const struct rga_img_info_t *img)
 
 	if (width > img->vir_w || height > img->vir_h)
 		return -EINVAL;
+	if (width > max_size || height > max_size)
+		return -EINVAL;
 	if (width > RK_RGA3_SIZE_MASK || height > RK_RGA3_SIZE_MASK)
 		return -EINVAL;
 	if (ALIGN(width, 16) > RK_RGA3_SIZE_MASK ||
 	    ALIGN(height, 16) > RK_RGA3_SIZE_MASK)
+		return -EINVAL;
+
+	ret = rk_rga_validate_virtual_row_strides(img);
+	if (ret)
+		return ret;
+
+	ret = rk_rga3_validate_raster_strides(img);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+static int rk_rga3_validate_tile_image(const struct rga_img_info_t *img,
+				       bool input)
+{
+	if (img->rd_mode != RK_RGA_TILE_MODE)
+		return 0;
+
+	/*
+	 * TILE8x8 stores complete 8-line blocks. The librga contract requires
+	 * active width/height and both virtual strides to be 8-aligned.
+	 */
+	if ((img->act_w | img->act_h | img->vir_w | img->vir_h) & 0x7)
+		return -EINVAL;
+
+	/*
+	 * The librga TILE8x8 contract additionally requires input-channel
+	 * width/height strides to be 16-aligned. This also contains RGA3's
+	 * 16-aligned SRC_SIZE within the tightly sized import.
+	 */
+	if (input && ((img->vir_w | img->vir_h) & 0xf))
+		return -EINVAL;
+
+	if (rk_rga_format_is_yuv10(img->format)) {
+		/*
+		 * The 10-bit semiplanar tile contract requires a 64-pixel
+		 * width stride and compact packing. RGA3's non-raster
+		 * encoding has no incompact TILE representation.
+		 */
+		if (!rk_rga_img_yuv10_compact(img))
+			return -EOPNOTSUPP;
+		if (img->vir_w & 0x3f)
+			return -EINVAL;
+	} else if (img->vir_w & 0xf) {
+		/*
+		 * The 8-bit semiplanar tile contract requires a 16-pixel
+		 * width stride.
+		 */
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int
+rk_rga3_validate_semiplanar_geometry(const struct rga_img_info_t *img,
+				     const struct rk_rga3_format_info *fmt)
+{
+	u32 width_alignment;
+
+	if (!fmt->yuv_sp)
+		return 0;
+
+	/*
+	 * The librga format contract requires four-pixel x/y crop alignment
+	 * for 10-bit semiplanar images and two-pixel alignment for the 8-bit
+	 * semiplanar 4:2:0/4:2:2 formats supported by RGA3. Active and virtual
+	 * widths use the same two-pixel rule for 8-bit images and a four-pixel
+	 * rule for 10-bit images; active and virtual heights must be even.
+	 * Validate this once after format discovery so every raster/FBC/tile
+	 * read and write path observes the same rule.
+	 */
+	width_alignment = fmt->yuv10 ? 4 : 2;
+	if ((img->x_offset % width_alignment) ||
+	    (img->y_offset % width_alignment) ||
+	    (img->act_w % width_alignment) ||
+	    (img->vir_w % width_alignment) ||
+	    (img->act_h & 1) || (img->vir_h & 1))
 		return -EINVAL;
 
 	return 0;
@@ -5889,10 +7362,10 @@ static bool rk_rga_mirror_only_rotate_mode(u16 rotate_mode)
 
 static bool rk_rga_in_place_bitblt_allowed(const struct rga_req *task)
 {
-	if (task->src.yrgb_addr != task->dst.yrgb_addr)
-		return true;
 	if (!task->src.yrgb_addr)
 		return false;
+	if (task->src.yrgb_addr != task->dst.yrgb_addr)
+		return true;
 	if (task->src.uv_addr != task->dst.uv_addr ||
 	    task->src.v_addr != task->dst.v_addr)
 		return false;
@@ -5929,7 +7402,9 @@ static bool rk_rga2_in_place_mosaic_allowed(const struct rga_req *task)
 		return false;
 	if (task->mosaic_info.mode > 4)
 		return false;
-	if (!task->src.yrgb_addr || task->src.yrgb_addr != task->dst.yrgb_addr)
+	if (!task->src.yrgb_addr)
+		return false;
+	if (task->src.yrgb_addr != task->dst.yrgb_addr)
 		return false;
 	if (task->src.uv_addr != task->dst.uv_addr ||
 	    task->src.v_addr != task->dst.v_addr)
@@ -6016,10 +7491,10 @@ static bool rk_rga2_alpha_bitmap_format(u32 format)
 
 static bool rk_rga2_rop_bitblt_allowed(const struct rga_req *task)
 {
-	if (task->src.yrgb_addr != task->dst.yrgb_addr)
-		return true;
 	if (!task->src.yrgb_addr)
 		return false;
+	if (task->src.yrgb_addr != task->dst.yrgb_addr)
+		return true;
 	if (task->src.uv_addr != task->dst.uv_addr ||
 	    task->src.v_addr != task->dst.v_addr)
 		return false;
@@ -6257,7 +7732,9 @@ static bool rk_rga2_osd_format(u32 format)
 
 static bool rk_rga2_osd_in_place_allowed(const struct rga_req *task)
 {
-	if (!task->src.yrgb_addr || task->src.yrgb_addr != task->dst.yrgb_addr)
+	if (!task->src.yrgb_addr)
+		return false;
+	if (task->src.yrgb_addr != task->dst.yrgb_addr)
 		return false;
 	if (task->src.uv_addr != task->dst.uv_addr ||
 	    task->src.v_addr != task->dst.v_addr)
@@ -7854,6 +9331,26 @@ static void rk_rga2_osd_emit_kunit(struct kunit *test)
 
 	memset(cmd, 0, sizeof(cmd));
 	job.cmd_ready = false;
+	type = 0;
+	task.pat.vir_w = task.pat.act_w - 1;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), -EINVAL);
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), -EINVAL);
+	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+
+	task.pat.vir_w = osd.vir_w;
+	task.pat.vir_h = task.pat.act_h - 1;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), -EINVAL);
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), -EINVAL);
+	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+
+	task.pat.vir_h = osd.vir_h;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
+
+	memset(cmd, 0, sizeof(cmd));
+	job.cmd_ready = false;
 	task.osd_info.mode_ctrl.color_mode = 1;
 	task.osd_info.bpp2_info.color0.value = 0xff336699;
 	task.osd_info.bpp2_info.color1.value = 0x80123456;
@@ -8144,17 +9641,13 @@ static void rk_rga_request_config_handles_kunit(struct kunit *test)
 
 	request = kzalloc_obj(*request, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, request);
-	src_import = kzalloc_obj(*src_import, GFP_KERNEL);
-	dst_import = kzalloc_obj(*dst_import, GFP_KERNEL);
+	src_import = rk_rga_kunit_import(test);
+	dst_import = rk_rga_kunit_import(test);
 	KUNIT_ASSERT_NOT_NULL(test, src_import);
 	KUNIT_ASSERT_NOT_NULL(test, dst_import);
 
-	src_import->type = RK_RGA_IMPORT_USERPTR;
-	refcount_set(&src_import->refs, 1);
 	src_import->iova = 0x10000000;
 	src_import->size = (size_t)1920 * 1080 * 4;
-	dst_import->type = RK_RGA_IMPORT_USERPTR;
-	refcount_set(&dst_import->refs, 1);
 	dst_import->iova = 0x20000000;
 	dst_import->size = (size_t)1280 * 720 * 4;
 
@@ -9135,7 +10628,7 @@ static void rk_rga_last_hw_remove_pending_acquire_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, dma_fence_get_status(release_fence), 0);
 
 	list_del_init(&hw.node);
-	rk_rga_abort_all_pending_acquire_jobs(-ENODEV);
+	rk_rga_abort_incompatible_pending_acquire_jobs(-ENODEV);
 	KUNIT_EXPECT_GT(test,
 			dma_fence_wait_timeout(release_fence, false,
 					       msecs_to_jiffies(1000)),
@@ -9158,6 +10651,249 @@ static void rk_rga_last_hw_remove_pending_acquire_kunit(struct kunit *test)
 	dma_fence_put(acquire_fence);
 	rk_rga_import_put(src_import);
 	rk_rga_import_put(dst_import);
+}
+
+static void
+rk_rga_incompatible_hw_pending_acquire_kunit(struct kunit *test)
+{
+	struct rk_rga_hw rga3 = {
+		.type = RK_RGA_HW_RGA3,
+		.core_mask = BIT(0),
+	};
+	struct rk_rga_session *session;
+	struct rk_rga_import *import;
+	struct dma_fence *acquire_fence;
+	struct dma_fence *release_fence;
+	struct rk_rga_job *job;
+
+	mutex_init(&rk_rga.hw_lock);
+	mutex_init(&rk_rga.session_lock);
+	INIT_LIST_HEAD(&rk_rga.hw_list);
+	INIT_LIST_HEAD(&rk_rga.sessions);
+	INIT_LIST_HEAD(&rga3.node);
+	list_add_tail(&rga3.node, &rk_rga.hw_list);
+
+	session = kzalloc_obj(*session, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, session);
+	rk_rga_session_init(session);
+	rk_rga_session_link(session);
+
+	job = kzalloc_obj(*job, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+	rk_rga_job_init(job);
+	job->tasks = kcalloc(1, sizeof(*job->tasks), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job->tasks);
+	job->tasks[0] = rk_rga_fill_task(BIT(2));
+	job->task_count = 1;
+	job->sync_mode = RGA_BLIT_ASYNC;
+
+	import = rk_rga_kunit_import(test);
+	KUNIT_ASSERT_NOT_NULL(test, import);
+	job->imports = kcalloc(1, sizeof(*job->imports), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job->imports);
+	job->imports[0] = import;
+	job->import_count = 1;
+
+	acquire_fence = rk_rga_kunit_alloc_fence();
+	KUNIT_ASSERT_NOT_NULL(test, acquire_fence);
+	dma_fence_get(acquire_fence);
+	job->acquire_fences = kcalloc(1, sizeof(*job->acquire_fences),
+				      GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job->acquire_fences);
+	job->acquire_fences[0] = acquire_fence;
+	job->acquire_fence_count = 1;
+
+	release_fence = rk_rga_kunit_alloc_fence();
+	KUNIT_ASSERT_NOT_NULL(test, release_fence);
+	dma_fence_get(release_fence);
+	job->release_fence = release_fence;
+
+	KUNIT_ASSERT_EQ(test, rk_rga_session_track_job(session, job), 0);
+	rk_rga_job_get(job);
+	KUNIT_ASSERT_EQ(test, rk_rga_job_arm_acquire_callbacks(job), 0);
+	KUNIT_ASSERT_TRUE(test, job->waiting_acquire);
+	KUNIT_ASSERT_EQ(test, dma_fence_get_status(release_fence), 0);
+
+	/* An RGA3 remains, but the RGA2/core2-only job cannot use it. */
+	rk_rga_abort_incompatible_pending_acquire_jobs(-ENODEV);
+	flush_work(&job->acquire_work);
+
+	KUNIT_EXPECT_TRUE(test, job->done);
+	KUNIT_EXPECT_EQ(test, job->result, -ENODEV);
+	KUNIT_EXPECT_EQ(test, dma_fence_get_status(release_fence), -ENODEV);
+	KUNIT_EXPECT_TRUE(test, list_empty(&session->jobs));
+	KUNIT_EXPECT_EQ(test, refcount_read(&job->refs), 1);
+
+	rk_rga_fence_signal(acquire_fence, 0);
+	KUNIT_EXPECT_EQ(test, dma_fence_get_status(release_fence), -ENODEV);
+
+	list_del_init(&rga3.node);
+	rk_rga_session_unlink(session);
+	rk_rga_job_put(job);
+	dma_fence_put(acquire_fence);
+	dma_fence_put(release_fence);
+	idr_destroy(&session->imports);
+	idr_destroy(&session->requests);
+	kfree(session);
+}
+
+static void
+rk_rga_incompatible_pending_acquire_oom_fallback_kunit(struct kunit *test)
+{
+	struct rk_rga_session session;
+	struct rk_rga_job compatible = { };
+	struct rk_rga_job incompatible = { };
+	struct rga_req compatible_task = rk_rga_fill_task(BIT(2));
+	struct rga_req incompatible_task = rk_rga_fill_task(BIT(3));
+	struct rk_rga_job *job;
+
+	rk_rga_session_init(&session);
+	rk_rga_job_init(&compatible);
+	rk_rga_job_init(&incompatible);
+
+	compatible.tasks = &compatible_task;
+	compatible.task_count = 1;
+	compatible.import_count = 1;
+	compatible.waiting_acquire = true;
+	compatible.session = &session;
+	compatible.session_linked = true;
+
+	incompatible.tasks = &incompatible_task;
+	incompatible.task_count = 1;
+	incompatible.import_count = 1;
+	incompatible.waiting_acquire = true;
+	incompatible.session = &session;
+	incompatible.session_linked = true;
+
+	list_add_tail(&compatible.session_node, &session.jobs);
+	list_add_tail(&incompatible.session_node, &session.jobs);
+
+	job = rk_rga_session_take_incompatible_pending_acquire_job(
+		&session, BIT(2), -ENODEV);
+	KUNIT_ASSERT_PTR_EQ(test, job, &incompatible);
+	KUNIT_EXPECT_FALSE(test, incompatible.waiting_acquire);
+	KUNIT_EXPECT_EQ(test, incompatible.result, -ENODEV);
+	KUNIT_EXPECT_TRUE(test, compatible.waiting_acquire);
+	KUNIT_EXPECT_EQ(test, compatible.result, 0);
+	rk_rga_job_put(job);
+
+	KUNIT_EXPECT_PTR_EQ(
+		test,
+		rk_rga_session_take_incompatible_pending_acquire_job(
+			&session, BIT(2), -ENODEV),
+		NULL);
+
+	list_del_init(&compatible.session_node);
+	list_del_init(&incompatible.session_node);
+	idr_destroy(&session.imports);
+	idr_destroy(&session.requests);
+}
+
+static void
+rk_rga_pending_import_invalidation_kunit(struct kunit *test,
+					 bool invalidate_before_arm)
+{
+	struct rk_rga_hw remaining = {
+		.type = RK_RGA_HW_RGA3,
+		.core_mask = BIT(1),
+	};
+	struct rk_rga_session *session;
+	struct rk_rga_import *import;
+	struct dma_fence *acquire_fence;
+	struct dma_fence *release_fence;
+	struct rk_rga_job *job;
+
+	mutex_init(&rk_rga.hw_lock);
+	mutex_init(&rk_rga.session_lock);
+	INIT_LIST_HEAD(&rk_rga.hw_list);
+	INIT_LIST_HEAD(&rk_rga.sessions);
+	INIT_LIST_HEAD(&remaining.node);
+	list_add_tail(&remaining.node, &rk_rga.hw_list);
+
+	session = kzalloc_obj(*session, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, session);
+	rk_rga_session_init(session);
+	rk_rga_session_link(session);
+
+	job = kzalloc_obj(*job, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+	rk_rga_job_init(job);
+	job->tasks = kcalloc(1, sizeof(*job->tasks), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job->tasks);
+	job->tasks[0] = rk_rga_fill_task(BIT(1));
+	job->task_count = 1;
+	job->sync_mode = RGA_BLIT_ASYNC;
+
+	import = rk_rga_kunit_import(test);
+	KUNIT_ASSERT_NOT_NULL(test, import);
+	job->imports = kcalloc(1, sizeof(*job->imports), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job->imports);
+	job->imports[0] = import;
+	job->import_count = 1;
+
+	acquire_fence = rk_rga_kunit_alloc_fence();
+	KUNIT_ASSERT_NOT_NULL(test, acquire_fence);
+	dma_fence_get(acquire_fence);
+	job->acquire_fences = kcalloc(1, sizeof(*job->acquire_fences),
+				      GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job->acquire_fences);
+	job->acquire_fences[0] = acquire_fence;
+	job->acquire_fence_count = 1;
+
+	release_fence = rk_rga_kunit_alloc_fence();
+	KUNIT_ASSERT_NOT_NULL(test, release_fence);
+	dma_fence_get(release_fence);
+	job->release_fence = release_fence;
+
+	KUNIT_ASSERT_EQ(test, rk_rga_session_track_job(session, job), 0);
+	rk_rga_job_get(job);
+	if (invalidate_before_arm)
+		WRITE_ONCE(import->mapping_invalidated, true);
+	KUNIT_ASSERT_EQ(test, rk_rga_job_arm_acquire_callbacks(job), 0);
+	KUNIT_ASSERT_TRUE(test, job->waiting_acquire);
+
+	/*
+	 * Topology alone still permits the job on the remaining RGA3 core,
+	 * but detaching the removed core invalidated one of its DMA-BUF
+	 * imports. It must finish without waiting for the acquire fence.
+	 */
+	if (invalidate_before_arm) {
+		rk_rga_job_abort_invalidated_pending_acquire(job, -ENODEV);
+	} else {
+		WRITE_ONCE(import->mapping_invalidated, true);
+		rk_rga_abort_invalidated_pending_acquire_jobs(-ENODEV);
+	}
+	flush_work(&job->acquire_work);
+
+	KUNIT_EXPECT_TRUE(test, job->done);
+	KUNIT_EXPECT_EQ(test, job->result, -ENODEV);
+	KUNIT_EXPECT_EQ(test, dma_fence_get_status(release_fence), -ENODEV);
+	KUNIT_EXPECT_TRUE(test, list_empty(&session->jobs));
+	KUNIT_EXPECT_EQ(test, refcount_read(&job->refs), 1);
+
+	rk_rga_fence_signal(acquire_fence, 0);
+	KUNIT_EXPECT_EQ(test, dma_fence_get_status(release_fence), -ENODEV);
+
+	list_del_init(&remaining.node);
+	rk_rga_session_unlink(session);
+	rk_rga_job_put(job);
+	dma_fence_put(acquire_fence);
+	dma_fence_put(release_fence);
+	idr_destroy(&session->imports);
+	idr_destroy(&session->requests);
+	kfree(session);
+}
+
+static void
+rk_rga_partial_hw_remove_pending_import_kunit(struct kunit *test)
+{
+	rk_rga_pending_import_invalidation_kunit(test, false);
+}
+
+static void
+rk_rga_submit_post_arm_invalidated_import_kunit(struct kunit *test)
+{
+	rk_rga_pending_import_invalidation_kunit(test, true);
 }
 
 static void rk_rga_release_queued_job_kunit(struct kunit *test)
@@ -10102,9 +11838,23 @@ static struct rk_rga_import *rk_rga_kunit_import(struct kunit *test)
 		KUNIT_FAIL(test, "failed to allocate fake import");
 		return NULL;
 	}
-	import->type = RK_RGA_IMPORT_USERPTR;
-	refcount_set(&import->refs, 1);
+	rk_rga_import_init(import, RK_RGA_IMPORT_USERPTR);
+	import->pages = kcalloc(1, sizeof(*import->pages), GFP_KERNEL);
+	import->userptr_extents =
+		kcalloc(1, sizeof(*import->userptr_extents), GFP_KERNEL);
+	if (!import->pages || !import->userptr_extents) {
+		kfree(import->userptr_extents);
+		kfree(import->pages);
+		kfree(import);
+		KUNIT_FAIL(test, "failed to allocate fake import backing");
+		return NULL;
+	}
 
+	import->pages[0] = (struct page *)import;
+	import->userptr_extents[0].page = import->pages[0];
+	import->userptr_extents[0].length = 1;
+	import->page_count = 1;
+	import->userptr_extent_count = 1;
 	return import;
 }
 
@@ -10374,7 +12124,6 @@ static void rk_rga_acquire_abort_during_arming_kunit(struct kunit *test)
 {
 	struct rk_rga_job *job;
 	struct dma_fence *fences[2];
-	bool last;
 	int ret;
 
 	job = kzalloc_obj(*job, GFP_KERNEL);
@@ -10397,19 +12146,24 @@ static void rk_rga_acquire_abort_during_arming_kunit(struct kunit *test)
 	atomic_set(&job->pending_acquire_count, 1);
 	atomic_set(&job->acquire_work_queued, 0);
 	WRITE_ONCE(job->result, 0);
-	WRITE_ONCE(job->waiting_acquire, true);
 	rk_rga_job_get(job);
+
+	/*
+	 * An early callback can retire while the next waiter is still uninitialized,
+	 * but the sentinel prevents work from being queued and waiting_acquire is
+	 * not visible to abort paths yet.
+	 */
 	atomic_inc(&job->pending_acquire_count);
 	job->acquire_waiters[0].job = job;
 	ret = dma_fence_add_callback(fences[0],
 				     &job->acquire_waiters[0].cb,
 				     rk_rga_job_acquire_cb);
 	KUNIT_ASSERT_EQ(test, ret, 0);
-
-	rk_rga_job_abort_pending_acquire(job, -ECANCELED);
+	rk_rga_fence_signal(fences[0], 0);
 	KUNIT_EXPECT_EQ(test, atomic_read(&job->pending_acquire_count), 1);
 	KUNIT_EXPECT_PTR_EQ(test, job->acquire_waiters[0].job, NULL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&job->acquire_work_queued), 0);
+	KUNIT_EXPECT_FALSE(test, job->waiting_acquire);
 	KUNIT_EXPECT_FALSE(test, job->done);
 
 	atomic_inc(&job->pending_acquire_count);
@@ -10418,16 +12172,22 @@ static void rk_rga_acquire_abort_during_arming_kunit(struct kunit *test)
 				     &job->acquire_waiters[1].cb,
 				     rk_rga_job_acquire_cb);
 	KUNIT_ASSERT_EQ(test, ret, 0);
-	last = atomic_dec_and_test(&job->pending_acquire_count);
-	KUNIT_EXPECT_FALSE(test, last);
+	rk_rga_job_publish_armed_acquire_callbacks(job);
+	KUNIT_EXPECT_TRUE(test, job->waiting_acquire);
+	KUNIT_EXPECT_EQ(test, atomic_read(&job->pending_acquire_count), 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&job->acquire_work_queued), 0);
 
-	rk_rga_fence_signal(fences[1], 0);
+	/* Once published, every visible waiter has a valid registered callback. */
+	rk_rga_job_abort_pending_acquire(job, -ECANCELED);
+	KUNIT_EXPECT_PTR_EQ(test, job->acquire_waiters[1].job, NULL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&job->pending_acquire_count), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&job->acquire_work_queued), 1);
 	flush_work(&job->acquire_work);
 	KUNIT_EXPECT_TRUE(test, job->done);
 	KUNIT_EXPECT_EQ(test, job->result, -ECANCELED);
 	KUNIT_EXPECT_EQ(test, refcount_read(&job->refs), 1);
 
-	rk_rga_fence_signal(fences[0], 0);
+	rk_rga_fence_signal(fences[1], 0);
 	KUNIT_EXPECT_EQ(test, job->result, -ECANCELED);
 	rk_rga_job_put(job);
 }
@@ -10498,6 +12258,8 @@ static void rk_rga_layout_yuv10_kunit(struct kunit *test)
 	img.format = RK_RGA_FORMAT_YCBCR_420_SP_10B;
 	img.compact_mode = RK_RGA_10BIT_INCOMPACT;
 	KUNIT_ASSERT_EQ(test, rk_rga_img_layout(&img, &layout), 0);
+	KUNIT_EXPECT_EQ(test, layout.yrgb_stride, (size_t)128);
+	KUNIT_EXPECT_EQ(test, layout.uv_stride, (size_t)128);
 	KUNIT_EXPECT_EQ(test, layout.yrgb_size, pixels * 2);
 	KUNIT_EXPECT_EQ(test, layout.uv_size, pixels);
 	KUNIT_EXPECT_EQ(test, layout.total_size, pixels * 3);
@@ -10506,6 +12268,8 @@ static void rk_rga_layout_yuv10_kunit(struct kunit *test)
 
 	img.compact_mode = 0;
 	KUNIT_ASSERT_EQ(test, rk_rga_img_layout(&img, &layout), 0);
+	KUNIT_EXPECT_EQ(test, layout.yrgb_stride, (size_t)80);
+	KUNIT_EXPECT_EQ(test, layout.uv_stride, (size_t)80);
 	KUNIT_EXPECT_EQ(test, layout.yrgb_size, pixels * 10 / 8);
 	KUNIT_EXPECT_EQ(test, layout.uv_size, pixels * 10 / 8 / 2);
 
@@ -10516,6 +12280,1036 @@ static void rk_rga_layout_yuv10_kunit(struct kunit *test)
 	/* 422 chroma plane is byte-for-byte the size of the Y plane. */
 	KUNIT_EXPECT_EQ(test, layout.uv_size, pixels * 2);
 	KUNIT_EXPECT_EQ(test, layout.v_size, (size_t)0);
+}
+
+static void rk_rga_raster_row_layout_kunit(struct kunit *test)
+{
+	struct rga_img_info_t img = {
+		.vir_w = 18,
+		.vir_h = 4,
+		.format = RK_RGA_FORMAT_YCBCR_420_SP,
+	};
+	struct rk_rga_img_layout layout;
+
+	KUNIT_ASSERT_EQ(test, rk_rga_img_layout(&img, &layout), 0);
+	KUNIT_EXPECT_EQ(test, layout.yrgb_stride, (size_t)18);
+	KUNIT_EXPECT_EQ(test, layout.yrgb_size, (size_t)72);
+	KUNIT_EXPECT_EQ(test, layout.uv_stride, (size_t)18);
+	KUNIT_EXPECT_EQ(test, layout.uv_size, (size_t)36);
+	KUNIT_EXPECT_EQ(test, layout.total_size, (size_t)108);
+
+	img.vir_w = 17;
+	img.format = RK_RGA_FORMAT_YCBCR_420_SP_10B;
+	img.compact_mode = 0;
+	KUNIT_ASSERT_EQ(test, rk_rga_img_layout(&img, &layout), 0);
+	KUNIT_EXPECT_EQ(test, layout.yrgb_stride, (size_t)22);
+	KUNIT_EXPECT_EQ(test, layout.yrgb_size, (size_t)88);
+	KUNIT_EXPECT_EQ(test, layout.uv_stride, (size_t)22);
+	KUNIT_EXPECT_EQ(test, layout.uv_size, (size_t)44);
+	KUNIT_EXPECT_EQ(test, layout.total_size, (size_t)132);
+
+	img.vir_w = 9;
+	img.vir_h = 2;
+	img.format = RK_RGA_FORMAT_BPP1;
+	KUNIT_ASSERT_EQ(test, rk_rga_img_layout(&img, &layout), 0);
+	KUNIT_EXPECT_EQ(test, layout.yrgb_stride, (size_t)4);
+	KUNIT_EXPECT_EQ(test, layout.yrgb_size, (size_t)8);
+}
+
+static void rk_rga_raster_stride_backend_mask_kunit(struct kunit *test)
+{
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGB_888,
+					  RK_RGA_FORMAT_RGB_888);
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 2,
+	};
+	u32 type_mask = 0;
+
+	task.yuv2rgb_mode = 0;
+	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGB_888,
+				    4, 4);
+	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_RGB_888,
+				    4, 4);
+	KUNIT_ASSERT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask), 0);
+	KUNIT_EXPECT_EQ(test, type_mask, RK_RGA_HW_TYPE_MASK_RGA2);
+
+	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGB_888,
+				    16, 4);
+	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_RGB_888,
+				    16, 4);
+	type_mask = 0;
+	KUNIT_ASSERT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask), 0);
+	KUNIT_EXPECT_EQ(test, type_mask, RK_RGA_HW_TYPE_MASK_ALL);
+
+	task.src = rk_rga_kunit_img(0x10000000,
+				    RK_RGA_FORMAT_YCBCR_420_SP, 18, 4);
+	task.dst = rk_rga_kunit_img(0x20000000,
+				    RK_RGA_FORMAT_YCBCR_420_SP, 18, 4);
+	type_mask = U32_MAX;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, type_mask, 0U);
+
+	/* Both backends accept the inclusive 32 KiB byte-stride boundary. */
+	task.src = rk_rga_kunit_img(0x10000000,
+				    RK_RGA_FORMAT_RGBA_8888, 16, 16);
+	task.dst = rk_rga_kunit_img(0x20000000,
+				    RK_RGA_FORMAT_RGBA_8888, 16, 16);
+	task.src.vir_w = 8192;
+	task.dst.vir_w = 8192;
+	type_mask = 0;
+	KUNIT_ASSERT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask), 0);
+	KUNIT_EXPECT_EQ(test, type_mask, RK_RGA_HW_TYPE_MASK_ALL);
+
+	/* 8208 RGBA pixels are 32,832 bytes and must reach neither backend. */
+	task.src.vir_w = 8208;
+	task.dst.vir_w = 8208;
+	type_mask = U32_MAX;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, type_mask, 0U);
+
+	/* RGA2's compact-10 ABI carries vir_w as the byte stride itself. */
+	task = rk_rga_ffmpeg_bitblt_task(
+		RK_RGA_FORMAT_YCBCR_420_SP_10B, RK_RGA_FORMAT_RGBA_8888);
+	task.src.vir_w = RK_RGA_MAX_BYTE_STRIDE;
+	type_mask = 0;
+	KUNIT_ASSERT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask), 0);
+	KUNIT_EXPECT_EQ(test, type_mask, RK_RGA_HW_TYPE_MASK_RGA2);
+
+	task.src.vir_w = RK_RGA_MAX_BYTE_STRIDE + 4;
+	type_mask = U32_MAX;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, type_mask, 0U);
+}
+
+static void rk_rga_direct_import_identity_kunit(struct kunit *test)
+{
+	struct dma_buf dmabuf0 = {};
+	struct dma_buf dmabuf1 = {};
+	struct rk_rga_import dmabuf_import = {
+		.type = RK_RGA_IMPORT_DMABUF,
+		.fd = 7,
+		.dmabuf = &dmabuf0,
+	};
+	struct rk_rga_import *imports[] = { &dmabuf_import };
+
+	/* Object identity reuses aliases across fds, not reused fd numbers. */
+	KUNIT_EXPECT_PTR_EQ(test,
+			    rk_rga_find_dmabuf_object_import(
+				    imports, ARRAY_SIZE(imports), &dmabuf0),
+			    &dmabuf_import);
+	KUNIT_EXPECT_PTR_EQ(test,
+			    rk_rga_find_dmabuf_object_import(
+				    imports, ARRAY_SIZE(imports), &dmabuf1),
+			    NULL);
+}
+
+static void rk_rga_userptr_backing_identity_kunit(struct kunit *test)
+{
+	struct page backing[4] = {};
+	struct page *first_pages[] = { &backing[0], &backing[1] };
+	struct page *same_pages[] = { &backing[0], &backing[1] };
+	struct page *different_pages[] = { &backing[2], &backing[3] };
+	struct page *partial_pages[] = { &backing[1], &backing[2] };
+	struct page *reordered_pages[] = { &backing[1], &backing[0] };
+	struct page *built_pages[] = { &backing[1], &backing[0] };
+	struct page *duplicate_pages[] = { &backing[0], &backing[0] };
+	struct page *head_pages[] = { &backing[3] };
+	struct page *tail_pages[] = { &backing[3] };
+	struct rk_rga_userptr_extent first_extents[] = {
+		{ .page = &backing[0], .length = PAGE_SIZE },
+		{ .page = &backing[1], .length = PAGE_SIZE },
+	};
+	struct rk_rga_userptr_extent same_extents[] = {
+		{ .page = &backing[0], .length = PAGE_SIZE },
+		{ .page = &backing[1], .length = PAGE_SIZE },
+	};
+	struct rk_rga_userptr_extent different_extents[] = {
+		{ .page = &backing[2], .length = PAGE_SIZE },
+		{ .page = &backing[3], .length = PAGE_SIZE },
+	};
+	struct rk_rga_userptr_extent partial_extents[] = {
+		{ .page = &backing[1], .length = PAGE_SIZE },
+		{ .page = &backing[2], .length = PAGE_SIZE },
+	};
+	struct rk_rga_userptr_extent reordered_extents[] = {
+		{ .page = &backing[0], .length = PAGE_SIZE },
+		{ .page = &backing[1], .length = PAGE_SIZE },
+	};
+	struct rk_rga_userptr_extent head_extent = {
+		.page = &backing[3],
+		.length = 512,
+	};
+	struct rk_rga_userptr_extent tail_extent = {
+		.page = &backing[3],
+		.offset = 512,
+		.length = 512,
+	};
+	struct rk_rga_import first = {
+		.type = RK_RGA_IMPORT_USERPTR,
+		.pages = first_pages,
+		.userptr_extents = first_extents,
+		.size = 2 * PAGE_SIZE,
+		.page_count = ARRAY_SIZE(first_pages),
+		.userptr_extent_count = ARRAY_SIZE(first_extents),
+	};
+	struct rk_rga_import candidate = {
+		.type = RK_RGA_IMPORT_USERPTR,
+		.pages = same_pages,
+		.userptr_extents = same_extents,
+		.size = 2 * PAGE_SIZE,
+		.page_count = ARRAY_SIZE(same_pages),
+		.userptr_extent_count = ARRAY_SIZE(same_extents),
+	};
+	struct rk_rga_import head = {
+		.type = RK_RGA_IMPORT_USERPTR,
+		.pages = head_pages,
+		.userptr_extents = &head_extent,
+		.size = 512,
+		.page_count = ARRAY_SIZE(head_pages),
+		.userptr_extent_count = 1,
+	};
+	struct rk_rga_import tail = {
+		.type = RK_RGA_IMPORT_USERPTR,
+		.pages = tail_pages,
+		.userptr_extents = &tail_extent,
+		.size = 512,
+		.page_count = ARRAY_SIZE(tail_pages),
+		.userptr_extent_count = 1,
+		.page_offset = 512,
+	};
+	struct rk_rga_import built = {
+		.type = RK_RGA_IMPORT_USERPTR,
+		.pages = built_pages,
+		.size = PAGE_SIZE,
+		.page_count = ARRAY_SIZE(built_pages),
+		.page_offset = 100,
+	};
+	struct rk_rga_import duplicate = {
+		.type = RK_RGA_IMPORT_USERPTR,
+		.pages = duplicate_pages,
+		.size = 2 * PAGE_SIZE,
+		.page_count = ARRAY_SIZE(duplicate_pages),
+	};
+	struct rk_rga_import *imports[] = { &first };
+	struct rk_rga_import *match = NULL;
+
+	/* Different VAs with identical pinned backing canonicalize. */
+	KUNIT_ASSERT_EQ(test,
+			rk_rga_find_userptr_import(imports,
+						   ARRAY_SIZE(imports),
+						   &candidate, &match),
+			0);
+	KUNIT_EXPECT_PTR_EQ(test, match, &first);
+
+	/* Reusing a VA for different pages must not reuse the old import. */
+	candidate.pages = different_pages;
+	candidate.userptr_extents = different_extents;
+	match = NULL;
+	KUNIT_ASSERT_EQ(test,
+			rk_rga_find_userptr_import(imports,
+						   ARRAY_SIZE(imports),
+						   &candidate, &match),
+			0);
+	KUNIT_EXPECT_PTR_EQ(test, match, NULL);
+
+	/* Any physical-byte overlap short of exact logical identity rejects. */
+	candidate.pages = partial_pages;
+	candidate.userptr_extents = partial_extents;
+	match = NULL;
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_find_userptr_import(imports,
+						   ARRAY_SIZE(imports),
+						   &candidate, &match),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_PTR_EQ(test, match, NULL);
+
+	/* Equal coverage in a different logical page order is still unsafe. */
+	candidate.pages = reordered_pages;
+	candidate.userptr_extents = reordered_extents;
+	match = NULL;
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_find_userptr_import(imports,
+						   ARRAY_SIZE(imports),
+						   &candidate, &match),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_PTR_EQ(test, match, NULL);
+
+	/* Sharing a page is safe when the covered byte intervals are disjoint. */
+	imports[0] = &head;
+	match = NULL;
+	KUNIT_ASSERT_EQ(test,
+			rk_rga_find_userptr_import(imports,
+						   ARRAY_SIZE(imports),
+						   &tail, &match),
+			0);
+	KUNIT_EXPECT_PTR_EQ(test, match, NULL);
+
+	/* Extent construction preserves per-page byte coverage while sorting. */
+	KUNIT_ASSERT_EQ(test, rk_rga_userptr_build_extents(&built), 0);
+	KUNIT_EXPECT_PTR_EQ(test, built.userptr_extents[0].page, &backing[0]);
+	KUNIT_EXPECT_EQ(test, built.userptr_extents[0].offset, 0U);
+	KUNIT_EXPECT_EQ(test, built.userptr_extents[0].length, 100U);
+	KUNIT_EXPECT_PTR_EQ(test, built.userptr_extents[1].page, &backing[1]);
+	KUNIT_EXPECT_EQ(test, built.userptr_extents[1].offset, 100U);
+	KUNIT_EXPECT_EQ(test, built.userptr_extents[1].length,
+			(u32)PAGE_SIZE - 100);
+	kfree(built.userptr_extents);
+
+	/* One logical buffer may not map two ranges onto the same physical bytes. */
+	KUNIT_EXPECT_EQ(test, rk_rga_userptr_build_extents(&duplicate),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_PTR_EQ(test, duplicate.userptr_extents, NULL);
+	KUNIT_EXPECT_EQ(test, duplicate.userptr_extent_count, 0U);
+}
+
+static void rk_rga_dmabuf_public_provenance_kunit(struct kunit *test)
+{
+	struct dma_buf object = {};
+	struct rk_rga_import dmabuf = {
+		.type = RK_RGA_IMPORT_DMABUF,
+		.dmabuf = &object,
+	};
+	struct rk_rga_import *imports[] = { &dmabuf };
+
+	/*
+	 * DMA-BUF object identity is public and stable; mapped attachment
+	 * page links are deliberately opaque to importers.
+	 */
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_check_alias_provenance(imports,
+						      ARRAY_SIZE(imports),
+						      &dmabuf),
+			0);
+}
+
+static void rk_rga_cross_type_alias_kunit(struct kunit *test)
+{
+	struct rk_rga_import dmabuf = {
+		.type = RK_RGA_IMPORT_DMABUF,
+	};
+	struct rk_rga_import userptr = {
+		.type = RK_RGA_IMPORT_USERPTR,
+	};
+	struct rk_rga_import *imports[] = { &dmabuf };
+
+	/* Public APIs cannot prove mixed DMA-BUF/USERPTR disjointness. */
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_check_alias_provenance(imports,
+						      ARRAY_SIZE(imports),
+						      &userptr),
+			-EOPNOTSUPP);
+	imports[0] = &userptr;
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_check_alias_provenance(imports,
+						      ARRAY_SIZE(imports),
+						      &dmabuf),
+			-EOPNOTSUPP);
+}
+
+static void rk_rga_distinct_dmabuf_provenance_kunit(struct kunit *test)
+{
+	struct dma_buf object_a = {};
+	struct dma_buf object_b = {};
+	struct rk_rga_dmabuf_extent first_extents[] = {
+		{ .start = 0x100000, .logical_offset = 0, .length = PAGE_SIZE },
+		{
+			.start = 0x300000,
+			.logical_offset = PAGE_SIZE,
+			.length = PAGE_SIZE,
+		},
+	};
+	struct rk_rga_dmabuf_extent disjoint_extents[] = {
+		{ .start = 0x500000, .logical_offset = 0, .length = PAGE_SIZE },
+		{
+			.start = 0x700000,
+			.logical_offset = PAGE_SIZE,
+			.length = PAGE_SIZE,
+		},
+	};
+	struct rk_rga_dmabuf_extent overlap_extents[] = {
+		{
+			.start = 0x100800,
+			.logical_offset = 0,
+			.length = PAGE_SIZE,
+		},
+	};
+	struct rk_rga_dmabuf_extent equal_extents[] = {
+		{ .start = 0x100000, .logical_offset = 0, .length = PAGE_SIZE },
+		{
+			.start = 0x300000,
+			.logical_offset = PAGE_SIZE,
+			.length = PAGE_SIZE,
+		},
+	};
+	struct rk_rga_dmabuf_extent self_alias_extents[] = {
+		{ .start = 0x900000, .logical_offset = 0, .length = PAGE_SIZE },
+		{
+			.start = 0x900800,
+			.logical_offset = PAGE_SIZE,
+			.length = PAGE_SIZE,
+		},
+	};
+	struct rk_rga_import first = {
+		.type = RK_RGA_IMPORT_DMABUF,
+		.dmabuf = &object_a,
+		.size = 2 * PAGE_SIZE,
+	};
+	struct rk_rga_import candidate = {
+		.type = RK_RGA_IMPORT_DMABUF,
+		.dmabuf = &object_b,
+		.size = 2 * PAGE_SIZE,
+	};
+	struct rk_rga_import *imports[] = { &first };
+
+	/* Object-level validation never infers backing from an attachment. */
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_check_alias_provenance(imports,
+						      ARRAY_SIZE(imports),
+						      &candidate),
+			0);
+	KUNIT_EXPECT_PTR_EQ(test,
+			    rk_rga_find_dmabuf_import(imports,
+						      ARRAY_SIZE(imports),
+						      &candidate),
+			    NULL);
+
+	/* Exact per-job targets accept disjoint mappings and reject any alias. */
+	KUNIT_EXPECT_FALSE(test,
+			   rk_rga_dmabuf_extents_overlap(
+				   first_extents, ARRAY_SIZE(first_extents),
+				   disjoint_extents,
+				   ARRAY_SIZE(disjoint_extents)));
+	KUNIT_EXPECT_TRUE(test,
+			  rk_rga_dmabuf_extents_overlap(
+				  first_extents, ARRAY_SIZE(first_extents),
+				  overlap_extents,
+				  ARRAY_SIZE(overlap_extents)));
+	KUNIT_EXPECT_TRUE(test,
+			  rk_rga_dmabuf_extents_overlap(
+				  first_extents, ARRAY_SIZE(first_extents),
+				  equal_extents,
+				  ARRAY_SIZE(equal_extents)));
+
+	/* Only stable DMA-BUF object identity canonicalizes imports. */
+	candidate.dmabuf = &object_a;
+	KUNIT_EXPECT_PTR_EQ(test,
+			    rk_rga_find_dmabuf_import(imports,
+						      ARRAY_SIZE(imports),
+						      &candidate),
+			    &first);
+
+	/* A single exported object may not alias itself internally either. */
+	KUNIT_EXPECT_TRUE(test,
+			  rk_rga_dmabuf_extents_self_overlap(
+				  self_alias_extents,
+				  ARRAY_SIZE(self_alias_extents)));
+}
+
+static void rk_rga_handle_dmabuf_alias_kunit(struct kunit *test)
+{
+	struct rk_rga_session session = {};
+	struct dma_buf dmabuf = {};
+	struct rk_rga_import first = {
+		.type = RK_RGA_IMPORT_DMABUF,
+		.dmabuf = &dmabuf,
+		.iova = 0x40000000,
+		.size = 4096,
+	};
+	struct rk_rga_import duplicate = {
+		.type = RK_RGA_IMPORT_DMABUF,
+		.dmabuf = &dmabuf,
+		.iova = 0x50000000,
+		.size = 4096,
+	};
+	struct rk_rga_import *imports[2] = { &first };
+	u32 import_count = 1;
+	__u64 addr = 0;
+	int handle;
+
+	idr_init(&session.imports);
+	refcount_set(&first.refs, 1);
+	refcount_set(&duplicate.refs, 1);
+	mutex_init(&first.map_lock);
+	mutex_init(&duplicate.map_lock);
+	handle = idr_alloc(&session.imports, &duplicate, 1, 2, GFP_KERNEL);
+	KUNIT_ASSERT_EQ(test, handle, 1);
+
+	KUNIT_ASSERT_EQ(test,
+			rk_rga_resolve_handle_locked(&session, handle, 64,
+						     &addr, imports,
+						     &import_count),
+			0);
+	KUNIT_EXPECT_EQ(test, import_count, 2U);
+	KUNIT_EXPECT_PTR_EQ(test, imports[1], &first);
+	KUNIT_EXPECT_EQ(test, addr, (__u64)first.iova);
+	KUNIT_EXPECT_EQ(test, refcount_read(&first.refs), 2);
+	KUNIT_EXPECT_EQ(test, refcount_read(&duplicate.refs), 1);
+
+	refcount_dec(&first.refs);
+	idr_destroy(&session.imports);
+}
+
+static void rk_rga_explicit_plane_dmabuf_alias_kunit(struct kunit *test)
+{
+	struct rk_rga_session session = {};
+	struct dma_buf dmabuf = {};
+	struct rk_rga_import y = {
+		.type = RK_RGA_IMPORT_DMABUF,
+		.dmabuf = &dmabuf,
+		.iova = 0x40000000,
+		.size = PAGE_SIZE,
+	};
+	struct rk_rga_import uv = {
+		.type = RK_RGA_IMPORT_DMABUF,
+		.dmabuf = &dmabuf,
+		.iova = 0x50000000,
+		.size = PAGE_SIZE,
+	};
+	struct rk_rga_import *imports[2] = {};
+	struct rga_img_info_t img = {
+		.format = RK_RGA_FORMAT_YCBCR_420_SP,
+		.act_w = 32,
+		.act_h = 32,
+		.vir_w = 32,
+		.vir_h = 32,
+	};
+	u32 import_count = 0;
+	int y_handle;
+	int uv_handle;
+
+	idr_init(&session.imports);
+	refcount_set(&y.refs, 1);
+	refcount_set(&uv.refs, 1);
+	mutex_init(&y.map_lock);
+	mutex_init(&uv.map_lock);
+	y_handle = idr_alloc(&session.imports, &y, 1, 0, GFP_KERNEL);
+	KUNIT_ASSERT_GT(test, y_handle, 0);
+	uv_handle = idr_alloc(&session.imports, &uv, 1, 0, GFP_KERNEL);
+	KUNIT_ASSERT_GT(test, uv_handle, 0);
+
+	/* One handle with implicit contiguous planes remains supported. */
+	img.yrgb_addr = y_handle;
+	KUNIT_ASSERT_EQ(test,
+			rk_rga_resolve_img_handles_locked(&session, &img,
+							  imports,
+							  &import_count,
+							  true),
+			0);
+	KUNIT_EXPECT_EQ(test, import_count, 1U);
+	KUNIT_EXPECT_EQ(test, img.yrgb_addr, (__u64)y.iova);
+	KUNIT_EXPECT_EQ(test, img.uv_addr, (__u64)y.iova + 32 * 32);
+	for (u32 i = 0; i < import_count; i++)
+		refcount_dec(&imports[i]->refs);
+
+	/* Explicit planes cannot both start at offset zero in one object. */
+	memset(imports, 0, sizeof(imports));
+	import_count = 0;
+	img.yrgb_addr = y_handle;
+	img.uv_addr = uv_handle;
+	img.v_addr = 0;
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_resolve_img_handles_locked(&session, &img,
+							  imports,
+							  &import_count,
+							  true),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, import_count, 2U);
+	KUNIT_EXPECT_PTR_EQ(test, imports[0], &y);
+	KUNIT_EXPECT_PTR_EQ(test, imports[1], &y);
+	for (u32 i = 0; i < import_count; i++)
+		refcount_dec(&imports[i]->refs);
+	KUNIT_EXPECT_EQ(test, refcount_read(&y.refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&uv.refs), 1);
+
+	idr_destroy(&session.imports);
+}
+
+static void rk_rga_explicit_plane_userptr_alias_kunit(struct kunit *test)
+{
+	struct rk_rga_session session = {};
+	struct page backing = {};
+	struct page *y_pages[] = { &backing };
+	struct page *uv_pages[] = { &backing };
+	struct rk_rga_userptr_extent y_extent = {
+		.page = &backing,
+		.length = PAGE_SIZE,
+	};
+	struct rk_rga_userptr_extent uv_extent = {
+		.page = &backing,
+		.length = PAGE_SIZE,
+	};
+	struct rk_rga_import y = {
+		.type = RK_RGA_IMPORT_USERPTR,
+		.pages = y_pages,
+		.userptr_extents = &y_extent,
+		.iova = 0x40000000,
+		.size = PAGE_SIZE,
+		.page_count = ARRAY_SIZE(y_pages),
+		.userptr_extent_count = 1,
+	};
+	struct rk_rga_import uv = {
+		.type = RK_RGA_IMPORT_USERPTR,
+		.pages = uv_pages,
+		.userptr_extents = &uv_extent,
+		.iova = 0x50000000,
+		.size = PAGE_SIZE,
+		.page_count = ARRAY_SIZE(uv_pages),
+		.userptr_extent_count = 1,
+	};
+	struct rk_rga_import *imports[2] = {};
+	struct rga_img_info_t img = {
+		.format = RK_RGA_FORMAT_YCBCR_420_SP,
+		.act_w = 32,
+		.act_h = 32,
+		.vir_w = 32,
+		.vir_h = 32,
+	};
+	u32 import_count = 0;
+	int y_handle;
+	int uv_handle;
+
+	idr_init(&session.imports);
+	refcount_set(&y.refs, 1);
+	refcount_set(&uv.refs, 1);
+	mutex_init(&y.map_lock);
+	mutex_init(&uv.map_lock);
+	y_handle = idr_alloc(&session.imports, &y, 1, 0, GFP_KERNEL);
+	KUNIT_ASSERT_GT(test, y_handle, 0);
+	uv_handle = idr_alloc(&session.imports, &uv, 1, 0, GFP_KERNEL);
+	KUNIT_ASSERT_GT(test, uv_handle, 0);
+	img.yrgb_addr = y_handle;
+	img.uv_addr = uv_handle;
+
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_resolve_img_handles_locked(&session, &img,
+							  imports,
+							  &import_count,
+							  true),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, import_count, 2U);
+	KUNIT_EXPECT_PTR_EQ(test, imports[0], &y);
+	KUNIT_EXPECT_PTR_EQ(test, imports[1], &y);
+	for (u32 i = 0; i < import_count; i++)
+		refcount_dec(&imports[i]->refs);
+	KUNIT_EXPECT_EQ(test, refcount_read(&y.refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&uv.refs), 1);
+
+	idr_destroy(&session.imports);
+}
+
+static void rk_rga_explicit_plane_distinct_kunit(struct kunit *test)
+{
+	struct rk_rga_session session = {};
+	struct dma_buf y_dmabuf = {};
+	struct dma_buf uv_dmabuf = {};
+	struct rk_rga_import y = {
+		.type = RK_RGA_IMPORT_DMABUF,
+		.dmabuf = &y_dmabuf,
+		.iova = 0x40000000,
+		.size = PAGE_SIZE,
+	};
+	struct rk_rga_import uv = {
+		.type = RK_RGA_IMPORT_DMABUF,
+		.dmabuf = &uv_dmabuf,
+		.iova = 0x50000000,
+		.size = PAGE_SIZE,
+	};
+	struct rk_rga_import *imports[2] = {};
+	struct rga_img_info_t img = {
+		.format = RK_RGA_FORMAT_YCBCR_420_SP,
+		.act_w = 32,
+		.act_h = 32,
+		.vir_w = 32,
+		.vir_h = 32,
+	};
+	u32 import_count = 0;
+	int y_handle;
+	int uv_handle;
+
+	idr_init(&session.imports);
+	refcount_set(&y.refs, 1);
+	refcount_set(&uv.refs, 1);
+	mutex_init(&y.map_lock);
+	mutex_init(&uv.map_lock);
+	y_handle = idr_alloc(&session.imports, &y, 1, 0, GFP_KERNEL);
+	KUNIT_ASSERT_GT(test, y_handle, 0);
+	uv_handle = idr_alloc(&session.imports, &uv, 1, 0, GFP_KERNEL);
+	KUNIT_ASSERT_GT(test, uv_handle, 0);
+	img.yrgb_addr = y_handle;
+	img.uv_addr = uv_handle;
+
+	KUNIT_ASSERT_EQ(test,
+			rk_rga_resolve_img_handles_locked(&session, &img,
+							  imports,
+							  &import_count,
+							  true),
+			0);
+	KUNIT_EXPECT_EQ(test, import_count, 2U);
+	KUNIT_EXPECT_PTR_EQ(test, imports[0], &y);
+	KUNIT_EXPECT_PTR_EQ(test, imports[1], &uv);
+	KUNIT_EXPECT_EQ(test, img.yrgb_addr, (__u64)y.iova);
+	KUNIT_EXPECT_EQ(test, img.uv_addr, (__u64)uv.iova);
+	for (u32 i = 0; i < import_count; i++)
+		refcount_dec(&imports[i]->refs);
+	KUNIT_EXPECT_EQ(test, refcount_read(&y.refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&uv.refs), 1);
+
+	idr_destroy(&session.imports);
+}
+
+static void rk_rga_iova_import_identity_kunit(struct kunit *test)
+{
+	u8 source_token;
+	u8 core_a_token;
+	u8 core_b_token;
+	struct device *source_dev = (struct device *)&source_token;
+	struct device *core_a_dev = (struct device *)&core_a_token;
+	struct device *core_b_dev = (struct device *)&core_b_token;
+	struct rk_rga_hw core_a = {
+		.dev = core_a_dev,
+	};
+	struct rk_rga_hw core_b = {
+		.dev = core_b_dev,
+	};
+	struct rk_rga_import import_a = {
+		.dev = source_dev,
+		.iova = 0x10000000,
+	};
+	struct rk_rga_import import_b = {
+		.dev = source_dev,
+		.iova = 0x50000000,
+	};
+	struct rk_rga_job_mapping mappings[] = {
+		{
+			.import = &import_a,
+			.hw = &core_a,
+			.dev = core_a_dev,
+			.iova = 0x50000000,
+		},
+		{
+			.import = &import_b,
+			.hw = &core_a,
+			.dev = core_a_dev,
+			.iova = 0x60000000,
+		},
+		{
+			.import = &import_b,
+			.hw = &core_b,
+			.dev = core_b_dev,
+			.iova = 0x70000000,
+		},
+	};
+	struct rk_rga_job job = {
+		.mappings = mappings,
+		.mapping_count = ARRAY_SIZE(mappings),
+	};
+	struct rk_rga_img_imports img_imports = {
+		.yrgb = &import_b,
+	};
+	struct rga_img_info_t img =
+		rk_rga_kunit_img(import_b.iova, RK_RGA_FORMAT_RGBA_8888,
+				  16, 16);
+
+	refcount_set(&import_a.refs, 1);
+	refcount_set(&import_b.refs, 1);
+	mutex_init(&import_a.map_lock);
+	mutex_init(&import_b.map_lock);
+	refcount_set(&core_a.refs, 1);
+	refcount_set(&core_b.refs, 1);
+
+	/*
+	 * B's source-device IOVA deliberately equals A's core-A IOVA. Rebase
+	 * must select B's core-A mapping by import identity, not short-circuit
+	 * on the colliding numeric address.
+	 */
+	KUNIT_ASSERT_EQ(test,
+			rk_rga_job_rebase_img_to_hw(&job, &img, &img_imports,
+						    &core_a),
+			0);
+	KUNIT_EXPECT_EQ(test, img.yrgb_addr, (__u64)0x60000000);
+
+	/* A later core handoff remains tied to B despite the mutated address. */
+	KUNIT_ASSERT_EQ(test,
+			rk_rga_job_rebase_img_to_hw(&job, &img, &img_imports,
+						    &core_b),
+			0);
+	KUNIT_EXPECT_EQ(test, img.yrgb_addr, (__u64)0x70000000);
+	KUNIT_EXPECT_EQ(test, job.mapping_count, ARRAY_SIZE(mappings));
+	KUNIT_EXPECT_EQ(test, refcount_read(&import_a.refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&import_b.refs), 1);
+}
+
+static void rk_rga_zero_iova_import_binding_kunit(struct kunit *test)
+{
+	struct rga_req task = {};
+	struct rk_rga_import y = {};
+	struct rk_rga_import uv = {};
+	struct rk_rga_import dst = {};
+	struct rk_rga_import pat = {};
+	struct rk_rga_import *single[] = { &y };
+	struct rk_rga_import *planes[] = { &y, &uv };
+	struct rk_rga_img_imports img_imports;
+	struct rk_rga_task_imports task_imports = {};
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_imports = &task_imports,
+		.task_count = 1,
+		.import_count = 2,
+	};
+	struct rga_img_info_t img =
+		rk_rga_kunit_img(0, RK_RGA_FORMAT_YCBCR_420_SP, 16, 16);
+	u32 type_mask;
+
+	/* Single-buffer chroma presence comes from layout, not IOVA truthiness. */
+	img.uv_addr = 0;
+	KUNIT_ASSERT_EQ(test,
+			rk_rga_capture_img_imports(&img, single, 0, 1,
+						   false, false,
+						   &img_imports),
+			0);
+	KUNIT_EXPECT_PTR_EQ(test, img_imports.yrgb, &y);
+	KUNIT_EXPECT_PTR_EQ(test, img_imports.uv, &y);
+	KUNIT_EXPECT_PTR_EQ(test, img_imports.v, NULL);
+	KUNIT_EXPECT_FALSE(test, rk_rga_img_has_addr(&img));
+
+	/* An explicit UV plane mapped at address zero still has an identity. */
+	KUNIT_ASSERT_EQ(test,
+			rk_rga_capture_img_imports(&img, planes, 0, 2,
+						   true, false,
+						   &img_imports),
+			0);
+	KUNIT_EXPECT_PTR_EQ(test, img_imports.yrgb, &y);
+	KUNIT_EXPECT_PTR_EQ(test, img_imports.uv, &uv);
+
+	img.format = RK_RGA_FORMAT_RGBA_8888;
+	img.rd_mode = RK_RGA_FBC_MODE;
+	KUNIT_ASSERT_EQ(test,
+			rk_rga_capture_img_imports(&img, single, 0, 1,
+						   false, false,
+						   &img_imports),
+			0);
+	KUNIT_EXPECT_PTR_EQ(test, img_imports.uv, &y);
+
+	task.src = rk_rga_kunit_img(0, RK_RGA_FORMAT_RGBA_8888, 64, 64);
+	task.dst = task.src;
+	task.src.act_w = 32;
+	task.dst.act_w = 32;
+	task.dst.x_offset = 32;
+	task_imports.src.yrgb = &y;
+	task_imports.dst.yrgb = &y;
+	rk_rga_task_use_import_identities(&task, &task_imports);
+	KUNIT_EXPECT_TRUE(test, rk_rga_in_place_bitblt_allowed(&task));
+
+	/*
+	 * Scheduling derives presence and aliasing from import identities:
+	 * unused pattern geometry stays absent, while a pattern mapped at
+	 * IOVA zero remains present.
+	 */
+	task.render_mode = RK_RGA_RENDER_BITBLT;
+	task.src = rk_rga_kunit_img(0, RK_RGA_FORMAT_RGBA_8888, 64, 64);
+	task.dst = rk_rga_kunit_img(0, RK_RGA_FORMAT_RGBA_8888, 64, 64);
+	task.pat = rk_rga_kunit_img(0, RK_RGA_FORMAT_RGBA_8888, 64, 64);
+	task_imports.src.yrgb = &y;
+	task_imports.dst.yrgb = &dst;
+	task_imports.pat.yrgb = NULL;
+	KUNIT_ASSERT_EQ(test,
+			rk_rga_task_hw_type_mask(&job, 0, &type_mask), 0);
+	KUNIT_EXPECT_NE(test, type_mask, 0U);
+
+	task_imports.pat.yrgb = &pat;
+	task.bsfilter_flag = 1;
+	task.alpha_rop_flag = BIT(0) | BIT(3) | BIT(4) | BIT(9);
+	task.PD_mode = RK_RGA_ALPHA_BLEND_SRC_OVER;
+	task.feature.global_alpha_en = true;
+	task.fg_global_alpha = 0xff;
+	task.bg_global_alpha = 0xff;
+	job.import_count = 3;
+	KUNIT_ASSERT_EQ(test,
+			rk_rga_task_hw_type_mask(&job, 0, &type_mask), 0);
+	KUNIT_EXPECT_TRUE(test, type_mask & RK_RGA_HW_TYPE_MASK_RGA3);
+}
+
+static void rk_rga_task_import_alias_kunit(struct kunit *test)
+{
+	struct dma_buf object_a = {};
+	struct dma_buf object_b = {};
+	struct rk_rga_import a = {
+		.type = RK_RGA_IMPORT_USERPTR,
+	};
+	struct rk_rga_import b = {
+		.type = RK_RGA_IMPORT_USERPTR,
+	};
+	struct rk_rga_import c = {
+		.type = RK_RGA_IMPORT_USERPTR,
+	};
+	struct rk_rga_task_imports imports = {
+		.src = {
+			.yrgb = &a,
+			.uv = &b,
+		},
+		.dst = {
+			.yrgb = &c,
+			.uv = &b,
+		},
+	};
+	struct rga_req task = {
+		.render_mode = RK_RGA_RENDER_BITBLT,
+	};
+
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_validate_task_import_aliases(&task, &imports),
+			-EOPNOTSUPP);
+
+	imports.dst = imports.src;
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_validate_task_import_aliases(&task, &imports), 0);
+
+	imports.src.yrgb = &c;
+	imports.src.uv = NULL;
+	imports.pat.yrgb = &a;
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_validate_task_import_aliases(&task, &imports),
+			-EOPNOTSUPP);
+
+	imports.pat.yrgb = NULL;
+	imports.dst.yrgb = &c;
+	imports.dst.uv = &a;
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_validate_task_import_aliases(&task, &imports),
+			-EOPNOTSUPP);
+
+	/* Disjoint device bounces cannot prove distinct outputs won't alias. */
+	a.type = RK_RGA_IMPORT_DMABUF;
+	b.type = RK_RGA_IMPORT_DMABUF;
+	a.dmabuf = &object_a;
+	b.dmabuf = &object_b;
+	imports.src.yrgb = &c;
+	imports.src.uv = NULL;
+	imports.dst.yrgb = &a;
+	imports.dst.uv = &b;
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_validate_task_import_aliases(&task, &imports),
+			-EOPNOTSUPP);
+
+	/* Duplicated handles canonicalize to one import/copyback identity. */
+	imports.dst.uv = &a;
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_validate_task_import_aliases(&task, &imports), 0);
+}
+
+static void rk_rga_dma_mapping_hw_lifetime_kunit(struct kunit *test)
+{
+	struct rk_rga_hw hw = {};
+	struct rk_rga_import *import;
+	struct rk_rga_import *imports[1] = {};
+	struct rga_img_info_t img =
+		rk_rga_kunit_img(0, RK_RGA_FORMAT_RGBA_8888, 16, 16);
+	struct rk_rga_job job = {};
+	dma_addr_t iova;
+	u32 import_count = 0;
+
+	refcount_set(&hw.refs, 2);
+	init_waitqueue_head(&hw.idle);
+	import = kzalloc_obj(*import, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, import);
+	rk_rga_import_init(import, RK_RGA_IMPORT_DMABUF);
+	import->map_hw = &hw;
+	import->size = 16 * 16 * 4;
+	mutex_lock(&rk_rga.import_lock);
+	rk_rga_import_register_locked(import);
+	mutex_unlock(&rk_rga.import_lock);
+	rk_rga_detach_hw_imports(&hw);
+	KUNIT_EXPECT_EQ(test, refcount_read(&hw.refs), 1);
+	KUNIT_EXPECT_PTR_EQ(test, import->map_hw, NULL);
+	KUNIT_EXPECT_TRUE(test, import->service_linked);
+	KUNIT_EXPECT_TRUE(test, import->mapping_invalidated);
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_materialize_existing_import(&img, import, imports,
+							   &import_count),
+			-ENODEV);
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_job_map_import(&job, import, &hw, &iova),
+			-ENODEV);
+	rk_rga_import_put(import);
+
+	job.mappings = kcalloc(1, sizeof(*job.mappings), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job.mappings);
+	job.mapping_count = 1;
+	job.mappings[0].hw = &hw;
+	refcount_inc(&hw.refs);
+	rk_rga_job_clear_mappings(&job);
+	KUNIT_EXPECT_EQ(test, refcount_read(&hw.refs), 1);
+}
+
+static void rk_rga_direct_import_reuse_kunit(struct kunit *test)
+{
+	struct rk_rga_import import = {
+		.type = RK_RGA_IMPORT_USERPTR,
+		.iova = 0x40000000,
+		.size = 64 * 64 * 4,
+	};
+	struct rk_rga_import *imports[2] = {};
+	struct rga_req task = {
+		.render_mode = RK_RGA_RENDER_BITBLT,
+		.src = {
+			.format = RK_RGA_FORMAT_RGBA_8888,
+			.act_w = 32,
+			.act_h = 32,
+			.vir_w = 64,
+			.vir_h = 64,
+		},
+		.dst = {
+			.format = RK_RGA_FORMAT_RGBA_8888,
+			.act_w = 32,
+			.act_h = 32,
+			.x_offset = 16,
+			.vir_w = 64,
+			.vir_h = 64,
+		},
+	};
+	u32 import_count = 0;
+
+	refcount_set(&import.refs, 1);
+	mutex_init(&import.map_lock);
+	KUNIT_ASSERT_EQ(test,
+			rk_rga_materialize_existing_import(&task.src, &import,
+							   imports,
+							   &import_count),
+			0);
+	KUNIT_ASSERT_EQ(test,
+			rk_rga_materialize_existing_import(&task.dst, &import,
+							   imports,
+							   &import_count),
+			0);
+	KUNIT_EXPECT_EQ(test, import_count, 2U);
+	KUNIT_EXPECT_EQ(test, refcount_read(&import.refs), 3);
+	KUNIT_EXPECT_EQ(test, task.src.yrgb_addr, task.dst.yrgb_addr);
+	KUNIT_EXPECT_FALSE(test, rk_rga_in_place_bitblt_allowed(&task));
+
+	task.dst.x_offset = 32;
+	KUNIT_EXPECT_TRUE(test, rk_rga_in_place_bitblt_allowed(&task));
+
+	/* Drop the two successful materializations without freeing stack data. */
+	refcount_dec(&import.refs);
+	refcount_dec(&import.refs);
+	KUNIT_EXPECT_EQ(test, refcount_read(&import.refs), 1);
+
+	import.size--;
+	import_count = 0;
+	memset(imports, 0, sizeof(imports));
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_materialize_existing_import(&task.src, &import,
+							   imports,
+							   &import_count),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, import_count, 0U);
+	KUNIT_EXPECT_EQ(test, refcount_read(&import.refs), 1);
 }
 
 static void rk_rga_session_dispatch_close_handoff_kunit(struct kunit *test)
@@ -11000,6 +13794,35 @@ static void rk_rga_irq_completion_result_kunit(struct kunit *test)
 			rk_rga_irq_completion_result((enum rk_rga_hw_type)-1,
 						     &job),
 			-EINVAL);
+}
+
+static void rk_rga_pending_multitask_core_mask_kunit(struct kunit *test)
+{
+	struct rga_req tasks[2] = {
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_BGRA_8888),
+		rk_rga_fill_task(BIT(2)),
+	};
+	struct rk_rga_job job = {
+		.tasks = tasks,
+		.task_count = ARRAY_SIZE(tasks),
+		.import_count = 2,
+	};
+
+	/* The first task can use RGA3/core0; the later fill still needs RGA2. */
+	tasks[0].core = BIT(0);
+	KUNIT_EXPECT_FALSE(test,
+			   rk_rga_pending_job_can_run_on_core_mask(&job,
+								    BIT(0)));
+
+	KUNIT_EXPECT_TRUE(test,
+			  rk_rga_pending_job_can_run_on_core_mask(
+				  &job, BIT(0) | BIT(2)));
+
+	/* Available hardware of the right type must also match explicit cores. */
+	KUNIT_EXPECT_FALSE(test,
+			   rk_rga_pending_job_can_run_on_core_mask(
+				   &job, BIT(1) | BIT(2)));
 }
 
 static void rk_rga_mixed_task_hw_type_kunit(struct kunit *test)
@@ -12462,7 +15285,7 @@ static void rk_rga3_librga_translate_emit_kunit(struct kunit *test)
 	stride_bytes = cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4] << 2;
 	KUNIT_EXPECT_EQ(test, stride_bytes, 1920U * 4U);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_SRC_SIZE_OFFSET / 4],
-			1920U | (1080U << 16));
+			1920U | (1088U << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_ACT_SIZE_OFFSET / 4],
 			1620U | (780U << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
@@ -12491,7 +15314,7 @@ static void rk_rga3_librga_translate_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_VIR_STRIDE_OFFSET / 4] << 2,
 			640U * 4U);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_SRC_SIZE_OFFSET / 4],
-			640U | (360U << 16));
+			640U | (368U << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_ACT_SIZE_OFFSET / 4],
 			640U | (360U << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
@@ -13733,6 +16556,8 @@ static void rk_rga3_tile8x8_profile_kunit(struct kunit *test)
 	u32 src_tile_uv_stride = ALIGN((u32)task.src.vir_w * 8, 16) >> 3;
 	u32 ctrl;
 
+	/* RGA3 tile input channels require a 16-aligned height stride. */
+	task.src.vir_h = ALIGN(task.src.vir_h, 16);
 	task.dst.rd_mode = RK_RGA_TILE_MODE;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
@@ -13791,6 +16616,255 @@ static void rk_rga3_tile8x8_profile_kunit(struct kunit *test)
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
 			-EOPNOTSUPP);
+}
+
+static void rk_rga3_tile8x8_alignment_kunit(struct kunit *test)
+{
+	enum rk_rga_hw_type type = 0;
+	struct rk_rga3_bitblt_profile profile;
+	struct rk_rga_img_layout layout;
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_420_SP,
+					  RK_RGA_FORMAT_YCBCR_420_SP);
+
+	/*
+	 * A 16x2 tight NV12 import is only 48 bytes, while tile writeback
+	 * operates on a complete 8-line block (128 bytes Y + 64 bytes UV).
+	 */
+	task.src = rk_rga_kunit_img(0x10000000,
+				    RK_RGA_FORMAT_YCBCR_420_SP, 16, 2);
+	task.dst = rk_rga_kunit_img(0x20000000,
+				    RK_RGA_FORMAT_YCBCR_420_SP, 16, 2);
+	task.dst.rd_mode = RK_RGA_TILE_MODE;
+	KUNIT_ASSERT_EQ(test, rk_rga_img_layout(&task.dst, &layout), 0);
+	KUNIT_EXPECT_EQ(test, layout.total_size, (size_t)48);
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile),
+			-EINVAL);
+
+	/* Native tile writeback geometry remains accepted with tight planes. */
+	task.src = rk_rga_kunit_img(0x10000000,
+				    RK_RGA_FORMAT_YCBCR_420_SP, 16, 8);
+	task.dst = rk_rga_kunit_img(0x20000000,
+				    RK_RGA_FORMAT_YCBCR_420_SP, 16, 8);
+	task.dst.rd_mode = RK_RGA_TILE_MODE;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile), 0);
+
+	/* Read windows need the documented 16-line input height stride. */
+	task.src.rd_mode = RK_RGA_TILE_MODE;
+	task.dst.rd_mode = RK_RGA_RASTER_MODE;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile),
+			-EINVAL);
+	task.src.vir_h = 16;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile), 0);
+
+	/* Dispatch selects RGA3 for the aligned tile input shape. */
+	{
+		struct rk_rga_job job = {
+			.tasks = &task,
+			.task_count = 1,
+			.import_count = 2,
+		};
+
+		KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+		KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	}
+}
+
+static void rk_rga3_size_and_tile_mode_limits_kunit(struct kunit *test)
+{
+	struct rga_img_info_t img =
+		rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
+				  RK_RGA3_OUTPUT_MAX_SIZE, 16);
+
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_image(&img, true), 0);
+	img.act_w = RK_RGA3_OUTPUT_MAX_SIZE + 16;
+	img.vir_w = img.act_w;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_image(&img, true), -EINVAL);
+
+	img = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
+			       RK_RGA3_INPUT_MAX_SIZE, 16);
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_image(&img, false), 0);
+	img.act_w = RK_RGA3_INPUT_MAX_SIZE + 16;
+	img.vir_w = img.act_w;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_image(&img, false), -EINVAL);
+
+	img = rk_rga_kunit_img(0x10000000,
+			       RK_RGA_FORMAT_YCBCR_420_SP_10B, 64, 16);
+	img.rd_mode = RK_RGA_TILE_MODE;
+	img.compact_mode = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_tile_image(&img, true), 0);
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_tile_image(&img, false), 0);
+
+	img.compact_mode = RK_RGA_10BIT_INCOMPACT;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_tile_image(&img, true),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_tile_image(&img, false),
+			-EOPNOTSUPP);
+}
+
+static void rk_rga3_chroma_offset_alignment_kunit(struct kunit *test)
+{
+	struct rk_rga3_bitblt_profile profile;
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_420_SP,
+					  RK_RGA_FORMAT_RGBA_8888);
+
+	/* Source read windows must not accept odd semiplanar crop offsets. */
+	task.src = rk_rga_kunit_img(0x10000000,
+				    RK_RGA_FORMAT_YCBCR_420_SP, 1280, 720);
+	task.src.act_w = 640;
+	task.src.act_h = 360;
+	task.dst = rk_rga_kunit_img(0x20000000,
+				    RK_RGA_FORMAT_RGBA_8888, 640, 360);
+	task.src.x_offset = 1;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile),
+			-EINVAL);
+	task.src.x_offset = 2;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile), 0);
+
+	/*
+	 * Alpha writeback passes destination placement through OVLP_OFF and
+	 * calls the write emitter without base-offset handling, so validation
+	 * must reject the odd destination before either emitter is selected.
+	 */
+	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_420_SP,
+					 RK_RGA_FORMAT_YCBCR_420_SP);
+	task.src = rk_rga_kunit_img(0x10000000,
+				    RK_RGA_FORMAT_YCBCR_420_SP, 1280, 720);
+	task.dst = rk_rga_kunit_img(0x20000000,
+				    RK_RGA_FORMAT_YCBCR_420_SP, 1280, 720);
+	task.src.act_w = 640;
+	task.src.act_h = 360;
+	task.dst.act_w = 640;
+	task.dst.act_h = 360;
+	task.alpha_rop_flag = BIT(0) | BIT(3) | BIT(4) | BIT(9);
+	task.PD_mode = RK_RGA_ALPHA_BLEND_SRC_OVER;
+	task.feature.global_alpha_en = true;
+	task.fg_global_alpha = 0xff;
+	task.bg_global_alpha = 0xff;
+	task.yuv2rgb_mode = 0;
+	task.dst.y_offset = 1;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile),
+			-EINVAL);
+	task.dst.y_offset = 2;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile), 0);
+
+	/* 10-bit semiplanar crops use the documented four-pixel granularity. */
+	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_420_SP_10B,
+					 RK_RGA_FORMAT_RGBA_8888);
+	task.src = rk_rga_kunit_img(0x10000000,
+				    RK_RGA_FORMAT_YCBCR_420_SP_10B,
+				    1280, 720);
+	task.src.act_w = 640;
+	task.src.act_h = 360;
+	task.dst = rk_rga_kunit_img(0x20000000,
+				    RK_RGA_FORMAT_RGBA_8888, 640, 360);
+	task.src.x_offset = 2;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile),
+			-EINVAL);
+	task.src.x_offset = 4;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile), 0);
+}
+
+static void rk_rga3_semiplanar_geometry_alignment_kunit(struct kunit *test)
+{
+	struct rk_rga3_bitblt_profile profile;
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_420_SP,
+					  RK_RGA_FORMAT_RGBA_8888);
+
+	task.src = rk_rga_kunit_img(0x10000000,
+				    RK_RGA_FORMAT_YCBCR_420_SP, 1280, 720);
+	task.src.act_w = 640;
+	task.src.act_h = 360;
+	task.dst = rk_rga_kunit_img(0x20000000,
+				    RK_RGA_FORMAT_RGBA_8888, 640, 360);
+
+	/* The active semiplanar rectangle must have even dimensions. */
+	task.src.act_w = 639;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile),
+			-EINVAL);
+	task.src.act_w = 640;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile), 0);
+
+	task.src.act_h = 359;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile),
+			-EINVAL);
+	task.src.act_h = 360;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile), 0);
+
+	/*
+	 * FBC pads its allocation internally, so these negatives prove that
+	 * format geometry is enforced independently of raster/tile layout.
+	 */
+	task.src.rd_mode = RK_RGA_FBC_MODE;
+	task.src.vir_h = 721;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile),
+			-EINVAL);
+	task.src.vir_h = 720;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile), 0);
+
+	task.src.vir_w = 1279;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile),
+			-EINVAL);
+	task.src.vir_w = 1280;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile), 0);
+
+	/*
+	 * The no-pattern alpha path reads the semiplanar destination back as
+	 * its background, so destination geometry must be checked before both
+	 * the writeback and background emit paths.
+	 */
+	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_420_SP,
+					 RK_RGA_FORMAT_YCBCR_420_SP);
+	task.src = rk_rga_kunit_img(0x10000000,
+				    RK_RGA_FORMAT_YCBCR_420_SP, 1280, 720);
+	task.dst = rk_rga_kunit_img(0x20000000,
+				    RK_RGA_FORMAT_YCBCR_420_SP, 1280, 720);
+	task.src.act_w = 640;
+	task.src.act_h = 360;
+	task.dst.act_w = 640;
+	task.dst.act_h = 359;
+	task.alpha_rop_flag = BIT(0) | BIT(3) | BIT(4) | BIT(9);
+	task.PD_mode = RK_RGA_ALPHA_BLEND_SRC_OVER;
+	task.feature.global_alpha_en = true;
+	task.fg_global_alpha = 0xff;
+	task.bg_global_alpha = 0xff;
+	task.yuv2rgb_mode = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile),
+			-EINVAL);
+	task.dst.act_h = 360;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile), 0);
+
+	task.dst.vir_h = 721;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile),
+			-EINVAL);
+	task.dst.vir_h = 720;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile), 0);
+
+	/* 10-bit active and virtual widths require four-pixel granularity. */
+	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_420_SP_10B,
+					 RK_RGA_FORMAT_RGBA_8888);
+	task.src = rk_rga_kunit_img(0x10000000,
+				    RK_RGA_FORMAT_YCBCR_420_SP_10B,
+				    1280, 720);
+	task.src.act_w = 638;
+	task.src.act_h = 360;
+	task.dst = rk_rga_kunit_img(0x20000000,
+				    RK_RGA_FORMAT_RGBA_8888, 640, 360);
+	task.dst.act_w = 638;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile),
+			-EINVAL);
+	task.src.act_w = 636;
+	task.dst.act_w = 636;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile), 0);
+
+	task.src.rd_mode = RK_RGA_FBC_MODE;
+	task.src.vir_w = 1278;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile),
+			-EINVAL);
+	task.src.vir_w = 1280;
+	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile), 0);
 }
 
 static void rk_rga_ffmpeg_alpha_overlay_kunit(struct kunit *test)
@@ -15165,6 +18239,10 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_release_configured_request_kunit),
 	KUNIT_CASE(rk_rga_release_pending_acquire_job_kunit),
 	KUNIT_CASE(rk_rga_last_hw_remove_pending_acquire_kunit),
+	KUNIT_CASE(rk_rga_incompatible_hw_pending_acquire_kunit),
+	KUNIT_CASE(rk_rga_incompatible_pending_acquire_oom_fallback_kunit),
+	KUNIT_CASE(rk_rga_partial_hw_remove_pending_import_kunit),
+	KUNIT_CASE(rk_rga_submit_post_arm_invalidated_import_kunit),
 	KUNIT_CASE(rk_rga_release_queued_job_kunit),
 	KUNIT_CASE(rk_rga_request_reconfig_gauss_kunit),
 	KUNIT_CASE(rk_rga_legacy_blit_sync_wait_kunit),
@@ -15188,6 +18266,22 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_acquire_abort_during_arming_kunit),
 	KUNIT_CASE(rk_rga_acquire_abort_queues_last_kunit),
 	KUNIT_CASE(rk_rga_layout_yuv10_kunit),
+	KUNIT_CASE(rk_rga_raster_row_layout_kunit),
+	KUNIT_CASE(rk_rga_raster_stride_backend_mask_kunit),
+	KUNIT_CASE(rk_rga_direct_import_identity_kunit),
+	KUNIT_CASE(rk_rga_userptr_backing_identity_kunit),
+	KUNIT_CASE(rk_rga_dmabuf_public_provenance_kunit),
+	KUNIT_CASE(rk_rga_cross_type_alias_kunit),
+	KUNIT_CASE(rk_rga_distinct_dmabuf_provenance_kunit),
+	KUNIT_CASE(rk_rga_handle_dmabuf_alias_kunit),
+	KUNIT_CASE(rk_rga_explicit_plane_dmabuf_alias_kunit),
+	KUNIT_CASE(rk_rga_explicit_plane_userptr_alias_kunit),
+	KUNIT_CASE(rk_rga_explicit_plane_distinct_kunit),
+	KUNIT_CASE(rk_rga_iova_import_identity_kunit),
+	KUNIT_CASE(rk_rga_zero_iova_import_binding_kunit),
+	KUNIT_CASE(rk_rga_task_import_alias_kunit),
+	KUNIT_CASE(rk_rga_dma_mapping_hw_lifetime_kunit),
+	KUNIT_CASE(rk_rga_direct_import_reuse_kunit),
 	KUNIT_CASE(rk_rga_session_dispatch_close_handoff_kunit),
 	KUNIT_CASE(rk_rga_job_free_release_fence_kunit),
 	KUNIT_CASE(rk_rga_release_fence_fd_state_kunit),
@@ -15199,6 +18293,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_userptr_shadow_layout_kunit),
 	KUNIT_CASE(rk_rga_userptr_shadow_copy_kunit),
 	KUNIT_CASE(rk_rga_irq_completion_result_kunit),
+	KUNIT_CASE(rk_rga_pending_multitask_core_mask_kunit),
 	KUNIT_CASE(rk_rga_mixed_task_hw_type_kunit),
 	KUNIT_CASE(rk_rga_mixed_task_core_handoff_kunit),
 	KUNIT_CASE(rk_rga_bitblt_hw_type_mask_kunit),
@@ -15238,6 +18333,10 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_ffmpeg_fbc_profiles_kunit),
 	KUNIT_CASE(rk_rga3_librga_afbc_copy_emit_kunit),
 	KUNIT_CASE(rk_rga3_tile8x8_profile_kunit),
+	KUNIT_CASE(rk_rga3_tile8x8_alignment_kunit),
+	KUNIT_CASE(rk_rga3_size_and_tile_mode_limits_kunit),
+	KUNIT_CASE(rk_rga3_chroma_offset_alignment_kunit),
+	KUNIT_CASE(rk_rga3_semiplanar_geometry_alignment_kunit),
 	KUNIT_CASE(rk_rga_ffmpeg_alpha_overlay_kunit),
 	KUNIT_CASE(rk_rga3_librga_alpha_yuv_emit_kunit),
 	KUNIT_CASE(rk_rga3_librga_slt_alpha_emit_kunit),
@@ -15267,6 +18366,9 @@ kunit_test_suite(rk_rga_rewrite_test_suite);
 
 static int rk_rga2_validate_image(const struct rga_img_info_t *img,
 				  const struct rk_rga2_format_info *fmt);
+static int rk_rga2_stride(const struct rga_img_info_t *img,
+			  const struct rk_rga2_format_info *fmt,
+			  u32 *stride, u32 *uv_stride);
 
 static int
 rk_rga2_validate_fill_csc(const struct rga_req *task,
@@ -15482,11 +18584,78 @@ static int rk_rga2_validate_update_palette(const struct rga_req *task)
 	return 0;
 }
 
+static int
+rk_rga2_validate_raster_strides(const struct rga_img_info_t *img,
+				const struct rk_rga2_format_info *fmt)
+{
+	struct rk_rga_img_layout layout;
+	u32 stride;
+	u32 uv_stride;
+	int ret;
+
+	if (img->rd_mode && img->rd_mode != RK_RGA_RASTER_MODE)
+		return 0;
+
+	ret = rk_rga_img_layout(img, &layout);
+	if (ret)
+		return ret;
+
+	/*
+	 * RGA2's legacy compact-10 ABI treats vir_w as a byte stride even
+	 * though the common image layout describes packed 10-bit pixels.
+	 * Preserve that ABI; the row-based layout remains conservative for
+	 * these imports.
+	 */
+	if (fmt->yuv10)
+		return 0;
+
+	switch (img->format) {
+	case RK_RGA_FORMAT_BPP1:
+	case RK_RGA_FORMAT_BPP2:
+	case RK_RGA_FORMAT_BPP4:
+	case RK_RGA_FORMAT_BPP8:
+		/* The palette emitter uses this same aligned packed stride. */
+		stride = layout.yrgb_stride;
+		uv_stride = 0;
+		break;
+	default:
+		ret = rk_rga2_stride(img, fmt, &stride, &uv_stride);
+		if (ret)
+			return ret;
+		break;
+	}
+
+	if (layout.yrgb_stride != stride)
+		return -EINVAL;
+	if (layout.uv_stride && layout.uv_stride != uv_stride)
+		return -EINVAL;
+	if (layout.v_stride && layout.v_stride != uv_stride)
+		return -EINVAL;
+
+	return 0;
+}
+
+static int
+rk_rga2_validate_virtual_row_strides(
+	const struct rga_img_info_t *img,
+	const struct rk_rga2_format_info *fmt)
+{
+	/*
+	 * RGA2's compact-10 ABI defines vir_w as the emitted byte stride,
+	 * unlike the common pixel-width layout used by other formats.
+	 */
+	if (fmt->yuv10)
+		return img->vir_w > RK_RGA_MAX_BYTE_STRIDE ? -EINVAL : 0;
+
+	return rk_rga_validate_virtual_row_strides(img);
+}
+
 static int rk_rga2_validate_image(const struct rga_img_info_t *img,
 				  const struct rk_rga2_format_info *fmt)
 {
 	u32 width;
 	u32 height;
+	int ret;
 
 	if (!img->act_w || !img->act_h || !img->vir_w || !img->vir_h)
 		return -EINVAL;
@@ -15507,6 +18676,10 @@ static int rk_rga2_validate_image(const struct rga_img_info_t *img,
 	if (fmt->y4 && (img->vir_w & 0x7))
 		return -EINVAL;
 
+	ret = rk_rga2_validate_virtual_row_strides(img, fmt);
+	if (ret)
+		return ret;
+
 	if (fmt->plane_width) {
 		if ((img->x_offset % fmt->x_div) || (img->act_w % fmt->x_div) ||
 		    (img->vir_w % fmt->x_div))
@@ -15515,6 +18688,10 @@ static int rk_rga2_validate_image(const struct rga_img_info_t *img,
 		    (img->vir_h % fmt->y_div))
 			return -EINVAL;
 	}
+
+	ret = rk_rga2_validate_raster_strides(img, fmt);
+	if (ret)
+		return ret;
 
 	return 0;
 }
@@ -15632,7 +18809,7 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 	ret = rk_rga2_validate_image(&dst, &profile->dst_fmt);
 	if (ret)
 		return ret;
-	if (uses_alpha_bitmap) {
+	if (uses_alpha_bitmap || uses_osd) {
 		ret = rk_rga2_validate_image(&task->pat, &profile->pat_fmt);
 		if (ret)
 			return ret;
@@ -15778,15 +18955,24 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 	    profile->bg_mode == 1 && profile->dst_mode == 1)
 		return -EOPNOTSUPP;
 
-	ret = rk_rga3_validate_image(&task->src);
+	ret = rk_rga3_validate_image(&task->src, false);
+	if (ret)
+		return ret;
+	ret = rk_rga3_validate_tile_image(&task->src, true);
 	if (ret)
 		return ret;
 
-	ret = rk_rga3_validate_image(&task->dst);
+	ret = rk_rga3_validate_image(&task->dst, true);
+	if (ret)
+		return ret;
+	ret = rk_rga3_validate_tile_image(&task->dst, false);
 	if (ret)
 		return ret;
 	if (profile->pattern_blend) {
-		ret = rk_rga3_validate_image(&task->pat);
+		ret = rk_rga3_validate_image(&task->pat, false);
+		if (ret)
+			return ret;
+		ret = rk_rga3_validate_tile_image(&task->pat, true);
 		if (ret)
 			return ret;
 		if (task->pat.act_w != task->dst.act_w ||
@@ -15798,6 +18984,10 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 				  &profile->src_fmt);
 	if (ret)
 		return ret;
+	ret = rk_rga3_validate_semiplanar_geometry(&task->src,
+						   &profile->src_fmt);
+	if (ret)
+		return ret;
 	if (profile->src_mode == 1 &&
 	    !rk_rga3_fbc_format_supported(task->src.format, false))
 		return -EOPNOTSUPP;
@@ -15806,6 +18996,10 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 		return -EOPNOTSUPP;
 	ret = rk_rga3_format_info(task->dst.format, true,
 				  &profile->dst_fmt);
+	if (ret)
+		return ret;
+	ret = rk_rga3_validate_semiplanar_geometry(&task->dst,
+						   &profile->dst_fmt);
 	if (ret)
 		return ret;
 	if (task->full_csc.flag &&
@@ -15832,6 +19026,11 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 	ret = rk_rga3_format_info(profile->pattern_blend ? task->pat.format :
 				  task->dst.format, false,
 				  &profile->bg_fmt);
+	if (ret)
+		return ret;
+	ret = rk_rga3_validate_semiplanar_geometry(profile->pattern_blend ?
+						   &task->pat : &task->dst,
+						   &profile->bg_fmt);
 	if (ret)
 		return ret;
 	if (profile->bg_mode == 1 &&
@@ -16778,7 +19977,7 @@ static int rk_rga2_palette_src_stride(const struct rga_req *task,
 	ret = rk_rga2_palette_shift(task, &shift);
 	if (ret)
 		return ret;
-	bytes = (u32)task->src.vir_w >> shift;
+	bytes = DIV_ROUND_UP((u32)task->src.vir_w, 1U << shift);
 	*stride = ALIGN(bytes, 4);
 	if (!*stride)
 		return -EINVAL;
@@ -16789,6 +19988,8 @@ static int rk_rga2_palette_src_stride(const struct rga_req *task,
 static int rk_rga2_emit_color_palette(struct rk_rga_job *job)
 {
 	struct rga_req *task = &job->tasks[job->current_task];
+	struct rga_req validation_task;
+	const struct rga_req *validate_task;
 	struct rk_rga2_palette_profile profile;
 	struct rk_rga2_transform transform = {
 		.dst_act_w = task->dst.act_w,
@@ -16800,7 +20001,9 @@ static int rk_rga2_emit_color_palette(struct rk_rga_job *job)
 	u32 src_info;
 	int ret;
 
-	ret = rk_rga2_validate_color_palette(task, &profile);
+	validate_task = rk_rga_job_validation_task(job, job->current_task,
+						   &validation_task);
+	ret = rk_rga2_validate_color_palette(validate_task, &profile);
 	if (ret)
 		return ret;
 	ret = rk_rga2_palette_src_stride(task, &src_stride);
@@ -16850,9 +20053,13 @@ static int rk_rga2_emit_color_palette(struct rk_rga_job *job)
 static int rk_rga2_emit_update_palette(struct rk_rga_job *job)
 {
 	struct rga_req *task = &job->tasks[job->current_task];
+	struct rga_req validation_task;
+	const struct rga_req *validate_task;
 	int ret;
 
-	ret = rk_rga2_validate_update_palette(task);
+	validate_task = rk_rga_job_validation_task(job, job->current_task,
+						   &validation_task);
+	ret = rk_rga2_validate_update_palette(validate_task);
 	if (ret)
 		return ret;
 
@@ -17110,13 +20317,17 @@ static int rk_rga2_emit_osd(struct rk_rga_job *job,
 static int rk_rga2_emit_simple_bitblt(struct rk_rga_job *job)
 {
 	struct rga_req *task = &job->tasks[job->current_task];
+	struct rga_req validation_task;
+	const struct rga_req *validate_task;
 	struct rk_rga2_bitblt_profile profile;
 	u32 quant_offset;
 	u32 quant_scale;
 	u32 rop_ctrl;
 	int ret;
 
-	ret = rk_rga2_validate_bitblt(task, &profile);
+	validate_task = rk_rga_job_validation_task(job, job->current_task,
+						   &validation_task);
+	ret = rk_rga2_validate_bitblt(validate_task, &profile);
 	if (ret)
 		return ret;
 
@@ -17215,6 +20426,8 @@ static u32 rk_rga2_pack_gr(__s16 x, __s16 y)
 static int rk_rga2_emit_color_fill(struct rk_rga_job *job)
 {
 	struct rga_req *task = &job->tasks[job->current_task];
+	struct rga_req validation_task;
+	const struct rga_req *validate_task;
 	struct rk_rga2_fill_profile profile;
 	struct rk_rga2_transform transform = {
 		.dst_act_w = task->dst.act_w,
@@ -17223,7 +20436,9 @@ static int rk_rga2_emit_color_fill(struct rk_rga_job *job)
 	u32 mode;
 	int ret;
 
-	ret = rk_rga2_validate_color_fill(task, &profile);
+	validate_task = rk_rga_job_validation_task(job, job->current_task,
+						   &validation_task);
+	ret = rk_rga2_validate_color_fill(validate_task, &profile);
 	if (ret)
 		return ret;
 
@@ -17484,7 +20699,8 @@ static void rk_rga3_emit_overlap(struct rk_rga_job *job,
 static int rk_rga3_prepare_bitblt(struct rk_rga_job *job,
 				  struct rk_rga3_bitblt_profile *profile)
 {
-	struct rga_req *task;
+	struct rga_req validation_task;
+	const struct rga_req *task;
 
 	if (!job->tasks)
 		return -EINVAL;
@@ -17493,7 +20709,8 @@ static int rk_rga3_prepare_bitblt(struct rk_rga_job *job,
 	if (job->import_count < 2)
 		return -EOPNOTSUPP;
 
-	task = &job->tasks[job->current_task];
+	task = rk_rga_job_validation_task(job, job->current_task,
+					  &validation_task);
 
 	return rk_rga3_validate_bitblt(task, profile);
 }
@@ -17666,31 +20883,38 @@ static int rk_rga_job_prepare_hw_mappings(struct rk_rga_hw *hw,
 					  struct rk_rga_job *job)
 {
 	struct rga_req *task;
+	struct rk_rga_task_imports *task_imports;
 	int ret;
 
-	if (!job->tasks || job->current_task >= job->task_count)
+	if (!job->tasks || !job->task_imports ||
+	    job->current_task >= job->task_count)
 		return -EINVAL;
 
 	task = &job->tasks[job->current_task];
+	task_imports = &job->task_imports[job->current_task];
 
 	if (task->render_mode == RK_RGA_RENDER_BITBLT ||
 	    task->render_mode == RK_RGA_RENDER_COLOR_PALETTE) {
-		ret = rk_rga_job_rebase_img_to_hw(job, &task->src, hw->dev);
+		ret = rk_rga_job_rebase_img_to_hw(job, &task->src,
+						  &task_imports->src, hw);
 		if (ret)
 			return ret;
-		ret = rk_rga_job_rebase_img_to_hw(job, &task->dst, hw->dev);
+		ret = rk_rga_job_rebase_img_to_hw(job, &task->dst,
+						  &task_imports->dst, hw);
 		if (ret)
 			return ret;
-		if (rk_rga_img_has_addr(&task->pat))
-			return rk_rga_job_rebase_img_to_hw(job, &task->pat,
-							  hw->dev);
+		if (task_imports->pat.yrgb)
+			return rk_rga_job_rebase_img_to_hw(
+				job, &task->pat, &task_imports->pat, hw);
 		return 0;
 	}
 
 	if (task->render_mode == RK_RGA_RENDER_COLOR_FILL)
-		return rk_rga_job_rebase_img_to_hw(job, &task->dst, hw->dev);
+		return rk_rga_job_rebase_img_to_hw(job, &task->dst,
+						   &task_imports->dst, hw);
 	if (task->render_mode == RK_RGA_RENDER_UPDATE_PALETTE)
-		return rk_rga_job_rebase_img_to_hw(job, &task->pat, hw->dev);
+		return rk_rga_job_rebase_img_to_hw(job, &task->pat,
+						   &task_imports->pat, hw);
 
 	return -EOPNOTSUPP;
 }
@@ -17841,14 +21065,15 @@ static int rk_rga_task_hw_type_mask(struct rk_rga_job *job, u32 task_index,
 	struct rk_rga2_bitblt_profile rga2_profile;
 	struct rk_rga2_fill_profile fill_profile;
 	struct rk_rga2_palette_profile palette_profile;
-	struct rga_req *task;
+	struct rga_req validation_task;
+	const struct rga_req *task;
 	int ret;
 
 	if (!job->task_count || !job->tasks || task_index >= job->task_count)
 		return -EINVAL;
 
 	*type_mask = 0;
-	task = &job->tasks[task_index];
+	task = rk_rga_job_validation_task(job, task_index, &validation_task);
 
 	switch (task->render_mode) {
 	case RK_RGA_RENDER_BITBLT:
@@ -18126,6 +21351,12 @@ static irqreturn_t rk_rga_irq_thread(int irq, void *data)
 		rk_rga_job_sync_userptr_for_cpu(job, hw->dev);
 		job->userptr_device_owned = false;
 	}
+	/*
+	 * Each task gets fresh role-specific DMA-BUF mappings. This makes
+	 * source/destination bounce-buffer copyback ordering match task
+	 * execution even when distinct DMA-BUF objects alias logical memory.
+	 */
+	rk_rga_job_clear_mappings(job);
 
 	if (rk_rga_job_advance_task(job, result)) {
 		dispatch_session = READ_ONCE(job->session);
@@ -18150,7 +21381,7 @@ static irqreturn_t rk_rga_irq_thread(int irq, void *data)
 	rk_rga_job_complete_queued(job, result);
 	rk_rga_hw_dispatch(hw);
 	if (reset_ret)
-		rk_rga_abort_pending_if_no_hw(-EIO);
+		rk_rga_abort_incompatible_pending_acquire_jobs(-EIO);
 
 	return IRQ_HANDLED;
 }
@@ -18245,7 +21476,7 @@ static void rk_rga_hw_recover_active(struct rk_rga_hw *hw, bool iommu_fault,
 	mutex_unlock(&hw->run_lock);
 	rk_rga_hw_dispatch(hw);
 	if (reset_ret)
-		rk_rga_abort_pending_if_no_hw(-EIO);
+		rk_rga_abort_incompatible_pending_acquire_jobs(-EIO);
 }
 
 static void rk_rga_hw_timeout_work(struct work_struct *work)
@@ -18650,7 +21881,7 @@ static void rk_rga_session_abort_hw_jobs(struct rk_rga_session *session,
 		if (rk_rga_hw_abort_session_jobs(hw, session, result))
 			rk_rga_hw_dispatch(hw);
 		if (READ_ONCE(hw->recovery_failed))
-			rk_rga_abort_pending_if_no_hw(-EIO);
+			rk_rga_abort_incompatible_pending_acquire_jobs(-EIO);
 		rk_rga_hw_put(hw);
 	}
 }
@@ -18738,8 +21969,12 @@ static int rk_rga_job_submit(struct rk_rga_session *session,
 			rk_rga_job_complete(job, ret);
 			return ret;
 		}
-		if (!rk_rga_has_available_hw())
+		if (!rk_rga_pending_job_can_run_on_core_mask(
+			    job, rk_rga_available_core_mask()))
 			rk_rga_job_abort_pending_acquire(job, -ENODEV);
+		else
+			rk_rga_job_abort_invalidated_pending_acquire(
+				job, -ENODEV);
 
 		*release_sync_file = sync_file;
 
@@ -18816,6 +22051,7 @@ static int rk_rga_request_config(struct rk_rga_session *session,
 	struct rk_rga_acquire_fd *acquire_fds;
 	struct dma_fence **fences = NULL;
 	struct rk_rga_import **imports = NULL;
+	struct rk_rga_task_imports *task_imports = NULL;
 	struct rga_req *tasks = NULL;
 	u32 *gauss_coeffs = NULL;
 	u32 acquire_fd_count = 0;
@@ -18852,16 +22088,19 @@ static int rk_rga_request_config(struct rk_rga_session *session,
 	ret = rk_rga_prepare_tasks_locked(session, tasks, user->task_num,
 					  user->acquire_fence_fd,
 					  &imports, &import_count,
+					  &task_imports,
 					  &fences, &fence_count,
 					  acquire_fds, &acquire_fd_count);
 	if (ret)
 		goto out_unlock;
 
 	rk_rga_request_clear_fences(request);
+	kfree(request->task_imports);
 	rk_rga_request_clear_imports(request);
 	rk_rga_request_clear_gauss(request);
 	kfree(request->tasks);
 	request->tasks = tasks;
+	request->task_imports = task_imports;
 	request->imports = imports;
 	request->acquire_fences = fences;
 	request->gauss_coeffs = gauss_coeffs;
@@ -18874,6 +22113,7 @@ static int rk_rga_request_config(struct rk_rga_session *session,
 	request->release_fence_fd = -1;
 	request->configured = true;
 	tasks = NULL;
+	task_imports = NULL;
 	imports = NULL;
 	fences = NULL;
 	gauss_coeffs = NULL;
@@ -18894,6 +22134,7 @@ out_unlock:
 						acquire_fd_count);
 	rk_rga_put_import_array(imports, import_count);
 	rk_rga_put_fence_array(fences, fence_count);
+	kfree(task_imports);
 	kfree(gauss_coeffs);
 	kfree(tasks);
 	kfree(acquire_fds);
@@ -19074,15 +22315,95 @@ err_release_view:
 	return ret;
 }
 
+/*
+ * Consume @dmabuf on every path. On success its reference belongs to the
+ * returned import; on failure it is dropped here.
+ */
+static int rk_rga_import_dmabuf_object(struct dma_buf *dmabuf, int fd,
+				       struct rk_rga_import **import_out)
+{
+	struct rk_rga_import *import;
+	struct dma_buf_attachment *attach;
+	struct sg_table *sgt;
+	struct rk_rga_hw *map_hw;
+	struct device *dev;
+	dma_addr_t iova;
+	int ret;
+
+	import = kzalloc(sizeof(*import), GFP_KERNEL);
+	if (!import) {
+		dma_buf_put(dmabuf);
+		return -ENOMEM;
+	}
+	rk_rga_import_init(import, RK_RGA_IMPORT_DMABUF);
+	import->fd = fd;
+	import->dmabuf = dmabuf;
+	import->size = dmabuf->size;
+
+	map_hw = rk_rga_get_map_hw_for_import();
+	if (!map_hw) {
+		rk_rga_import_put(import);
+		return -ENODEV;
+	}
+	dev = get_device(map_hw->dev);
+
+	attach = dma_buf_attach(dmabuf, dev);
+	if (IS_ERR(attach)) {
+		ret = PTR_ERR(attach);
+		put_device(dev);
+		rk_rga_hw_put(map_hw);
+		mutex_unlock(&rk_rga.import_lock);
+		rk_rga_import_put(import);
+		return ret;
+	}
+
+	/*
+	 * This persistent attachment supplies an address placeholder and
+	 * validates that the buffer is usable by at least one RGA core. Jobs
+	 * always create a fresh role-specific attachment, so map this one
+	 * read-only to prevent a stale bounce buffer from copying back later.
+	 */
+	sgt = dma_buf_map_attachment_unlocked(attach, DMA_TO_DEVICE);
+	if (IS_ERR(sgt)) {
+		ret = PTR_ERR(sgt);
+		dma_buf_detach(dmabuf, attach);
+		put_device(dev);
+		rk_rga_hw_put(map_hw);
+		mutex_unlock(&rk_rga.import_lock);
+		rk_rga_import_put(import);
+		return ret;
+	}
+
+	ret = rk_rga_check_dma_sgt(sgt, "dma-buf", dmabuf->size, &iova,
+				   true);
+	if (ret) {
+		dma_buf_unmap_attachment_unlocked(attach, sgt,
+						  DMA_TO_DEVICE);
+		dma_buf_detach(dmabuf, attach);
+		put_device(dev);
+		rk_rga_hw_put(map_hw);
+		mutex_unlock(&rk_rga.import_lock);
+		rk_rga_import_put(import);
+		return ret;
+	}
+
+	import->map_hw = map_hw;
+	import->dev = dev;
+	import->attach = attach;
+	import->sgt = sgt;
+	import->iova = iova;
+
+	rk_rga_import_register_locked(import);
+	mutex_unlock(&rk_rga.import_lock);
+	*import_out = import;
+
+	return 0;
+}
+
 static int rk_rga_import_dmabuf(struct rga_external_buffer *buffer,
 				struct rk_rga_import **import_out)
 {
-	struct rk_rga_import *import;
 	struct dma_buf *dmabuf;
-	struct dma_buf_attachment *attach;
-	struct sg_table *sgt;
-	struct device *dev;
-	dma_addr_t iova;
 	int fd;
 	int ret;
 
@@ -19090,69 +22411,18 @@ static int rk_rga_import_dmabuf(struct rga_external_buffer *buffer,
 	if (ret)
 		return ret;
 
-	dev = rk_rga_get_map_dev();
-	if (!dev)
-		return -ENODEV;
-
 	dmabuf = dma_buf_get(fd);
-	if (IS_ERR(dmabuf)) {
-		put_device(dev);
+	if (IS_ERR(dmabuf))
 		return PTR_ERR(dmabuf);
-	}
 
-	attach = dma_buf_attach(dmabuf, dev);
-	if (IS_ERR(attach)) {
-		dma_buf_put(dmabuf);
-		put_device(dev);
-		return PTR_ERR(attach);
-	}
-
-	sgt = dma_buf_map_attachment(attach, DMA_BIDIRECTIONAL);
-	if (IS_ERR(sgt)) {
-		dma_buf_detach(dmabuf, attach);
-		dma_buf_put(dmabuf);
-		put_device(dev);
-		return PTR_ERR(sgt);
-	}
-
-	ret = rk_rga_check_dma_sgt(sgt, "dma-buf", dmabuf->size, &iova,
-				   true);
-	if (ret) {
-		dma_buf_unmap_attachment(attach, sgt, DMA_BIDIRECTIONAL);
-		dma_buf_detach(dmabuf, attach);
-		dma_buf_put(dmabuf);
-		put_device(dev);
-		return ret;
-	}
-
-	import = kzalloc(sizeof(*import), GFP_KERNEL);
-	if (!import) {
-		dma_buf_unmap_attachment(attach, sgt, DMA_BIDIRECTIONAL);
-		dma_buf_detach(dmabuf, attach);
-		dma_buf_put(dmabuf);
-		put_device(dev);
-		return -ENOMEM;
-	}
-
-	import->type = RK_RGA_IMPORT_DMABUF;
-	import->fd = fd;
-	refcount_set(&import->refs, 1);
-	import->dev = dev;
-	import->dmabuf = dmabuf;
-	import->attach = attach;
-	import->sgt = sgt;
-	import->iova = iova;
-	import->size = dmabuf->size;
-
-	*import_out = import;
-
-	return 0;
+	return rk_rga_import_dmabuf_object(dmabuf, fd, import_out);
 }
 
 static int rk_rga_import_userptr(struct rga_external_buffer *buffer,
 				 struct rk_rga_import **import_out)
 {
 	struct rk_rga_import *import;
+	struct rk_rga_hw *map_hw;
 	struct device *dev;
 	struct page **pages;
 	unsigned long start;
@@ -19186,15 +22456,9 @@ static int rk_rga_import_userptr(struct rga_external_buffer *buffer,
 		return -EOVERFLOW;
 	page_count = nr_pages;
 
-	dev = rk_rga_get_map_dev();
-	if (!dev)
-		return -ENODEV;
-
 	pages = kcalloc(page_count, sizeof(*pages), GFP_KERNEL);
-	if (!pages) {
-		put_device(dev);
+	if (!pages)
 		return -ENOMEM;
-	}
 
 	pinned = pin_user_pages_fast(start, page_count,
 				     FOLL_WRITE | FOLL_LONGTERM, pages);
@@ -19202,7 +22466,6 @@ static int rk_rga_import_userptr(struct rga_external_buffer *buffer,
 		if (pinned > 0)
 			unpin_user_pages(pages, pinned);
 		kfree(pages);
-		put_device(dev);
 		return pinned < 0 ? pinned : -EFAULT;
 	}
 
@@ -19210,19 +22473,28 @@ static int rk_rga_import_userptr(struct rga_external_buffer *buffer,
 	if (!import) {
 		unpin_user_pages(pages, page_count);
 		kfree(pages);
-		put_device(dev);
 		return -ENOMEM;
 	}
 
-	import->type = RK_RGA_IMPORT_USERPTR;
-	import->fd = -1;
-	refcount_set(&import->refs, 1);
-	import->dev = dev;
+	rk_rga_import_init(import, RK_RGA_IMPORT_USERPTR);
 	import->pages = pages;
 	import->size = size;
 	import->page_count = page_count;
 	import->pinned_pages = page_count;
 	import->page_offset = page_offset;
+
+	ret = rk_rga_userptr_build_extents(import);
+	if (ret) {
+		rk_rga_import_put(import);
+		return ret;
+	}
+
+	map_hw = rk_rga_get_map_hw_for_import();
+	if (!map_hw) {
+		rk_rga_import_put(import);
+		return -ENODEV;
+	}
+	dev = get_device(map_hw->dev);
 
 	ret = rk_rga_map_userptr_sgt(import, dev, &import->sgt,
 				     &import->userptr_view,
@@ -19230,10 +22502,17 @@ static int rk_rga_import_userptr(struct rga_external_buffer *buffer,
 				     &import->iova_size,
 				     &import->iommu_mapped);
 	if (ret) {
+		put_device(dev);
+		rk_rga_hw_put(map_hw);
+		mutex_unlock(&rk_rga.import_lock);
 		rk_rga_import_put(import);
 		return ret;
 	}
 
+	import->map_hw = map_hw;
+	import->dev = dev;
+	rk_rga_import_register_locked(import);
+	mutex_unlock(&rk_rga.import_lock);
 	*import_out = import;
 
 	return 0;
@@ -19563,6 +22842,7 @@ static long rk_rga_ioctl_blit(unsigned long arg, struct rk_rga_session *session,
 	struct rk_rga_acquire_fd *acquire_fds;
 	struct dma_fence **fences = NULL;
 	struct rk_rga_import **imports = NULL;
+	struct rk_rga_task_imports *task_imports = NULL;
 	struct sync_file *release_sync_file = NULL;
 	struct rga_req *task;
 	u32 *gauss_coeffs = NULL;
@@ -19594,16 +22874,19 @@ static long rk_rga_ioctl_blit(unsigned long arg, struct rk_rga_session *session,
 	mutex_lock(&session->lock);
 	ret = rk_rga_prepare_tasks_locked(session, task, 1, -1,
 					  &imports, &import_count,
+					  &task_imports,
 					  &fences, &fence_count,
 					  acquire_fds, &acquire_fd_count);
 	if (!ret) {
 		close_acquire_fds = true;
-		ret = rk_rga_job_take_prepared(task, 1, sync_mode, imports,
+		ret = rk_rga_job_take_prepared(task, 1, task_imports,
+					       sync_mode, imports,
 					       import_count, fences, fence_count,
 					       gauss_coeffs,
 					       &job);
 		if (!ret) {
 			task = NULL;
+			task_imports = NULL;
 			imports = NULL;
 			fences = NULL;
 			gauss_coeffs = NULL;
@@ -19617,6 +22900,7 @@ static long rk_rga_ioctl_blit(unsigned long arg, struct rk_rga_session *session,
 						acquire_fd_count);
 	rk_rga_put_import_array(imports, import_count);
 	rk_rga_put_fence_array(fences, fence_count);
+	kfree(task_imports);
 	kfree(gauss_coeffs);
 	kfree(task);
 	if (ret) {
@@ -19899,7 +23183,6 @@ static void rk_rga_hw_remove(struct platform_device *pdev)
 {
 	struct rk_rga_hw *hw = platform_get_drvdata(pdev);
 	unsigned long flags;
-	bool no_hw_left;
 
 	mutex_lock(&rk_rga.hw_lock);
 	spin_lock_irqsave(&hw->job_lock, flags);
@@ -19907,14 +23190,14 @@ static void rk_rga_hw_remove(struct platform_device *pdev)
 	spin_unlock_irqrestore(&hw->job_lock, flags);
 	list_del_init(&hw->node);
 	rk_rga_refresh_hw_versions_locked();
-	no_hw_left = !rk_rga.hw_count;
 	mutex_unlock(&rk_rga.hw_lock);
 
-	if (no_hw_left)
-		rk_rga_abort_all_pending_acquire_jobs(-ENODEV);
+	rk_rga_abort_incompatible_pending_acquire_jobs(-ENODEV);
 	rk_rga_iommu_unregister_fault_handler(hw);
 	cancel_work_sync(&hw->iommu_fault_work);
 	rk_rga_hw_abort_jobs(hw, -ENODEV);
+	rk_rga_detach_hw_imports(hw);
+	rk_rga_abort_invalidated_pending_acquire_jobs(-ENODEV);
 	wait_event(hw->idle, refcount_read(&hw->refs) == 1);
 	/* The fail-fast handler makes balancing safe before devres frees the IRQ. */
 	rk_rga_hw_restore_irq_depth(hw);
@@ -20058,9 +23341,11 @@ static int __init rk_rga_init(void)
 	int ret;
 
 	mutex_init(&rk_rga.hw_lock);
+	mutex_init(&rk_rga.import_lock);
 	mutex_init(&rk_rga.session_lock);
 	spin_lock_init(&rk_rga.fault_lock);
 	INIT_LIST_HEAD(&rk_rga.hw_list);
+	INIT_LIST_HEAD(&rk_rga.imports);
 	INIT_LIST_HEAD(&rk_rga.sessions);
 	INIT_LIST_HEAD(&rk_rga.fault_hws);
 	spin_lock_init(&rk_rga.fence_lock);
