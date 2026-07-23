@@ -16,6 +16,13 @@
 #include "rga_hw_config.h"
 #include "rga_debugger.h"
 
+/*
+ * RGA3 fetches a window base address on a 16-byte granularity (the low 4 bits
+ * of the *_BASE registers are ignored by the hardware), so an IOMMU-mapped base
+ * must be 16-byte aligned to read/write the intended bytes.
+ */
+#define RGA_IOMMU_ADDR_ALIGN 16
+
 struct rga_shadow_node {
 	int page_idx;
 	struct page *orig_page;
@@ -2052,6 +2059,28 @@ static int rga_mm_get_buffer_info(struct rga_job *job,
 		if (dma_mapping_error(internal_buffer->dma_buffer->map_dev, (dma_addr_t)addr)) {
 			rga_job_err(job, "invalid iova for dma-buffer with IOMMU device!\n");
 			return -EFAULT;
+		}
+
+		/*
+		 * The RGA3 window base is fetched on a 16-byte granularity: the
+		 * low 4 bits of yrgb_addr are dropped by the hardware. The
+		 * scattered-userptr path carries the original sub-page byte
+		 * offset in the base (iova + real_offset) and, for a shadow_page
+		 * head, leaves the bytes before real_offset zeroed -- so a base
+		 * whose offset is not 16-byte aligned makes RGA read the zeroed
+		 * head and silently return all-zero pixels (see
+		 * findings/2026-07-23-rga-scattered-userptr-unaligned-src-zero-output).
+		 * Sub-16 alignment cannot be expressed as a whole-pixel window
+		 * offset for every format, so reject it loudly here instead of
+		 * corrupting data silently. Aligned userptr and dma-buf imports
+		 * always land on a >=page-aligned base and are unaffected.
+		 */
+		if (!IS_ALIGNED(addr, RGA_IOMMU_ADDR_ALIGN)) {
+			rga_job_err(job,
+				"core[%d] handle[%d] iova 0x%llx not %d-byte aligned; unaligned scattered userptr is unsupported\n",
+				job->core, internal_buffer->handle,
+				(unsigned long long)addr, RGA_IOMMU_ADDR_ALIGN);
+			return -EINVAL;
 		}
 
 		break;
