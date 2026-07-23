@@ -271,9 +271,15 @@ static int rga_mm_session_show(struct seq_file *m, void *data)
 	seq_puts(m, "===============================================================\n");
 
 	idr_for_each_entry(&mm_session->memory_idr, dump_buffer, id) {
+		/*
+		 * rga_mm_session_release_buffer() detaches a still-referenced
+		 * buffer from its exiting owner by setting session = NULL, so
+		 * this dump must not assume a live session.
+		 */
 		seq_printf(m, "handle = %d refcount = %d mm_flag = 0x%x	tgid = %d\n",
 			   dump_buffer->handle, kref_read(&dump_buffer->refcount),
-			   dump_buffer->mm_flag, dump_buffer->session->tgid);
+			   dump_buffer->mm_flag,
+			   dump_buffer->session ? dump_buffer->session->tgid : -1);
 
 		switch (dump_buffer->type) {
 		case RGA_DMA_BUFFER:

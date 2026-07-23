@@ -3188,12 +3188,29 @@ int rga_mm_session_release_buffer(struct rga_session *session)
 			 * for the owner here.
 			 */
 			buffer->session = NULL;
+			/*
+			 * refcount > 1, so this only decrements: it never runs
+			 * rga_mm_kref_release_buffer() and therefore never drops
+			 * mm->lock -- safe to call inside idr_for_each_entry().
+			 */
+			kref_put(&buffer->refcount, rga_mm_kref_release_buffer);
 		} else {
 			rga_err("[tgid:%d] Destroy handle[%d] when the user exits\n",
 			       session->tgid, buffer->handle);
+			/*
+			 * Last reference: free it while still holding mm->lock.
+			 * Must NOT use kref_put(rga_mm_kref_release_buffer) here --
+			 * that release callback drops and re-acquires mm->lock
+			 * around the sleeping unmap, i.e. mid-idr_for_each_entry().
+			 * On heavy session teardown that left mm->lock owned by an
+			 * exited/freed task and wedged the next mm->lock waiter
+			 * (e.g. rga_mm_session_show) in an unkillable D state with a
+			 * KASAN use-after-free on the freed task_struct. Freeing in
+			 * place under the held lock (as the BSP does) is
+			 * iteration-safe and drops no lock.
+			 */
+			rga_mm_force_releaser_buffer(buffer);
 		}
-
-		kref_put(&buffer->refcount, rga_mm_kref_release_buffer);
 	}
 
 	mutex_unlock(&mm->lock);
