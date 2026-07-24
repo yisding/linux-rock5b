@@ -168,7 +168,16 @@ static bool rga_check_align(struct rga_job *job,
 	if (pixel_stride <= 0)
 		return false;
 
-	bit_stride = pixel_stride * w_stride;
+	/*
+	 * 10-bit formats carry a byte stride in vir_w (legacy BSP ABI
+	 * contract), so a stride unit is 8 bits, not the 10-bit pixel
+	 * depth — otherwise legitimate byte strides (e.g. 464) are
+	 * rejected and pixel-count strides wrongly accepted.
+	 */
+	if (rga_is_yuv10bit_format(format))
+		bit_stride = w_stride * 8;
+	else
+		bit_stride = pixel_stride * w_stride;
 
 	if (bit_stride % (byte_stride_align * 8) == 0)
 		return true;
