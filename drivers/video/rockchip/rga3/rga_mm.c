@@ -1541,6 +1541,17 @@ static int rga_mm_sgt_to_page_table(struct sg_table *sg,
 				break_flag = 1;
 				break;
 			}
+			/*
+			 * RGA2 MMU entries are 32-bit page addresses; an
+			 * entry above 4 GiB would be silently truncated and
+			 * make the hardware fetch an unrelated page (observed
+			 * as an RGA2 bus error on >4G userptr pages).  Fail
+			 * closed instead; below-4G and swiotlb-bounced
+			 * dma-buf paths are unaffected.
+			 */
+			if ((Address + ((unsigned long)i << PAGE_SHIFT)) >
+			    (SZ_4G - PAGE_SIZE))
+				return -EOPNOTSUPP;
 			page_table[mapped_size + i] = (uint32_t)(Address + (i << PAGE_SHIFT));
 		}
 		if (break_flag)
@@ -1805,8 +1816,12 @@ static int rga_mm_set_mmu_base(struct rga_job *job,
 				ret = sgt ? PTR_ERR(sgt) : -EINVAL;
 				goto err_free_page_table;
 			}
-			rga_mm_sgt_to_page_table(sgt, page_table, yrgb_count,
-						 use_dma_address);
+			ret = rga_mm_sgt_to_page_table(sgt, page_table, yrgb_count,
+						       use_dma_address);
+			if (ret < 0) {
+				rga_job_err(job, "rga2 page table reject: %d\n", ret);
+				goto err_free_page_table;
+			}
 		}
 
 		if (job_buf->uv_addr) {
@@ -1817,8 +1832,12 @@ static int rga_mm_set_mmu_base(struct rga_job *job,
 				ret = sgt ? PTR_ERR(sgt) : -EINVAL;
 				goto err_free_page_table;
 			}
-			rga_mm_sgt_to_page_table(sgt, page_table + yrgb_count,
-						 uv_count, use_dma_address);
+			ret = rga_mm_sgt_to_page_table(sgt, page_table + yrgb_count,
+						       uv_count, use_dma_address);
+			if (ret < 0) {
+				rga_job_err(job, "rga2 page table reject: %d\n", ret);
+				goto err_free_page_table;
+			}
 		}
 
 		if (job_buf->v_addr) {
@@ -1829,9 +1848,13 @@ static int rga_mm_set_mmu_base(struct rga_job *job,
 				ret = sgt ? PTR_ERR(sgt) : -EINVAL;
 				goto err_free_page_table;
 			}
-			rga_mm_sgt_to_page_table(sgt,
-						 page_table + yrgb_count + uv_count,
-						 v_count, use_dma_address);
+			ret = rga_mm_sgt_to_page_table(sgt,
+						       page_table + yrgb_count + uv_count,
+						       v_count, use_dma_address);
+			if (ret < 0) {
+				rga_job_err(job, "rga2 page table reject: %d\n", ret);
+				goto err_free_page_table;
+			}
 		}
 
 		img->yrgb_addr = yrgb_offset;
@@ -1876,7 +1899,12 @@ static int rga_mm_set_mmu_base(struct rga_job *job,
 			ret = sgt ? PTR_ERR(sgt) : -EINVAL;
 			goto err_free_page_table;
 		}
-		rga_mm_sgt_to_page_table(sgt, page_table, page_count, use_dma_address);
+		ret = rga_mm_sgt_to_page_table(sgt, page_table, page_count,
+					       use_dma_address);
+		if (ret < 0) {
+			rga_job_err(job, "rga2 page table reject: %d\n", ret);
+			goto err_free_page_table;
+		}
 
 		img->yrgb_addr = img_offset;
 		rga_convert_addr(img, false);
