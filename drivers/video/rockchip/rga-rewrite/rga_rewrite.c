@@ -2529,15 +2529,30 @@ static int rk_rga_row_layout(u32 width, u32 height, size_t multiplier,
 	return 0;
 }
 
+static bool rk_rga_img_is_raster(const struct rga_img_info_t *img)
+{
+	return !img->rd_mode || img->rd_mode == RK_RGA_RASTER_MODE;
+}
+
 static int rk_rga_yuv10_plane_layout(const struct rga_img_info_t *img,
 				     u32 height, size_t *stride, size_t *size)
 {
 	/*
-	 * 10-bit semi-planar rows are byte-literal: incompact P010/P210 rows
-	 * carry 16-bit containers (2 bytes per pixel), compact NV15/NV20 rows
-	 * pack 10 bits per pixel. Round each row independently so fractional
-	 * bytes cannot make the following plane overlap the last row.
+	 * RASTER 10-bit vir_w is the BYTE stride: the legacy BSP ABI
+	 * contract ("width_stride equals byte_stride") that librga and the
+	 * JeffyCN GStreamer plugin rely on, and that both the RGA2 and RGA3
+	 * register writers here already program literally (pixel_width 1).
+	 *
+	 * TILE keeps the pixel convention (the librga tile contract and the
+	 * tile stride math scale vir_w themselves): incompact P010/P210
+	 * rows carry 16-bit containers (2 bytes per pixel), compact
+	 * NV15/NV20 rows pack 10 bits per pixel. Round each row
+	 * independently so fractional bytes cannot make the following plane
+	 * overlap the last row.
 	 */
+	if (rk_rga_img_is_raster(img))
+		return rk_rga_row_layout(img->vir_w, height, 1, 1,
+					 stride, size);
 	if (img->compact_mode == RK_RGA_10BIT_INCOMPACT)
 		return rk_rga_row_layout(img->vir_w, height, 2, 1,
 					 stride, size);
@@ -2892,12 +2907,52 @@ static int rk_rga_img_layout(const struct rga_img_info_t *img,
 	return 0;
 }
 
+static bool rk_rga_format_is_yuv10(u32 format);
+static bool rk_rga_img_yuv10_compact(const struct rga_img_info_t *img);
+
 static int
 rk_rga_validate_virtual_row_strides(const struct rga_img_info_t *img)
 {
 	struct rga_img_info_t raster = *img;
 	struct rk_rga_img_layout layout;
 	int ret;
+
+	if (rk_rga_format_is_yuv10(img->format)) {
+		size_t bytes;
+		u32 act_end;
+
+		if (!rk_rga_img_is_raster(img)) {
+			/*
+			 * Pixel-convention modes (TILE/FBC): bound the
+			 * uncompressed byte rows the capability describes.
+			 */
+			if (rk_rga_img_yuv10_compact(img))
+				bytes = DIV_ROUND_UP((size_t)img->vir_w * 10,
+						     8);
+			else
+				bytes = (size_t)img->vir_w * 2;
+			return bytes > RK_RGA_MAX_BYTE_STRIDE ? -EINVAL : 0;
+		}
+
+		/*
+		 * RASTER 10-bit vir_w is the BYTE stride (legacy BSP ABI).
+		 * The generic act/vir comparison in the per-core validators
+		 * compares pixels against bytes for these images, so
+		 * additionally require the active window's rows, in bytes,
+		 * to fit inside the byte stride.
+		 */
+		if (check_add_overflow((u32)img->x_offset, (u32)img->act_w,
+				       &act_end))
+			return -EOVERFLOW;
+		if (rk_rga_img_yuv10_compact(img))
+			bytes = DIV_ROUND_UP((size_t)act_end * 10, 8);
+		else
+			bytes = (size_t)act_end * 2;
+		if (bytes > img->vir_w)
+			return -EINVAL;
+
+		return img->vir_w > RK_RGA_MAX_BYTE_STRIDE ? -EINVAL : 0;
+	}
 
 	/*
 	 * The capability is an uncompressed byte-row limit even when the
@@ -7010,18 +7065,12 @@ static int rk_rga3_validate_raster_strides(const struct rga_img_info_t *img)
 
 	aligned_w = ALIGN((u32)img->vir_w, 16);
 	if (rk_rga_format_is_yuv10(img->format)) {
-		size_t bytes;
-
-		if (rk_rga_img_yuv10_compact(img)) {
-			if (check_mul_overflow((size_t)aligned_w, (size_t)10,
-					       &bytes))
-				return -EOVERFLOW;
-			y_stride = DIV_ROUND_UP(bytes, 8);
-		} else {
-			if (check_mul_overflow((size_t)aligned_w, (size_t)2,
-					       &y_stride))
-				return -EOVERFLOW;
-		}
+		/*
+		 * RASTER 10-bit vir_w is the BYTE stride (legacy BSP ABI),
+		 * and the register writer programs it literally with a
+		 * 16-byte hardware row alignment.
+		 */
+		y_stride = aligned_w;
 		uv_stride = y_stride;
 	} else {
 		y_stride = ALIGN(layout.yrgb_stride, 16);
@@ -7030,10 +7079,12 @@ static int rk_rga3_validate_raster_strides(const struct rga_img_info_t *img)
 	}
 
 	/*
-	 * The ABI carries a virtual width, not a byte stride. Accept raster
-	 * images only when their tightly packed rows already satisfy RGA3's
-	 * physical row alignment; otherwise its implicit padding would cross
-	 * the next row or plane in a tightly sized import.
+	 * For 8-bit formats the ABI carries a virtual width, not a byte
+	 * stride; for 10-bit rasters it carries the byte stride itself.
+	 * Either way, accept raster images only when their tightly packed
+	 * rows already satisfy RGA3's physical row alignment; otherwise its
+	 * implicit padding would cross the next row or plane in a tightly
+	 * sized import.
 	 */
 	if (layout.yrgb_stride != y_stride)
 		return -EINVAL;
@@ -8220,6 +8271,19 @@ static struct rga_img_info_t rk_rga_kunit_img(u64 addr, u32 format,
 		.vir_w = width,
 		.vir_h = height,
 	};
+}
+
+/*
+ * Convert a pixel-width test image to the raster 10-bit byte-stride ABI
+ * (compact rows pack 10 bits/pixel, incompact rows 2 bytes/pixel).  Call
+ * after rk_rga_kunit_img() for every RASTER 10-bit image; TILE/FBC 10-bit
+ * images keep the pixel convention.
+ */
+static void rk_rga_kunit_img_10b_stride(struct rga_img_info_t *img)
+{
+	img->vir_w = img->compact_mode == RK_RGA_10BIT_INCOMPACT ?
+		     img->vir_w * 2 :
+		     DIV_ROUND_UP((u32)img->vir_w * 10, 8);
 }
 
 static struct rga_req rk_rga_ffmpeg_bitblt_task(u32 src_format,
@@ -12252,7 +12316,11 @@ static void rk_rga_layout_yuv10_kunit(struct kunit *test)
 	struct rk_rga_img_layout layout;
 	size_t pixels = (size_t)64 * 64;
 
-	img.vir_w = 64;
+	/*
+	 * RASTER 10-bit vir_w is the byte stride (legacy BSP ABI): the
+	 * layout reports it literally regardless of compact_mode.
+	 */
+	img.vir_w = 128; /* 64 incompact pixels = 128 bytes */
 	img.vir_h = 64;
 
 	img.format = RK_RGA_FORMAT_YCBCR_420_SP_10B;
@@ -12263,9 +12331,8 @@ static void rk_rga_layout_yuv10_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, layout.yrgb_size, pixels * 2);
 	KUNIT_EXPECT_EQ(test, layout.uv_size, pixels);
 	KUNIT_EXPECT_EQ(test, layout.total_size, pixels * 3);
-	/* Regression guard against the old 1 byte/pixel Y size. */
-	KUNIT_EXPECT_NE(test, layout.yrgb_size, pixels);
 
+	img.vir_w = 80; /* 64 compact pixels = 80 bytes */
 	img.compact_mode = 0;
 	KUNIT_ASSERT_EQ(test, rk_rga_img_layout(&img, &layout), 0);
 	KUNIT_EXPECT_EQ(test, layout.yrgb_stride, (size_t)80);
@@ -12273,6 +12340,7 @@ static void rk_rga_layout_yuv10_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, layout.yrgb_size, pixels * 10 / 8);
 	KUNIT_EXPECT_EQ(test, layout.uv_size, pixels * 10 / 8 / 2);
 
+	img.vir_w = 128;
 	img.format = RK_RGA_FORMAT_YCBCR_422_SP_10B;
 	img.compact_mode = RK_RGA_10BIT_INCOMPACT;
 	KUNIT_ASSERT_EQ(test, rk_rga_img_layout(&img, &layout), 0);
@@ -12280,6 +12348,18 @@ static void rk_rga_layout_yuv10_kunit(struct kunit *test)
 	/* 422 chroma plane is byte-for-byte the size of the Y plane. */
 	KUNIT_EXPECT_EQ(test, layout.uv_size, pixels * 2);
 	KUNIT_EXPECT_EQ(test, layout.v_size, (size_t)0);
+
+	/* TILE keeps the pixel convention: 64 compact pixels pack 80 bytes. */
+	img.vir_w = 64;
+	img.vir_h = 64;
+	img.rd_mode = RK_RGA_TILE_MODE;
+	img.format = RK_RGA_FORMAT_YCBCR_420_SP_10B;
+	img.compact_mode = 0;
+	KUNIT_ASSERT_EQ(test, rk_rga_img_layout(&img, &layout), 0);
+	KUNIT_EXPECT_EQ(test, layout.yrgb_stride, (size_t)80);
+	KUNIT_EXPECT_EQ(test, layout.yrgb_size, pixels * 10 / 8);
+	/* Regression guard against byte-literal rows leaking into TILE. */
+	KUNIT_EXPECT_NE(test, layout.yrgb_size, pixels);
 }
 
 static void rk_rga_raster_row_layout_kunit(struct kunit *test)
@@ -12298,7 +12378,8 @@ static void rk_rga_raster_row_layout_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, layout.uv_size, (size_t)36);
 	KUNIT_EXPECT_EQ(test, layout.total_size, (size_t)108);
 
-	img.vir_w = 17;
+	/* Raster 10-bit vir_w is already the byte stride: reported as-is. */
+	img.vir_w = 22;
 	img.format = RK_RGA_FORMAT_YCBCR_420_SP_10B;
 	img.compact_mode = 0;
 	KUNIT_ASSERT_EQ(test, rk_rga_img_layout(&img, &layout), 0);
@@ -12372,13 +12453,16 @@ static void rk_rga_raster_stride_backend_mask_kunit(struct kunit *test)
 			-EOPNOTSUPP);
 	KUNIT_EXPECT_EQ(test, type_mask, 0U);
 
-	/* RGA2's compact-10 ABI carries vir_w as the byte stride itself. */
+	/*
+	 * The compact-10 ABI carries vir_w as the byte stride itself, and
+	 * both backends now honor it — the inclusive boundary reaches all.
+	 */
 	task = rk_rga_ffmpeg_bitblt_task(
 		RK_RGA_FORMAT_YCBCR_420_SP_10B, RK_RGA_FORMAT_RGBA_8888);
 	task.src.vir_w = RK_RGA_MAX_BYTE_STRIDE;
 	type_mask = 0;
 	KUNIT_ASSERT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask), 0);
-	KUNIT_EXPECT_EQ(test, type_mask, RK_RGA_HW_TYPE_MASK_RGA2);
+	KUNIT_EXPECT_EQ(test, type_mask, RK_RGA_HW_TYPE_MASK_ALL);
 
 	task.src.vir_w = RK_RGA_MAX_BYTE_STRIDE + 4;
 	type_mask = U32_MAX;
@@ -14555,6 +14639,7 @@ static void rk_rga_ffmpeg_rga3_profiles_kunit(struct kunit *test)
 	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_420_SP_10B,
 					 RK_RGA_FORMAT_YCBCR_420_SP);
 	task.src.compact_mode = RK_RGA_10BIT_INCOMPACT;
+	rk_rga_kunit_img_10b_stride(&task.src);
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
@@ -14692,6 +14777,10 @@ rk_rga_gstreamer_legacy_convert_matrix_case(struct kunit *test,
 	task.dst = rk_rga_kunit_img(0x20000000, profile->dst_format,
 				    profile->rotate_90 ? 360 : 640,
 				    profile->rotate_90 ? 640 : 360);
+	if (rk_rga_format_is_yuv10(profile->src_format))
+		rk_rga_kunit_img_10b_stride(&task.src);
+	if (rk_rga_format_is_yuv10(profile->dst_format))
+		rk_rga_kunit_img_10b_stride(&task.dst);
 	if (rk_rga_kunit_format_is_planar_yuv(profile->src_format))
 		task.src.v_addr = 0x10180000;
 	if (rk_rga_kunit_format_is_planar_yuv(profile->dst_format))
@@ -15720,6 +15809,7 @@ static void rk_rga2_compact_10bit_profile_kunit(struct kunit *test)
 	};
 	u32 src_info;
 
+	rk_rga_kunit_img_10b_stride(&task.src);
 	task.core = BIT(2);
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
@@ -15746,6 +15836,7 @@ static void rk_rga2_compact_10bit_profile_kunit(struct kunit *test)
 				   RK_RGA2_SCALE_FORCE_TILE));
 
 	task.src.compact_mode = RK_RGA_10BIT_INCOMPACT;
+	task.src.vir_w = 3840; /* 1920 incompact pixels, byte stride */
 	job.cmd_ready = false;
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
@@ -15753,6 +15844,7 @@ static void rk_rga2_compact_10bit_profile_kunit(struct kunit *test)
 
 	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_420_SP,
 					 RK_RGA_FORMAT_YCBCR_420_SP_10B);
+	rk_rga_kunit_img_10b_stride(&task.dst);
 	task.core = BIT(2);
 	job.tasks = &task;
 	type = 0;
@@ -16324,6 +16416,7 @@ static void rk_rga3_librga_afbc_copy_emit_kunit(struct kunit *test)
 	task.src = rk_rga_kunit_img(0x10000000,
 				    RK_RGA_FORMAT_YCBCR_420_SP_10B,
 				    1280, 720);
+	rk_rga_kunit_img_10b_stride(&task.src);
 	task.dst = rk_rga_kunit_img(0x20000000,
 				    RK_RGA_FORMAT_YCBCR_420_SP_10B,
 				    1280, 720);
@@ -16333,7 +16426,8 @@ static void rk_rga3_librga_afbc_copy_emit_kunit(struct kunit *test)
 
 	fbc_payload_stride = aligned_w >> 1;
 	fbc_header_size = (fbc_header_stride * aligned_h) >> 2;
-	raster_stride = aligned_w >> 2;
+	/* Raster 10-bit vir_w is the byte stride: programmed literally. */
+	raster_stride = ALIGN((u32)task.src.vir_w, 16) >> 2;
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
@@ -16505,10 +16599,12 @@ static void rk_rga3_librga_afbc_copy_emit_kunit(struct kunit *test)
 				    1280, 720);
 	task.src.rd_mode = RK_RGA_FBC_MODE;
 	task.dst.rd_mode = RK_RGA_RASTER_MODE;
+	rk_rga_kunit_img_10b_stride(&task.dst);
 	job.cmd_ready = false;
 	type = 0;
 
-	raster_stride = aligned_w >> 2;
+	/* Raster 10-bit vir_w is the byte stride: programmed literally. */
+	raster_stride = ALIGN((u32)task.dst.vir_w, 16) >> 2;
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
@@ -17035,6 +17131,7 @@ static void rk_rga3_librga_alpha_yuv_emit_kunit(struct kunit *test)
 			   RK_RGA3_WR_PIX_SWAP);
 
 	task.src.format = RK_RGA_FORMAT_YCRCB_420_SP_10B;
+	rk_rga_kunit_img_10b_stride(&task.src);
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
 			-EOPNOTSUPP);
@@ -17700,6 +17797,8 @@ static void rk_rga3_alpha_yuv10_overlay_emit_kunit(struct kunit *test)
 		.cmd_size = sizeof(cmd),
 	};
 
+	rk_rga_kunit_img_10b_stride(&task.src);
+	rk_rga_kunit_img_10b_stride(&task.dst);
 	task.pat = rk_rga_kunit_img(0x30000000, RK_RGA_FORMAT_RGBA_8888,
 				    task.dst.act_w, task.dst.act_h);
 	task.bsfilter_flag = 1;
@@ -17747,6 +17846,7 @@ static void rk_rga3_alpha_yuv10_overlay_emit_kunit(struct kunit *test)
 	memset(cmd, 0, sizeof(cmd));
 	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_YCBCR_420_SP_10B,
 				    1280, 720);
+	rk_rga_kunit_img_10b_stride(&task.src);
 	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_YCBCR_420_SP,
 				    1280, 720);
 	job.cmd_ready = false;
@@ -17769,6 +17869,7 @@ static void rk_rga3_alpha_yuv10_overlay_emit_kunit(struct kunit *test)
 	memset(cmd, 0, sizeof(cmd));
 	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_YCBCR_420_SP_10B,
 				    1280, 720);
+	rk_rga_kunit_img_10b_stride(&task.src);
 	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_YCBCR_420_SP_10B,
 				    1280, 720);
 	task.dst.rd_mode = RK_RGA_FBC_MODE;
@@ -17798,6 +17899,7 @@ static void rk_rga3_alpha_yuv10_overlay_emit_kunit(struct kunit *test)
 
 	memset(cmd, 0, sizeof(cmd));
 	task.dst.rd_mode = RK_RGA_RASTER_MODE;
+	rk_rga_kunit_img_10b_stride(&task.dst); /* raster again: bytes */
 	memset(&task.pat, 0, sizeof(task.pat));
 	task.bsfilter_flag = 0;
 	job.import_count = 2;
@@ -17838,6 +17940,7 @@ static void rk_rga3_alpha_yuv10_overlay_emit_kunit(struct kunit *test)
 	memset(cmd, 0, sizeof(cmd));
 	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_YCBCR_420_SP_10B,
 				    1280, 720);
+	rk_rga_kunit_img_10b_stride(&task.src);
 	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_YCBCR_420_SP,
 				    1280, 720);
 	job.cmd_ready = false;
@@ -18034,6 +18137,7 @@ static void rk_rga3_dst_offset_emit_kunit(struct kunit *test)
 	task.dst.y_offset = 8;
 	task.dst.compact_mode = RK_RGA_10BIT_INCOMPACT;
 	task.dst.is_10b_endian = 1;
+	rk_rga_kunit_img_10b_stride(&task.dst); /* 1280 px -> 2560 bytes */
 	job.cmd_ready = false;
 	type = 0;
 
@@ -18046,9 +18150,9 @@ static void rk_rga3_dst_offset_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WR_CTRL_OFFSET / 4] &
 			  RK_RGA3_WR_ENDIAN_MODE);
 
-	y_stride_bytes = (cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4] << 2) * 2;
-	uv_stride_bytes =
-		(cmd[RK_RGA3_WR_PL_VIR_STRIDE_OFFSET / 4] << 2) * 2;
+	/* 10-bit vir_w is the byte stride: programmed literally. */
+	y_stride_bytes = cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4] << 2;
+	uv_stride_bytes = cmd[RK_RGA3_WR_PL_VIR_STRIDE_OFFSET / 4] << 2;
 	KUNIT_EXPECT_EQ(test, y_stride_bytes, 2560);
 	KUNIT_EXPECT_EQ(test, uv_stride_bytes, 2560);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_Y_BASE_OFFSET / 4],
@@ -18061,6 +18165,7 @@ static void rk_rga3_dst_offset_emit_kunit(struct kunit *test)
 	memset(cmd, 0, sizeof(cmd));
 	task.dst.compact_mode = 0;
 	task.dst.is_10b_endian = 0;
+	task.dst.vir_w = 1600; /* 1280 compact pixels, byte stride */
 	job.cmd_ready = false;
 	type = 0;
 
@@ -18075,8 +18180,8 @@ static void rk_rga3_dst_offset_emit_kunit(struct kunit *test)
 
 	y_stride_bytes = cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4] << 2;
 	uv_stride_bytes = cmd[RK_RGA3_WR_PL_VIR_STRIDE_OFFSET / 4] << 2;
-	KUNIT_EXPECT_EQ(test, y_stride_bytes, 1280U);
-	KUNIT_EXPECT_EQ(test, uv_stride_bytes, 1280U);
+	KUNIT_EXPECT_EQ(test, y_stride_bytes, 1600U);
+	KUNIT_EXPECT_EQ(test, uv_stride_bytes, 1600U);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_Y_BASE_OFFSET / 4],
 			lower_32_bits(task.dst.yrgb_addr +
 				      8 * y_stride_bytes + 64));
@@ -18135,12 +18240,14 @@ static void rk_rga3_ffmpeg_p210_emit_kunit(struct kunit *test)
 
 	task.src.compact_mode = RK_RGA_10BIT_INCOMPACT;
 	task.src.is_10b_endian = 1;
+	rk_rga_kunit_img_10b_stride(&task.src); /* 1920 px -> 3840 bytes */
 	task.dst.act_w = 640;
 	task.dst.act_h = 360;
 	task.dst.x_offset = 32;
 	task.dst.y_offset = 7;
 	task.dst.compact_mode = RK_RGA_10BIT_INCOMPACT;
 	task.dst.is_10b_endian = 1;
+	rk_rga_kunit_img_10b_stride(&task.dst); /* 1280 px -> 2560 bytes */
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
@@ -18155,9 +18262,9 @@ static void rk_rga3_ffmpeg_p210_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WR_CTRL_OFFSET / 4] &
 			  RK_RGA3_WR_ENDIAN_MODE);
 
-	y_stride_bytes = (cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4] << 2) * 2;
-	uv_stride_bytes =
-		(cmd[RK_RGA3_WR_PL_VIR_STRIDE_OFFSET / 4] << 2) * 2;
+	/* 10-bit vir_w is the byte stride: programmed literally. */
+	y_stride_bytes = cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4] << 2;
+	uv_stride_bytes = cmd[RK_RGA3_WR_PL_VIR_STRIDE_OFFSET / 4] << 2;
 	KUNIT_EXPECT_EQ(test, y_stride_bytes, 2560U);
 	KUNIT_EXPECT_EQ(test, uv_stride_bytes, 2560U);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_Y_BASE_OFFSET / 4],
@@ -18601,14 +18708,11 @@ rk_rga2_validate_raster_strides(const struct rga_img_info_t *img,
 		return ret;
 
 	/*
-	 * RGA2's legacy compact-10 ABI treats vir_w as a byte stride even
-	 * though the common image layout describes packed 10-bit pixels.
-	 * Preserve that ABI; the row-based layout remains conservative for
-	 * these imports.
+	 * The common layout now shares RGA2's legacy byte-stride semantics
+	 * for raster 10-bit vir_w, so 10-bit images take the same exact
+	 * stride comparison as every other format (rejecting strides whose
+	 * 4-byte hardware alignment would pad past a tightly sized import).
 	 */
-	if (fmt->yuv10)
-		return 0;
-
 	switch (img->format) {
 	case RK_RGA_FORMAT_BPP1:
 	case RK_RGA_FORMAT_BPP2:
@@ -18641,12 +18745,10 @@ rk_rga2_validate_virtual_row_strides(
 	const struct rk_rga2_format_info *fmt)
 {
 	/*
-	 * RGA2's compact-10 ABI defines vir_w as the emitted byte stride,
-	 * unlike the common pixel-width layout used by other formats.
+	 * The common validator now implements the byte-stride semantics for
+	 * raster 10-bit vir_w (including the active-window byte fit), so
+	 * RGA2 needs no special case.
 	 */
-	if (fmt->yuv10)
-		return img->vir_w > RK_RGA_MAX_BYTE_STRIDE ? -EINVAL : 0;
-
 	return rk_rga_validate_virtual_row_strides(img);
 }
 
@@ -19289,14 +19391,16 @@ static int rk_rga3_emit_wr(struct rk_rga_job *job,
 			if (dst_fmt->yuv_sp) {
 				if (dst_fmt->yuv10 &&
 				    !rk_rga_img_yuv10_compact(&task->dst)) {
+					/*
+					 * x_offset is in pixels; incompact
+					 * rows carry 16-bit containers.  The
+					 * row strides need no scaling: 10-bit
+					 * vir_w already IS the byte stride
+					 * (legacy BSP ABI) and feeds
+					 * y/uv_stride_bytes literally.
+					 */
 					if (check_mul_overflow(x_offset, 2U,
 							       &x_offset_bytes))
-						return -EOVERFLOW;
-					if (check_mul_overflow(y_stride_bytes, 2U,
-							       &y_stride_bytes))
-						return -EOVERFLOW;
-					if (check_mul_overflow(uv_stride_bytes, 2U,
-							       &uv_stride_bytes))
 						return -EOVERFLOW;
 				} else {
 					x_offset_bytes = x_offset;
