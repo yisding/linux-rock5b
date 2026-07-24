@@ -273,6 +273,14 @@ Implemented
   unsupported pattern operations, and supports the 8-bit RGB/YUV plus
   semiplanar 10-bit YUV formats exposed by common ``librga`` and
   ``ffmpeg-rockchip`` blit/scale/convert users.
+  For RASTER 10-bit semiplanar images ``vir_w`` carries the row stride in
+  **bytes** (the legacy BSP contract "width_stride equals byte_stride" that
+  ``librga``'s legacy blit path and the JeffyCN GStreamer plugin rely on):
+  compact NV15/NV20 pack 10 bits per pixel, incompact P010/P210 carry 16-bit
+  containers, and both register writers program the value literally.  The
+  active window's rows, in bytes, must fit inside ``vir_w``.  TILE and FBC
+  10-bit images keep the pixel-count ``vir_w`` convention (their stride math
+  scales ``vir_w`` itself); ``act_w``/``x_offset`` are always pixels.
   For RGB-to-YUV BT.709 limited conversion, RGA3 accepts the exact
   ``full_csc`` enable flag current ``librga`` also supplies for its RGA2E
   workaround, ignores the coefficient block, and emits RGA3's native direct
