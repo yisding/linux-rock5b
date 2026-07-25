@@ -1963,6 +1963,30 @@ static int rk_rga_check_dma_sgt(struct sg_table *sgt, const char *source,
 				      log_errors);
 }
 
+/*
+ * Clear the bookkeeping left behind by an abandoned dma_map_sgtable().  Route B
+ * programs its own IOVA over the same pages, so any residual SG_DMA_SWIOTLB
+ * marking would send later dma_sync_sgtable_*() calls -- and the copy-back in
+ * dma_unmap_sgtable() -- at a bounce buffer the hardware never touches.
+ */
+static void rk_rga_reset_sgt_dma_state(struct sg_table *sgt)
+{
+	struct scatterlist *sg;
+	unsigned int i;
+
+	for_each_sg(sgt->sgl, sg, sgt->orig_nents, i) {
+		sg_dma_address(sg) = DMA_MAPPING_ERROR;
+#ifdef CONFIG_NEED_SG_DMA_LENGTH
+		sg_dma_len(sg) = 0;
+#endif
+#ifdef CONFIG_NEED_SG_DMA_FLAGS
+		sg->dma_flags &= ~(SG_DMA_BUS_ADDRESS | SG_DMA_SWIOTLB);
+#endif
+	}
+
+	sgt->nents = sgt->orig_nents;
+}
+
 static int rk_rga_iommu_prot(struct device *dev, enum dma_data_direction dir)
 {
 	int prot = dev_is_dma_coherent(dev) ? IOMMU_CACHE : 0;
@@ -2337,10 +2361,16 @@ static void rk_rga_unmap_userptr_sgt(struct device *dev, struct sg_table *sgt,
 	if (!sgt)
 		return;
 
+	/*
+	 * The two mappings are mutually exclusive: route B dropped the
+	 * DMA-API mapping before programming its own IOVA, so unmapping it
+	 * again here would be a second unmap of an already-released mapping.
+	 */
 	if (iommu_mapped)
 		rk_rga_unmap_userptr_iommu(domain, iova, iova_size,
 					   page_offset);
-	dma_unmap_sgtable(dev, sgt, DMA_BIDIRECTIONAL, 0);
+	else
+		dma_unmap_sgtable(dev, sgt, DMA_BIDIRECTIONAL, 0);
 
 	sg_free_table(sgt);
 	kfree(sgt);
@@ -22473,14 +22503,26 @@ static int rk_rga_map_userptr_sgt(struct rk_rga_import *import,
 		return 0;
 	}
 
+	/*
+	 * Route B maps the pinned pages under a driver-owned IOVA, so the
+	 * DMA-API mapping is abandoned here.  Release it and clear its
+	 * bookkeeping before remapping: leaving a SWIOTLB-bounced mapping
+	 * alive would point the later dma_sync_sgtable_*() calls at the bounce
+	 * buffer instead of the pages the device reads and writes, and the
+	 * copy-back in dma_unmap_sgtable() would overwrite the device's output
+	 * with a pre-job snapshot.
+	 */
+	dma_unmap_sgtable(dev, sgt, DMA_BIDIRECTIONAL, 0);
+	rk_rga_reset_sgt_dma_state(sgt);
+
 	if (ret && ret != -EOPNOTSUPP && ret != -EOVERFLOW)
-		goto err_unmap_dma;
+		goto err_free_table;
 
 	atomic_inc(&rk_rga.route_b_attempt_count);
 	ret = rk_rga_map_userptr_sgt_iommu(import, dev, sgt, iova_out,
 					   domain_out, iova_size_out);
 	if (ret)
-		goto err_unmap_dma;
+		goto err_free_table;
 
 	atomic_inc(&rk_rga.route_b_ok_count);
 	atomic_inc(&rk_rga.route_b_active_count);
@@ -22491,8 +22533,6 @@ static int rk_rga_map_userptr_sgt(struct rk_rga_import *import,
 
 	return 0;
 
-err_unmap_dma:
-	dma_unmap_sgtable(dev, sgt, DMA_BIDIRECTIONAL, 0);
 err_free_table:
 	sg_free_table(sgt);
 err_free_sgt:
