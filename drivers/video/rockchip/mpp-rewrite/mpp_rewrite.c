@@ -2144,23 +2144,38 @@ static int rk_mpp_trans_fd_to_iova(struct rk_mpp_session *session,
 		rk_mpp_import_put(import);
 	}
 
+	/* Usability of the CCU/DMA state must be sampled under hw_lock. */
 	mutex_lock(&srv->hw_lock);
 	if (!rk_mpp_hw_usable(map_hw) ||
 	    !map_hw->match->contributes_support ||
 	    map_hw->match->type != session->client_type ||
 	    !rk_mpp_hw_ccu_online_locked(srv, map_hw) ||
 	    !rk_mpp_rkvdec2_hard_ccu_dma_ready_locked(srv, map_hw)) {
+		mutex_unlock(&srv->hw_lock);
 		ret = -ENODEV;
-		goto unlock_hw;
+		goto put_map_hw;
 	}
+	mutex_unlock(&srv->hw_lock);
+
+	/*
+	 * Publish the translated IOVAs with no driver-global lock held.  A
+	 * user page fault here is unbounded (uffd-wp, a FUSE-backed mapping, a
+	 * swap-in), and srv->hw_lock gates job admission and hardware
+	 * completion for every session on the device.  session->
+	 * explicit_map_lock is still held, so a racing RELEASE_FD cannot
+	 * unmap an IOVA before it is returned.
+	 */
+	if (copy_to_user(req->data, data, req->size)) {
+		ret = -EINVAL;
+		goto put_map_hw;
+	}
+
 	mutex_lock(&session->lock);
 	if (session->state_seq != state_seq) {
 		ret = -ECANCELED;
 	} else if (session->explicit_map_dev &&
 		   session->explicit_map_dev != map_hw->dev) {
 		ret = -ENODEV;
-	} else if (copy_to_user(req->data, data, req->size)) {
-		ret = -EINVAL;
 	} else {
 		if (!session->explicit_map_dev)
 			session->explicit_map_dev = get_device(map_hw->dev);
@@ -2168,8 +2183,6 @@ static int rk_mpp_trans_fd_to_iova(struct rk_mpp_session *session,
 	}
 	mutex_unlock(&session->lock);
 
-unlock_hw:
-	mutex_unlock(&srv->hw_lock);
 put_map_hw:
 	rk_mpp_hw_put(map_hw);
 unlock_explicit_map:
