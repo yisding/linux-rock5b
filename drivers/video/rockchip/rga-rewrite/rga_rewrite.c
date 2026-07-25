@@ -2589,35 +2589,25 @@ static int rk_rga_row_layout(u32 width, u32 height, size_t multiplier,
 	return 0;
 }
 
-static bool rk_rga_img_is_raster(const struct rga_img_info_t *img)
-{
-	return !img->rd_mode || img->rd_mode == RK_RGA_RASTER_MODE;
-}
-
 static int rk_rga_yuv10_plane_layout(const struct rga_img_info_t *img,
 				     u32 height, size_t *stride, size_t *size)
 {
 	/*
-	 * RASTER 10-bit vir_w is the BYTE stride: the legacy BSP ABI
-	 * contract ("width_stride equals byte_stride") that librga and the
-	 * JeffyCN GStreamer plugin rely on, and that both the RGA2 and RGA3
-	 * register writers here already program literally (pixel_width 1).
+	 * 10-bit vir_w is the BYTE stride: the legacy BSP ABI contract
+	 * ("width_stride equals byte_stride") that librga and the JeffyCN
+	 * GStreamer plugin rely on, and that both the RGA2 and RGA3 register
+	 * writers here already program literally (pixel_width 1).
 	 *
-	 * TILE keeps the pixel convention (the librga tile contract and the
-	 * tile stride math scale vir_w themselves): incompact P010/P210
-	 * rows carry 16-bit containers (2 bytes per pixel), compact
-	 * NV15/NV20 rows pack 10 bits per pixel. Round each row
-	 * independently so fractional bytes cannot make the following plane
-	 * overlap the last row.
+	 * This holds for RASTER and TILE alike. The BSP derives both strides
+	 * from vir_w * pixel_width (rga3_reg_info.c), and pixel_width stays 1
+	 * for every 10-bit format -- the extra * 8 in the TILE expression is
+	 * the eight-lines-per-tile-block factor, not a pixel-depth scale. Its
+	 * rga_convert_addr() likewise offsets the UV plane by a flat
+	 * vir_w * vir_h for every mode. Only the compressed modes carry a
+	 * pixel-count vir_w, and they never reach here: rk_rga_img_layout()
+	 * dispatches FBC/RKFBC/AFBC32x8 to their own layout helpers first.
 	 */
-	if (rk_rga_img_is_raster(img))
-		return rk_rga_row_layout(img->vir_w, height, 1, 1,
-					 stride, size);
-	if (img->compact_mode == RK_RGA_10BIT_INCOMPACT)
-		return rk_rga_row_layout(img->vir_w, height, 2, 1,
-					 stride, size);
-	return rk_rga_row_layout(img->vir_w, height, 10, 8,
-				 stride, size);
+	return rk_rga_row_layout(img->vir_w, height, 1, 1, stride, size);
 }
 
 static int rk_rga_bpp_layout_size(const struct rga_img_info_t *img,
@@ -2981,10 +2971,12 @@ rk_rga_validate_virtual_row_strides(const struct rga_img_info_t *img)
 		size_t bytes;
 		u32 act_end;
 
-		if (!rk_rga_img_is_raster(img)) {
+		if (rk_rga_img_single_buffer_compressed(img)) {
 			/*
-			 * Pixel-convention modes (TILE/FBC): bound the
-			 * uncompressed byte rows the capability describes.
+			 * Only the compressed modes carry a pixel-count
+			 * vir_w: their payload strides apply the format's
+			 * bytes-per-pixel to it. Bound the uncompressed byte
+			 * rows the capability describes.
 			 */
 			if (rk_rga_img_yuv10_compact(img))
 				bytes = DIV_ROUND_UP((size_t)img->vir_w * 10,
@@ -2995,7 +2987,8 @@ rk_rga_validate_virtual_row_strides(const struct rga_img_info_t *img)
 		}
 
 		/*
-		 * RASTER 10-bit vir_w is the BYTE stride (legacy BSP ABI).
+		 * RASTER and TILE 10-bit vir_w is the BYTE stride (legacy
+		 * BSP ABI).
 		 * The generic act/vir comparison in the per-core validators
 		 * compares pixels against bytes for these images, so
 		 * additionally require the active window's rows, in bytes,
@@ -7303,23 +7296,21 @@ static int rk_rga3_validate_tile_image(const struct rga_img_info_t *img,
 	if (input && ((img->vir_w | img->vir_h) & 0xf))
 		return -EINVAL;
 
-	if (rk_rga_format_is_yuv10(img->format)) {
-		/*
-		 * The 10-bit semiplanar tile contract requires a 64-pixel
-		 * width stride and compact packing. RGA3's non-raster
-		 * encoding has no incompact TILE representation.
-		 */
-		if (!rk_rga_img_yuv10_compact(img))
-			return -EOPNOTSUPP;
-		if (img->vir_w & 0x3f)
-			return -EINVAL;
-	} else if (img->vir_w & 0xf) {
-		/*
-		 * The 8-bit semiplanar tile contract requires a 16-pixel
-		 * width stride.
-		 */
+	/* RGA3's non-raster encoding has no incompact TILE representation. */
+	if (rk_rga_format_is_yuv10(img->format) &&
+	    !rk_rga_img_yuv10_compact(img))
+		return -EOPNOTSUPP;
+
+	/*
+	 * The semiplanar tile contract requires a 16-byte width stride,
+	 * matching RGA3's byte_stride_align. 10-bit vir_w is already a byte
+	 * stride (see rk_rga_yuv10_plane_layout()), so one rule covers both
+	 * depths. librga's own rga_check_align() only ever emits 10-bit
+	 * strides whose byte form is a multiple of 80, so this accepts
+	 * everything current userspace can produce.
+	 */
+	if (img->vir_w & 0xf)
 		return -EINVAL;
-	}
 
 	return 0;
 }
@@ -12504,17 +12495,28 @@ static void rk_rga_layout_yuv10_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, layout.uv_size, pixels * 2);
 	KUNIT_EXPECT_EQ(test, layout.v_size, (size_t)0);
 
-	/* TILE keeps the pixel convention: 64 compact pixels pack 80 bytes. */
-	img.vir_w = 64;
+	/*
+	 * TILE 10-bit vir_w is a byte stride too: the BSP derives the TILE
+	 * register stride from vir_w * pixel_width * 8 with pixel_width 1
+	 * (the * 8 is the lines-per-tile-block factor), and offsets the UV
+	 * plane by a flat vir_w * vir_h. 80 bytes = 64 compact pixels.
+	 */
+	img.vir_w = 80;
 	img.vir_h = 64;
 	img.rd_mode = RK_RGA_TILE_MODE;
 	img.format = RK_RGA_FORMAT_YCBCR_420_SP_10B;
 	img.compact_mode = 0;
 	KUNIT_ASSERT_EQ(test, rk_rga_img_layout(&img, &layout), 0);
 	KUNIT_EXPECT_EQ(test, layout.yrgb_stride, (size_t)80);
-	KUNIT_EXPECT_EQ(test, layout.yrgb_size, pixels * 10 / 8);
-	/* Regression guard against byte-literal rows leaking into TILE. */
-	KUNIT_EXPECT_NE(test, layout.yrgb_size, pixels);
+	KUNIT_EXPECT_EQ(test, layout.yrgb_size, (size_t)80 * 64);
+	KUNIT_EXPECT_EQ(test, layout.uv_stride, (size_t)80);
+	KUNIT_EXPECT_EQ(test, layout.uv_size, (size_t)80 * 32);
+	/*
+	 * Regression guard against the pixel convention leaking back in,
+	 * which offset the UV plane 25% past the row the register writer
+	 * programs.
+	 */
+	KUNIT_EXPECT_NE(test, layout.yrgb_size, (size_t)80 * 64 * 10 / 8);
 }
 
 static void rk_rga_raster_row_layout_kunit(struct kunit *test)
