@@ -722,21 +722,18 @@ void rga_convert_addr(struct rga_img_info_t *img, bool before_vir_get_channel)
 	if (img->rd_mode != RGA_FBC_MODE || before_vir_get_channel) {
 		if (rga_is_yuv10bit_format(img->format)) {
 			/*
-			 * 10-bit semi-planar rows are byte-literal: incompact
-			 * P010/P210 rows carry 16-bit containers (2 bytes per
-			 * pixel), compact NV15/NV20 rows pack 10 bits per
-			 * pixel. The 1 byte/pixel offset below would place the
-			 * UV plane inside the Y plane.
+			 * 10-bit vir_w already IS the row size in bytes (the
+			 * legacy BSP ABI contract honoured by the RGA2 writer
+			 * and restored on RGA3 by commit 138f0de2c972), so the
+			 * Y plane is vir_w * vir_h bytes for compact NV15/NV20
+			 * and incompact P010/P210 alike.  Scaling by the pixel
+			 * depth here (x10/8 or x2) double-applies it and pushes
+			 * the UV plane past the true one -- reading chroma from
+			 * the wrong offset, and running off the end of a
+			 * tightly sized surface.
 			 */
-			uint64_t y_bytes;
-
-			if (img->compact_mode == RGA_10BIT_INCOMPACT)
-				y_bytes = (uint64_t)img->vir_w * img->vir_h * 2;
-			else
-				y_bytes =
-					(uint64_t)img->vir_w * img->vir_h * 10 / 8;
-
-			img->uv_addr = img->yrgb_addr + y_bytes;
+			img->uv_addr = img->yrgb_addr +
+				       (u64)img->vir_w * img->vir_h;
 			/* All 10-bit formats are semi-planar: no third plane. */
 			img->v_addr = 0;
 			return;
