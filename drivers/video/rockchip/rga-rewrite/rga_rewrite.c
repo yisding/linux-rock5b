@@ -1706,11 +1706,34 @@ static void rk_rga_refresh_hw_versions(void)
 
 static void rk_rga_hw_put(struct rk_rga_hw *hw)
 {
+	unsigned long flags;
+
 	if (!hw)
 		return;
 
+	/*
+	 * Publish the drop and the wake atomically.  rk_rga_hw_remove() waits
+	 * for the last reference and then lets devres free the hardware
+	 * object, and wait_event() evaluates its predicate before it ever
+	 * touches hw->idle -- so both the drop and the wake must be invisible
+	 * to rk_rga_hw_unreferenced() until this critical section ends.
+	 */
+	spin_lock_irqsave(&hw->job_lock, flags);
 	refcount_dec(&hw->refs);
 	wake_up(&hw->idle);
+	spin_unlock_irqrestore(&hw->job_lock, flags);
+}
+
+static bool rk_rga_hw_unreferenced(struct rk_rga_hw *hw)
+{
+	unsigned long flags;
+	bool idle;
+
+	spin_lock_irqsave(&hw->job_lock, flags);
+	idle = refcount_read(&hw->refs) == 1;
+	spin_unlock_irqrestore(&hw->job_lock, flags);
+
+	return idle;
 }
 
 static int rk_rga_hw_power_on_internal(struct rk_rga_hw *hw, bool count_cycle)
@@ -4703,8 +4726,14 @@ static void rk_rga_session_end_job_dispatch(struct rk_rga_session *session)
 	WARN_ON_ONCE(!session->dispatching_jobs);
 	if (session->dispatching_jobs)
 		session->dispatching_jobs--;
-	spin_unlock_irqrestore(&session->job_lock, flags);
+	/*
+	 * Wake under job_lock.  rk_rga_release() frees the session as soon as
+	 * rk_rga_session_dispatches_idle() observes the drop, and wait_event()
+	 * evaluates that predicate before it ever touches job_wait, so a wake
+	 * issued after the unlock can land on freed memory.
+	 */
 	wake_up_all(&session->job_wait);
+	spin_unlock_irqrestore(&session->job_lock, flags);
 }
 
 static void rk_rga_session_mark_closing(struct rk_rga_session *session)
@@ -4743,13 +4772,20 @@ static void rk_rga_job_unlink_session(struct rk_rga_job *job)
 		job->session_linked = false;
 		job->session = NULL;
 		linked = true;
+		/*
+		 * Wake under job_lock.  rk_rga_release() frees the session as
+		 * soon as rk_rga_session_jobs_empty() observes the empty list,
+		 * and wait_event() evaluates that predicate before it ever
+		 * touches job_wait, so a wake issued after the unlock can land
+		 * on freed memory.  rk_rga_job_put() must stay outside the
+		 * lock because rk_rga_job_free() can sleep.
+		 */
+		wake_up_all(&session->job_wait);
 	}
 	spin_unlock_irqrestore(&session->job_lock, flags);
 
-	if (linked) {
-		wake_up_all(&session->job_wait);
+	if (linked)
 		rk_rga_job_put(job);
-	}
 }
 
 static void rk_rga_job_forget_release_fence_fd(struct rk_rga_job *job, int fd)
@@ -13298,6 +13334,7 @@ static void rk_rga_dma_mapping_hw_lifetime_kunit(struct kunit *test)
 	dma_addr_t iova;
 	u32 import_count = 0;
 
+	spin_lock_init(&hw.job_lock);
 	refcount_set(&hw.refs, 2);
 	init_waitqueue_head(&hw.idle);
 	import = kzalloc_obj(*import, GFP_KERNEL);
@@ -13983,6 +14020,8 @@ static void rk_rga_mixed_task_core_handoff_kunit(struct kunit *test)
 	rga2->core_mask = BIT(2);
 	spin_lock_init(&rga3->job_lock);
 	spin_lock_init(&rga2->job_lock);
+	init_waitqueue_head(&rga3->idle);
+	init_waitqueue_head(&rga2->idle);
 	refcount_set(&rga3->refs, 2);
 	refcount_set(&rga2->refs, 1);
 	list_add_tail(&rga3->node, &hw_list);
@@ -14454,6 +14493,7 @@ static void rk_rga_iommu_fault_generation_kunit(struct kunit *test)
 	bool queued;
 
 	spin_lock_init(&hw.job_lock);
+	init_waitqueue_head(&hw.idle);
 	mutex_init(&hw.run_lock);
 	INIT_DELAYED_WORK(&hw.timeout_work, rk_rga_hw_timeout_work);
 	INIT_WORK(&hw.iommu_fault_work, rk_rga_hw_iommu_fault_work);
@@ -14489,6 +14529,7 @@ static void rk_rga_timeout_target_replacement_kunit(struct kunit *test)
 	struct rk_rga_job replacement = {};
 
 	spin_lock_init(&hw.job_lock);
+	init_waitqueue_head(&hw.idle);
 	mutex_init(&hw.run_lock);
 	INIT_DELAYED_WORK(&hw.timeout_work, rk_rga_hw_timeout_work);
 	refcount_set(&target.refs, 1);
@@ -23302,7 +23343,7 @@ static void rk_rga_hw_remove(struct platform_device *pdev)
 	rk_rga_hw_abort_jobs(hw, -ENODEV);
 	rk_rga_detach_hw_imports(hw);
 	rk_rga_abort_invalidated_pending_acquire_jobs(-ENODEV);
-	wait_event(hw->idle, refcount_read(&hw->refs) == 1);
+	wait_event(hw->idle, rk_rga_hw_unreferenced(hw));
 	/* The fail-fast handler makes balancing safe before devres frees the IRQ. */
 	rk_rga_hw_restore_irq_depth(hw);
 	devm_free_irq(&pdev->dev, hw->irq, hw);
