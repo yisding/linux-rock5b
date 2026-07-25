@@ -3120,7 +3120,20 @@ static void rk_mpp_rkvdec2_release_link_table(struct rk_mpp_job *job)
 		ccu_empty = rk_mpp_rkvdec2_ccu_job_del(job, ccu);
 		if (!ccu_empty)
 			rk_mpp_rkvdec2_transfer_powered_ccu_cores(job, ccu);
-		if (ccu_empty && rk_mpp_rkvdec2_ccu_regs_ready(ccu))
+		/*
+		 * A terminally isolated coordinator has already had its
+		 * clocks and runtime-PM references drained, so its register
+		 * window is no longer accessible -- and it is already stopped,
+		 * which is exactly what this write would assert.  Mirror the
+		 * guard rk_mpp_rkvdec2_force_stop_ccu() applies before its own
+		 * MMIO.  power_count is defence in depth: every job that sets
+		 * rkvdec_ccu_started holds a coordinator power reference until
+		 * after this point.
+		 */
+		if (ccu_empty && !READ_ONCE(ccu->terminally_stopped) &&
+		    !READ_ONCE(ccu->terminal_power_drained) &&
+		    atomic_read(&ccu->power_count) > 0 &&
+		    rk_mpp_rkvdec2_ccu_regs_ready(ccu))
 			writel_relaxed(0,
 				       ccu->regs[0] +
 				       RK_MPP_RKVDEC_CCU_WORK_BASE);
