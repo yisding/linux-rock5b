@@ -10160,6 +10160,18 @@ static void rk_mpp_hw_abort_job(struct rk_mpp_job *job)
 		mutex_lock(&ccu->ccu_recovery_lock);
 	mutex_lock(&hw->run_lock);
 	active_owned = rk_mpp_hw_active_job_is(hw, job);
+	if (!active_owned) {
+		/*
+		 * The synchronous drain above had to run before run_lock (the
+		 * timeout worker takes run_lock), so it cleared the watchdog
+		 * slot for whatever job owns this core.  If that job is not
+		 * ours -- an unrelated session's job queued to or running on
+		 * the same core -- restore its watchdog before leaving, or its
+		 * software timeout is silently gone for the rest of its life.
+		 * This is a no-op when the core has no active job.
+		 */
+		rk_mpp_hw_schedule_timeout(hw);
+	}
 	hard_ccu_abort = active_owned && ccu && job->rkvdec_ccu_started &&
 			 job->rkvdec_ccu == ccu;
 	/*
