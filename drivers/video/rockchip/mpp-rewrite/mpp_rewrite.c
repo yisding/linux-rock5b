@@ -11600,6 +11600,7 @@ static int rk_mpp_rkvenc2_submit(struct rk_mpp_job *job)
 	struct rk_mpp_hw *hw = job->hw;
 	u32 start_value = 0;
 	bool start_seen;
+	bool irq_disabled;
 	int ret;
 
 	if (hw->irq < 0 || !hw->regs[0])
@@ -11664,9 +11665,27 @@ static int rk_mpp_rkvenc2_submit(struct rk_mpp_job *job)
 
 err_power_off:
 	rk_mpp_rkvenc2_dchs_release(job);
+	/*
+	 * The encoder's hard IRQ handler takes a temporary job reference and
+	 * reads core MMIO.  Drain it before gating the clocks or dropping the
+	 * active-slot reference: otherwise it can touch a powered-off register
+	 * window, or its put can be the last one and run the sleeping dma-buf
+	 * teardown from hardirq context.  _nosync is required -- disable_irq()
+	 * would wait for the threaded handler, which takes the run_lock we
+	 * already hold.
+	 */
+	irq_disabled = rk_mpp_hw_disable_irq_nosync(hw);
+	rk_mpp_hw_synchronize_hardirq(hw);
 	rk_mpp_hw_power_off(hw);
-err_clear_active:
 	rk_mpp_hw_clear_active_job(hw, job, NULL);
+	rk_mpp_hw_enable_irq(hw, irq_disabled);
+	mutex_unlock(&hw->run_lock);
+	return ret;
+err_clear_active:
+	irq_disabled = rk_mpp_hw_disable_irq_nosync(hw);
+	rk_mpp_hw_synchronize_hardirq(hw);
+	rk_mpp_hw_clear_active_job(hw, job, NULL);
+	rk_mpp_hw_enable_irq(hw, irq_disabled);
 err_unlock:
 	mutex_unlock(&hw->run_lock);
 	return ret;
