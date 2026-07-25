@@ -11485,9 +11485,14 @@ static void rk_rga_legacy_blit_async_acquire_kunit(struct kunit *test)
 
 	uncopied = copy_from_user(&task, task_user, sizeof(task));
 	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
-	KUNIT_EXPECT_EQ(test, task.handle_flag & 1, 0U);
-	KUNIT_EXPECT_EQ(test, task.src.yrgb_addr, src_import->iova);
-	KUNIT_EXPECT_EQ(test, task.dst.yrgb_addr, dst_import->iova);
+	/*
+	 * The async reply is the caller's own request with only out_fence_fd
+	 * filled in: handle_flag and the handle-shaped addresses come back
+	 * exactly as submitted, and no kernel-resolved IOVA is disclosed.
+	 */
+	KUNIT_EXPECT_EQ(test, task.handle_flag & 1, 1U);
+	KUNIT_EXPECT_EQ(test, task.src.yrgb_addr, 11ULL);
+	KUNIT_EXPECT_EQ(test, task.dst.yrgb_addr, 12ULL);
 	release_fd = task.out_fence_fd;
 	KUNIT_ASSERT_GE(test, release_fd, 0);
 
@@ -23204,6 +23209,7 @@ static long rk_rga_ioctl_blit(unsigned long arg, struct rk_rga_session *session,
 	struct rk_rga_task_imports *task_imports = NULL;
 	struct sync_file *release_sync_file = NULL;
 	struct rga_req *task;
+	struct rga_req *reply = NULL;
 	u32 *gauss_coeffs = NULL;
 	int release_fence_fd = -1;
 	u32 acquire_fd_count = 0;
@@ -23216,8 +23222,26 @@ static long rk_rga_ioctl_blit(unsigned long arg, struct rk_rga_session *session,
 	if (IS_ERR(task))
 		return PTR_ERR(task);
 
+	if (sync_mode == RGA_BLIT_ASYNC) {
+		/*
+		 * Snapshot the request before rk_rga_prepare_tasks_locked()
+		 * resolves handles in place.  The legacy async reply carries
+		 * the caller's own request back with only out_fence_fd filled
+		 * in: replying out of job->tasks instead would hand userspace
+		 * the kernel-resolved DMA addresses and would race the
+		 * dispatcher, which rewrites those same fields when the job
+		 * starts on a core.
+		 */
+		reply = kmemdup(task, sizeof(*task), GFP_KERNEL);
+		if (!reply) {
+			kfree(task);
+			return -ENOMEM;
+		}
+	}
+
 	ret = rk_rga_copy_gauss_coeffs(task, 1, &gauss_coeffs);
 	if (ret) {
+		kfree(reply);
 		kfree(task);
 		return ret;
 	}
@@ -23226,6 +23250,7 @@ static long rk_rga_ioctl_blit(unsigned long arg, struct rk_rga_session *session,
 			      GFP_KERNEL);
 	if (!acquire_fds) {
 		kfree(gauss_coeffs);
+		kfree(reply);
 		kfree(task);
 		return -ENOMEM;
 	}
@@ -23264,6 +23289,7 @@ static long rk_rga_ioctl_blit(unsigned long arg, struct rk_rga_session *session,
 	kfree(task);
 	if (ret) {
 		kfree(acquire_fds);
+		kfree(reply);
 		return ret;
 	}
 
@@ -23274,9 +23300,9 @@ static long rk_rga_ioctl_blit(unsigned long arg, struct rk_rga_session *session,
 		if (release_fence_fd < 0 || !release_sync_file) {
 			ret = -EIO;
 		} else {
-			job->tasks[0].out_fence_fd = release_fence_fd;
-			if (copy_to_user((void __user *)arg, job->tasks,
-					 sizeof(*job->tasks))) {
+			reply->out_fence_fd = release_fence_fd;
+			if (copy_to_user((void __user *)arg, reply,
+					 sizeof(*reply))) {
 				rk_rga_job_abort_fd(job, release_sync_file);
 				ret = -EFAULT;
 			} else {
@@ -23286,6 +23312,7 @@ static long rk_rga_ioctl_blit(unsigned long arg, struct rk_rga_session *session,
 	}
 	rk_rga_job_put(job);
 	kfree(acquire_fds);
+	kfree(reply);
 
 	return ret;
 }
