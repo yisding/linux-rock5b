@@ -522,6 +522,9 @@
 #define RK_RGA3_SIZE_MASK			0x1fff
 #define RK_RGA3_INPUT_MAX_SIZE			8176
 #define RK_RGA3_OUTPUT_MAX_SIZE			8128
+/* BSP rga3_data input_range/output_range minima: {68, 2}. */
+#define RK_RGA3_MIN_WIDTH			68
+#define RK_RGA3_MIN_HEIGHT			2
 #define RK_RGA_MAX_BYTE_STRIDE			32768
 #define RK_RGA_RASTER_MODE			BIT(0)
 #define RK_RGA_FBC_MODE			BIT(1)
@@ -7033,6 +7036,60 @@ static int rk_rga3_scale_axis(u32 src, u32 dst, u32 *factor, bool *up,
 	return 0;
 }
 
+/*
+ * RGA3's scaler covers 1/8x..8x per axis (BSP rga_hw_config.c rga3_data
+ * max_upscale_factor / max_downscale_factor = 3); RGA2E covers 1/16x..16x.
+ * Mirror the BSP rga_check_scale() policy gate so out-of-range requests drop
+ * the RGA3 bit from the eligible type mask and fall back to an RGA2 core
+ * instead of being programmed into WIN0/WIN1 SCL_FAC.  The comparisons are
+ * strict so an exact 8x ratio stays on RGA3, matching the BSP.
+ */
+static int rk_rga3_check_scale_axis(u32 src, u32 dst)
+{
+	if (src > dst && (src >> 3) > dst)
+		return -EOPNOTSUPP;
+	if (dst > src && (src << 3) < dst)
+		return -EOPNOTSUPP;
+
+	return 0;
+}
+
+static int rk_rga3_check_scale(const struct rga_req *task,
+			       const struct rk_rga3_bitblt_profile *profile)
+{
+	u32 src_w = task->src.act_w;
+	u32 src_h = task->src.act_h;
+	u32 dst_w = task->dst.act_w;
+	u32 dst_h = task->dst.act_h;
+	int ret;
+
+	/*
+	 * Match the pairing rk_rga3_emit_read_window() uses: ROT_90 swaps the
+	 * source window, and swaps the destination too except for the
+	 * pattern-blend source window (rotate_dst_size == false).  The WIN0
+	 * background/pattern window is always 1:1 because validation already
+	 * pins pat.act_* to dst.act_*, so only the source needs checking.
+	 */
+	if (profile->rotate_flags & RK_RGA3_ROT_BIT_ROT_90) {
+		u32 tmp = src_w;
+
+		src_w = src_h;
+		src_h = tmp;
+
+		if (!profile->pattern_blend) {
+			tmp = dst_w;
+			dst_w = dst_h;
+			dst_h = tmp;
+		}
+	}
+
+	ret = rk_rga3_check_scale_axis(src_w, dst_w);
+	if (ret)
+		return ret;
+
+	return rk_rga3_check_scale_axis(src_h, dst_h);
+}
+
 static u32 rk_rga3_y2r_mode(u8 yuv2rgb_mode)
 {
 	switch (yuv2rgb_mode) {
@@ -7188,6 +7245,17 @@ static int rk_rga3_validate_image(const struct rga_img_info_t *img, bool write)
 
 	if (!img->act_w || !img->act_h || !img->vir_w || !img->vir_h)
 		return -EINVAL;
+
+	/*
+	 * RGA3 declares a 68x2 minimum active window (BSP rga_hw_config.c
+	 * rga3_data input_range/output_range).  Report it as unsupported
+	 * rather than invalid so small windows fall back to RGA2 (min 2x2)
+	 * instead of failing the ioctl.  Only the active size needs the test:
+	 * the offsets are unsigned and only add, so the post-offset extent
+	 * cannot drop below a minimum the active size already cleared.
+	 */
+	if (img->act_w < RK_RGA3_MIN_WIDTH || img->act_h < RK_RGA3_MIN_HEIGHT)
+		return -EOPNOTSUPP;
 
 	if (check_add_overflow((u32)img->x_offset, (u32)img->act_w, &width) ||
 	    check_add_overflow((u32)img->y_offset, (u32)img->act_h, &height))
@@ -8408,7 +8476,7 @@ static struct rga_req rk_rga_librga_side_border_task(u16 src_x, u16 dst_x,
 		.rotate_mode = reflect ? 2 : 0,
 	};
 
-	img.vir_w = 64;
+	img.vir_w = 320;
 	task.src = img;
 	task.dst = img;
 	task.src.x_offset = src_x;
@@ -13278,9 +13346,10 @@ static void rk_rga_zero_iova_import_binding_kunit(struct kunit *test)
 	 * IOVA zero remains present.
 	 */
 	task.render_mode = RK_RGA_RENDER_BITBLT;
-	task.src = rk_rga_kunit_img(0, RK_RGA_FORMAT_RGBA_8888, 64, 64);
-	task.dst = rk_rga_kunit_img(0, RK_RGA_FORMAT_RGBA_8888, 64, 64);
-	task.pat = rk_rga_kunit_img(0, RK_RGA_FORMAT_RGBA_8888, 64, 64);
+	/* 128 wide: at/above RGA3's declared 68-pixel minimum window. */
+	task.src = rk_rga_kunit_img(0, RK_RGA_FORMAT_RGBA_8888, 128, 64);
+	task.dst = rk_rga_kunit_img(0, RK_RGA_FORMAT_RGBA_8888, 128, 64);
+	task.pat = rk_rga_kunit_img(0, RK_RGA_FORMAT_RGBA_8888, 128, 64);
 	task_imports.src.yrgb = &y;
 	task_imports.dst.yrgb = &dst;
 	task_imports.pat.yrgb = NULL;
@@ -15745,10 +15814,14 @@ static void rk_rga3_librga_side_border_kunit(struct kunit *test)
 	tasks = kunit_kcalloc(test, job.task_count, sizeof(*tasks),
 			      GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, tasks);
-	tasks[0] = rk_rga_librga_side_border_task(16, 0, 16, true, 0);
-	tasks[1] = rk_rga_librga_side_border_task(32, 48, 16, true, 0);
-	tasks[2] = rk_rga_librga_side_border_task(32, 0, 16, false, 0);
-	tasks[3] = rk_rga_librga_side_border_task(16, 48, 16, false, 0);
+	/*
+	 * Border strips are 80 px wide inside a 320 px row: narrower windows
+	 * are below RGA3's declared 68-pixel minimum and belong on RGA2.
+	 */
+	tasks[0] = rk_rga_librga_side_border_task(80, 0, 80, true, 0);
+	tasks[1] = rk_rga_librga_side_border_task(160, 240, 80, true, 0);
+	tasks[2] = rk_rga_librga_side_border_task(160, 0, 80, false, 0);
+	tasks[3] = rk_rga_librga_side_border_task(80, 240, 80, false, 0);
 	job.tasks = tasks;
 
 	for (u32 i = 0; i < job.task_count; i++) {
@@ -15799,7 +15872,7 @@ static void rk_rga3_librga_side_border_kunit(struct kunit *test)
 									 0));
 	}
 
-	task = rk_rga_librga_side_border_task(16, 48, 16, true, BIT(2));
+	task = rk_rga_librga_side_border_task(80, 240, 80, true, BIT(2));
 	single_job = (struct rk_rga_job) {
 		.tasks = &task,
 		.task_count = 1,
@@ -15818,15 +15891,16 @@ static void rk_rga3_librga_side_border_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&single_job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 
-	task = rk_rga_librga_side_border_task(16, 20, 16, true, 0);
+	/* Overlapping in-place source and destination windows stay rejected. */
+	task = rk_rga_librga_side_border_task(80, 100, 80, true, 0);
 	single_job.cmd_ready = false;
-	task.dst.x_offset = 20;
+	task.dst.x_offset = 100;
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&single_job, &type),
 			-EOPNOTSUPP);
 
-	task = rk_rga_librga_side_border_task(16, 48, 16, true, 0);
-	task.dst.act_w = 8;
+	task = rk_rga_librga_side_border_task(80, 240, 80, true, 0);
+	task.dst.act_w = 40;
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&single_job, &type),
 			-EOPNOTSUPP);
@@ -16830,24 +16904,25 @@ static void rk_rga3_tile8x8_alignment_kunit(struct kunit *test)
 					  RK_RGA_FORMAT_YCBCR_420_SP);
 
 	/*
-	 * A 16x2 tight NV12 import is only 48 bytes, while tile writeback
-	 * operates on a complete 8-line block (128 bytes Y + 64 bytes UV).
+	 * An 80x2 tight NV12 import is only 240 bytes, while tile writeback
+	 * operates on a complete 8-line block (640 bytes Y + 320 bytes UV).
+	 * 80 is 16-aligned and at/above RGA3's 68-pixel minimum window.
 	 */
 	task.src = rk_rga_kunit_img(0x10000000,
-				    RK_RGA_FORMAT_YCBCR_420_SP, 16, 2);
+				    RK_RGA_FORMAT_YCBCR_420_SP, 80, 2);
 	task.dst = rk_rga_kunit_img(0x20000000,
-				    RK_RGA_FORMAT_YCBCR_420_SP, 16, 2);
+				    RK_RGA_FORMAT_YCBCR_420_SP, 80, 2);
 	task.dst.rd_mode = RK_RGA_TILE_MODE;
 	KUNIT_ASSERT_EQ(test, rk_rga_img_layout(&task.dst, &layout), 0);
-	KUNIT_EXPECT_EQ(test, layout.total_size, (size_t)48);
+	KUNIT_EXPECT_EQ(test, layout.total_size, (size_t)240);
 	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile),
 			-EINVAL);
 
 	/* Native tile writeback geometry remains accepted with tight planes. */
 	task.src = rk_rga_kunit_img(0x10000000,
-				    RK_RGA_FORMAT_YCBCR_420_SP, 16, 8);
+				    RK_RGA_FORMAT_YCBCR_420_SP, 80, 8);
 	task.dst = rk_rga_kunit_img(0x20000000,
-				    RK_RGA_FORMAT_YCBCR_420_SP, 16, 8);
+				    RK_RGA_FORMAT_YCBCR_420_SP, 80, 8);
 	task.dst.rd_mode = RK_RGA_TILE_MODE;
 	KUNIT_EXPECT_EQ(test, rk_rga3_validate_bitblt(&task, &profile), 0);
 
@@ -17494,10 +17569,10 @@ static void rk_rga3_display_partial_alpha_blend_kunit(struct kunit *test)
 		.render_mode = RK_RGA_RENDER_BITBLT,
 		.src = rk_rga_kunit_img(0x10000000,
 					RK_RGA_FORMAT_BGRA_8888,
-					64, 48),
+					128, 48),
 		.dst = rk_rga_kunit_img(0x20000000,
 					RK_RGA_FORMAT_BGRA_8888,
-					80, 64),
+					160, 64),
 		.alpha_rop_flag = BIT(0) | BIT(3) | BIT(4) | BIT(9),
 		.PD_mode = RK_RGA_ALPHA_BLEND_SRC_OVER,
 		.feature.global_alpha_en = true,
@@ -17516,13 +17591,14 @@ static void rk_rga3_display_partial_alpha_blend_kunit(struct kunit *test)
 	u32 expected_top_alpha;
 	u32 expected_bottom_alpha;
 
+	/* act_w stays at/above RGA3's declared 68-pixel minimum window. */
 	task.src.x_offset = 8;
 	task.src.y_offset = 6;
-	task.src.act_w = 28;
+	task.src.act_w = 108;
 	task.src.act_h = 20;
 	task.dst.x_offset = 24;
 	task.dst.y_offset = 18;
-	task.dst.act_w = 28;
+	task.dst.act_w = 108;
 	task.dst.act_h = 20;
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
@@ -17532,24 +17608,26 @@ static void rk_rga3_display_partial_alpha_blend_kunit(struct kunit *test)
 
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_Y_BASE_OFFSET / 4],
 			lower_32_bits(task.dst.yrgb_addr));
+	/* Background window aligns act+offset to 16: 108+24 -> 144, 20+18 -> 48. */
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_SRC_SIZE_OFFSET / 4],
-			64U | (48U << 16));
+			144U | (48U << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_ACT_OFF_OFFSET / 4],
 			24U | (18U << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_ACT_SIZE_OFFSET / 4],
-			28U | (20U << 16));
+			108U | (20U << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
-			28U | (20U << 16));
+			108U | (20U << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN1_Y_BASE_OFFSET / 4],
 			lower_32_bits(task.src.yrgb_addr));
+	/* Foreground window is unaligned: 108+8, 20+6. */
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN1_SRC_SIZE_OFFSET / 4],
-			36U | (26U << 16));
+			116U | (26U << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN1_ACT_OFF_OFFSET / 4],
 			8U | (6U << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN1_ACT_SIZE_OFFSET / 4],
-			28U | (20U << 16));
+			108U | (20U << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN1_DST_SIZE_OFFSET / 4],
-			28U | (20U << 16));
+			108U | (20U << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_CTRL_OFFSET / 4],
 			FIELD_PREP(RK_RGA3_OVLP_MODE, 1) |
 			RK_RGA3_OVLP_TOP_ALPHA_EN);
@@ -17558,7 +17636,7 @@ static void rk_rga3_display_partial_alpha_blend_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_Y_BASE_OFFSET / 4],
 			lower_32_bits(task.dst.yrgb_addr));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4],
-			80U);
+			160U);
 
 	expected_top_ctrl =
 		FIELD_PREP(RK_RGA3_ALPHA_COLOR_MODE,
@@ -17601,10 +17679,11 @@ static void rk_rga3_display_rgb565_rotate_kunit(struct kunit *test)
 	enum rk_rga_hw_type type = 0;
 	struct rga_req task = {
 		.render_mode = RK_RGA_RENDER_BITBLT,
+		/* 128 wide: at/above RGA3's declared 68-pixel minimum window. */
 		.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGB_565,
-					64, 32),
+					128, 32),
 		.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_RGB_565,
-					64, 32),
+					128, 32),
 		.rotate_mode = 1,
 		.cosa = -65536,
 		.core = BIT(0),
@@ -17639,13 +17718,13 @@ static void rk_rga3_display_rgb565_rotate_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_Y_BASE_OFFSET / 4],
 			lower_32_bits(task.src.yrgb_addr));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_VIR_STRIDE_OFFSET / 4],
-			32U);
+			64U);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_SRC_SIZE_OFFSET / 4],
-			64U | (32U << 16));
+			128U | (32U << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_ACT_SIZE_OFFSET / 4],
-			64U | (32U << 16));
+			128U | (32U << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
-			64U | (32U << 16));
+			128U | (32U << 16));
 
 	wr_ctrl = cmd[RK_RGA3_WR_CTRL_OFFSET / 4];
 	KUNIT_EXPECT_EQ(test, wr_ctrl & RK_RGA3_WR_PIC_FORMAT,
@@ -17656,7 +17735,7 @@ static void rk_rga3_display_rgb565_rotate_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_Y_BASE_OFFSET / 4],
 			lower_32_bits(task.dst.yrgb_addr));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4],
-			32U);
+			64U);
 }
 
 static void rk_rga2_display_xrgb_rotate_kunit(struct kunit *test)
@@ -19188,6 +19267,10 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 		    task->pat.act_h != task->dst.act_h)
 			return -EOPNOTSUPP;
 	}
+
+	ret = rk_rga3_check_scale(task, profile);
+	if (ret)
+		return ret;
 
 	ret = rk_rga3_format_info(task->src.format, false,
 				  &profile->src_fmt);
