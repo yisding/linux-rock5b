@@ -1303,6 +1303,7 @@ struct rk_rga_hw {
 	struct rk_rga_job *active_job;
 	struct rk_rga_job *timeout_job;
 	u64 active_generation;
+	u64 timeout_generation;
 	u64 iommu_fault_generation;
 	atomic_t irq_disable_depth;
 	u32 queued_jobs;
@@ -5943,7 +5944,8 @@ static int rk_rga3_start_hw(struct rk_rga_hw *hw, struct rk_rga_job *job)
 	return 0;
 }
 
-static struct rk_rga_job *rk_rga_hw_take_timeout_job(struct rk_rga_hw *hw)
+static struct rk_rga_job *rk_rga_hw_take_timeout_job(struct rk_rga_hw *hw,
+						    u64 *generation)
 {
 	struct rk_rga_job *job;
 	unsigned long flags;
@@ -5951,6 +5953,9 @@ static struct rk_rga_job *rk_rga_hw_take_timeout_job(struct rk_rga_hw *hw)
 	spin_lock_irqsave(&hw->job_lock, flags);
 	job = hw->timeout_job;
 	hw->timeout_job = NULL;
+	if (generation)
+		*generation = hw->timeout_generation;
+	hw->timeout_generation = 0;
 	spin_unlock_irqrestore(&hw->job_lock, flags);
 
 	return job;
@@ -5961,7 +5966,7 @@ static void rk_rga_hw_cancel_timeout(struct rk_rga_hw *hw)
 	struct rk_rga_job *job;
 
 	cancel_delayed_work(&hw->timeout_work);
-	job = rk_rga_hw_take_timeout_job(hw);
+	job = rk_rga_hw_take_timeout_job(hw, NULL);
 	rk_rga_job_put(job);
 }
 
@@ -5970,7 +5975,7 @@ static void rk_rga_hw_cancel_timeout_sync(struct rk_rga_hw *hw)
 	struct rk_rga_job *job;
 
 	cancel_delayed_work_sync(&hw->timeout_work);
-	job = rk_rga_hw_take_timeout_job(hw);
+	job = rk_rga_hw_take_timeout_job(hw, NULL);
 	rk_rga_job_put(job);
 }
 
@@ -5986,6 +5991,14 @@ static void rk_rga_hw_schedule_timeout(struct rk_rga_hw *hw,
 		old = hw->timeout_job;
 		hw->timeout_job = job;
 	}
+	/*
+	 * Stamp the activation this watchdog belongs to.  A multi-task job is
+	 * re-dispatched under the same pointer, so the pointer alone cannot
+	 * tell a stale worker apart from the task it was armed for.  The
+	 * caller reaches here from rk_rga_hw_dispatch() under run_lock, right
+	 * after that dispatch bumped active_generation.
+	 */
+	hw->timeout_generation = hw->active_generation;
 	spin_unlock_irqrestore(&hw->job_lock, flags);
 	rk_rga_job_put(old);
 
@@ -14552,6 +14565,25 @@ static void rk_rga_timeout_target_replacement_kunit(struct kunit *test)
 	rk_rga_hw_cancel_timeout_sync(&hw);
 	KUNIT_EXPECT_PTR_EQ(test, hw.timeout_job, NULL);
 	KUNIT_EXPECT_EQ(test, refcount_read(&replacement.refs), 1);
+
+	/*
+	 * An old timeout for the same job pointer must not consume a freshly
+	 * restarted generation.  A multi-task job is re-dispatched under the
+	 * same pointer, so the pointer match alone would reset the job's next
+	 * task after the previous one completed.
+	 */
+	hw.active_job = &replacement;
+	hw.active_generation = 2;
+	hw.timeout_job = &replacement;
+	hw.timeout_generation = 1;
+	rk_rga_job_get(&replacement);
+
+	rk_rga_hw_timeout_work(&hw.timeout_work.work);
+
+	KUNIT_EXPECT_PTR_EQ(test, hw.active_job, &replacement);
+	KUNIT_EXPECT_PTR_EQ(test, hw.timeout_job, NULL);
+	KUNIT_EXPECT_EQ(test, hw.timeout_generation, 0ULL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&replacement.refs), 1);
 }
 
 static void rk_rga_iommu_fault_match_kunit(struct kunit *test)
@@ -21571,7 +21603,8 @@ static bool rk_rga_hw_iommu_fault_matches_locked(struct rk_rga_hw *hw)
 }
 
 static void rk_rga_hw_recover_active(struct rk_rga_hw *hw, bool iommu_fault,
-				     struct rk_rga_job *timeout_job)
+				     struct rk_rga_job *timeout_job,
+				     u64 timeout_generation)
 {
 	struct rk_rga_job *job;
 	unsigned long flags;
@@ -21587,7 +21620,15 @@ static void rk_rga_hw_recover_active(struct rk_rga_hw *hw, bool iommu_fault,
 	if (iommu_fault)
 		recover = rk_rga_hw_iommu_fault_matches_locked(hw);
 	else
-		recover = job && job == timeout_job && !job->irq_seen;
+		/*
+		 * A multi-task job is re-dispatched under the same pointer, so
+		 * match the exact activation this watchdog was armed for.
+		 * Without the generation test a worker that lost the race with
+		 * the completion IRQ would reset the job's *next* task.
+		 */
+		recover = job && job == timeout_job && timeout_generation &&
+			  timeout_generation == hw->active_generation &&
+			  !job->irq_seen;
 	if (!recover) {
 		spin_unlock_irqrestore(&hw->job_lock, flags);
 		rk_rga_hw_enable_irq(hw, irq_disabled);
@@ -21630,11 +21671,12 @@ static void rk_rga_hw_timeout_work(struct work_struct *work)
 	struct rk_rga_hw *hw = container_of(delayed, struct rk_rga_hw,
 					    timeout_work);
 	struct rk_rga_job *job;
+	u64 generation;
 
-	job = rk_rga_hw_take_timeout_job(hw);
+	job = rk_rga_hw_take_timeout_job(hw, &generation);
 	if (!job)
 		return;
-	rk_rga_hw_recover_active(hw, false, job);
+	rk_rga_hw_recover_active(hw, false, job, generation);
 	rk_rga_job_put(job);
 }
 
@@ -21643,7 +21685,7 @@ static void rk_rga_hw_iommu_fault_work(struct work_struct *work)
 	struct rk_rga_hw *hw =
 		container_of(work, struct rk_rga_hw, iommu_fault_work);
 
-	rk_rga_hw_recover_active(hw, true, NULL);
+	rk_rga_hw_recover_active(hw, true, NULL, 0);
 }
 
 static struct rk_rga_hw *
