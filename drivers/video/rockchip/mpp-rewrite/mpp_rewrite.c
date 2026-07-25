@@ -578,6 +578,7 @@ static void
 rk_mpp_hw_abort_ccu_active_dependents(struct rk_mpp_hw *ccu,
 				      struct rk_mpp_hw *skip, int result);
 static bool rk_mpp_job_rkvenc_slice_mode(struct rk_mpp_job *job);
+static void rk_mpp_job_rkvenc_fixup_slice_flush(struct rk_mpp_job *job);
 static bool rk_mpp_job_rkvenc_slice_ready(struct rk_mpp_job *job);
 static bool rk_mpp_job_rkvenc_slice_done(struct rk_mpp_job *job);
 static void rk_mpp_job_push_rkvenc_slice(struct rk_mpp_job *job, u32 value);
@@ -952,6 +953,8 @@ MODULE_DEVICE_TABLE(of, rk_mpp_hw_of_match);
 #define RK_MPP_RKVENC_OSD_BASE_WORDS		(0x3000 / sizeof(u32))
 #define RK_MPP_RKVENC_ENC_PIC_WORD		(RK_MPP_RKVENC_PIC_BASE_WORDS + 32)
 #define RK_MPP_RKVENC_SLI_SPLIT_WORD		(RK_MPP_RKVENC_PIC_BASE_WORDS + 56)
+/* 0x02d8: external line buffer top address (VEPU580 ebuft_addr). */
+#define RK_MPP_RKVENC_EXT_LINE_BUF_WORD	(RK_MPP_RKVENC_PIC_BASE_WORDS + 22)
 #define RK_MPP_RKVENC_FMT_WORD			(0x0300 / sizeof(u32))
 #define RK_MPP_RKVENC_FMT_MASK			0x1
 #define RK_MPP_RKVENC_DCHS_WORD		(0x0304 / sizeof(u32))
@@ -977,7 +980,9 @@ MODULE_DEVICE_TABLE(of, rk_mpp_hw_of_match);
 #define RK_MPP_RKVENC_INT_WATCHDOG		BIT(8)
 #define RK_MPP_RKVENC_RESET_MASK		0x03f0
 #define RK_MPP_RKVENC_ENC_PIC_SLEN_FIFO	BIT(30)
+#define RK_MPP_RKVENC_ENC_PIC_STND		BIT(0)	/* 0 = H.264, 1 = H.265 */
 #define RK_MPP_RKVENC_SLI_SPLIT_EN		BIT(0)
+#define RK_MPP_RKVENC_SLI_SPLIT_FLUSH		BIT(15)
 #define RK_MPP_RKVENC_SLICE_NUM_MASK		GENMASK(5, 0)
 #define RK_MPP_RKVENC_SLICE_LAST		BIT(31)
 #define RK_MPP_RKVENC_DCHS_TXID_MASK		GENMASK(1, 0)
@@ -6299,6 +6304,35 @@ static void rk_mpp_rkvenc_slice_mode_kunit(struct kunit *test)
 
 	job.client_type = RK_MPP_DEVICE_RKVDEC;
 	KUNIT_EXPECT_FALSE(test, rk_mpp_job_rkvenc_slice_mode(&job));
+
+	/*
+	 * VEPU580 H.264 slice-flush erratum: the flush bit is cleared only
+	 * when an external line buffer is programmed and the stream is H.264.
+	 */
+	job.client_type = RK_MPP_DEVICE_RKVENC;
+	regs[RK_MPP_RKVENC_SLI_SPLIT_WORD] = RK_MPP_RKVENC_SLI_SPLIT_EN |
+					     RK_MPP_RKVENC_SLI_SPLIT_FLUSH;
+
+	/* No external line buffer: the register image is left untouched. */
+	regs[RK_MPP_RKVENC_EXT_LINE_BUF_WORD] = 0;
+	rk_mpp_job_rkvenc_fixup_slice_flush(&job);
+	KUNIT_EXPECT_TRUE(test, regs[RK_MPP_RKVENC_SLI_SPLIT_WORD] &
+			  RK_MPP_RKVENC_SLI_SPLIT_FLUSH);
+
+	/* H.265 with an external line buffer is also untouched. */
+	regs[RK_MPP_RKVENC_EXT_LINE_BUF_WORD] = 0x12340000;
+	regs[RK_MPP_RKVENC_ENC_PIC_WORD] |= RK_MPP_RKVENC_ENC_PIC_STND;
+	rk_mpp_job_rkvenc_fixup_slice_flush(&job);
+	KUNIT_EXPECT_TRUE(test, regs[RK_MPP_RKVENC_SLI_SPLIT_WORD] &
+			  RK_MPP_RKVENC_SLI_SPLIT_FLUSH);
+
+	/* H.264 with an external line buffer loses the flush bit. */
+	regs[RK_MPP_RKVENC_ENC_PIC_WORD] &= ~RK_MPP_RKVENC_ENC_PIC_STND;
+	rk_mpp_job_rkvenc_fixup_slice_flush(&job);
+	KUNIT_EXPECT_FALSE(test, regs[RK_MPP_RKVENC_SLI_SPLIT_WORD] &
+			   RK_MPP_RKVENC_SLI_SPLIT_FLUSH);
+	KUNIT_EXPECT_TRUE(test, regs[RK_MPP_RKVENC_SLI_SPLIT_WORD] &
+			  RK_MPP_RKVENC_SLI_SPLIT_EN);
 }
 
 static void rk_mpp_rkvenc_slice_fifo_kunit(struct kunit *test)
@@ -8486,6 +8520,30 @@ static bool rk_mpp_job_rkvenc_slice_mode(struct rk_mpp_job *job)
 	       (sli_split & RK_MPP_RKVENC_SLI_SPLIT_EN);
 }
 
+/*
+ * BSP rkvenc2_check_split_task() FIXUP: VEPU580 H.264 encoding is broken when
+ * the external line buffer and the slice flush are enabled together, so the
+ * shipped driver clears the flush bit for that combination.  Runs on the
+ * job-private register image after fd-to-IOVA translation (so word 22 holds a
+ * real address rather than a packed fd) and before any MMIO write.
+ */
+static void rk_mpp_job_rkvenc_fixup_slice_flush(struct rk_mpp_job *job)
+{
+	struct rk_mpp_reg_image *image = &job->reg_image;
+
+	if (RK_MPP_RKVENC_EXT_LINE_BUF_WORD >= image->reg_words)
+		return;
+	if (!image->regs[RK_MPP_RKVENC_EXT_LINE_BUF_WORD])
+		return;
+	/* H.265 is unaffected by the erratum. */
+	if (image->regs[RK_MPP_RKVENC_ENC_PIC_WORD] &
+	    RK_MPP_RKVENC_ENC_PIC_STND)
+		return;
+
+	image->regs[RK_MPP_RKVENC_SLI_SPLIT_WORD] &=
+		~RK_MPP_RKVENC_SLI_SPLIT_FLUSH;
+}
+
 static u32 rk_mpp_rkvenc_dchs_txid(u32 val)
 {
 	return (val & RK_MPP_RKVENC_DCHS_TXID_MASK) >>
@@ -8792,6 +8850,8 @@ static int rk_mpp_job_submit(struct rk_mpp_job *job)
 	}
 
 	job->rkvenc_slice_mode = rk_mpp_job_rkvenc_slice_mode(job);
+	if (job->rkvenc_slice_mode)
+		rk_mpp_job_rkvenc_fixup_slice_flush(job);
 
 	/*
 	 * Serialize admission with core/CCU removal.  Once this check passes,
