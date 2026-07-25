@@ -467,6 +467,14 @@ struct rk_mpp_job {
 	struct list_head link;
 	struct list_head session_link;
 	struct list_head sched_link;
+	/*
+	 * Private to a running abort sweep.  It must not reuse sched_link:
+	 * list_empty(&job->sched_link) is what rk_mpp_job_dequeue() uses to
+	 * decide it owns the queue reference, so parking an already-unqueued
+	 * job back on sched_link would let a concurrent dequeue drop a
+	 * reference the sweep owns.
+	 */
+	struct list_head abort_link;
 	struct list_head rkvdec_ccu_node;
 	struct list_head rkvdec_link_node;
 	struct rk_mpp_session *session;
@@ -5880,6 +5888,7 @@ static void rk_mpp_scheduler_skips_recovery_failed_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&srv->queued_jobs);
 	spin_lock_init(&hw->lock);
 	INIT_LIST_HEAD(&job->sched_link);
+	INIT_LIST_HEAD(&job->abort_link);
 	list_add_tail(&job->sched_link, &srv->queued_jobs);
 	atomic_set(&hw->queued_job_count, 1);
 	atomic_set(&srv->queued_job_count, 1);
@@ -7094,6 +7103,7 @@ static void rk_mpp_job_queue_current_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&session->active_jobs);
 	INIT_LIST_HEAD(&job->session_link);
 	INIT_LIST_HEAD(&job->sched_link);
+	INIT_LIST_HEAD(&job->abort_link);
 	refcount_set(&job->refs, 1);
 
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_queue_current_locked(job),
@@ -8947,6 +8957,7 @@ rk_mpp_batch_get_job(struct rk_mpp_batch_state *batch,
 	INIT_LIST_HEAD(&job->link);
 	INIT_LIST_HEAD(&job->session_link);
 	INIT_LIST_HEAD(&job->sched_link);
+	INIT_LIST_HEAD(&job->abort_link);
 	INIT_LIST_HEAD(&job->rkvdec_ccu_node);
 	INIT_LIST_HEAD(&job->rkvdec_link_node);
 	list_add_tail(&job->link, &batch->jobs);
@@ -9020,12 +9031,18 @@ static void rk_mpp_hw_abort_queued_matching(struct rk_mpp_hw *target,
 
 		WRITE_ONCE(job->canceled, true);
 		rk_mpp_job_unqueue_locked(job);
-		list_add_tail(&job->sched_link, &aborted);
+		list_add_tail(&job->abort_link, &aborted);
 	}
 	mutex_unlock(&srv->sched_lock);
 
-	list_for_each_entry_safe(job, tmp, &aborted, sched_link) {
-		list_del_init(&job->sched_link);
+	/*
+	 * rk_mpp_job_unqueue_locked() left sched_link empty, so a racing
+	 * rk_mpp_job_dequeue() correctly reports the job as no longer queued:
+	 * it decrements no counter and drops no reference, leaving the queue
+	 * reference owned by this sweep alone.
+	 */
+	list_for_each_entry_safe(job, tmp, &aborted, abort_link) {
+		list_del_init(&job->abort_link);
 		rk_mpp_job_complete(job, result);
 		rk_mpp_job_put(job);
 	}
