@@ -213,6 +213,7 @@
 #define RK_RGA2_MODE_RENDER_MODE		GENMASK(2, 0)
 #define RK_RGA2_MODE_BITBLT_MODE		BIT(3)
 #define RK_RGA2_MODE_COLOR_FILL_MODE		BIT(4)
+#define RK_RGA2_MODE_ALPHA_ZERO_KEY		BIT(5)
 #define RK_RGA2_MODE_INTR_CF_E			BIT(7)
 #define RK_RGA2_MODE_OSD_EN			BIT(8)
 #define RK_RGA2_MODE_MOSAIC_EN			BIT(9)
@@ -342,6 +343,8 @@
 #define RK_RGA2_SCALE_DOWN			1
 #define RK_RGA2_SCALE_UP			2
 #define RK_RGA2_SCALE_FORCE_TILE		3
+/* BSP RGA2_VSP_BICUBIC_LIMIT: vertical scale-up bicubic line-buffer width. */
+#define RK_RGA2_VSP_BICUBIC_LIMIT		1996
 #define RK_RGA2_BILINEAR_PREC			12
 #define RK_RGA2_INTERP_DEFAULT			0
 #define RK_RGA2_INTERP_LINEAR			1
@@ -18285,12 +18288,13 @@ static void rk_rga3_dst_offset_emit_kunit(struct kunit *test)
 	uv_stride_bytes = cmd[RK_RGA3_WR_PL_VIR_STRIDE_OFFSET / 4] << 2;
 	KUNIT_EXPECT_EQ(test, y_stride_bytes, 1600U);
 	KUNIT_EXPECT_EQ(test, uv_stride_bytes, 1600U);
+	/* Compact 10-bit packs 4 pixels per 5 bytes: column 64 is byte 80. */
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_Y_BASE_OFFSET / 4],
 			lower_32_bits(task.dst.yrgb_addr +
-				      8 * y_stride_bytes + 64));
+				      8 * y_stride_bytes + 64 / 4 * 5));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_U_BASE_OFFSET / 4],
 			lower_32_bits(task.dst.uv_addr +
-				      4 * uv_stride_bytes + 64));
+				      4 * uv_stride_bytes + 64 / 4 * 5));
 
 	memset(cmd, 0, sizeof(cmd));
 	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
@@ -19486,14 +19490,16 @@ static int rk_rga3_emit_wr(struct rk_rga_job *job,
 			u32 x_offset_bytes;
 			u32 y_plane_offset;
 
-			if (dst_fmt->yuv_sp && (x_offset & 1))
+			if (dst_fmt->yuv_sp &&
+			    (x_offset & (dst_fmt->yuv10 ? 3U : 1U)))
 				return -EINVAL;
 			if (dst_fmt->yuv420_sp && (task->dst.y_offset & 1))
 				return -EINVAL;
 
 			if (dst_fmt->yuv_sp) {
-				if (dst_fmt->yuv10 &&
-				    !rk_rga_img_yuv10_compact(&task->dst)) {
+				if (!dst_fmt->yuv10) {
+					x_offset_bytes = x_offset;
+				} else if (!rk_rga_img_yuv10_compact(&task->dst)) {
 					/*
 					 * x_offset is in pixels; incompact
 					 * rows carry 16-bit containers.  The
@@ -19506,7 +19512,13 @@ static int rk_rga3_emit_wr(struct rk_rga_job *job,
 							       &x_offset_bytes))
 						return -EOVERFLOW;
 				} else {
-					x_offset_bytes = x_offset;
+					/*
+					 * Compact NV15/NV20 rows pack 10 bits
+					 * per pixel.  10-bit semiplanar
+					 * x_offset is validated 4-pixel
+					 * aligned, so the divide is exact.
+					 */
+					x_offset_bytes = x_offset / 4 * 5;
 				}
 			} else {
 				if (check_mul_overflow(x_offset,
@@ -19627,6 +19639,15 @@ static int rk_rga2_image_offsets(const struct rga_img_info_t *img,
 		return -EOVERFLOW;
 	if (fmt->y4)
 		x /= 2;
+	/*
+	 * x_offset is a pixel count (ABI.rst) while the row stride is a byte
+	 * stride, so a compact 10-bit raster has to convert.  RGA2 rejects
+	 * incompact 10-bit sources, so yuv10 here always means 10 bits per
+	 * pixel -- the same x_offset * pixel_depth / 8 the BSP applies in
+	 * rga2_reg_info.c.
+	 */
+	if (fmt->yuv10)
+		x = x * 10 / 8;
 	if (check_add_overflow(y, x, y_offset))
 		return -EOVERFLOW;
 
@@ -19641,6 +19662,8 @@ static int rk_rga2_image_offsets(const struct rga_img_info_t *img,
 		if (check_mul_overflow((u32)(img->x_offset / fmt->x_div),
 				       (u32)fmt->plane_width, &uv_x))
 			return -EOVERFLOW;
+		if (fmt->yuv10)
+			uv_x = uv_x * 10 / 8;
 		if (check_add_overflow(uv_y, uv_x, uv_offset))
 			return -EOVERFLOW;
 	}
@@ -19979,6 +20002,22 @@ static int rk_rga2_emit_src(struct rk_rga_job *job,
 		active_w = task->src.act_w;
 		active_h = task->src.act_h;
 	}
+
+	/*
+	 * The RGA2 vertical scale-up bicubic filter runs out of a fixed line
+	 * buffer.  The BSP forces bilinear once the line feeding it reaches
+	 * RK_RGA2_VSP_BICUBIC_LIMIT pixels (rga2_reg_info.c) rather than
+	 * programming a mode the scaler cannot execute.  RK_RGA2_INTERP_AVERAGE
+	 * is excluded because the BSP switch has no case for it and leaves the
+	 * selection unclamped.  Force-tile never yields SCALE_UP, so this
+	 * cannot undo the block above.
+	 */
+	if (v_mode == RK_RGA2_SCALE_UP && !v_filter &&
+	    task->interp.verti != RK_RGA2_INTERP_AVERAGE &&
+	    !((h_mode == RK_RGA2_SCALE_DOWN &&
+	       dst_w < RK_RGA2_VSP_BICUBIC_LIMIT) ||
+	      task->src.act_w < RK_RGA2_VSP_BICUBIC_LIMIT))
+		v_filter = true;
 
 	src_info = FIELD_PREP(RK_RGA2_SRC_RB_SWAP, src_fmt->rb_swap) |
 		   FIELD_PREP(RK_RGA2_SRC_ALPHA_SWAP, src_fmt->alpha_swap) |
@@ -20543,6 +20582,16 @@ static int rk_rga2_emit_simple_bitblt(struct rk_rga_job *job)
 				    RK_RGA_RENDER_BITBLT) |
 			 FIELD_PREP(RK_RGA2_MODE_BITBLT_MODE,
 				    !!task->bsfilter_flag) |
+			 /*
+			  * BSP rga2_reg_info.c derives alpha_zero_key from
+			  * alpha_rop_mode >> 4; librga's imcolorkey sets it
+			  * through NormalRgaSetSrcTransModeInfo(zero_mode_en).
+			  * Every other accepted RGA2 profile pins
+			  * alpha_rop_mode to 0 or 1, so this is a no-op
+			  * outside the color-key path.
+			  */
+			 FIELD_PREP(RK_RGA2_MODE_ALPHA_ZERO_KEY,
+				    (task->alpha_rop_mode >> 4) & 0x1) |
 			 RK_RGA2_MODE_INTR_CF_E |
 			 FIELD_PREP(RK_RGA2_MODE_OSD_EN, profile.osd) |
 			 FIELD_PREP(RK_RGA2_MODE_MOSAIC_EN,
