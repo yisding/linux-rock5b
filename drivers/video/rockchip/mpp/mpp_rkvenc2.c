@@ -276,6 +276,8 @@ struct rkvenc_task {
 	u32 last_slice_found;
 	u32 slice_wr_cnt;
 	u32 slice_rd_cnt;
+	u32 slice_drop_cnt;
+	u32 slice_drop_len;
 	DECLARE_KFIFO(slice_info, union rkvenc2_slice_len_info, RKVENC_MAX_SLICE_FIFO_LEN);
 
 	/* jpege bitstream */
@@ -1637,6 +1639,55 @@ err_leave:
 	return ret;
 }
 
+/*
+ * Push one slice length record into the per task fifo.
+ *
+ * Runs in hard irq context, so it must not sleep, allocate or take a mutex.
+ * The fifo is a lock free single producer single consumer kfifo, so only the
+ * producer side primitives kfifo_avail() and kfifo_in() may be used here.
+ *
+ * The last free slot is reserved for the terminal record.  Losing an ordinary
+ * record only coarsens the slice boundaries reported for one frame, but losing
+ * the terminal record hangs userspace outright, because every slice poll loop
+ * ends on the last flag alone.  Ordinary records are dropped first so that the
+ * terminal record is always guaranteed a slot.
+ *
+ * The length of a dropped record is carried into the next stored record, so the
+ * running byte offset userspace derives from the lengths stays exact.
+ *
+ * Returns true when the record was stored.
+ */
+static bool rkvenc2_push_slice_len(struct mpp_dev *mpp, struct rkvenc_task *task,
+				   union rkvenc2_slice_len_info slice_info)
+{
+	u32 len = slice_info.slice_len + task->slice_drop_len;
+
+	/* at most one terminal record may be stored per task */
+	if (slice_info.last && task->last_slice_found)
+		slice_info.last = 0;
+
+	if (slice_info.last || kfifo_avail(&task->slice_info) > 1) {
+		slice_info.slice_len = len;
+
+		if (kfifo_in(&task->slice_info, &slice_info, 1)) {
+			task->slice_drop_len = 0;
+			if (slice_info.last)
+				task->last_slice_found = 1;
+
+			return true;
+		}
+	}
+
+	task->slice_drop_len = len;
+	task->slice_drop_cnt++;
+	dev_warn_ratelimited(mpp->dev,
+			     "task %d slice fifo full (%d), merged %u record(s), last %d\n",
+			     task->mpp_task.task_id, RKVENC_MAX_SLICE_FIFO_LEN,
+			     task->slice_drop_cnt, slice_info.last);
+
+	return false;
+}
+
 static void rkvenc2_read_slice_len(struct mpp_dev *mpp, struct rkvenc_task *task,
 				   u32 *irq_status)
 {
@@ -1666,18 +1717,19 @@ static void rkvenc2_read_slice_len(struct mpp_dev *mpp, struct rkvenc_task *task
 		slice_info.val = mpp_read_relaxed(mpp, RKVENC2_REG_SLICE_LEN_BASE);
 		/* after vepu510, HW will return last slice flag in bit(31) */
 		last |= slice_info.last;
-		if (last && i == sli_num - 1) {
-			task->last_slice_found = 1;
+		if (last && i == sli_num - 1)
 			slice_info.last = 1;
-		}
 
 		if (split) {
-			mpp_dbg_slice("task %d wr %3d len %d %s\n", task_id,
-				task->slice_wr_cnt, slice_info.slice_len,
-				slice_info.last ? "last" : "");
+			bool stored = rkvenc2_push_slice_len(mpp, task, slice_info);
 
-			kfifo_in(&task->slice_info, &slice_info, 1);
-			task->slice_wr_cnt++;
+			mpp_dbg_slice("task %d wr %3d len %d %s%s\n", task_id,
+				      task->slice_wr_cnt, slice_info.slice_len,
+				      slice_info.last ? "last " : "",
+				      stored ? "" : "merged");
+
+			if (stored)
+				task->slice_wr_cnt++;
 		}
 	}
 
@@ -1687,7 +1739,7 @@ static void rkvenc2_read_slice_len(struct mpp_dev *mpp, struct rkvenc_task *task
 			mpp_dbg_slice("task %d mark last slice\n", task_id);
 			slice_info.last = 1;
 			slice_info.slice_len = 0;
-			kfifo_in(&task->slice_info, &slice_info, 1);
+			rkvenc2_push_slice_len(mpp, task, slice_info);
 		}
 	}
 
@@ -2726,6 +2778,7 @@ static int rkvenc2_wait_result(struct mpp_session *session,
 	u32 task_id;
 	bool got_slice;
 	bool aborted;
+	u32 merged;
 	int ret = 0;
 
 	mutex_lock(&session->pending_lock);
@@ -2764,11 +2817,31 @@ task_done_ret:
 		 * task off the pending list and drops the reference that can
 		 * free the task, so reading task->state afterwards is a
 		 * use-after-free once the hardware worker's ref is already gone.
+		 * The merged record count is sampled here for the same reason.
+		 *
+		 * A merge is reported but deliberately does NOT fail the frame.
+		 * Reserving the terminal slot keeps the stream terminable, and
+		 * carrying a dropped length into the next stored record keeps
+		 * the byte offsets exact, so the encoded frame stays complete
+		 * and decodable -- only the reported slice boundaries are
+		 * coarser than the caller asked for.  Failing here would
+		 * discard a good frame on every frame of an over-split stream,
+		 * which is precisely the workload that fills the fifo.
+		 *
+		 * Only a caller that reads the slice records back is told about
+		 * a merge.  Without a poll request the lengths are drained and
+		 * discarded, so merging two cannot affect the frame.
 		 */
 		aborted = test_bit(TASK_STATE_ABORT, &task->state);
+		merged = req ? enc_task->slice_drop_cnt : 0;
 		ret = rkvenc2_task_default_process(mpp, task);
 		if (!ret && aborted)
 			ret = -EIO;
+		if (merged)
+			dev_warn_ratelimited(mpp->dev,
+					     "session %d:%d task %d merged %u slice record(s)\n",
+					     session->pid, session->index,
+					     task_id, merged);
 
 		return ret;
 
