@@ -168,8 +168,11 @@ Implemented
   applying ``SET_REG_ADDR_OFFSET``.  Embedded and separate offsets are combined
   with checked arithmetic and rejected when their cumulative value is outside
   the mapped dma-buf or makes the 32-bit register IOVA overflow, instead of
-  allowing hardware to fault past its mapping.  Offset tuples for literal
-  non-fd registers retain the BSP's additive behavior, but reject cumulative
+  allowing hardware to fault past its mapping.  The completed image is checked
+  against the custom-plus-built-in address tables again after every separate
+  offset is applied; an optional zero fd therefore cannot become an unretained
+  literal DMA address.  Offset tuples for literal non-fd registers retain the
+  BSP's additive behavior outside address-table entries, but reject cumulative
   32-bit wrap instead of programming the wrapped register value.
   Both kernel-translated and validated explicit-IOVA jobs retain references to
   every imported dma-buf mapping they use so ``MPP_CMD_RELEASE_FD``,
@@ -231,8 +234,12 @@ Implemented
   AFBC IRQ, clears the three BSP cache-state registers after completion, and
   derives 16x16-tiled AFBC parameters from the translated VCD image.  AFBC
   width, height, stride, header size, and payload address use checked
-  arithmetic; the derived payload must remain inside the same retained
-  dma-buf provenance as output register 505.
+  arithmetic; the complete worst-case header-plus-payload span must fit inside
+  the same retained dma-buf provenance as output register 505.  AFBC-class
+  request bytes may be retained for ABI-shaped readback, but they are not
+  written directly to the driver-owned AFBC MMIO class.  Power-off masks and
+  acknowledges the level-triggered AFBC source while clocks are still on,
+  before synchronizing the auxiliary IRQ.
   The RLC delta and ten-bit ABI scaling are evaluated as unsigned
   32-bit arithmetic, preserving the BSP bit pattern while avoiding an undefined
   signed left shift if an error/wrap status reports an address below the stream
@@ -332,7 +339,13 @@ Implemented
   activation generation under the active-job lock.  The worker only claims
   that exact activation and cancels its ordinary watchdog after the match, so
   delayed fault work cannot complete a replacement job or consume the
-  replacement's timeout.  If the descriptor cannot be matched, any active job
+  replacement's timeout.  Once a generation is fault-marked, normal IRQ and
+  timeout completion cannot claim it, and the scheduler treats the slot as
+  busy until recovery finishes.  After DMA is stopped, recovery refreshes the
+  provider even if completion or abort already removed the marked activation;
+  this is required to re-enable VSI's fault source, which the provider masks
+  when reporting an exception.  A failed refresh quarantines the core.  If the
+  descriptor cannot be matched, any active job
   in that HARD coordinator is used to enter the existing
   force-stop/coordinator-wide abort path instead of scheduling an empty peer
   slot and silently waiting for the normal timeout.  If neither supported
@@ -526,11 +539,14 @@ Implemented
   deferred peer-abort target replacement/result/reference lifetime and
   replacement-watchdog preservation, MPP
   codec-neutral core-counter and per-core timing routing (including AV1),
-  sparse AV1 request mapping and lazy allocation, dynamic metadata growth past
-  80 entries, checked AFBC layout/address derivation and dma-buf provenance,
+  sparse AV1 request mapping and lazy allocation, all 103 exact region-based
+  AV1 translation indices and dynamic metadata growth past 80 entries,
+  post-offset address-table provenance, checked AFBC layout/address derivation,
+  worst-case dma-buf capacity, and floor-before-alignment payload placement,
   exact IOMMU fault source matching
   plus HARD-CCU descriptor-owner/fail-closed fallback selection, exact
-  IOMMU-fault activation attribution, and replacement-watchdog preservation,
+  IOMMU-fault activation attribution, fault-owned completion exclusion, and
+  replacement-watchdog preservation,
   exact timeout-job targeting and stale-worker replacement rearming,
   ``INIT_TRANS_TABLE`` ``u16`` storage, locking, and boundary behavior,
   mandatory built-in address-table union plus explicit-IOVA range/lifetime
