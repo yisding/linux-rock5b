@@ -28,15 +28,17 @@ Implemented
   ``POLL_HW_FINISH|POLL_NON_BLOCK|LAST_MSG`` pairs and rejected with
   ``-EOPNOTSUPP`` instead of extending the BSP ABI with multiple
   ``LAST_MSG`` groups in one ioctl.
-* RK3588 BSP-style RKVENC2/RKVDEC2 platform-device binding with devm-managed
-  MMIO, IRQ, clock, and reset discovery.
+* RK3588 BSP-style RKVENC2/RKVDEC2/AV1 platform-device binding with
+  devm-managed MMIO, IRQ, clock, and reset discovery.
   Hardware-backed encoder/decoder cores and the decoder CCU require a nonempty
   clock list and fail probe with ``-EINVAL`` when none is discovered.  The
   zero-clock encoder CCU remains valid because that node is only a virtual
   coordinator and has no MMIO hardware to power.
   Those hardware-backed matches also require the complete RK3588 primary
   register window (RKVENC2 ``0x6000``, RKVDEC2 ``0x5a0``, decoder CCU
-  ``0x100``); a missing or truncated resource fails probe with ``-EINVAL``
+  ``0x100``).  AV1 requires all three non-contiguous hardware classes:
+  VCD ``0x800``, cache ``0x298``, and AFBC ``0x350``.  A missing or truncated
+  resource fails probe with ``-EINVAL``
   before hardware-ID or job register access and before support is advertised.
   The RKVDEC2 span includes the VDPU381 cache/max-outstanding-read registers
   through offset ``0x59c``; board descriptions expose a page-safe ``0x600``
@@ -45,11 +47,11 @@ Implemented
   silently skip cache setup because a truncated ``0x400`` resource passed
   probe.
   After powering each core, probe also requires the register-0 identity used by
-  current libmpp for the selected backend: VEPU58x ``0x50603312`` for RKVENC2
-  and VDPU38x ``0x53813f05`` for RKVDEC2.  A zero, missing, or different
-  identity fails probe with ``-ENODEV`` before IRQ/fault registration or
-  support advertisement, so generic compatible strings cannot silently select
-  the RK3588 VEPU580/VDPU381 register and link-table profiles on another
+  current libmpp for the selected backend: VEPU58x ``0x50603312`` for RKVENC2,
+  VDPU38x ``0x53813f05`` for RKVDEC2, and ``0x80019000`` for AV1.  A zero,
+  missing, or different identity fails probe with ``-ENODEV`` before
+  IRQ/fault registration or support advertisement, so generic compatible
+  strings cannot silently select RK3588-specific register profiles on another
   hardware revision.
   Encoder and decoder cores require an available ``rockchip,ccu`` phandle of
   the corresponding encoder/decoder CCU compatible; decoder cores additionally
@@ -74,7 +76,7 @@ Implemented
   domain active after unbind.
 * ``MPP_CMD_QUERY_HW_SUPPORT`` from bound RK3588 MPP hardware cores.
 * ``MPP_CMD_QUERY_HW_ID`` returns the validated register-0 hardware id captured
-  from the first bound RK3588 RKVENC2/RKVDEC2 core whose referenced CCU
+  from the first bound RK3588 RKVENC2, RKVDEC2, or AV1 core whose required
   coordinator is online, matching the forward port's userspace-visible
   HAL-selection contract for enabled RK3588 nodes.
 * ``MPP_CMD_QUERY_CMD_SUPPORT`` group boundary queries.
@@ -146,11 +148,19 @@ Implemented
 * Kernel-owned per-session job staging for register write/read, offset, RCB,
   and poll messages.  The rewrite preserves userspace message order and copies
   write-like payloads before returning to userspace.
-* Flat register-image materialization for ``SET_REG_WRITE`` requests, bounded
-  readback descriptor retention for ``SET_REG_READ`` requests, and validated
-  register-offset tuple storage for ``SET_REG_ADDR_OFFSET`` requests.
+* Class-aware register-image materialization for ``SET_REG_WRITE`` requests,
+  bounded readback descriptor retention for ``SET_REG_READ`` requests, and
+  validated register-offset tuple storage for ``SET_REG_ADDR_OFFSET`` requests.
+  RKVENC2 and RKVDEC2 use one dense region.  AV1 preserves the BSP ABI offsets
+  ``0x00000``, ``0x10000``, and ``0x20000`` while allocating only the VCD,
+  cache, and AFBC bytes a job actually supplies.  Requests must fit wholly
+  within one declared class; holes, cross-class spans, misalignment, and
+  arithmetic overflow are rejected before allocation or MMIO.
 * Register-image fd-to-IOVA translation using the RK3588
-  RKVENC2/RKVDEC2 default translation tables plus any session-provided entries.
+  RKVENC2/RKVDEC2/AV1 default translation tables plus any session-provided
+  entries.  Per-job imports and provenance bindings grow dynamically so AV1's
+  67 VCD, 24 cache, and 12 AFBC entries (103 total) are retained without the
+  older 80-entry truncation.
   Translated register jobs map dma-bufs against the selected hardware core's
   DMA device.  The ``REG_NO_OFFSET``/``REG_OFFSET_ALONE`` flag aliases preserve
   the BSP split between plain fd register values and separate offset records.
@@ -212,12 +222,18 @@ Implemented
   pointer before dropping that reference.  Concurrent platform removal
   therefore cannot pass its final hardware-release wait and free the devm
   object between abort's pointer load and use.
-* First RK3588 RKVENC2/RKVDEC2 hardware execution slice: one active job per
+* RK3588 RKVENC2/RKVDEC2/AV1 hardware execution: one active job per
   bound core, runtime-PM power-domain resume, bulk clock enable, range-checked
   MMIO writes from the original ``SET_REG_WRITE`` spans, start-register
   deferral, IRQ-driven completion, retained ``SET_REG_READ`` register readback,
   BSP-style interrupt-status readback override, and decoder RLC decoded-length
-  adjustment.  The RLC delta and ten-bit ABI scaling are evaluated as unsigned
+  adjustment.  AV1 uses the VCD completion IRQ plus a separately synchronized
+  AFBC IRQ, clears the three BSP cache-state registers after completion, and
+  derives 16x16-tiled AFBC parameters from the translated VCD image.  AFBC
+  width, height, stride, header size, and payload address use checked
+  arithmetic; the derived payload must remain inside the same retained
+  dma-buf provenance as output register 505.
+  The RLC delta and ten-bit ABI scaling are evaluated as unsigned
   32-bit arithmetic, preserving the BSP bit pattern while avoiding an undefined
   signed left shift if an error/wrap status reports an address below the stream
   start.
@@ -265,7 +281,7 @@ Implemented
   the state per hardware row and counts first failures in
   ``recovery_failure_count``.
   Interrupt status remains available through normal register readback.
-* Per-core software timeout completion for active RKVENC2/RKVDEC2 jobs using
+* Per-core software timeout completion for active RKVENC2/RKVDEC2/AV1 jobs using
   the same 500 ms timeout window as the BSP-derived forward port.  A timed-out
   job is removed from the active hardware slot, the core reset line is pulsed
   when available, runtime PM/clocks are released, ``POLL_HW_FINISH`` wakes, and
@@ -294,7 +310,11 @@ Implemented
   timeout.  Lock contention therefore cannot defer containment to the ordinary
   500 ms timeout, abort a replacement job, or remove the replacement's
   watchdog when a stale target is discarded.
-* Public IOMMU fault callback registration for bound MPP cores.  A fault
+* Public IOMMU fault callback registration for bound MPP cores.  Rockchip-IOMMU
+  cores use the Rockchip provider callback; AV1 uses the VSI provider callback
+  and provider refresh operation.  Registration records the provider so
+  removal clears the matching callback and waits for any in-flight VSI IRQ
+  callback before releasing the hardware object.  A fault
   records ``iommu_fault_count`` in debugfs, logs the IOVA/status, marks the
   active job for immediate recovery through the same serialized reset path,
   and completes the job with ``-EIO``.  This deliberately avoids private
@@ -315,12 +335,12 @@ Implemented
   replacement's timeout.  If the descriptor cannot be matched, any active job
   in that HARD coordinator is used to enter the existing
   force-stop/coordinator-wide abort path instead of scheduling an empty peer
-  slot and silently waiting for the normal timeout.  If
-  the public provider hook is unavailable, fault reporting remains disabled:
-  the legacy domain callback is set-once, cannot be safely unregistered from a
-  default DMA domain that outlives a loadable MPP driver, and is not used as a
-  fallback.  If an IOMMU domain is attached but the public provider hook is
-  unavailable, core probe fails instead of running without the intended fault
+  slot and silently waiting for the normal timeout.  If neither supported
+  provider hook is available, fault reporting remains disabled: the legacy
+  domain callback is set-once, cannot be safely unregistered from a default
+  DMA domain that outlives a loadable MPP driver, and is not used as a
+  fallback.  If an IOMMU domain is attached but no matching provider hook is
+  available, core probe fails instead of running without the intended fault
   recovery path; cores operating without an IOMMU domain do not require it.
 * RK3588 RKVDEC2 performance-selector readbacks for ``SET_REG_READ`` requests
   in the BSP ``0x20000`` selector window.  The rewrite validates this as a
@@ -482,8 +502,8 @@ Implemented
   ``SEND_CODEC_INFO`` storage and trailing-byte tolerance, overflow-safe
   RKVDEC2 CCU timeout selection, VEPU580 resolution/rate watchdog selection,
   required-versus-virtual clock-count validation,
-  per-match minimum MMIO sizing including the VDPU381 cache aperture, exact
-  VEPU58x/VDPU38x hardware-ID gating,
+  per-match MMIO layout sizing including the VDPU381 cache aperture and all
+  three sparse AV1 classes, exact VEPU58x/VDPU38x/AV1 hardware-ID gating,
   required CCU/core-mask topology,
   hot-reprobe core-ID vacancy and decoder-mask collision handling,
   register-span overflow
@@ -505,7 +525,10 @@ Implemented
   recovery-failed core/CCU admission and scheduling rejection,
   deferred peer-abort target replacement/result/reference lifetime and
   replacement-watchdog preservation, MPP
-  core-counter and per-core timing routing, exact IOMMU fault source matching
+  codec-neutral core-counter and per-core timing routing (including AV1),
+  sparse AV1 request mapping and lazy allocation, dynamic metadata growth past
+  80 entries, checked AFBC layout/address derivation and dma-buf provenance,
+  exact IOMMU fault source matching
   plus HARD-CCU descriptor-owner/fail-closed fallback selection, exact
   IOMMU-fault activation attribution, and replacement-watchdog preservation,
   exact timeout-job targeting and stale-worker replacement rearming,
@@ -543,7 +566,7 @@ under ``/sys/kernel/debug/rk_mpp_rewrite``.  They do not require rebuilding with
 extra logging and do not emit per-job kernel messages unless tracing is enabled.
 
 ``state``
-  Reports aggregate job/error/IRQ counters, every bound encoder/decoder/CCU
+  Reports aggregate job/error/IRQ counters, every bound encoder/decoder/AV1/CCU
   device (online/recovery-failed/runtime-PM/queue/active-job state and active
   age), the software dispatch queue with each job's queued age, and active
   RKVENC2 DCHS slots.  Counts include jobs discarded by reset/close, hardware

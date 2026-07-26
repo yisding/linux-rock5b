@@ -31,6 +31,7 @@
 #include <linux/ktime.h>
 #include <linux/list.h>
 #include <linux/math.h>
+#include <linux/math64.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -61,7 +62,7 @@
 #include <kunit/test.h>
 #endif
 
-#define RK_MPP_REWRITE_VERSION		"rk3588-mpp-rewrite-0.1"
+#define RK_MPP_REWRITE_VERSION		"rk3588-mpp-rewrite-0.2"
 #define RK_MPP_MAX_MSG_NUM		16
 #define RK_MPP_MAX_BATCH_WAIT_MSGS	64
 #define RK_MPP_MAX_BATCH_MSGS		RK_MPP_MAX_BATCH_WAIT_MSGS
@@ -4457,6 +4458,11 @@ static void rk_mpp_av1_afbc_config_kunit(struct kunit *test)
 	regs[RK_MPP_AV1_PP_CONFIG_WORD] = 0;
 	KUNIT_ASSERT_EQ(test, rk_mpp_av1_build_afbc_config(job, &config), 0);
 	KUNIT_EXPECT_FALSE(test, config.enabled);
+
+	job->reg_image.reg_words = 320;
+	job->reg_image.reg_bytes = 320 * sizeof(*regs);
+	KUNIT_ASSERT_EQ(test, rk_mpp_av1_build_afbc_config(job, &config), 0);
+	KUNIT_EXPECT_FALSE(test, config.enabled);
 }
 
 static void rk_mpp_hw_id_kunit(struct kunit *test)
@@ -5162,6 +5168,8 @@ static void rk_mpp_rkvdec2_vp9_translate_validate_kunit(struct kunit *test)
 	if (job->import_count)
 		rk_mpp_import_put(job->imports[0]);
 	rk_mpp_import_put(import);
+	kfree(job->reg_image.bindings);
+	kfree(job->imports);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv.import_count), 0);
 }
 
@@ -6688,6 +6696,8 @@ static void rk_mpp_explicit_iova_validation_kunit(struct kunit *test)
 	job->import_count = 0;
 	refcount_dec(&import->refs);
 	list_del_init(&import->link);
+	kfree(job->reg_image.bindings);
+	kfree(job->imports);
 }
 
 static void rk_mpp_iommu_fault_match_kunit(struct kunit *test)
@@ -8864,8 +8874,8 @@ static int rk_mpp_job_hold_explicit_iova(struct rk_mpp_job *job, u32 index)
 {
 	struct rk_mpp_reg_binding *binding;
 	struct rk_mpp_import *import;
+	dma_addr_t iova;
 	u32 *word;
-	u32 iova;
 	u32 offset;
 	int ret;
 
@@ -8874,6 +8884,14 @@ static int rk_mpp_job_hold_explicit_iova(struct rk_mpp_job *job, u32 index)
 		return ret;
 	if (!word)
 		return 0;
+	binding = rk_mpp_job_find_reg_binding(job, index);
+	if (binding) {
+		ret = rk_mpp_import_iova_at_offset(binding->import,
+						   binding->offset, &iova);
+		if (ret)
+			return ret;
+		return *word == lower_32_bits(iova) ? 0 : -ERANGE;
+	}
 	if (!job->hw)
 		return -ENODEV;
 
@@ -12180,6 +12198,14 @@ static int rk_mpp_iommu_register_fault_handler(struct rk_mpp_hw *hw)
 	if (!hw->iommu_domain)
 		return 0;
 
+	/*
+	 * Publish the lookup entry before the provider can invoke the callback.
+	 * Unregistration removes it first and then drains provider IRQs.
+	 */
+	spin_lock_irqsave(&srv->fault_lock, flags);
+	list_add_tail(&hw->fault_link, &srv->fault_hws);
+	spin_unlock_irqrestore(&srv->fault_lock, flags);
+
 	ret = rockchip_iommu_set_fault_handler(hw->dev,
 					       rk_mpp_iommu_fault_handler, srv);
 	if (!ret) {
@@ -12191,14 +12217,14 @@ static int rk_mpp_iommu_register_fault_handler(struct rk_mpp_hw *hw)
 		if (!ret)
 			hw->iommu_provider = RK_MPP_IOMMU_VSI;
 	}
-	if (ret)
+	if (ret) {
+		spin_lock_irqsave(&srv->fault_lock, flags);
+		list_del_init(&hw->fault_link);
+		spin_unlock_irqrestore(&srv->fault_lock, flags);
 		return dev_err_probe(hw->dev, ret,
 				     "no supported unregisterable IOMMU fault handler\n");
+	}
 	hw->iommu_fault_handler_registered = true;
-
-	spin_lock_irqsave(&srv->fault_lock, flags);
-	list_add_tail(&hw->fault_link, &srv->fault_hws);
-	spin_unlock_irqrestore(&srv->fault_lock, flags);
 
 	return 0;
 }
@@ -13190,13 +13216,17 @@ rk_mpp_av1_build_afbc_config(struct rk_mpp_job *job,
 	u32 padded_height;
 	u32 payload_offset;
 	u32 stride;
+	u32 *word;
 	int ret;
 
 	memset(config, 0, sizeof(*config));
-	ret = rk_mpp_av1_required_word(job, RK_MPP_AV1_PP_CONFIG_WORD,
-				       &pp_config);
+	ret = rk_mpp_job_reg_word(job, RK_MPP_AV1_PP_CONFIG_WORD, false,
+				  &word);
 	if (ret)
 		return ret;
+	if (!word)
+		return 0;
+	pp_config = *word;
 	if ((pp_config & RK_MPP_AV1_PP_TILE_MASK) !=
 	    RK_MPP_AV1_PP_TILE_16X16)
 		return 0;
@@ -13248,7 +13278,8 @@ rk_mpp_av1_build_afbc_config(struct rk_mpp_job *job,
 	if (check_add_overflow(height, 28U, &height))
 		return -EOVERFLOW;
 	pixels = (u64)padded_width * height;
-	header_size = DIV_ROUND_UP_ULL(pixels, 16);
+	/* Preserve the BSP's integer division before the 64-byte alignment. */
+	header_size = div_u64(pixels, 16);
 	header_size = ALIGN(header_size, 64);
 	if (header_size > U32_MAX)
 		return -EOVERFLOW;
