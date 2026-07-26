@@ -5612,10 +5612,13 @@ static void rk_mpp_hw_abort_ccu_dependents_kunit(struct kunit *test)
 
 	device_initialize(ccu_dev);
 	ccu_dev->of_node = ccu_node;
+	ccu_dev->init_name = "kunit-rkvdec2-ccu";
 	ccu_dev->release = rk_mpp_kunit_device_release;
 	device_initialize(core0_dev);
+	core0_dev->init_name = "kunit-rkvdec2-core0";
 	core0_dev->release = rk_mpp_kunit_device_release;
 	device_initialize(core1_dev);
+	core1_dev->init_name = "kunit-rkvdec2-core1";
 	core1_dev->release = rk_mpp_kunit_device_release;
 	pm_runtime_set_active(core1_dev);
 	pm_runtime_enable(core1_dev);
@@ -5638,6 +5641,7 @@ static void rk_mpp_hw_abort_ccu_dependents_kunit(struct kunit *test)
 	refcount_set(&session->refs, 1);
 
 	ccu->dev = ccu_dev;
+	ccu->match = &rk_mpp_rkvdec2_ccu;
 	refcount_set(&ccu->refs, 1);
 	init_completion(&ccu->released);
 	mutex_init(&ccu->ccu_recovery_lock);
@@ -5650,6 +5654,7 @@ static void rk_mpp_hw_abort_ccu_dependents_kunit(struct kunit *test)
 
 	core0->dev = core0_dev;
 	core0->ccu_node = ccu_node;
+	core0->match = &rk_mpp_rkvdec2_core;
 	core0->online = true;
 	core0->terminally_stopped = true;
 	refcount_set(&core0->refs, 2);
@@ -5663,6 +5668,7 @@ static void rk_mpp_hw_abort_ccu_dependents_kunit(struct kunit *test)
 
 	core1->dev = core1_dev;
 	core1->ccu_node = ccu_node;
+	core1->match = &rk_mpp_rkvdec2_core;
 	core1->online = true;
 	core1->terminally_stopped = true;
 	refcount_set(&core1->refs, 2);
