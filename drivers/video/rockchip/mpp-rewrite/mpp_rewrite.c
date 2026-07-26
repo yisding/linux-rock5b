@@ -5187,33 +5187,34 @@ static void rk_mpp_rkvdec2_fill_link_table_kunit(struct kunit *test)
 {
 	const struct rk_mpp_rkvdec2_link_info *info =
 		&rk_mpp_rkvdec2_vdpu381_link_info;
+	struct rk_mpp_reg_image *image;
 	u32 *regs;
 	u32 *table;
-	struct rk_mpp_reg_image image = {
-		.reg_words = 360,
-	};
 	struct rk_mpp_job *job;
 	dma_addr_t iova = 0x12345000;
 	dma_addr_t next = 0x12345400;
 	u32 i;
 
-	regs = kunit_kcalloc(test, image.reg_words, sizeof(*regs), GFP_KERNEL);
+	image = kunit_kzalloc(test, sizeof(*image), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, image);
+	image->reg_words = 360;
+	regs = kunit_kcalloc(test, image->reg_words, sizeof(*regs), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, regs);
 	table = kunit_kzalloc(test, rk_mpp_rkvdec2_link_node_size(info),
 			      GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, table);
 	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, job);
-	image.regs = regs;
-	job->reg_image = image;
+	image->regs = regs;
+	job->reg_image = *image;
 	job->rkvdec_link_vaddr = table;
 
-	for (i = 0; i < image.reg_words; i++)
+	for (i = 0; i < image->reg_words; i++)
 		regs[i] = 0xa5000000 | i;
 	memset(table, 0xff, info->table_words * sizeof(*table));
 
 	KUNIT_EXPECT_EQ(test,
-			rk_mpp_rkvdec2_fill_link_table(&image, info, table,
+			rk_mpp_rkvdec2_fill_link_table(image, info, table,
 						       iova, next),
 			0);
 
@@ -5243,7 +5244,7 @@ static void rk_mpp_rkvdec2_fill_link_table_kunit(struct kunit *test)
 		table[190 + i] = 0xbb000000 | i;
 
 	KUNIT_EXPECT_EQ(test,
-			rk_mpp_rkvdec2_read_link_table(&image, info, table,
+			rk_mpp_rkvdec2_read_link_table(image, info, table,
 						       0x1234),
 			0);
 	KUNIT_EXPECT_EQ(test, regs[RK_MPP_RKVDEC_LINK_STATUS_WORD], 0x1234U);
@@ -5262,19 +5263,19 @@ static void rk_mpp_rkvdec2_fill_link_table_kunit(struct kunit *test)
 	regs[RK_MPP_RKVDEC_LINK_STATUS_WORD] = info->err_mask;
 	KUNIT_EXPECT_TRUE(test, rk_mpp_rkvdec2_ccu_job_error(job, info));
 
-	image.reg_words = 285;
+	image->reg_words = 285;
 	KUNIT_EXPECT_EQ(test,
-			rk_mpp_rkvdec2_read_link_table(&image, info, table,
+			rk_mpp_rkvdec2_read_link_table(image, info, table,
 						       0x1234),
 			-EINVAL);
 	KUNIT_EXPECT_EQ(test,
-			rk_mpp_rkvdec2_fill_link_table(&image, info, table,
+			rk_mpp_rkvdec2_fill_link_table(image, info, table,
 						       iova, next),
 			-EINVAL);
 
-	image.reg_words = 128;
+	image->reg_words = 128;
 	KUNIT_EXPECT_EQ(test,
-			rk_mpp_rkvdec2_fill_link_table(&image, info, table,
+			rk_mpp_rkvdec2_fill_link_table(image, info, table,
 						       iova, next),
 			-EINVAL);
 }
@@ -5284,9 +5285,7 @@ static void rk_mpp_rkvdec2_link_table_ownership_kunit(struct kunit *test)
 	const struct rk_mpp_rkvdec2_link_info *info =
 		&rk_mpp_rkvdec2_vdpu381_link_info;
 	unsigned long used[BITS_TO_LONGS(3)] = {};
-	struct rk_mpp_reg_image image = {
-		.reg_words = 360,
-	};
+	struct rk_mpp_reg_image *image;
 	struct rk_mpp_hw *hw;
 	struct rk_mpp_job *job0;
 	struct rk_mpp_job *job1;
@@ -5303,6 +5302,9 @@ static void rk_mpp_rkvdec2_link_table_ownership_kunit(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, job1);
 	job2 = kunit_kzalloc(test, sizeof(*job2), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, job2);
+	image = kunit_kzalloc(test, sizeof(*image), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, image);
+	image->reg_words = 360;
 
 	hw->rkvdec_link_iova = 0x12345000;
 	hw->rkvdec_link_capacity = 3;
@@ -5310,23 +5312,23 @@ static void rk_mpp_rkvdec2_link_table_ownership_kunit(struct kunit *test)
 	hw->rkvdec_link_node_size = rk_mpp_rkvdec2_link_node_size(info);
 	tables = kunit_kzalloc(test, 3 * hw->rkvdec_link_node_size, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, tables);
-	regs = kunit_kcalloc(test, image.reg_words, sizeof(*regs), GFP_KERNEL);
+	regs = kunit_kcalloc(test, image->reg_words, sizeof(*regs), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, regs);
 	hw->rkvdec_link_vaddr = tables;
-	image.regs = regs;
+	image->regs = regs;
 	job0->hw = hw;
-	job0->reg_image = image;
+	job0->reg_image = *image;
 	job1->hw = hw;
-	job1->reg_image = image;
+	job1->reg_image = *image;
 	job2->hw = hw;
-	job2->reg_image = image;
+	job2->reg_image = *image;
 	spin_lock_init(&hw->lock);
 	INIT_LIST_HEAD(&hw->rkvdec_link_jobs);
 	INIT_LIST_HEAD(&job0->rkvdec_link_node);
 	INIT_LIST_HEAD(&job1->rkvdec_link_node);
 	INIT_LIST_HEAD(&job2->rkvdec_link_node);
 
-	for (i = 0; i < image.reg_words; i++)
+	for (i = 0; i < image->reg_words; i++)
 		regs[i] = 0xa5000000 | i;
 
 	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_stage_link_table(job0), 0);
