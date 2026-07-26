@@ -9,9 +9,9 @@ config ROCKCHIP_MPP_REWRITE
 	  Minimal ABI-compatible /dev/mpp_service rewrite for RK3588 bring-up.
 	  This driver preserves the userspace ioctl parser, query commands,
 	  session switching, and dma-buf fd-to-IOVA import/release using public
-	  APIs. It includes the RK3588 RKVENC2/VDPU381 register execution
-	  paths used by current upstream MPP consumers while leaving unsupported
-	  BSP-only commands as explicit errors.
+	  APIs. It includes the RK3588 RKVENC2, VDPU381, and AV1 register
+	  execution paths used by current MPP consumers while leaving
+	  unsupported BSP-only commands as explicit errors.
 
 config ROCKCHIP_MPP_REWRITE_KUNIT_TEST
 	bool "KUnit tests for Rockchip MPP service compatibility rewrite" if !KUNIT_ALL_TESTS
