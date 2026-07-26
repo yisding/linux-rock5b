@@ -8438,6 +8438,7 @@ static struct rga_req rk_rga_ffmpeg_bitblt_task(u32 src_format,
 		.src = rk_rga_kunit_img(0x10000000, src_format, 1920, 1080),
 		.dst = rk_rga_kunit_img(0x20000000, dst_format, 1280, 720),
 		.yuv2rgb_mode = 1,
+		.in_fence_fd = -1,
 	};
 }
 
@@ -9822,6 +9823,7 @@ static void rk_rga_request_config_handles_kunit(struct kunit *test)
 		.id = 7,
 		.sync_mode = RGA_BLIT_ASYNC,
 		.mpi_config_flags = 0x5a,
+		.acquire_fence_fd = -1,
 	};
 	struct rk_rga_session session = {};
 	struct rk_rga_request *request;
@@ -9979,6 +9981,7 @@ static void rk_rga_request_config_direct_phys_reject_kunit(struct kunit *test)
 	struct rga_user_request user = {
 		.task_num = ARRAY_SIZE(tasks),
 		.id = 8,
+		.acquire_fence_fd = -1,
 	};
 	struct rk_rga_session session = {};
 	struct rk_rga_request *request;
@@ -10068,6 +10071,7 @@ static void rk_rga_request_reconfig_resources_kunit(struct kunit *test)
 	struct rga_user_request user = {
 		.task_num = 1,
 		.id = 9,
+		.acquire_fence_fd = -1,
 	};
 	struct rk_rga_session session = {};
 	struct rk_rga_request *request;
@@ -10315,6 +10319,7 @@ static void rk_rga_request_config_ioctl_acquire_kunit(struct kunit *test)
 	struct rk_rga_import *dst_import;
 	struct dma_fence *acquire_fence;
 	struct dma_fence *fd_fence;
+	struct file *acquire_file;
 	void __user *task_user;
 	void __user *request_user;
 	unsigned long uncopied;
@@ -10331,6 +10336,8 @@ static void rk_rga_request_config_ioctl_acquire_kunit(struct kunit *test)
 	acquire_fd = rk_rga_kunit_install_fence_fd(acquire_fence);
 	KUNIT_ASSERT_GE(test, acquire_fd, 0);
 
+	acquire_file = fget(acquire_fd);
+	KUNIT_ASSERT_NOT_NULL(test, acquire_file);
 	task.handle_flag = 1;
 	task.src.yrgb_addr = 51;
 	task.src.uv_addr = 0;
@@ -10395,6 +10402,7 @@ static void rk_rga_request_config_ioctl_acquire_kunit(struct kunit *test)
 		dma_fence_put(fd_fence);
 
 	KUNIT_EXPECT_TRUE(test, rk_rga_request_remove_free(&session, 12));
+	__fput_sync(acquire_file);
 	KUNIT_EXPECT_EQ(test, kref_read(&acquire_fence->refcount), 1U);
 	KUNIT_EXPECT_EQ(test, refcount_read(&src_import->refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&dst_import->refs), 1);
@@ -10646,7 +10654,10 @@ static void rk_rga_release_pending_acquire_job_kunit(struct kunit *test)
 	struct dma_fence *acquire_fence;
 	struct dma_fence *release_fence;
 	struct file file = {};
-	struct rk_rga_hw hw = { };
+	struct rk_rga_hw hw = {
+		.type = RK_RGA_HW_RGA3,
+		.core_mask = BIT(0),
+	};
 	void __user *task_user;
 	unsigned long uncopied;
 	int acquire_fd;
@@ -10759,7 +10770,10 @@ static void rk_rga_last_hw_remove_pending_acquire_kunit(struct kunit *test)
 	struct dma_fence *acquire_fence;
 	struct dma_fence *release_fence;
 	struct file file = {};
-	struct rk_rga_hw hw = { };
+	struct rk_rga_hw hw = {
+		.type = RK_RGA_HW_RGA3,
+		.core_mask = BIT(0),
+	};
 	void __user *task_user;
 	unsigned long uncopied;
 	int acquire_fd;
@@ -10960,8 +10974,22 @@ rk_rga_incompatible_pending_acquire_oom_fallback_kunit(struct kunit *test)
 	struct rk_rga_job *job;
 
 	rk_rga_session_init(&session);
-	rk_rga_job_init(&compatible);
-	rk_rga_job_init(&incompatible);
+	INIT_LIST_HEAD(&compatible.node);
+	INIT_LIST_HEAD(&compatible.session_node);
+	INIT_WORK_ONSTACK(&compatible.acquire_work, rk_rga_job_acquire_work);
+	refcount_set(&compatible.refs, 1);
+	init_waitqueue_head(&compatible.wait);
+	atomic_set(&compatible.pending_acquire_count, 0);
+	atomic_set(&compatible.acquire_work_queued, 0);
+	compatible.release_fence_fd = -1;
+	INIT_LIST_HEAD(&incompatible.node);
+	INIT_LIST_HEAD(&incompatible.session_node);
+	INIT_WORK_ONSTACK(&incompatible.acquire_work, rk_rga_job_acquire_work);
+	refcount_set(&incompatible.refs, 1);
+	init_waitqueue_head(&incompatible.wait);
+	atomic_set(&incompatible.pending_acquire_count, 0);
+	atomic_set(&incompatible.acquire_work_queued, 0);
+	incompatible.release_fence_fd = -1;
 
 	compatible.tasks = &compatible_task;
 	compatible.task_count = 1;
@@ -10997,6 +11025,8 @@ rk_rga_incompatible_pending_acquire_oom_fallback_kunit(struct kunit *test)
 
 	list_del_init(&compatible.session_node);
 	list_del_init(&incompatible.session_node);
+	destroy_work_on_stack(&compatible.acquire_work);
+	destroy_work_on_stack(&incompatible.acquire_work);
 	idr_destroy(&session.imports);
 	idr_destroy(&session.requests);
 }
@@ -11185,6 +11215,7 @@ static void rk_rga_request_reconfig_gauss_kunit(struct kunit *test)
 	struct rga_user_request user = {
 		.task_num = 1,
 		.id = 11,
+		.acquire_fence_fd = -1,
 	};
 	struct rk_rga_session session = {};
 	struct rk_rga_request *request;
@@ -11342,7 +11373,8 @@ static void rk_rga_legacy_blit_sync_wait_kunit(struct kunit *test)
 	init_waitqueue_head(&hw.idle);
 	INIT_LIST_HEAD(&hw.node);
 	INIT_LIST_HEAD(&hw.job_queue);
-	INIT_DELAYED_WORK(&hw.timeout_work, rk_rga_hw_timeout_work);
+	INIT_DELAYED_WORK_ONSTACK(&hw.timeout_work,
+				  rk_rga_hw_timeout_work);
 	refcount_set(&hw.refs, 1);
 	hw.type = RK_RGA_HW_RGA3;
 	hw.core_mask = BIT(0);
@@ -11354,7 +11386,7 @@ static void rk_rga_legacy_blit_sync_wait_kunit(struct kunit *test)
 	list_add_tail(&hw.node, &rk_rga.hw_list);
 
 	ioctl.task_user = task_user;
-	INIT_WORK(&ioctl.work, rk_rga_kunit_sync_ioctl_work);
+	INIT_WORK_ONSTACK(&ioctl.work, rk_rga_kunit_sync_ioctl_work);
 	schedule_work(&ioctl.work);
 
 	for (u32 i = 0; i < 100; i++) {
@@ -11411,6 +11443,8 @@ static void rk_rga_legacy_blit_sync_wait_kunit(struct kunit *test)
 	rk_rga_import_put(dst_import);
 	idr_destroy(&session.requests);
 	idr_destroy(&session.imports);
+	destroy_work_on_stack(&ioctl.work);
+	destroy_delayed_work_on_stack(&hw.timeout_work);
 }
 
 static void rk_rga_legacy_blit_async_acquire_kunit(struct kunit *test)
