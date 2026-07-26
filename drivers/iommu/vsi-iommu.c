@@ -895,6 +895,8 @@ int vsi_iommu_set_fault_handler(struct device *dev,
 	iommu->fault_handler = handler;
 	iommu->fault_handler_token = token;
 	spin_unlock_irqrestore(&iommu->fault_lock, flags);
+	if (!handler)
+		synchronize_irq(iommu->irq);
 
 	return 0;
 }
