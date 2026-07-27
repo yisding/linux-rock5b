@@ -13710,29 +13710,32 @@ static void rk_rga_release_fence_fd_state_kunit(struct kunit *test)
 	struct sync_file *sync_file;
 	struct dma_fence *fd_fence;
 	struct dma_fence *fence;
-	struct rk_rga_job job = { };
+	struct rk_rga_job *job;
 	int fd;
 
-	rk_rga_job_init(&job);
-	job.release_fence_fd = 9;
+	/* rk_rga_job_init() uses INIT_WORK(), so its owner cannot be on-stack. */
+	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+	rk_rga_job_init(job);
+	job->release_fence_fd = 9;
 
-	rk_rga_job_forget_release_fence_fd(&job, -1);
-	KUNIT_EXPECT_EQ(test, job.release_fence_fd, 9);
+	rk_rga_job_forget_release_fence_fd(job, -1);
+	KUNIT_EXPECT_EQ(test, job->release_fence_fd, 9);
 
-	rk_rga_job_forget_release_fence_fd(&job, 8);
-	KUNIT_EXPECT_EQ(test, job.release_fence_fd, 9);
+	rk_rga_job_forget_release_fence_fd(job, 8);
+	KUNIT_EXPECT_EQ(test, job->release_fence_fd, 9);
 
 	rk_rga_job_forget_release_fence_fd(NULL, 9);
-	KUNIT_EXPECT_EQ(test, job.release_fence_fd, 9);
+	KUNIT_EXPECT_EQ(test, job->release_fence_fd, 9);
 
-	rk_rga_job_forget_release_fence_fd(&job, 9);
-	KUNIT_EXPECT_EQ(test, job.release_fence_fd, -1);
+	rk_rga_job_forget_release_fence_fd(job, 9);
+	KUNIT_EXPECT_EQ(test, job->release_fence_fd, -1);
 
 	fence = rk_rga_kunit_alloc_fence();
 	KUNIT_ASSERT_NOT_NULL(test, fence);
 	fd = rk_rga_fence_create_fd(fence, &sync_file);
 	KUNIT_ASSERT_GE(test, fd, 0);
-	job.release_fence_fd = fd;
+	job->release_fence_fd = fd;
 
 	/* Reserved descriptors must stay invisible until user copy succeeds. */
 	fd_fence = sync_file_get_fence(fd);
@@ -13740,8 +13743,8 @@ static void rk_rga_release_fence_fd_state_kunit(struct kunit *test)
 	if (fd_fence)
 		dma_fence_put(fd_fence);
 
-	rk_rga_job_install_fd(&job, sync_file);
-	KUNIT_EXPECT_EQ(test, job.release_fence_fd, -1);
+	rk_rga_job_install_fd(job, sync_file);
+	KUNIT_EXPECT_EQ(test, job->release_fence_fd, -1);
 	fd_fence = sync_file_get_fence(fd);
 	KUNIT_EXPECT_PTR_EQ(test, fd_fence, fence);
 	if (fd_fence)
@@ -13753,9 +13756,9 @@ static void rk_rga_release_fence_fd_state_kunit(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, fence);
 	fd = rk_rga_fence_create_fd(fence, &sync_file);
 	KUNIT_ASSERT_GE(test, fd, 0);
-	job.release_fence_fd = fd;
-	rk_rga_job_abort_fd(&job, sync_file);
-	KUNIT_EXPECT_EQ(test, job.release_fence_fd, -1);
+	job->release_fence_fd = fd;
+	rk_rga_job_abort_fd(job, sync_file);
+	KUNIT_EXPECT_EQ(test, job->release_fence_fd, -1);
 	fd_fence = sync_file_get_fence(fd);
 	KUNIT_EXPECT_PTR_EQ(test, fd_fence, NULL);
 	if (fd_fence)
@@ -13765,18 +13768,21 @@ static void rk_rga_release_fence_fd_state_kunit(struct kunit *test)
 
 static void rk_rga_hw_abort_queued_jobs_kunit(struct kunit *test)
 {
-	struct rk_rga_hw hw = { };
+	struct rk_rga_hw *hw;
 	struct rk_rga_job *job0;
 	struct rk_rga_job *job1;
 	struct dma_fence *fence0;
 	struct dma_fence *fence1;
 
-	mutex_init(&hw.run_lock);
-	spin_lock_init(&hw.job_lock);
-	init_waitqueue_head(&hw.idle);
-	INIT_LIST_HEAD(&hw.job_queue);
-	INIT_DELAYED_WORK(&hw.timeout_work, rk_rga_hw_timeout_work);
-	refcount_set(&hw.refs, 3);
+	/* timeout_work uses INIT_DELAYED_WORK(), so keep its owner off-stack. */
+	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
+	mutex_init(&hw->run_lock);
+	spin_lock_init(&hw->job_lock);
+	init_waitqueue_head(&hw->idle);
+	INIT_LIST_HEAD(&hw->job_queue);
+	INIT_DELAYED_WORK(&hw->timeout_work, rk_rga_hw_timeout_work);
+	refcount_set(&hw->refs, 3);
 
 	job0 = kzalloc_obj(*job0, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, job0);
@@ -13786,8 +13792,8 @@ static void rk_rga_hw_abort_queued_jobs_kunit(struct kunit *test)
 	rk_rga_job_init(job1);
 	rk_rga_job_get(job0);
 	rk_rga_job_get(job1);
-	job0->hw = &hw;
-	job1->hw = &hw;
+	job0->hw = hw;
+	job1->hw = hw;
 	job0->queued = true;
 	job1->queued = true;
 
@@ -13800,14 +13806,14 @@ static void rk_rga_hw_abort_queued_jobs_kunit(struct kunit *test)
 	job0->release_fence = fence0;
 	job1->release_fence = fence1;
 
-	list_add_tail(&job0->node, &hw.job_queue);
-	list_add_tail(&job1->node, &hw.job_queue);
-	hw.queued_jobs = 2;
+	list_add_tail(&job0->node, &hw->job_queue);
+	list_add_tail(&job1->node, &hw->job_queue);
+	hw->queued_jobs = 2;
 
-	rk_rga_hw_abort_jobs(&hw, -ENODEV);
+	rk_rga_hw_abort_jobs(hw, -ENODEV);
 
-	KUNIT_EXPECT_TRUE(test, list_empty(&hw.job_queue));
-	KUNIT_EXPECT_EQ(test, hw.queued_jobs, 0U);
+	KUNIT_EXPECT_TRUE(test, list_empty(&hw->job_queue));
+	KUNIT_EXPECT_EQ(test, hw->queued_jobs, 0U);
 	KUNIT_EXPECT_FALSE(test, job0->queued);
 	KUNIT_EXPECT_FALSE(test, job1->queued);
 	KUNIT_EXPECT_TRUE(test, job0->done);
@@ -13818,7 +13824,7 @@ static void rk_rga_hw_abort_queued_jobs_kunit(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, job1->hw, NULL);
 	KUNIT_EXPECT_EQ(test, refcount_read(&job0->refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&job1->refs), 1);
-	KUNIT_EXPECT_EQ(test, refcount_read(&hw.refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&hw->refs), 1);
 	KUNIT_EXPECT_EQ(test, dma_fence_get_status(fence0), -ENODEV);
 	KUNIT_EXPECT_EQ(test, dma_fence_get_status(fence1), -ENODEV);
 
@@ -14667,41 +14673,44 @@ static void rk_rga_priority_enqueue_kunit(struct kunit *test)
 
 static void rk_rga_iommu_fault_generation_kunit(struct kunit *test)
 {
-	struct rk_rga_hw hw = {};
+	struct rk_rga_hw *hw;
 	struct rk_rga_job target = {};
 	struct rk_rga_job replacement = {};
 	unsigned long flags;
 	bool matches;
 	bool queued;
 
-	spin_lock_init(&hw.job_lock);
-	init_waitqueue_head(&hw.idle);
-	mutex_init(&hw.run_lock);
-	INIT_DELAYED_WORK(&hw.timeout_work, rk_rga_hw_timeout_work);
-	INIT_WORK(&hw.iommu_fault_work, rk_rga_hw_iommu_fault_work);
+	/* Both embedded work items use ordinary, non-stack initializers. */
+	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
+	spin_lock_init(&hw->job_lock);
+	init_waitqueue_head(&hw->idle);
+	mutex_init(&hw->run_lock);
+	INIT_DELAYED_WORK(&hw->timeout_work, rk_rga_hw_timeout_work);
+	INIT_WORK(&hw->iommu_fault_work, rk_rga_hw_iommu_fault_work);
 
-	hw.active_job = &target;
-	hw.active_generation = 1;
-	hw.iommu_fault_generation = 1;
-	spin_lock_irqsave(&hw.job_lock, flags);
-	matches = rk_rga_hw_iommu_fault_matches_locked(&hw);
-	spin_unlock_irqrestore(&hw.job_lock, flags);
+	hw->active_job = &target;
+	hw->active_generation = 1;
+	hw->iommu_fault_generation = 1;
+	spin_lock_irqsave(&hw->job_lock, flags);
+	matches = rk_rga_hw_iommu_fault_matches_locked(hw);
+	spin_unlock_irqrestore(&hw->job_lock, flags);
 	KUNIT_EXPECT_TRUE(test, matches);
-	KUNIT_EXPECT_EQ(test, hw.iommu_fault_generation, 0ULL);
+	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 0ULL);
 
-	hw.active_job = &replacement;
-	hw.active_generation = 2;
-	hw.iommu_fault_generation = 1;
-	queued = schedule_delayed_work(&hw.timeout_work,
+	hw->active_job = &replacement;
+	hw->active_generation = 2;
+	hw->iommu_fault_generation = 1;
+	queued = schedule_delayed_work(&hw->timeout_work,
 				       msecs_to_jiffies(60000));
 	KUNIT_ASSERT_TRUE(test, queued);
 
-	rk_rga_hw_iommu_fault_work(&hw.iommu_fault_work);
+	rk_rga_hw_iommu_fault_work(&hw->iommu_fault_work);
 
-	KUNIT_EXPECT_PTR_EQ(test, hw.active_job, &replacement);
-	KUNIT_EXPECT_EQ(test, hw.iommu_fault_generation, 0ULL);
-	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&hw.timeout_work));
-	cancel_delayed_work_sync(&hw.timeout_work);
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, &replacement);
+	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 0ULL);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&hw->timeout_work));
+	cancel_delayed_work_sync(&hw->timeout_work);
 }
 
 static void rk_rga_timeout_target_replacement_kunit(struct kunit *test)
