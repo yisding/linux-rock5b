@@ -74,6 +74,7 @@
 
 #define RK_RGA_QUIRK_RGA3_LOGIC_CLK_ON	BIT(0)
 #define RK_RGA_QUIRK_RGA2_DISABLE_AUTO_RST	BIT(1)
+#define RK_RGA_QUIRK_SHARED_IOMMU_IRQ	BIT(2)
 
 #define RK_RGA2_SYS_CTRL	0x000
 #define RK_RGA2_CMD_CTRL	0x004
@@ -1937,9 +1938,9 @@ static int rk_rga_validate_mmio_size(u32 minimum, resource_size_t size)
 	return size < minimum ? -EINVAL : 0;
 }
 
-static unsigned long rk_rga_irq_flags(bool has_external_iommu)
+static unsigned long rk_rga_irq_flags(u32 quirks)
 {
-	return has_external_iommu ? IRQF_SHARED : IRQF_ONESHOT;
+	return quirks & RK_RGA_QUIRK_SHARED_IOMMU_IRQ ? IRQF_SHARED : IRQF_ONESHOT;
 }
 
 static int rk_rga_check_dma_sgt(struct sg_table *sgt, const char *source,
@@ -11939,9 +11940,13 @@ static void rk_rga_mmio_size_kunit(struct kunit *test)
 			rk_rga_validate_mmio_size(RK_RGA3_MIN_REG_SIZE,
 						  RK_RGA3_MIN_REG_SIZE),
 			0);
-	KUNIT_EXPECT_EQ(test, rk_rga_irq_flags(false),
+}
+
+static void rk_rga_irq_flags_kunit(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, rk_rga_irq_flags(0),
 			(unsigned long)IRQF_ONESHOT);
-	KUNIT_EXPECT_EQ(test, rk_rga_irq_flags(true),
+	KUNIT_EXPECT_EQ(test, rk_rga_irq_flags(RK_RGA_QUIRK_SHARED_IOMMU_IRQ),
 			(unsigned long)IRQF_SHARED);
 }
 
@@ -18626,6 +18631,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_iova_span_kunit),
 	KUNIT_CASE(rk_rga_clock_count_kunit),
 	KUNIT_CASE(rk_rga_mmio_size_kunit),
+	KUNIT_CASE(rk_rga_irq_flags_kunit),
 	KUNIT_CASE(rk_rga_hw_version_kunit),
 	KUNIT_CASE(rk_rga_import_dmabuf_fd_kunit),
 	KUNIT_CASE(rk_rga_import_buffer_ioctl_errors_kunit),
@@ -23459,7 +23465,8 @@ static const struct rk_rga_hw_match rk_rga3_match = {
 	.version_minor = 0,
 	.version_revision = 0x76831,
 	.min_reg_size = RK_RGA3_MIN_REG_SIZE,
-	.quirks = RK_RGA_QUIRK_RGA3_LOGIC_CLK_ON,
+	.quirks = RK_RGA_QUIRK_RGA3_LOGIC_CLK_ON |
+		  RK_RGA_QUIRK_SHARED_IOMMU_IRQ,
 };
 
 static const struct of_device_id rk_rga_of_match[] = {
@@ -23592,7 +23599,7 @@ static int rk_rga_hw_probe(struct platform_device *pdev)
 	 * masking the entire shared line until that thread exits is unnecessary
 	 * and conflicts with rockchip-iommu's non-oneshot IRQ registration.
 	 */
-	irq_flags = rk_rga_irq_flags(!!hw->iommu_node);
+	irq_flags = rk_rga_irq_flags(match->quirks);
 
 	ret = devm_request_threaded_irq(dev, hw->irq, rk_rga_irq_handler,
 					rk_rga_irq_thread, irq_flags,
