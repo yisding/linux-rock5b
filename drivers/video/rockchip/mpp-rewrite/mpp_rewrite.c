@@ -7644,6 +7644,7 @@ static void rk_mpp_session_abort_hw_active_kunit(struct kunit *test)
 	pm_runtime_get_noresume(dev);
 
 	mutex_init(&srv.sched_lock);
+	spin_lock_init(&srv.rkvenc_dchs_lock);
 	INIT_LIST_HEAD(&srv.queued_jobs);
 
 	session->srv = &srv;
@@ -13407,7 +13408,8 @@ static int rk_mpp_debug_state_show(struct seq_file *s, void *unused)
 		   recent_events, next_event_seq);
 
 	seq_puts(s, "\n# hardware: device hw core online recovery_failed pm_active refs queued irq active_session active_job active_client active_ms ccu_mode\n");
-	mutex_lock(&srv->hw_lock);
+	if (!mutex_trylock(&srv->hw_lock))
+		return -EBUSY;
 	list_for_each_entry(hw, &srv->hw_list, link) {
 		u32 active_session = 0;
 		u32 active_job = 0;
@@ -13448,7 +13450,8 @@ static int rk_mpp_debug_state_show(struct seq_file *s, void *unused)
 	mutex_unlock(&srv->hw_lock);
 
 	seq_puts(s, "\n# queue: device core session job client requests registers flags canceled queued_ms\n");
-	mutex_lock(&srv->sched_lock);
+	if (!mutex_trylock(&srv->sched_lock))
+		return -EBUSY;
 	list_for_each_entry(job, &srv->queued_jobs, sched_link) {
 		u64 queued_ms = job->queued_ns && snapshot_ns >= job->queued_ns ?
 			(snapshot_ns - job->queued_ns) / NSEC_PER_MSEC : 0;
