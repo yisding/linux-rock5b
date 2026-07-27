@@ -3471,6 +3471,8 @@ static void rk_mpp_kunit_put_device(void *data)
 	put_device(data);
 }
 
+KUNIT_DEFINE_ACTION_WRAPPER(rk_mpp_kunit_kfree, kfree, const void *);
+
 static int rk_mpp_kunit_dmabuf_fd(struct kunit *test, size_t size,
 				  struct dma_buf **held_dmabuf)
 {
@@ -3739,6 +3741,7 @@ static void rk_mpp_set_err_ref_hack_kunit(struct kunit *test)
 		.size = sizeof(stack_payload),
 	};
 
+	mutex_init(&session.lock);
 	req.data = rk_mpp_kunit_user_payload(test, &stack_payload,
 					     sizeof(stack_payload));
 	KUNIT_ASSERT_NOT_NULL(test, req.data);
@@ -4643,7 +4646,17 @@ static void rk_mpp_rkvdec2_vp9_translate_validate_kunit(struct kunit *test)
 	job->reqs[0].req.offset = RK_MPP_RKVDEC_START_BASE;
 	job->reqs[0].req.size = sizeof(u32);
 
-	KUNIT_EXPECT_EQ(test, rk_mpp_job_translate_reg_image(job), 0);
+	ret = rk_mpp_job_translate_reg_image(job);
+	if (job->reg_image.bindings) {
+		int action_ret;
+
+		action_ret =
+			kunit_add_action_or_reset(test, rk_mpp_kunit_kfree,
+						  job->reg_image.bindings);
+		KUNIT_ASSERT_EQ(test, action_ret, 0);
+	}
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_ASSERT_NOT_NULL(test, job->reg_image.bindings);
 	KUNIT_EXPECT_TRUE(test, job->reg_image.translated);
 	KUNIT_EXPECT_EQ(test, job->reg_image.regs[160], 0x80000004U);
 	KUNIT_EXPECT_EQ(test, job->reg_image.regs[162], 0x80000008U);
