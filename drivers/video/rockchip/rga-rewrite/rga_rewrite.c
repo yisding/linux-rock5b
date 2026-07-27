@@ -14715,33 +14715,36 @@ static void rk_rga_iommu_fault_generation_kunit(struct kunit *test)
 
 static void rk_rga_timeout_target_replacement_kunit(struct kunit *test)
 {
-	struct rk_rga_hw hw = {};
+	struct rk_rga_hw *hw;
 	struct rk_rga_job target = {};
 	struct rk_rga_job replacement = {};
 
-	spin_lock_init(&hw.job_lock);
-	init_waitqueue_head(&hw.idle);
-	mutex_init(&hw.run_lock);
-	INIT_DELAYED_WORK(&hw.timeout_work, rk_rga_hw_timeout_work);
+	/* timeout_work uses INIT_DELAYED_WORK(), so keep its owner off-stack. */
+	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
+	spin_lock_init(&hw->job_lock);
+	init_waitqueue_head(&hw->idle);
+	mutex_init(&hw->run_lock);
+	INIT_DELAYED_WORK(&hw->timeout_work, rk_rga_hw_timeout_work);
 	refcount_set(&target.refs, 1);
 	refcount_set(&replacement.refs, 1);
-	hw.active_job = &replacement;
-	hw.timeout_job = &target;
+	hw->active_job = &replacement;
+	hw->timeout_job = &target;
 	rk_rga_job_get(&target);
 
-	rk_rga_hw_timeout_work(&hw.timeout_work.work);
+	rk_rga_hw_timeout_work(&hw->timeout_work.work);
 
-	KUNIT_EXPECT_PTR_EQ(test, hw.active_job, &replacement);
-	KUNIT_EXPECT_PTR_EQ(test, hw.timeout_job, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, &replacement);
+	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_job, NULL);
 	KUNIT_EXPECT_EQ(test, refcount_read(&target.refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&replacement.refs), 1);
 
-	rk_rga_hw_schedule_timeout(&hw, &replacement);
-	KUNIT_EXPECT_PTR_EQ(test, hw.timeout_job, &replacement);
+	rk_rga_hw_schedule_timeout(hw, &replacement);
+	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_job, &replacement);
 	KUNIT_EXPECT_EQ(test, refcount_read(&replacement.refs), 2);
-	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&hw.timeout_work));
-	rk_rga_hw_cancel_timeout_sync(&hw);
-	KUNIT_EXPECT_PTR_EQ(test, hw.timeout_job, NULL);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&hw->timeout_work));
+	rk_rga_hw_cancel_timeout_sync(hw);
+	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_job, NULL);
 	KUNIT_EXPECT_EQ(test, refcount_read(&replacement.refs), 1);
 
 	/*
@@ -14750,17 +14753,17 @@ static void rk_rga_timeout_target_replacement_kunit(struct kunit *test)
 	 * same pointer, so the pointer match alone would reset the job's next
 	 * task after the previous one completed.
 	 */
-	hw.active_job = &replacement;
-	hw.active_generation = 2;
-	hw.timeout_job = &replacement;
-	hw.timeout_generation = 1;
+	hw->active_job = &replacement;
+	hw->active_generation = 2;
+	hw->timeout_job = &replacement;
+	hw->timeout_generation = 1;
 	rk_rga_job_get(&replacement);
 
-	rk_rga_hw_timeout_work(&hw.timeout_work.work);
+	rk_rga_hw_timeout_work(&hw->timeout_work.work);
 
-	KUNIT_EXPECT_PTR_EQ(test, hw.active_job, &replacement);
-	KUNIT_EXPECT_PTR_EQ(test, hw.timeout_job, NULL);
-	KUNIT_EXPECT_EQ(test, hw.timeout_generation, 0ULL);
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, &replacement);
+	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_job, NULL);
+	KUNIT_EXPECT_EQ(test, hw->timeout_generation, 0ULL);
 	KUNIT_EXPECT_EQ(test, refcount_read(&replacement.refs), 1);
 }
 
