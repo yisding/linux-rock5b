@@ -1391,6 +1391,9 @@ struct rk_rga_service {
 };
 
 static struct rk_rga_service rk_rga;
+static bool rk_rga_runtime_registered;
+static int rk_rga_runtime_register(void);
+static void rk_rga_runtime_unregister(void);
 
 static void rk_rga_service_state_init(struct rk_rga_service *rga)
 {
@@ -1408,7 +1411,9 @@ static void rk_rga_service_state_init(struct rk_rga_service *rga)
 }
 
 #if IS_ENABLED(CONFIG_ROCKCHIP_RGA_REWRITE_KUNIT_TEST)
+static bool rk_rga_kunit_runtime_isolated;
 static int rk_rga_kunit_suite_init(struct kunit_suite *suite);
+static void rk_rga_kunit_suite_exit(struct kunit_suite *suite);
 #endif
 
 static int rk_rga_release(struct inode *inode, struct file *file);
@@ -18766,13 +18771,44 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 
 static int rk_rga_kunit_suite_init(struct kunit_suite *suite)
 {
+	/*
+	 * Built-in suites run after every initcall from kernel_init_freeable(),
+	 * not from kunit_init(). Unbind the already-probed runtime before the
+	 * singleton becomes fixture storage. A debugfs rerun after boot must not
+	 * tear down open sessions or active hardware.
+	 */
+	if (system_state != SYSTEM_SCHEDULING)
+		return -EBUSY;
+	if (!rk_rga_runtime_registered)
+		return -ENODEV;
+
+	rk_rga_runtime_unregister();
 	rk_rga_service_state_init(&rk_rga);
+	rk_rga_kunit_runtime_isolated = true;
 	return 0;
+}
+
+static void rk_rga_kunit_suite_exit(struct kunit_suite *suite)
+{
+	int ret;
+
+	if (!rk_rga_kunit_runtime_isolated)
+		return;
+
+	rk_rga_kunit_runtime_isolated = false;
+	ret = rk_rga_runtime_register();
+	if (ret) {
+		/* suite_init_err is included in the final suite outcome. */
+		suite->suite_init_err = ret;
+		kunit_err(suite,
+			  "# failed to restore production RGA service (%d)", ret);
+	}
 }
 
 static struct kunit_suite rk_rga_rewrite_test_suite = {
 	.name = "rockchip-rga-rewrite",
 	.suite_init = rk_rga_kunit_suite_init,
+	.suite_exit = rk_rga_kunit_suite_exit,
 	.test_cases = rk_rga_rewrite_test_cases,
 };
 
@@ -23851,7 +23887,7 @@ static void rk_rga_debugfs_create_route_b(void)
 	debugfs_create_bool("force_remap", 0600, dir, &rk_rga.route_b_force_remap);
 }
 
-static int __init rk_rga_init(void)
+static int rk_rga_runtime_register(void)
 {
 	int ret;
 
@@ -23960,32 +23996,36 @@ static int __init rk_rga_init(void)
 	pr_info("registered /dev/rga (%s), hw_count=%u\n",
 		RK_RGA_REWRITE_VERSION, rk_rga.hw_versions.size);
 
+	rk_rga_runtime_registered = true;
 	return 0;
 
 err_unregister_platform:
 	platform_driver_unregister(&rk_rga_platform_driver);
-
 	return ret;
 }
 
-static void __exit rk_rga_exit(void)
+static void rk_rga_runtime_unregister(void)
 {
+	if (!rk_rga_runtime_registered)
+		return;
+
+	rk_rga_runtime_registered = false;
 	debugfs_remove_recursive(rk_rga.debugfs_root);
 	misc_deregister(&rk_rga.miscdev);
 	platform_driver_unregister(&rk_rga_platform_driver);
 }
 
-/*
- * Built-in KUnit suites execute from kunit_init() at late_initcall time.
- * Bind the hardware in the following sync phase so tests can use the singleton
- * as isolated fixture storage; rk_rga_init() then discards all fixture state
- * before any production device is registered.
- */
-#if IS_ENABLED(CONFIG_ROCKCHIP_RGA_REWRITE_KUNIT_TEST)
-late_initcall_sync(rk_rga_init);
-#else
+static int __init rk_rga_init(void)
+{
+	return rk_rga_runtime_register();
+}
+
+static void __exit rk_rga_exit(void)
+{
+	rk_rga_runtime_unregister();
+}
+
 module_init(rk_rga_init);
-#endif
 module_exit(rk_rga_exit);
 
 MODULE_IMPORT_NS("DMA_BUF");
