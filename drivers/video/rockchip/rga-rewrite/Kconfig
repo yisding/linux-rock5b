@@ -13,8 +13,11 @@ config ROCKCHIP_RGA_REWRITE
 
 config ROCKCHIP_RGA_REWRITE_KUNIT_TEST
 	bool "KUnit tests for Rockchip RGA compatibility rewrite" if !KUNIT_ALL_TESTS
-	depends on ROCKCHIP_RGA_REWRITE && KUNIT
+	depends on ROCKCHIP_RGA_REWRITE=y && KUNIT
 	default KUNIT_ALL_TESTS
 	help
 	  Unit tests for rewrite-local ABI normalization helpers, including
 	  RGA2 userspace transform decoding and destination-corner selection.
+	  The in-source suite uses the service singleton as test-fixture
+	  storage, so it is available only when the driver is built in and
+	  can bind after the suite has completed.
