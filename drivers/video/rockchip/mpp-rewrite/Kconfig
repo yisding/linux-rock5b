@@ -14,8 +14,11 @@ config ROCKCHIP_MPP_REWRITE
 
 config ROCKCHIP_MPP_REWRITE_KUNIT_TEST
 	bool "KUnit tests for Rockchip MPP service compatibility rewrite" if !KUNIT_ALL_TESTS
-	depends on ROCKCHIP_MPP_REWRITE && KUNIT
+	depends on ROCKCHIP_MPP_REWRITE=y && KUNIT
 	default KUNIT_ALL_TESTS
 	help
 	  Unit tests for rewrite-local MPP ABI parser helpers, including
 	  command range classification and register-span validation.
+	  The in-source suite uses the service singleton as test-fixture
+	  storage, so it is available only when the driver is built in and
+	  can bind after the suite has completed.

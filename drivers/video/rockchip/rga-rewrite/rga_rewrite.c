@@ -1392,6 +1392,25 @@ struct rk_rga_service {
 
 static struct rk_rga_service rk_rga;
 
+static void rk_rga_service_state_init(struct rk_rga_service *rga)
+{
+	memset(rga, 0, sizeof(*rga));
+	mutex_init(&rga->hw_lock);
+	mutex_init(&rga->import_lock);
+	mutex_init(&rga->session_lock);
+	spin_lock_init(&rga->fault_lock);
+	INIT_LIST_HEAD(&rga->hw_list);
+	INIT_LIST_HEAD(&rga->imports);
+	INIT_LIST_HEAD(&rga->sessions);
+	INIT_LIST_HEAD(&rga->fault_hws);
+	spin_lock_init(&rga->fence_lock);
+	rga->fence_context = dma_fence_context_alloc(1);
+}
+
+#if IS_ENABLED(CONFIG_ROCKCHIP_RGA_REWRITE_KUNIT_TEST)
+static int rk_rga_kunit_suite_init(struct kunit_suite *suite);
+#endif
+
 static int rk_rga_release(struct inode *inode, struct file *file);
 static int rk_rga_task_hw_type_mask(struct rk_rga_job *job, u32 task_index,
 				    u32 *type_mask);
@@ -18745,8 +18764,15 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	{ }
 };
 
+static int rk_rga_kunit_suite_init(struct kunit_suite *suite)
+{
+	rk_rga_service_state_init(&rk_rga);
+	return 0;
+}
+
 static struct kunit_suite rk_rga_rewrite_test_suite = {
 	.name = "rockchip-rga-rewrite",
+	.suite_init = rk_rga_kunit_suite_init,
 	.test_cases = rk_rga_rewrite_test_cases,
 };
 
@@ -23829,16 +23855,7 @@ static int __init rk_rga_init(void)
 {
 	int ret;
 
-	mutex_init(&rk_rga.hw_lock);
-	mutex_init(&rk_rga.import_lock);
-	mutex_init(&rk_rga.session_lock);
-	spin_lock_init(&rk_rga.fault_lock);
-	INIT_LIST_HEAD(&rk_rga.hw_list);
-	INIT_LIST_HEAD(&rk_rga.imports);
-	INIT_LIST_HEAD(&rk_rga.sessions);
-	INIT_LIST_HEAD(&rk_rga.fault_hws);
-	spin_lock_init(&rk_rga.fence_lock);
-	rk_rga.fence_context = dma_fence_context_alloc(1);
+	rk_rga_service_state_init(&rk_rga);
 
 	ret = platform_driver_register(&rk_rga_platform_driver);
 	if (ret)
@@ -23958,7 +23975,17 @@ static void __exit rk_rga_exit(void)
 	platform_driver_unregister(&rk_rga_platform_driver);
 }
 
+/*
+ * Built-in KUnit suites execute from kunit_init() at late_initcall time.
+ * Bind the hardware in the following sync phase so tests can use the singleton
+ * as isolated fixture storage; rk_rga_init() then discards all fixture state
+ * before any production device is registered.
+ */
+#if IS_ENABLED(CONFIG_ROCKCHIP_RGA_REWRITE_KUNIT_TEST)
+late_initcall_sync(rk_rga_init);
+#else
 module_init(rk_rga_init);
+#endif
 module_exit(rk_rga_exit);
 
 MODULE_IMPORT_NS("DMA_BUF");
