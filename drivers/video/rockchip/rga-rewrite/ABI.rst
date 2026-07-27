@@ -1,8 +1,8 @@
 Rockchip RGA Rewrite ABI Status
 ===============================
 
-This rewrite registers ``/dev/rga`` when ``ROCKCHIP_MULTI_RGA`` is disabled and
-``ROCKCHIP_RGA_REWRITE`` is enabled.
+This rewrite registers ``/dev/rga`` when both ``ROCKCHIP_MULTI_RGA`` and
+``VIDEO_ROCKCHIP_RGA`` are disabled and ``ROCKCHIP_RGA_REWRITE`` is enabled.
 
 Implemented
 -----------
@@ -95,15 +95,20 @@ Implemented
   resolved imports and acquire fences, and carries those resources to the
   scheduler/backend boundary.
 * Rewrite-local ``dma_fence`` context and prepared-job completion path.  Async
-  jobs own a release fence internally and signal it with the same completion
-  status that the submit path returns.  If userspace drops a pending async job
-  before completion, cleanup signals the release fence with ``-EFAULT`` like
-  the BSP request teardown path.
+  jobs own a release fence internally and signal it with the eventual backend
+  completion status; synchronous submits return that status directly.  If
+  userspace drops a pending async job before completion, cleanup signals the
+  release fence with ``-EFAULT`` like the BSP request teardown path.
 * Race-free release-fence fd publication.  Async submit reserves the descriptor
   and creates its ``sync_file``, copies the descriptor number to userspace, and
   installs the file only after that copy succeeds.  A usercopy fault drops the
   still-private ``sync_file`` and descriptor reservation, so rollback cannot
-  close an unrelated file if another thread races fd close/reuse.
+  close an unrelated file if another thread races fd close/reuse.  A legacy
+  ``RGA_BLIT_ASYNC`` reply is copied from a pre-resolution snapshot of the
+  caller's request with only ``out_fence_fd`` changed.  Handle-shaped addresses
+  and userspace virtual addresses therefore round-trip unchanged; kernel-resolved
+  IOVAs are neither disclosed nor raced against per-core rebasing by the
+  dispatcher.
 * File-close ownership for submitted jobs.  The open file session tracks every
   submitted sync/async job until completion.  ``release()`` marks the session
   closing, rejects newly tracked jobs, cancels unsignaled acquire-fence
@@ -194,9 +199,14 @@ Implemented
 * Runtime PM and clock-bulk sequencing around the backend dispatch boundary.
   Each dispatched job resumes the selected RGA core, enables discovered clocks,
   enters the backend, then disables clocks and drops runtime PM.
-* Threaded IRQ registration and active-job completion scaffolding.  A backend
-  can now accept a job, leave it active, and have the IRQ thread complete it,
-  signal fences, release runtime PM/clocks, and dispatch the next queued job.
+* Threaded IRQ registration and active-job completion scaffolding.  RK3588 RGA3
+  registers its level IRQ with ``IRQF_SHARED`` because that line is shared with
+  the external Rockchip IOMMU; the hard handler clears RGA status before waking
+  the thread, so masking the complete shared line with ``IRQF_ONESHOT`` is
+  unnecessary and would conflict with the IOMMU handler.  RGA2 retains
+  ``IRQF_ONESHOT``.  A backend can accept a job, leave it active, and have the
+  IRQ thread complete it, signal fences, release runtime PM/clocks, and dispatch
+  the next queued job.
   The top half decodes RGA2/RGA3 done and error interrupt status, clears handled
   bits, and propagates hardware error status to the job completion result.
   RGA2 config/parser error bit 25 is enabled and terminal, with its companion
@@ -273,14 +283,15 @@ Implemented
   unsupported pattern operations, and supports the 8-bit RGB/YUV plus
   semiplanar 10-bit YUV formats exposed by common ``librga`` and
   ``ffmpeg-rockchip`` blit/scale/convert users.
-  For RASTER 10-bit semiplanar images ``vir_w`` carries the row stride in
+  For RASTER and TILE 10-bit semiplanar images ``vir_w`` carries the row stride in
   **bytes** (the legacy BSP contract "width_stride equals byte_stride" that
   ``librga``'s legacy blit path and the JeffyCN GStreamer plugin rely on):
   compact NV15/NV20 pack 10 bits per pixel, incompact P010/P210 carry 16-bit
-  containers, and both register writers program the value literally.  The
-  active window's rows, in bytes, must fit inside ``vir_w``.  TILE and FBC
-  10-bit images keep the pixel-count ``vir_w`` convention (their stride math
-  scales ``vir_w`` itself); ``act_w``/``x_offset`` are always pixels.
+  containers, and the register writers use that byte stride directly (with the
+  TILE writer's additional eight-lines-per-block factor).  The active window's
+  rows, in bytes, must fit inside ``vir_w``.  Compressed FBC modes keep the
+  pixel-count ``vir_w`` convention because their payload stride math scales
+  ``vir_w`` itself; ``act_w``/``x_offset`` are always pixels.
   For RGB-to-YUV BT.709 limited conversion, RGA3 accepts the exact
   ``full_csc`` enable flag current ``librga`` also supplies for its RGA2E
   workaround, ignores the coefficient block, and emits RGA3's native direct
@@ -298,7 +309,12 @@ Implemented
   round-trips through the RGA2 fallback.
   Explicit interpolation selectors from current ``librga`` resize calls are
   accepted on native RGA3 bitblits; like the BSP RGA3 register builder, the
-  rewrite programs only the RGA3 scale direction and factor fields.
+  rewrite programs only the RGA3 scale direction and factor fields.  The
+  scheduler applies the BSP RGA3 capability floor of 68x2 active pixels and the
+  per-axis 1/8x..8x scale range before selecting a core.  Smaller windows and
+  wider scale ratios drop the RGA3 eligibility bit and can fall back to RGA2E's
+  2x2 and 1/16x..16x ranges instead of being programmed outside the declared
+  RGA3 capability.
   AFBC is accepted through ``RGA_FBC_MODE`` for the RGA3 FBCD/FBCE format
   subset, including current ``librga`` ``rga_copy_fbc_demo`` AFBC16x16
   raster-to-FBC and FBC-to-raster YUV420SP copies, current ffmpeg AFBC
@@ -515,8 +531,8 @@ Implemented
 * Legacy ``RGA_CACHE_FLUSH``, ``RGA_FLUSH``, ``RGA2_FLUSH``,
   ``RGA_GET_RESULT``, and ``RGA2_GET_RESULT`` as BSP-compatible no-ops.
 * Optional ``ROCKCHIP_RGA_REWRITE_KUNIT_TEST`` coverage for rewrite-local ABI
-  normalization helpers, including required clock-count and per-generation MMIO
-  aperture validation, the RGA2
+  normalization helpers, including required clock-count, per-generation MMIO
+  aperture, and RGA2/RGA3 IRQ-flag selection validation, the RGA2
   ``rotate_mode``/``sina``/``cosa``
   decoder, transformed destination-corner selection, color-fill core-mask
   dispatch, BSP request task-count limits and return codes, legacy/modern
@@ -533,7 +549,8 @@ Implemented
   queued on hardware,
   request create/cancel ioctl id allocation, usercopy, and miss handling,
   legacy ``RGA_BLIT_ASYNC`` acquire-fence ioctls that copy a release-fence fd
-  back through ``rga_req.out_fence_fd`` before deferred dispatch,
+  back through ``rga_req.out_fence_fd`` before deferred dispatch while
+  preserving the caller's pre-resolution addresses,
   modern request-submit async acquire-fence ioctls that return a release-fence
   fd before deferred dispatch and signal it with the eventual backend result,
   release-fence descriptor reservation staying invisible until publication and
@@ -574,7 +591,8 @@ Implemented
   cases and active-byte copy integrity,
   scheduler priority enqueue/aging,
   scheduler core-counter and per-core timing mapping,
-  RGA3 tile8x8 raster/tile round-trip and tile-to-tile command emission,
+  RGA3 tile8x8 raster/tile round-trip, byte-stride layout for 10-bit TILE
+  surfaces, and tile-to-tile command emission,
   RGA2 ``librga`` full-CSC RGB-to-YUV dispatch/emission,
   RGA3 BT.709-limited direct-CSC dispatch/emission with the narrow ignored
   ``librga`` full-CSC compatibility flag,
@@ -590,7 +608,8 @@ Implemented
   RGA3 multi-task command-buffer rebuild between alpha and plain copy tasks,
   RGA3 ``librga`` RGB translate and ffmpeg overlay-preprocess destination-offset emission,
   RGA3 ``librga`` RGB rotate, flip/mirror, and combined rotate/mirror
-  emission, RGA3 ``librga`` centered RGB rotate destination-offset emission,
+  emission, RGA3 active-window and 1/8x..8x scale capability selection with
+  RGA2 fallback, RGA3 ``librga`` centered RGB rotate destination-offset emission,
   JeffyCN ``gstreamer-rockchip`` legacy ``c_RkRgaBlit()`` RGB-to-NV12,
   rotated NV12-to-RGB, and planar-I420 RGA2 fallback profile selection and
   command emission,
@@ -614,20 +633,33 @@ Implemented
 Recognized But Unsupported
 --------------------------
 
-* RGA2 hardware command generation outside the solid color fill, raster bitblit,
-  and color-palette profiles above, including full-CSC outside raster bitblit.
+* RGA2 hardware command generation outside the explicitly enumerated solid
+  color fill, raster bitblit, color-palette, and update-palette profiles above,
+  including full-CSC outside raster bitblit.
 * RGA3 pattern outside the supported alpha-overlay profile, color-key outside
   the RGB ``imcolorkey`` profile, per-channel rotation, RFBC/AFBC32x8 source
   and destination modes, tile outside simple bitblits, physical-address
   channels, and non-bitblit operation modes.
-Unsupported submit profiles return ``-EOPNOTSUPP`` after copying, validating,
-preparing, queuing, dispatching, resolving imported buffers, allocating an owned
-command buffer, and power-sequencing an owned job to the backend boundary.
+* Legacy ``RGA_IMPORT_DMA`` and ``RGA_RELEASE_DMA`` command numbers are
+  recognized but return ``-EINVAL``; modern buffer import/release uses the
+  implemented ``RGA_IOC_IMPORT_BUFFER``/``RGA_IOC_RELEASE_BUFFER`` path.
+
+Unsupported task profiles are rejected by the scheduler's complete-task
+validation before a job is enqueued, dispatched, power-sequenced, or given a
+hardware command buffer.  Legacy blit ioctls preserve the internal
+``-EOPNOTSUPP`` result.  After ``rga_request_check()`` accepts a modern request,
+``RGA_IOC_REQUEST_CONFIG`` normalizes preparation failures to the BSP wrapper's
+``-EFAULT``; it may stage an unsupported profile because backend validation is a
+submit-time operation.  ``RGA_IOC_REQUEST_SUBMIT`` likewise normalizes its
+preparation and profile-validation failures to ``-EFAULT``.  Any imported
+resources, tracked job state, private async fence reservation, and copied task
+storage are rolled back before return.
 
 Outside This Slice
 ------------------
 
-* Physical address imports.
-* Full RGA2/RGA3 command-register generation and policy selection.
-* Full BSP timeout diagnostics and private-IOMMU recovery policy beyond the
-  public post-reset domain refresh.
+* The remainder of the BSP RGA2/RGA3 command-register matrix and capability
+  policy beyond the explicitly enumerated profiles above.
+* BSP-private page-table inspection and extended timeout register dumps beyond
+  the public fault callback, reset, quarantine, and post-reset domain refresh
+  implemented here.
