@@ -605,6 +605,9 @@ rk_mpp_hard_fault_owner(struct list_head *fault_hws,
 static struct rk_mpp_service rk_mpp_srv;
 static struct rk_mpp_debug_event
 	rk_mpp_debug_events[RK_MPP_DEBUG_EVENT_COUNT];
+static bool rk_mpp_runtime_registered;
+static int rk_mpp_runtime_register(void);
+static void rk_mpp_runtime_unregister(void);
 
 static void rk_mpp_service_state_init(struct rk_mpp_service *srv)
 {
@@ -626,10 +629,42 @@ static void rk_mpp_service_state_init(struct rk_mpp_service *srv)
 }
 
 #if IS_ENABLED(CONFIG_ROCKCHIP_MPP_REWRITE_KUNIT_TEST)
+static bool rk_mpp_kunit_runtime_isolated;
+
 static int rk_mpp_kunit_suite_init(struct kunit_suite *suite)
 {
+	/*
+	 * Built-in suites run after every initcall from kernel_init_freeable(),
+	 * not from kunit_init(). Unbind the already-probed runtime before the
+	 * singleton becomes fixture storage. A debugfs rerun after boot must not
+	 * tear down open sessions or active hardware.
+	 */
+	if (system_state != SYSTEM_SCHEDULING)
+		return -EBUSY;
+	if (!rk_mpp_runtime_registered)
+		return -ENODEV;
+
+	rk_mpp_runtime_unregister();
 	rk_mpp_service_state_init(&rk_mpp_srv);
+	rk_mpp_kunit_runtime_isolated = true;
 	return 0;
+}
+
+static void rk_mpp_kunit_suite_exit(struct kunit_suite *suite)
+{
+	int ret;
+
+	if (!rk_mpp_kunit_runtime_isolated)
+		return;
+
+	rk_mpp_kunit_runtime_isolated = false;
+	ret = rk_mpp_runtime_register();
+	if (ret) {
+		/* suite_init_err is included in the final suite outcome. */
+		suite->suite_init_err = ret;
+		kunit_err(suite,
+			  "# failed to restore production MPP service (%d)", ret);
+	}
 }
 #endif
 
@@ -7999,6 +8034,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 static struct kunit_suite rk_mpp_rewrite_test_suite = {
 	.name = "rk_mpp_rewrite",
 	.suite_init = rk_mpp_kunit_suite_init,
+	.suite_exit = rk_mpp_kunit_suite_exit,
 	.test_cases = rk_mpp_rewrite_test_cases,
 };
 
@@ -13977,7 +14013,7 @@ static struct platform_driver rk_mpp_hw_driver = {
 	},
 };
 
-static int __init rk_mpp_init(void)
+static int rk_mpp_runtime_register(void)
 {
 	int ret;
 
@@ -14079,6 +14115,7 @@ static int __init rk_mpp_init(void)
 	pr_info("registered /dev/mpp_service (%s), hw_support=0x%08x\n",
 		RK_MPP_REWRITE_VERSION, rk_mpp_srv.hw_support);
 
+	rk_mpp_runtime_registered = true;
 	return 0;
 
 err_deregister_misc:
@@ -14086,11 +14123,16 @@ err_deregister_misc:
 err_unregister_hw:
 	platform_driver_unregister(&rk_mpp_hw_driver);
 	rk_mpp_dma_groups_destroy();
+	WRITE_ONCE(rk_mpp_srv.debug_ready, false);
 	return ret;
 }
 
-static void __exit rk_mpp_exit(void)
+static void rk_mpp_runtime_unregister(void)
 {
+	if (!rk_mpp_runtime_registered)
+		return;
+
+	rk_mpp_runtime_registered = false;
 	rk_mpp_remove_procfs(&rk_mpp_srv);
 	debugfs_remove_recursive(rk_mpp_srv.debugfs_root);
 	misc_deregister(&rk_mpp_srv.miscdev);
@@ -14100,17 +14142,17 @@ static void __exit rk_mpp_exit(void)
 	WRITE_ONCE(rk_mpp_srv.debug_ready, false);
 }
 
-/*
- * Built-in KUnit suites execute from kunit_init() at late_initcall time.
- * Bind the hardware in the following sync phase so tests can use the singleton
- * as isolated fixture storage; rk_mpp_init() then discards all fixture state
- * before any production device is registered.
- */
-#if IS_ENABLED(CONFIG_ROCKCHIP_MPP_REWRITE_KUNIT_TEST)
-late_initcall_sync(rk_mpp_init);
-#else
+static int __init rk_mpp_init(void)
+{
+	return rk_mpp_runtime_register();
+}
+
+static void __exit rk_mpp_exit(void)
+{
+	rk_mpp_runtime_unregister();
+}
+
 module_init(rk_mpp_init);
-#endif
 module_exit(rk_mpp_exit);
 
 MODULE_IMPORT_NS("DMA_BUF");
