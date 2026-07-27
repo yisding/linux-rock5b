@@ -6874,10 +6874,8 @@ static void rk_mpp_batch_server_wait_detect_kunit(struct kunit *test)
 
 static void rk_mpp_batch_server_wait_collect_reject_kunit(struct kunit *test)
 {
-	struct rk_mpp_service srv = {};
-	struct rk_mpp_session session = {
-		.srv = &srv,
-	};
+	struct rk_mpp_service *srv;
+	struct rk_mpp_session session = {};
 	struct {
 		struct rk_mpp_msg_v1 reqs[2];
 		struct mpp_bat_msg bat[1];
@@ -6886,6 +6884,10 @@ static void rk_mpp_batch_server_wait_collect_reject_kunit(struct kunit *test)
 	void __user *user;
 	unsigned long uncopied;
 	uintptr_t base;
+
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
+	session.srv = srv;
 
 	user = rk_mpp_kunit_user_payload(test, &layout, sizeof(layout));
 	KUNIT_ASSERT_NOT_NULL(test, user);
