@@ -7814,6 +7814,7 @@ static void rk_mpp_reset_session_hw_active_import_kunit(struct kunit *test)
 	pm_runtime_get_noresume(dev);
 
 	mutex_init(&srv.sched_lock);
+	spin_lock_init(&srv.rkvenc_dchs_lock);
 	INIT_LIST_HEAD(&srv.queued_jobs);
 
 	session->srv = &srv;
