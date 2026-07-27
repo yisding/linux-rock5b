@@ -606,6 +606,33 @@ static struct rk_mpp_service rk_mpp_srv;
 static struct rk_mpp_debug_event
 	rk_mpp_debug_events[RK_MPP_DEBUG_EVENT_COUNT];
 
+static void rk_mpp_service_state_init(struct rk_mpp_service *srv)
+{
+	memset(srv, 0, sizeof(*srv));
+	memset(rk_mpp_debug_events, 0, sizeof(rk_mpp_debug_events));
+	mutex_init(&srv->hw_lock);
+	mutex_init(&srv->dma_group_lock);
+	mutex_init(&srv->sched_lock);
+	spin_lock_init(&srv->fault_lock);
+	spin_lock_init(&srv->rkvenc_dchs_lock);
+	spin_lock_init(&srv->debug_lock);
+	srv->debug_events = rk_mpp_debug_events;
+	WRITE_ONCE(srv->debug_ready, true);
+	INIT_LIST_HEAD(&srv->hw_list);
+	INIT_LIST_HEAD(&srv->dma_groups);
+	INIT_LIST_HEAD(&srv->fault_hws);
+	INIT_LIST_HEAD(&srv->queued_jobs);
+	INIT_WORK(&srv->sched_work, rk_mpp_scheduler_work);
+}
+
+#if IS_ENABLED(CONFIG_ROCKCHIP_MPP_REWRITE_KUNIT_TEST)
+static int rk_mpp_kunit_suite_init(struct kunit_suite *suite)
+{
+	rk_mpp_service_state_init(&rk_mpp_srv);
+	return 0;
+}
+#endif
+
 static const char *rk_mpp_debug_event_name(enum rk_mpp_debug_event_type type)
 {
 	switch (type) {
@@ -7969,6 +7996,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 
 static struct kunit_suite rk_mpp_rewrite_test_suite = {
 	.name = "rk_mpp_rewrite",
+	.suite_init = rk_mpp_kunit_suite_init,
 	.test_cases = rk_mpp_rewrite_test_cases,
 };
 
@@ -13951,19 +13979,7 @@ static int __init rk_mpp_init(void)
 {
 	int ret;
 
-	mutex_init(&rk_mpp_srv.hw_lock);
-	mutex_init(&rk_mpp_srv.dma_group_lock);
-	mutex_init(&rk_mpp_srv.sched_lock);
-	spin_lock_init(&rk_mpp_srv.fault_lock);
-	spin_lock_init(&rk_mpp_srv.rkvenc_dchs_lock);
-	spin_lock_init(&rk_mpp_srv.debug_lock);
-	rk_mpp_srv.debug_events = rk_mpp_debug_events;
-	WRITE_ONCE(rk_mpp_srv.debug_ready, true);
-	INIT_LIST_HEAD(&rk_mpp_srv.hw_list);
-	INIT_LIST_HEAD(&rk_mpp_srv.dma_groups);
-	INIT_LIST_HEAD(&rk_mpp_srv.fault_hws);
-	INIT_LIST_HEAD(&rk_mpp_srv.queued_jobs);
-	INIT_WORK(&rk_mpp_srv.sched_work, rk_mpp_scheduler_work);
+	rk_mpp_service_state_init(&rk_mpp_srv);
 
 	ret = platform_driver_register(&rk_mpp_hw_driver);
 	if (ret)
@@ -14082,7 +14098,17 @@ static void __exit rk_mpp_exit(void)
 	WRITE_ONCE(rk_mpp_srv.debug_ready, false);
 }
 
+/*
+ * Built-in KUnit suites execute from kunit_init() at late_initcall time.
+ * Bind the hardware in the following sync phase so tests can use the singleton
+ * as isolated fixture storage; rk_mpp_init() then discards all fixture state
+ * before any production device is registered.
+ */
+#if IS_ENABLED(CONFIG_ROCKCHIP_MPP_REWRITE_KUNIT_TEST)
+late_initcall_sync(rk_mpp_init);
+#else
 module_init(rk_mpp_init);
+#endif
 module_exit(rk_mpp_exit);
 
 MODULE_IMPORT_NS("DMA_BUF");
