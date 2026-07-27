@@ -117,8 +117,11 @@ Implemented
   translations use the same device instead of silently moving outstanding
   IOVAs to another IOMMU domain.  Translation and release are serialized so a
   racing ``RELEASE_FD`` cannot unmap an IOVA before its translation is returned.
-  The affinity is cleared when ``RELEASE_FD`` empties the import cache, or by
-  reset/close.
+  The translated IOVA array is copied back after dropping the service-wide
+  hardware mutex, so a faulting userspace destination cannot stall unrelated
+  codec admission or IRQ completion; the narrower explicit-map lock retains the
+  release exclusion.  The affinity is cleared when ``RELEASE_FD`` empties the
+  import cache, or by reset/close.
   Both commands require a nonempty, bounded payload containing an exact array
   of 32-bit fd elements; partial trailing bytes are rejected rather than
   silently ignored.
@@ -247,7 +250,11 @@ Implemented
   watchdog also owns a reference to its exact job.  If cancellation races a
   worker that has already started, that worker cannot claim a replacement slot,
   and replacement start uses ``mod_delayed_work()`` to guarantee a fresh
-  watchdog even while the stale invocation exits.
+  watchdog even while the stale invocation exits.  Aborting a queued job whose
+  selected core is actually running another session's job restores that
+  active job's watchdog after the ownership check.  Encoder submit-failure
+  teardown disables and drains the hard IRQ before gating clocks or dropping
+  the active-slot reference.
   Encoder and direct decoder error IRQs pulse the reporting core's reset line
   before releasing runtime PM.  SOFT-CCU decoder error/timeout/IOMMU recovery
   additionally follows the BSP per-core coordinator sequence: force that core
@@ -264,6 +271,15 @@ Implemented
   quarantine and queue drain to every dependent decoder core.  Debugfs exposes
   the state per hardware row and counts first failures in
   ``recovery_failure_count``.
+  If reset cannot prove that a failed DMA-capable core stopped, the rewrite
+  permanently attaches its complete IOMMU group to a probe-time preallocated
+  empty paging domain after barring admission for every bound group member.
+  A coordinator without an IOMMU group instead requires its generic power
+  domain to report physically off.  Either proof is terminal for the current
+  bound instance: power-on is rejected.  An isolated domain is
+  deliberately retained rather than reopening DMA during module teardown, so
+  later probe of that group also fails until reboot.  Probe fails up front when
+  an attached IOMMU group cannot provide this isolation mechanism.
   Interrupt status remains available through normal register readback.
 * Per-core software timeout completion for active RKVENC2/RKVDEC2 jobs using
   the same 500 ms timeout window as the BSP-derived forward port.  A timed-out
@@ -459,7 +475,11 @@ Implemented
   lets encoding continue.  When that frame reaches its terminal IRQ, the
   retained overflow participates in VEPU580's BSP ``0x03f0`` reset mask, so the
   core is reset before the next frame rather than continuing from
-  overflow-recovery state.
+  overflow-recovery state.  For the BSP erratum combination of H.264 slice
+  mode, a nonzero translated external line-buffer address, and the slice-flush
+  bit, submit clears only the flush bit in the job-private register image before
+  MMIO programming.  H.265 and jobs without an external line buffer retain the
+  userspace value.
 * ``MPP_CMD_SET_RCB_INFO`` for RK3588 RKVENC2/RKVDEC2 jobs.  The rewrite stores
   BSP-compatible ``(register index, size)`` descriptors per session, snapshots
   them into each job, allocates per-core coherent scratch memory using the
@@ -524,7 +544,8 @@ Implemented
   procfs support-command table coverage,
   RKVENC2 DCHS tx/rx id remapping and release, independent-core DCHS id
   capacity plus occupied/exhausted admission errors, VEPU580 bitstream-overflow
-  pointer advance/wrap and terminal reset classification, ``POLL_HW_IRQ``
+  pointer advance/wrap and terminal reset classification, the H.264 external
+  line-buffer slice-flush fixup, ``POLL_HW_IRQ``
   flexible-buffer sizing, RKVENC2 slice-mode detection and slice FIFO
   recoverable overflow/final-slice reporting, non-slice flexible-buffer bypass,
   ``POLL_HW_FINISH`` nonblocking pending-job
@@ -634,13 +655,17 @@ Findings
   materialization, coordinator running-list, add-mode, readback, timeout, and
   recovery machinery as an explicit opt-in path.  HARD mode additionally
   requires one DMA/IOMMU domain shared by every online decoder core behind the
-  coordinator; the shipped per-core IOMMU topology does not establish that
-  invariant by itself, so selecting HARD mode without separate shared-domain
+  coordinator.  Independent per-core IOMMU providers do not establish that
+  invariant by themselves, so selecting HARD mode without shared-domain
   integration disables decoder support instead of exposing peer cores to
-  unmapped table/import IOVAs.  KUnit covers ccu-mode normalization, SOFT-CCU
-  register programming, the HARD-CCU shared-domain gate, and descriptor and
-  ownership helpers, but these are logic-level tests: they do not drive MMIO,
-  DMA, the real CCU register block, or real decoder interrupts.
+  unmapped table/import IOVAs.  This tree's Rock 5B description supplies that
+  integration explicitly: ``vdec1_mmu`` names ``vdec0_mmu`` through
+  ``rockchip,shared-domain-owner``.  The shipped board still selects SOFT mode,
+  so the HARD path remains opt-in and hardware-unvalidated.  KUnit covers
+  ccu-mode normalization, SOFT-CCU register programming, the HARD-CCU
+  shared-domain gate, and descriptor and ownership helpers, but these are
+  logic-level tests: they do not drive MMIO, DMA, the real CCU register block,
+  or real decoder interrupts.
 
   Remaining evidence required for release is RK3588 hardware validation of the
   default SOFT path under normal decode, multi-stream scheduling, timeout/reset,
