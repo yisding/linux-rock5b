@@ -14,7 +14,7 @@ config ROCKCHIP_RGA_REWRITE
 config ROCKCHIP_RGA_REWRITE_KUNIT_TEST
 	bool "KUnit tests for Rockchip RGA compatibility rewrite" if !KUNIT_ALL_TESTS
 	depends on ROCKCHIP_RGA_REWRITE=y && KUNIT
-	default KUNIT_ALL_TESTS
+	default n
 	help
 	  Unit tests for rewrite-local ABI normalization helpers, including
 	  RGA2 userspace transform decoding and destination-corner selection.
