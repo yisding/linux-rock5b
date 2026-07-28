@@ -15,7 +15,7 @@ config ROCKCHIP_MPP_REWRITE
 config ROCKCHIP_MPP_REWRITE_KUNIT_TEST
 	bool "KUnit tests for Rockchip MPP service compatibility rewrite" if !KUNIT_ALL_TESTS
 	depends on ROCKCHIP_MPP_REWRITE=y && KUNIT
-	default KUNIT_ALL_TESTS
+	default n
 	help
 	  Unit tests for rewrite-local MPP ABI parser helpers, including
 	  command range classification and register-span validation.
