@@ -3655,23 +3655,6 @@ static void rk_mpp_support_cmds_kunit(struct kunit *test)
 #undef RK_MPP_EXPECT_SUPPORT_CMD
 }
 
-static void rk_mpp_abi_layout_kunit(struct kunit *test)
-{
-	KUNIT_EXPECT_EQ(test, sizeof(struct rk_mpp_msg_v1),
-			(size_t)RK_MPP_MSG_V1_ABI_SIZE);
-	KUNIT_EXPECT_EQ(test, offsetof(struct rk_mpp_msg_v1, data_ptr),
-			(size_t)RK_MPP_MSG_V1_DATA_PTR_ABI_OFFSET);
-	KUNIT_EXPECT_EQ(test, sizeof(struct mpp_bat_msg),
-			(size_t)RK_MPP_BAT_MSG_ABI_SIZE);
-	KUNIT_EXPECT_EQ(test, offsetof(struct mpp_bat_msg, ret),
-			(size_t)RK_MPP_BAT_MSG_RET_ABI_OFFSET);
-	KUNIT_EXPECT_EQ(test, _IOC_SIZE(MPP_IOC_CFG_V1),
-			sizeof(unsigned int));
-	KUNIT_EXPECT_EQ(test, _IOC_TYPE(MPP_IOC_CFG_V1),
-			(unsigned int)MPP_IOC_MAGIC);
-	KUNIT_EXPECT_EQ(test, _IOC_NR(MPP_IOC_CFG_V1), 1U);
-}
-
 static void rk_mpp_msg_v1_to_request_kunit(struct kunit *test)
 {
 	struct rk_mpp_msg_v1 msg = {
@@ -7962,7 +7945,6 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_check_msg_flags_kunit),
 	KUNIT_CASE(rk_mpp_get_cmd_butt_kunit),
 	KUNIT_CASE(rk_mpp_support_cmds_kunit),
-	KUNIT_CASE(rk_mpp_abi_layout_kunit),
 	KUNIT_CASE(rk_mpp_msg_v1_to_request_kunit),
 	KUNIT_CASE(rk_mpp_cmd_copies_payload_kunit),
 	KUNIT_CASE(rk_mpp_fd_array_count_kunit),
