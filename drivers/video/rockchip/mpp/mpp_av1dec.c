@@ -474,6 +474,8 @@ static void *av1dec_alloc_task(struct mpp_session *session,
 			u32 fmt = hw->trans_class[i].trans_fmt;
 			u32 *reg = task->reg_class[class].data;
 			u32 base_idx = MPP_BASE_TO_IDX(task->reg_class[class].base);
+			u32 reg_cnt = task->reg_class[class].len / sizeof(u32);
+			struct mpp_trans_info *trans_info;
 
 			if (!task->reg_class[class].valid)
 				continue;
@@ -482,13 +484,27 @@ static void *av1dec_alloc_task(struct mpp_session *session,
 			if (!reg)
 				continue;
 
-			ret = mpp_translate_reg_address(session, mpp_task, fmt, reg, NULL);
+			trans_info = mpp_get_trans_info(mpp, fmt);
+			if (!trans_info) {
+				mpp_err("invalid translate format %u\n", fmt);
+				ret = -EINVAL;
+				goto fail;
+			}
+
+			ret = mpp_translate_reg_address(session, mpp_task, fmt, reg,
+							reg_cnt, NULL);
 			if (ret)
 				goto fail;
 
-			cnt = mpp->var->trans_info[fmt].count;
-			tbl = mpp->var->trans_info[fmt].table;
+			cnt = trans_info->count;
+			tbl = trans_info->table;
 			for (k = 0; k < cnt; k++) {
+				if (tbl[k] >= reg_cnt) {
+					mpp_err("reg index %u out of range %u\n",
+						tbl[k], reg_cnt);
+					ret = -EINVAL;
+					goto fail;
+				}
 				offset = mpp_query_reg_offset_info(&task->off_inf,
 								   tbl[k] + base_idx);
 				mpp_debug(DEBUG_IOMMU,
@@ -1031,6 +1047,7 @@ static const struct mpp_dev_var av1dec_data = {
 	.device_type = MPP_DEVICE_AV1DEC,
 	.hw_info = &av1dec_hw_info.hw,
 	.trans_info = trans_av1dec,
+	.trans_count = ARRAY_SIZE(trans_av1dec),
 	.hw_ops = &av1dec_hw_ops,
 	.dev_ops = &av1dec_dev_ops,
 };

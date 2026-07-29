@@ -1518,6 +1518,7 @@ static int mpp_process_request(struct mpp_session *session,
 	case MPP_CMD_RESET_SESSION: {
 		int ret;
 		int val;
+		struct mpp_dma_session *dma;
 
 		ret = readx_poll_timeout(atomic_read,
 					 &session->task_count,
@@ -1530,9 +1531,25 @@ static int mpp_process_request(struct mpp_session *session,
 				return -EINVAL;
 
 			mpp_session_clear_pending(session);
+			/*
+			 * Publish the NULL under session_lock before freeing,
+			 * for the same reason mpp_session_deinit() does: the
+			 * world-readable procfs dump walks the service list
+			 * under that lock and takes session->dma->list_mutex.
+			 * Taking it here also waits out an in-progress reader.
+			 */
+			if (session->srv) {
+				mutex_lock(&session->srv->session_lock);
+				dma = session->dma;
+				session->dma = NULL;
+				mutex_unlock(&session->srv->session_lock);
+			} else {
+				dma = session->dma;
+				session->dma = NULL;
+			}
+
 			mpp_iommu_down_write(mpp->iommu_info);
-			ret = mpp_dma_session_destroy(session->dma);
-			session->dma = NULL;
+			ret = mpp_dma_session_destroy(dma);
 			mpp_iommu_up_write(mpp->iommu_info);
 		}
 		return ret;
@@ -2067,9 +2084,29 @@ mpp_task_attach_fd(struct mpp_task *task, int fd)
 	return mem_region;
 }
 
+/*
+ * Look up a format's translation entry. fmt reaches callers straight out of a
+ * user-written register word, so it must be bounded against the device's table
+ * before it is used as an index.
+ */
+struct mpp_trans_info *mpp_get_trans_info(struct mpp_dev *mpp, int fmt)
+{
+	if (!mpp || !mpp->var || !mpp->var->trans_info)
+		return NULL;
+
+	if (fmt < 0 || (u32)fmt >= mpp->var->trans_count)
+		return NULL;
+
+	if (!mpp->var->trans_info[fmt].table)
+		return NULL;
+
+	return &mpp->var->trans_info[fmt];
+}
+
 int mpp_translate_reg_address(struct mpp_session *session,
 			      struct mpp_task *task, int fmt,
-			      u32 *reg, struct reg_offset_info *off_inf)
+			      u32 *reg, u32 reg_cnt,
+			      struct reg_offset_info *off_inf)
 {
 	int i;
 	int cnt;
@@ -2082,16 +2119,33 @@ int mpp_translate_reg_address(struct mpp_session *session,
 		tbl = session->trans_table;
 	} else {
 		struct mpp_dev *mpp = mpp_get_task_used_device(task, session);
-		struct mpp_trans_info *trans_info = mpp->var->trans_info;
+		struct mpp_trans_info *trans_info = mpp_get_trans_info(mpp, fmt);
 
-		cnt = trans_info[fmt].count;
-		tbl = trans_info[fmt].table;
+		if (!trans_info) {
+			mpp_err("invalid translate format %d\n", fmt);
+			return -EINVAL;
+		}
+
+		cnt = trans_info->count;
+		tbl = trans_info->table;
 	}
 
 	for (i = 0; i < cnt; i++) {
 		int usr_fd;
 		u32 offset;
 		struct mpp_mem_region *mem_region = NULL;
+
+		/*
+		 * With a session translation table these indexes are raw
+		 * user input (MPP_CMD_INIT_TRANS_TABLE validates only the byte
+		 * count), so they must be bounded against the register buffer
+		 * before being used to read and write through it.
+		 */
+		if (tbl[i] >= reg_cnt) {
+			mpp_err("reg index %u out of range %u\n",
+				tbl[i], reg_cnt);
+			return -EINVAL;
+		}
 
 		if (session->msg_flags & MPP_FLAGS_REG_NO_OFFSET) {
 			usr_fd = reg[tbl[i]];
@@ -2126,33 +2180,53 @@ int mpp_translate_reg_address(struct mpp_session *session,
 int mpp_check_req(struct mpp_request *req, int base,
 		  int max_size, u32 off_s, u32 off_e)
 {
-	int req_off;
+	/*
+	 * req_off must be unsigned: it used to be int, so an offset at or above
+	 * 0x80000000 became negative and passed every bound below, after which
+	 * the caller copied through it.
+	 */
+	u32 req_off;
 
-	if (req->offset < base) {
+	if (base < 0 || max_size < 0) {
+		mpp_err("error: base %x, max_size %x\n", base, max_size);
+		return -EINVAL;
+	}
+	if (req->offset < (u32)base) {
 		mpp_err("error: base %x, offset %x\n",
 			base, req->offset);
 		return -EINVAL;
 	}
-	req_off = req->offset - base;
+	req_off = req->offset - (u32)base;
+	if (req->size > U32_MAX - req_off) {
+		mpp_err("error: req_off %x, req_size %x wraps\n",
+			req_off, req->size);
+		return -EINVAL;
+	}
 	if ((req_off + req->size) < off_s) {
 		mpp_err("error: req_off %x, req_size %x, off_s %x\n",
 			req_off, req->size, off_s);
 		return -EINVAL;
 	}
-	if (max_size < off_e) {
+	if ((u32)max_size < off_e) {
 		mpp_err("error: off_e %x, max_size %x\n",
 			off_e, max_size);
 		return -EINVAL;
 	}
-	if (req_off > max_size) {
+	if (req_off > (u32)max_size) {
 		mpp_err("error: req_off %x, max_size %x\n",
 			req_off, max_size);
 		return -EINVAL;
 	}
-	if ((req_off + req->size) > max_size) {
+	/*
+	 * Clamp to the space that is actually left. The previous expression
+	 * computed the overflow amount instead, which left req->size untouched
+	 * whenever req_off == max_size and shrank it to the wrong value
+	 * otherwise.
+	 */
+	if (req->size > (u32)max_size - req_off) {
 		mpp_err("error: req_off %x, req_size %x, max_size %x\n",
 			req_off, req->size, max_size);
-		req->size = req_off + req->size - max_size;
+		req->size = (u32)max_size - req_off;
 	}
 
 	return 0;
@@ -2209,7 +2283,7 @@ int mpp_query_reg_offset_info(struct reg_offset_info *off_inf,
 
 int mpp_translate_reg_offset_info(struct mpp_task *task,
 				  struct reg_offset_info *off_inf,
-				  u32 *reg)
+				  u32 *reg, u32 reg_cnt)
 {
 	mpp_debug_enter();
 
@@ -2217,10 +2291,17 @@ int mpp_translate_reg_offset_info(struct mpp_task *task,
 		int i;
 
 		for (i = 0; i < off_inf->cnt; i++) {
+			u32 index = off_inf->elem[i].index;
+
+			if (index >= reg_cnt) {
+				mpp_err("reg offset index %u out of range %u\n",
+					index, reg_cnt);
+				return -EINVAL;
+			}
+
 			mpp_debug(DEBUG_IOMMU, "reg[%d] + offset %d\n",
-				  off_inf->elem[i].index,
-				  off_inf->elem[i].offset);
-			reg[off_inf->elem[i].index] += off_inf->elem[i].offset;
+				  index, off_inf->elem[i].offset);
+			reg[index] += off_inf->elem[i].offset;
 		}
 	}
 	mpp_debug_leave();

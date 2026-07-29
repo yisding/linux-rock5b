@@ -392,12 +392,18 @@ int rkvdec2_task_init(struct mpp_dev *mpp, struct mpp_session *session,
 		int reg_fmt = mpp_task->hw_info->reg_fmt;
 		u32 fmt = RKVDEC_GET_FORMAT(task->reg[reg_fmt]);
 
-		ret = mpp_translate_reg_address(session, mpp_task,
-						fmt, task->reg, &task->off_inf);
+		ret = mpp_translate_reg_address(session, mpp_task, fmt,
+						task->reg,
+						ARRAY_SIZE(task->reg),
+						&task->off_inf);
 		if (ret)
 			goto fail;
 
-		mpp_translate_reg_offset_info(mpp_task, &task->off_inf, task->reg);
+		ret = mpp_translate_reg_offset_info(mpp_task, &task->off_inf,
+						    task->reg,
+						    ARRAY_SIZE(task->reg));
+		if (ret)
+			goto fail;
 	}
 
 	task->strm_addr = task->reg[RKVDEC_REG_RLC_BASE_INDEX];
@@ -1655,6 +1661,7 @@ static const struct mpp_dev_var rkvdec_v2_data = {
 	.device_type = MPP_DEVICE_RKVDEC,
 	.hw_info = &rkvdec_v2_hw_info,
 	.trans_info = rkvdec_v2_trans,
+	.trans_count = ARRAY_SIZE(rkvdec_v2_trans),
 	.hw_ops = &rkvdec_v2_hw_ops,
 	.dev_ops = &rkvdec_v2_dev_ops,
 };
@@ -1663,6 +1670,7 @@ static const struct mpp_dev_var rkvdec_rk3568_data __maybe_unused = {
 	.device_type = MPP_DEVICE_RKVDEC,
 	.hw_info = &rkvdec_rk356x_hw_info,
 	.trans_info = rkvdec_v2_trans,
+	.trans_count = ARRAY_SIZE(rkvdec_v2_trans),
 	.hw_ops = &rkvdec_rk3568_hw_ops,
 	.dev_ops = &rkvdec_rk3568_dev_ops,
 };
@@ -1671,6 +1679,7 @@ static const struct mpp_dev_var rkvdec_rk3528_data __maybe_unused = {
 	.device_type = MPP_DEVICE_RKVDEC,
 	.hw_info = &rkvdec_vdpu382_hw_info,
 	.trans_info = rkvdec_v2_trans,
+	.trans_count = ARRAY_SIZE(rkvdec_v2_trans),
 	.hw_ops = &rkvdec_vdpu382_hw_ops,
 	.dev_ops = &rkvdec_v2_dev_ops,
 };
@@ -1679,6 +1688,7 @@ static const struct mpp_dev_var rkvdec_rk3562_data __maybe_unused = {
 	.device_type = MPP_DEVICE_RKVDEC,
 	.hw_info = &rkvdec_vdpu382_hw_info,
 	.trans_info = rkvdec_v2_trans,
+	.trans_count = ARRAY_SIZE(rkvdec_v2_trans),
 	.hw_ops = &rkvdec_rk3562_hw_ops,
 	.dev_ops = &rkvdec_v2_dev_ops,
 };
@@ -1687,6 +1697,7 @@ static const struct mpp_dev_var rkvdec_rk3588_data = {
 	.device_type = MPP_DEVICE_RKVDEC,
 	.hw_info = &rkvdec_v2_hw_info,
 	.trans_info = rkvdec_v2_trans,
+	.trans_count = ARRAY_SIZE(rkvdec_v2_trans),
 	.hw_ops = &rkvdec_rk3588_hw_ops,
 	.dev_ops = &rkvdec_v2_dev_ops,
 };
@@ -1695,6 +1706,7 @@ static const struct mpp_dev_var rkvdec_rk3576_data __maybe_unused = {
 	.device_type = MPP_DEVICE_RKVDEC,
 	.hw_info = &rkvdec_vdpu383_hw_info,
 	.trans_info = rkvdec_vdpu383_trans,
+	.trans_count = ARRAY_SIZE(rkvdec_vdpu383_trans),
 	.hw_ops = &rkvdec_rk3576_hw_ops,
 	.dev_ops = &rkvdec_vdpu383_dev_ops,
 };
@@ -1703,6 +1715,7 @@ static const struct mpp_dev_var rkvdec_rv1126b_data __maybe_unused = {
 	.device_type = MPP_DEVICE_RKVDEC,
 	.hw_info = &rkvdec_vdpu384a_hw_info,
 	.trans_info = rkvdec_vdpu384a_trans,
+	.trans_count = ARRAY_SIZE(rkvdec_vdpu384a_trans),
 	.hw_ops = &rkvdec_rv1126b_hw_ops,
 	.dev_ops = &rkvdec_vdpu383_dev_ops,
 };
