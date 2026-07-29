@@ -79,7 +79,7 @@ static ssize_t rga_debug_write(struct file *file, const char __user *ubuf,
 {
 	char buf[14];
 
-	if (len > sizeof(buf) - 1)
+	if (len == 0 || len > sizeof(buf) - 1)
 		return -EINVAL;
 	if (copy_from_user(buf, ubuf, len))
 		return -EFAULT;
@@ -368,9 +368,8 @@ static int rga_request_manager_show(struct seq_file *m, void *data)
 		failed_task_count = request->failed_task_count;
 		task_list = request->task_list;
 
-		spin_unlock_irqrestore(&request->lock, flags);
-
 		if (task_list == NULL) {
+			spin_unlock_irqrestore(&request->lock, flags);
 			seq_puts(m, "\t can not find task list from id\n");
 			continue;
 		}
@@ -381,8 +380,16 @@ static int rga_request_manager_show(struct seq_file *m, void *data)
 
 		seq_puts(m, "\t cmd dump:\n\n");
 
-		for (i = 0; i < request->task_count; i++)
+		/*
+		 * Stay under request->lock for the dump: rga_request_config()
+		 * swaps task_list and frees the old one, so dropping the lock
+		 * here would walk freed memory. The bound must be the snapshot
+		 * too -- the live count describes the replacement list.
+		 */
+		for (i = 0; i < task_count; i++)
 			rga_request_task_debug_info(m, &(task_list[i]));
+
+		spin_unlock_irqrestore(&request->lock, flags);
 	}
 
 	mutex_unlock(&request_manager->lock);
@@ -403,7 +410,7 @@ static ssize_t rga_dump_path_write(struct file *file, const char __user *ubuf,
 {
 	char buf[100];
 
-	if (len > sizeof(buf) - 1)
+	if (len == 0 || len > sizeof(buf) - 1)
 		return -EINVAL;
 	if (copy_from_user(buf, ubuf, len))
 		return -EFAULT;
@@ -429,7 +436,7 @@ static ssize_t rga_dump_image_write(struct file *file, const char __user *ubuf,
 	int dump_count = 0;
 	char buf[14];
 
-	if (len > sizeof(buf) - 1)
+	if (len == 0 || len > sizeof(buf) - 1)
 		return -EINVAL;
 	if (copy_from_user(buf, ubuf, len))
 		return -EFAULT;
@@ -517,7 +524,7 @@ static ssize_t rga_reset_write(struct file *file, const char __user *ubuf,
 	int reset_done = false;
 	struct rga_scheduler_t *scheduler = NULL;
 
-	if (len > sizeof(buf) - 1)
+	if (len == 0 || len > sizeof(buf) - 1)
 		return -EINVAL;
 	if (copy_from_user(buf, ubuf, len))
 		return -EFAULT;

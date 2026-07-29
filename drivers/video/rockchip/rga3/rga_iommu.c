@@ -256,10 +256,24 @@ static int rga_iommu_intr_fault_handler(struct iommu_domain *iommu, struct devic
 					unsigned long iova, int status, void *arg)
 {
 	struct rga_scheduler_t *scheduler = (struct rga_scheduler_t *)arg;
-	struct rga_job *job = scheduler->running_job;
+	struct rga_job *job;
+	unsigned long flags;
 
-	if (job == NULL)
+	/*
+	 * This runs in the IOMMU's hard-IRQ handler. Every other reader of
+	 * running_job holds irq_lock, and the job is freed by the isr thread
+	 * right after rga_job_done() clears it -- so without the lock the
+	 * writes below can land in a kfree()d job. Holding irq_lock across the
+	 * body keeps the job alive for the duration; ops->irq and soft_reset
+	 * are already called under it from the ordinary IRQ and timeout paths.
+	 */
+	spin_lock_irqsave(&scheduler->irq_lock, flags);
+
+	job = scheduler->running_job;
+	if (job == NULL) {
+		spin_unlock_irqrestore(&scheduler->irq_lock, flags);
 		return 0;
+	}
 
 	rga_err("IOMMU intr fault, IOVA[0x%lx], STATUS[0x%x]\n", iova, status);
 	if (scheduler->ops->irq)
@@ -281,6 +295,8 @@ static int rga_iommu_intr_fault_handler(struct iommu_domain *iommu, struct devic
 		rga_err("RGA IOMMU: read fault! Please check the memory size.\n");
 		job->ret = -EACCES;
 	}
+
+	spin_unlock_irqrestore(&scheduler->irq_lock, flags);
 
 	return 0;
 }

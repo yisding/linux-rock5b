@@ -255,6 +255,25 @@ static int rga_get_user_pages_from_vma(struct page **pages, unsigned long Memory
 			break;
 		}
 
+		/*
+		 * follow_pfnmap_start() is reached precisely for VM_PFNMAP /
+		 * VM_IO ranges -- device MMIO, reserved and no-map memory --
+		 * where a PFN frequently has no struct page behind it and
+		 * pfn_to_page() yields a pointer into a vmemmap hole. That
+		 * pointer would go on to rga_alloc_sgt() and be DMA-mapped and
+		 * cache-synced. pfn_valid() alone is not enough (it is true for
+		 * sparse-memory holes and no-map ranges), so use the same
+		 * stricter test the physical-import path already applies.
+		 */
+		if (!pfn_valid(args.pfn) ||
+		    !virt_addr_valid(phys_to_virt(PFN_PHYS(args.pfn)))) {
+			rga_err("page[%d] pfn %#lx is not mappable memory\n",
+				i, (unsigned long)args.pfn);
+			follow_pfnmap_end(&args);
+			ret = RGA_OUT_OF_RESOURCES;
+			break;
+		}
+
 		pages[i] = pfn_to_page(args.pfn);
 		follow_pfnmap_end(&args);
 #else
@@ -473,6 +492,22 @@ static int rga_alloc_virt_addr(struct rga_virt_addr **virt_addr_p,
 					      memory_parm->height,
 					      memory_parm->format,
 					      NULL, NULL, NULL);
+	/*
+	 * rga_image_size_cal() returns a negative errno for an unsupported
+	 * format, and memory_parm->size is an unvalidated u32 that can land
+	 * negative in this int. Either way the value ends up in the unsigned
+	 * long virt_addr->size and is later used as a memcpy()/cache-sync
+	 * length. The !count guard below does not catch it: img_size + offset
+	 * promotes to size_t and wraps back to a plausible page count for any
+	 * page offset above 14. Reject it here, as the dma-buf and phys-addr
+	 * import paths already do.
+	 */
+	if (img_size <= 0) {
+		rga_err("failed to calculating buffer size! img_size = %d\n",
+			img_size);
+		rga_dump_memory_parm(memory_parm);
+		return img_size == 0 ? -EINVAL : img_size;
+	}
 
 	offset = viraddr & (~PAGE_MASK);
 	count = RGA_GET_PAGE_COUNT(img_size + offset);
@@ -3194,6 +3229,17 @@ int rga_mm_release_buffer(uint32_t handle)
 		rga_buf_log(internal_buffer, "release buffer:\n");
 		rga_mm_dump_buffer(internal_buffer);
 	}
+
+	/*
+	 * The import reference is being surrendered here, so the buffer is no
+	 * longer owned by any session. Clearing this matters because
+	 * rga_mm_session_release_buffer() treats a refcount of 1 on a buffer
+	 * it still owns as "the last reference is mine" and frees it in place.
+	 * Handles are global, so without this a session could import, hand the
+	 * handle to a job in another session, release it, and then free the
+	 * buffer out from under that still-running job on close.
+	 */
+	internal_buffer->session = NULL;
 
 	kref_put(&internal_buffer->refcount, rga_mm_kref_release_buffer);
 

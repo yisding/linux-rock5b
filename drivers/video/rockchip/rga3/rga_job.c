@@ -1359,6 +1359,7 @@ int rga_request_submit(struct rga_request *request)
 	int ret = 0;
 	unsigned long flags;
 	struct dma_fence *release_fence;
+	struct mm_struct *current_mm;
 
 	spin_lock_irqsave(&request->lock, flags);
 
@@ -1445,8 +1446,17 @@ export_release_fence_fd:
 	return 0;
 
 err_put_current_mm:
-	rga_request_put_current_mm(request->current_mm);
+	/*
+	 * The completion path consumes current_mm under request->lock. Taking
+	 * it here too keeps the two from each dropping the same reference,
+	 * which would tear down the address space of a live process.
+	 */
+	spin_lock_irqsave(&request->lock, flags);
+	current_mm = request->current_mm;
 	request->current_mm = NULL;
+	spin_unlock_irqrestore(&request->lock, flags);
+
+	rga_request_put_current_mm(current_mm);
 
 err_abort_request:
 	rga_request_release_abort(request, ret);
