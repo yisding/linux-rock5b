@@ -1561,8 +1561,19 @@ static void vop2_crtc_atomic_set_gamma_seamless(struct vop2 *vop2,
 						struct vop2_video_port *vp,
 						struct drm_crtc *crtc)
 {
-	vop2_writel(vop2, RK3568_LUT_PORT_SEL,
-		    FIELD_PREP(RK3588_LUT_PORT_SEL__GAMMA_AHB_WRITE_SEL, vp->id));
+	u32 sel = FIELD_PREP(RK3588_LUT_PORT_SEL__GAMMA_AHB_WRITE_SEL, vp->id);
+
+	/*
+	 * On rk3576 LUT_PORT_SEL is a write-masked register: bits [31:16]
+	 * are a write-enable mask for bits [15:0]. A plain write is silently
+	 * ignored, the AHB write port stays at its reset value (VP0) and the
+	 * LUT data ends up in VP0's table while this VP's stale LUT gets
+	 * enabled - visible as wild gamma corruption on VP1/VP2.
+	 */
+	if (vop2->version == VOP_VERSION_RK3576)
+		sel |= RK3588_LUT_PORT_SEL__GAMMA_AHB_WRITE_SEL << 16;
+
+	vop2_writel(vop2, RK3568_LUT_PORT_SEL, sel);
 	vop2_vp_dsp_lut_enable(vp);
 	vop2_crtc_write_gamma_lut(vop2, crtc);
 	vop2_vp_dsp_lut_update_enable(vp);
