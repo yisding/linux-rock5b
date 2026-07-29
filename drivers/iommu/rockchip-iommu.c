@@ -1031,13 +1031,17 @@ static int rk_iommu_call_fault_handler(struct rk_iommu *iommu,
 	return handler(iommu->domain, iommu->dev, iova, flags, token);
 }
 
+/*
+ * Atomic-safe: media drivers install and clear the handler from hard-IRQ
+ * context. Clearing does NOT wait for an in-flight callback; teardown paths
+ * that free the token must follow up with
+ * rockchip_iommu_sync_fault_handler().
+ */
 int rockchip_iommu_set_fault_handler(struct device *dev,
 				     iommu_fault_handler_t handler, void *token)
 {
 	struct rk_iommu *iommu = rk_iommu_from_dev_checked(dev);
-	struct platform_device *pdev;
 	unsigned long flags;
-	int i;
 
 	if (!iommu)
 		return -ENODEV;
@@ -1047,19 +1051,36 @@ int rockchip_iommu_set_fault_handler(struct device *dev,
 	iommu->fault_handler_token = token;
 	spin_unlock_irqrestore(&iommu->fault_lock, flags);
 
-	if (!handler) {
-		pdev = to_platform_device(iommu->dev);
-		for (i = 0; i < iommu->num_irq; i++) {
-			int irq = platform_get_irq(pdev, i);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(rockchip_iommu_set_fault_handler);
 
-			if (irq >= 0)
-				synchronize_irq(irq);
-		}
+/*
+ * The fault callback is invoked outside fault_lock, so clearing the handler
+ * cannot itself guarantee no callback still runs with the old token. Sleeps.
+ */
+int rockchip_iommu_sync_fault_handler(struct device *dev)
+{
+	struct rk_iommu *iommu = rk_iommu_from_dev_checked(dev);
+	struct platform_device *pdev;
+	int i;
+
+	might_sleep();
+
+	if (!iommu)
+		return -ENODEV;
+
+	pdev = to_platform_device(iommu->dev);
+	for (i = 0; i < iommu->num_irq; i++) {
+		int irq = platform_get_irq(pdev, i);
+
+		if (irq >= 0)
+			synchronize_irq(irq);
 	}
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(rockchip_iommu_set_fault_handler);
+EXPORT_SYMBOL_GPL(rockchip_iommu_sync_fault_handler);
 
 /* Must be called with iommu powered on and attached */
 static void rk_iommu_disable(struct rk_iommu *iommu)
