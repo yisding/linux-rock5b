@@ -397,10 +397,14 @@ Implemented
   before the final BSP readback word fails with ``-EINVAL`` before the CCU
   start doorbell.  A HARD-mode pool must contain at least two nodes, and one
   unused node per core is retained as the hardware next-table sentinel instead
-  of consuming the full pool and emitting a zero tail address.  The per-core
-  active table list is relinked whenever a node is staged or released, so the
-  tail points at that unused node and earlier active tables point at the next
-  active table, matching the BSP add-mode queue invariant.  Jobs also record
+  of consuming the full pool and emitting a zero tail address.  A staged table
+  is prelinked to an unused node of its core, and the coordinator running list
+  is the only chain writer afterwards: relinking on start, add-mode append,
+  and removal keeps earlier tables pointing at their chain successor and the
+  tail at an unused node.  Releasing a node only returns it to the pool -- a
+  per-core rewrite here would race the coordinator relink on the same
+  next-table words and could point a running cross-core chain at an unused
+  node.  Jobs also record
   BSP-shaped hard-CCU submit descriptor values for
   all online cores behind the selected coordinator: core-work mask, table
   address, link-mode word,

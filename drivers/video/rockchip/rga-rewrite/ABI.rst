@@ -46,7 +46,11 @@ Implemented
   instead of being truncated to another descriptor.  Virtual-address imports
   pin user pages, build sg_tables through ``sg_alloc_table_from_pages()``, map
   them with the public DMA API, and synchronize them around hardware execution
-  for the common CPU-buffer ``librga`` sample paths.  The rewrite prefers an
+  for the common CPU-buffer ``librga`` sample paths.  Imports synthesized for
+  legacy direct-address tasks size a compressed or tiled image from its own
+  ``rd_mode`` layout (FBC header plus payload) rather than the raster
+  width/height fallback, so the pinned range covers what materialization
+  checks against.  The rewrite prefers an
   available RGA3 node for imports because that is the first executable hardware
   backend; RGA2 fallback jobs create job-owned remaps against the selected RGA2
   device.  A core quarantined after an unsuccessful recovery reset is no longer
@@ -94,11 +98,19 @@ Implemented
   submit clones the configured task payload, takes independent references to
   resolved imports and acquire fences, and carries those resources to the
   scheduler/backend boundary.
-* Rewrite-local ``dma_fence`` context and prepared-job completion path.  Async
-  jobs own a release fence internally and signal it with the eventual backend
-  completion status; synchronous submits return that status directly.  If
-  userspace drops a pending async job before completion, cleanup signals the
-  release fence with ``-EFAULT`` like the BSP request teardown path.
+* Rewrite-local ``dma_fence`` release fences and prepared-job completion path.
+  Async jobs own a release fence internally and signal it with the eventual
+  backend completion status; synchronous submits return that status directly.
+  If userspace drops a pending async job before completion, cleanup signals the
+  release fence with ``-EFAULT`` like the BSP request teardown path.  Every
+  release fence carries its own ``dma_fence`` context: jobs complete on any of
+  the four cores in any order, so a shared timeline would signal out of order
+  and let a ``sync_file`` merge collapse distinct jobs into the highest seqno
+  (the BSP's single-context allocation has exactly that flaw).  Each live
+  fence also holds a module reference, because exported ``sync_file`` fds pin
+  only the built-in sync core; module unload therefore fails with ``-EBUSY``
+  instead of leaving fence ops and the fence lock dangling in freed module
+  memory.
 * Race-free release-fence fd publication.  Async submit reserves the descriptor
   and creates its ``sync_file``, copies the descriptor number to userspace, and
   installs the file only after that copy succeeds.  A usercopy fault drops the
@@ -204,7 +216,13 @@ Implemented
   the external Rockchip IOMMU; the hard handler clears RGA status before waking
   the thread, so masking the complete shared line with ``IRQF_ONESHOT`` is
   unnecessary and would conflict with the IOMMU handler.  RGA2 retains
-  ``IRQF_ONESHOT``.  A backend can accept a job, leave it active, and have the
+  ``IRQF_ONESHOT``.  The hard handler performs MMIO only while a job_lock-held
+  regs-live count proves the core's clocks are up: a shared-line refire after
+  power-off, or an interrupt in the probe window before the first power-on,
+  returns ``IRQ_NONE`` instead of reading gated registers and stalling the
+  bus.  Power-off drops that count under the same lock before gating clocks,
+  so no handler is mid-read when they go down.  A backend can accept a job,
+  leave it active, and have the
   IRQ thread complete it, signal fences, release runtime PM/clocks, and dispatch
   the next queued job.
   The top half decodes RGA2/RGA3 done and error interrupt status, clears handled
@@ -229,7 +247,11 @@ Implemented
   RGA2/RGA3 status registers, reset the selected core with the BSP-style
   soft-reset helper plus reset-controller fallback when present, ask the public
   IOMMU layer to flush the core's attached domain, complete with ``-EBUSY``,
-  release runtime PM/clocks, and dispatch the next queued job.  Recovery
+  release runtime PM/clocks, and dispatch the next queued job.  If the status
+  readback shows the blit actually finished -- its completion latched while
+  the watchdog held the IRQ line masked -- the job completes with the normal
+  interrupt-derived result instead of ``-EBUSY``, and the recovery reset still
+  clears the undelivered latch.  Recovery
   fallback pulses the reset array through explicit
   assert/delay/deassert calls because Rockchip's reset provider does not
   implement the one-shot ``reset_control_reset()`` operation.  Timeout, fault,
@@ -333,7 +355,13 @@ Implemented
   rotate-plus-mirror RGB blits; unknown main rotate selector values fall back
   to no-op rotation like the BSP RGA2/RGA3 register builders while preserving
   rejection of source/destination per-channel rotate fields and pattern-channel
-  rotate fields on pattern-blend requests.
+  rotate fields on pattern-blend requests.  ``librga`` submits the 90/270-degree
+  destination window pre-swapped (``act_w`` carries the canvas height) while
+  the vir strides stay in canvas orientation; the emitters and scale checks
+  consume that wire form directly, and the rectangle, tile, and
+  subsampling-alignment validators check the canvas orientation, mirroring
+  the vendor's un-swap plus its explicit act-versus-vir rotate exemption, so
+  genuine portrait rotate requests are not rejected.
   BSP's RGA3 policy restriction for source YUV422 90/270-degree rotation is
   preserved so those jobs fall back to an eligible RGA2 core unless the request
   forced an RGA3-only core mask.  Per-channel rotate flags remain unsupported.
@@ -365,7 +393,10 @@ Implemented
   CSC and compact-10-bit policy generated by ``librga``.
   Main-request rotation/mirror is applied to the
   foreground WIN1 path, including BSP-matched 90-degree sizing for pattern and
-  no-pattern A+B jobs.  The current public
+  no-pattern A+B jobs.  The no-pattern A+B->B rotate path follows the same
+  pre-swapped wire convention as simple bitblits; the pattern-blend rotate
+  path keeps its historical canvas-form model, and its wire-form semantics
+  remain unresolved against the vendor.  The current public
   ``librga`` Porter-Duff modes SRC, DST, SRC_OVER, DST_OVER, SRC_IN, DST_IN,
   SRC_OUT, DST_OUT, SRC_ATOP, DST_ATOP, XOR, and CLEAR are accepted; other
   unlisted blend modes remain unsupported.  Compressed in-place write-back
@@ -422,8 +453,10 @@ Implemented
   factor emission for current ``librga`` ``imresize()`` default/bicubic/linear
   requests, BSP-compatible ``rga_req.rotate_mode`` plus ``sina``/``cosa``
   rotation and mirror encoding, including the active-rectangle
-  swap used by ``librga`` for 90/270-degree rotation, the BSP force-tile scale
-  mode used by no-scale compact 10-bit and YUV444 semiplanar blits, and
+  swap used by ``librga`` for 90/270-degree rotation -- the destination
+  rectangle is validated in canvas orientation after un-swapping, mirroring
+  the vendor's explicit act-versus-vir rotate exemption -- the BSP force-tile
+  scale mode used by no-scale compact 10-bit and YUV444 semiplanar blits, and
   job-owned dma-buf mappings for the selected RGA2 core.  RGA2 destination
   full-CSC coefficients generated by ``librga`` for RGB-to-YUV conversion,
   including current ``imcvtcolor()`` BT.709 limited-range requests selected by
@@ -478,7 +511,10 @@ Implemented
   coefficient pointer after ioctl return.  Only same-size, raster RGB
   source/destination bitblit requests with ``gauss_config.size == 3`` are
   accepted; scaled, converted, rotated, YUV, pattern, ROP, OSD, and
-  multi-kernel gauss variants remain unsupported.
+  multi-kernel gauss variants remain unsupported.  When the caller does not
+  set ``feature.global_alpha_en``, the gauss path defaults the source global
+  alpha to opaque ``0xff`` like the vendor, so an unset flag cannot zero the
+  blurred output's alpha channel.
 * RGA2 RGB NN quantize for current ``librga`` ``imquantize`` and
   ``imquantizeTask`` request shapes.  The rewrite accepts same-size, raster RGB
   source/destination bitblit requests encoded with ``alpha_rop_flag == BIT(8)``
