@@ -1047,6 +1047,10 @@ static int rk_udphy_dp_phy_init(struct phy *phy)
 
 	udphy->dp_in_use = true;
 
+	/* Replay any HPD state that arrived before the PHY was initialized */
+	if (udphy->dp_sink_hpd_sel)
+		rk_udphy_dp_hpd_event_trigger(udphy, udphy->dp_sink_hpd_cfg);
+
 	mutex_unlock(&udphy->mutex);
 
 	return 0;
