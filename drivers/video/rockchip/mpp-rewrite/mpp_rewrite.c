@@ -307,7 +307,6 @@ struct rk_mpp_hw {
 	atomic_t power_count;
 	struct device_node *ccu_node;
 	struct list_head rkvdec_ccu_jobs;
-	struct list_head rkvdec_link_jobs;
 	u32 taskqueue_node;
 	u32 task_capacity;
 	u32 core_mask;
@@ -479,7 +478,6 @@ struct rk_mpp_job {
 	 */
 	struct list_head abort_link;
 	struct list_head rkvdec_ccu_node;
-	struct list_head rkvdec_link_node;
 	struct rk_mpp_session *session;
 	enum rk_mpp_job_state state;
 	struct rk_mpp_hw *hw;
@@ -509,7 +507,6 @@ struct rk_mpp_job {
 	bool poll_irq;
 	bool canceled;
 	bool rkvdec_link_active;
-	bool rkvdec_link_listed;
 	bool rkvdec_ccu_listed;
 	bool rkvdec_ccu_desc_valid;
 	bool rkvdec_ccu_powered;
@@ -778,7 +775,7 @@ static void rk_mpp_debug_record_active(struct rk_mpp_hw *hw,
 	}
 	spin_unlock_irqrestore(&hw->lock, flags);
 
-	rk_mpp_debug_record_values(&rk_mpp_srv, hw, type, session_id, job_id,
+	rk_mpp_debug_record_values(hw->srv, hw, type, session_id, job_id,
 				   client_type, result, irq_status, data);
 }
 
@@ -2847,46 +2844,6 @@ static dma_addr_t rk_mpp_rkvdec2_next_unused_link_iova(struct rk_mpp_hw *hw)
 	return hw->rkvdec_link_iova + index * hw->rkvdec_link_node_size;
 }
 
-static void rk_mpp_rkvdec2_relink_tables_locked(struct rk_mpp_hw *hw)
-{
-	const struct rk_mpp_rkvdec2_link_info *info =
-		&rk_mpp_rkvdec2_vdpu381_link_info;
-	struct rk_mpp_job *job;
-
-	list_for_each_entry(job, &hw->rkvdec_link_jobs, rkvdec_link_node) {
-		struct rk_mpp_job *next;
-		dma_addr_t next_iova;
-		u32 *table = job->rkvdec_link_vaddr;
-
-		if (!table)
-			continue;
-
-		if (list_is_last(&job->rkvdec_link_node, &hw->rkvdec_link_jobs)) {
-			next_iova = rk_mpp_rkvdec2_next_unused_link_iova(hw);
-		} else {
-			next = list_next_entry(job, rkvdec_link_node);
-			next_iova = next->rkvdec_link_iova;
-		}
-
-		table[info->next_word] = lower_32_bits(next_iova);
-	}
-}
-
-static void rk_mpp_rkvdec2_link_table_list_add(struct rk_mpp_job *job)
-{
-	struct rk_mpp_hw *hw = job->hw;
-	unsigned long flags;
-
-	if (!hw || job->rkvdec_link_listed)
-		return;
-
-	spin_lock_irqsave(&hw->lock, flags);
-	list_add_tail(&job->rkvdec_link_node, &hw->rkvdec_link_jobs);
-	job->rkvdec_link_listed = true;
-	rk_mpp_rkvdec2_relink_tables_locked(hw);
-	spin_unlock_irqrestore(&hw->lock, flags);
-}
-
 static void rk_mpp_rkvdec2_ccu_relink_tables_locked(struct rk_mpp_hw *ccu)
 {
 	const struct rk_mpp_rkvdec2_link_info *info =
@@ -3178,15 +3135,17 @@ static void rk_mpp_rkvdec2_release_link_table(struct rk_mpp_job *job)
 		rk_mpp_hw_power_off(ccu);
 	rk_mpp_rkvdec2_power_off_ccu_cores(job);
 
+	/*
+	 * Only return the node to the pool.  The coordinator running list
+	 * owns every DMA chain rewrite: a per-core rewrite here would race
+	 * rk_mpp_rkvdec2_ccu_relink_tables_locked() on the same next-table
+	 * words and could point a running cross-core chain at an unused
+	 * node, silently dropping the queued jobs behind it.
+	 */
 	if (job->rkvdec_link_active && hw && hw->rkvdec_link_used) {
 		spin_lock_irqsave(&hw->lock, flags);
 		if (job->rkvdec_link_index < hw->rkvdec_link_capacity)
 			clear_bit(job->rkvdec_link_index, hw->rkvdec_link_used);
-		if (job->rkvdec_link_listed) {
-			list_del_init(&job->rkvdec_link_node);
-			job->rkvdec_link_listed = false;
-		}
-		rk_mpp_rkvdec2_relink_tables_locked(hw);
 		spin_unlock_irqrestore(&hw->lock, flags);
 	}
 
@@ -3194,7 +3153,6 @@ static void rk_mpp_rkvdec2_release_link_table(struct rk_mpp_job *job)
 	job->rkvdec_link_iova = 0;
 	job->rkvdec_link_index = 0;
 	job->rkvdec_link_active = false;
-	job->rkvdec_link_listed = false;
 	job->rkvdec_ccu_listed = false;
 	job->rkvdec_ccu_core_work = 0;
 	job->rkvdec_ccu_cfg_addr = 0;
@@ -3310,7 +3268,8 @@ static int rk_mpp_rkvdec2_prepare_ccu_descriptor(struct rk_mpp_job *job)
 static int rk_mpp_rkvdec2_stage_link_table(struct rk_mpp_job *job)
 {
 	struct rk_mpp_hw *hw = job->hw;
-	dma_addr_t next_iova = 0;
+	dma_addr_t next_iova;
+	unsigned long flags;
 	int ret;
 
 	ret = rk_mpp_rkvdec2_reserve_link_table(job);
@@ -3321,8 +3280,15 @@ static int rk_mpp_rkvdec2_stage_link_table(struct rk_mpp_job *job)
 		return ret;
 	}
 
-	if (job->rkvdec_link_index + 1 < hw->rkvdec_link_capacity)
-		next_iova = job->rkvdec_link_iova + hw->rkvdec_link_node_size;
+	/*
+	 * Prelink the staged table to an unused node so it never names an
+	 * active sibling table.  This value is advisory: the coordinator
+	 * relink rewrites it when the job enters the running chain, and
+	 * reservation always keeps one spare node, so it cannot be zero.
+	 */
+	spin_lock_irqsave(&hw->lock, flags);
+	next_iova = rk_mpp_rkvdec2_next_unused_link_iova(hw);
+	spin_unlock_irqrestore(&hw->lock, flags);
 	ret = rk_mpp_rkvdec2_fill_link_table(&job->reg_image,
 					     &rk_mpp_rkvdec2_vdpu381_link_info,
 					     job->rkvdec_link_vaddr,
@@ -3341,8 +3307,6 @@ static int rk_mpp_rkvdec2_stage_link_table(struct rk_mpp_job *job)
 		rk_mpp_rkvdec2_release_link_table(job);
 		return ret;
 	}
-
-	rk_mpp_rkvdec2_link_table_list_add(job);
 
 	return 0;
 }
@@ -4889,10 +4853,6 @@ static void rk_mpp_rkvdec2_link_table_ownership_kunit(struct kunit *test)
 	job2->hw = hw;
 	job2->reg_image = image;
 	spin_lock_init(&hw->lock);
-	INIT_LIST_HEAD(&hw->rkvdec_link_jobs);
-	INIT_LIST_HEAD(&job0->rkvdec_link_node);
-	INIT_LIST_HEAD(&job1->rkvdec_link_node);
-	INIT_LIST_HEAD(&job2->rkvdec_link_node);
 
 	for (i = 0; i < image.reg_words; i++)
 		regs[i] = 0xa5000000 | i;
@@ -4920,15 +4880,22 @@ static void rk_mpp_rkvdec2_link_table_ownership_kunit(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, job0->rkvdec_link_active);
 	KUNIT_EXPECT_FALSE(test, test_bit(0, used));
 	KUNIT_EXPECT_TRUE(test, test_bit(1, used));
+	/*
+	 * Release only returns the node.  The coordinator running list owns
+	 * every chain rewrite, so a sibling table's next pointer must not
+	 * change when another job's node is released or staged.
+	 */
 	KUNIT_EXPECT_EQ(test, ((u32 *)job1->rkvdec_link_vaddr)[info->next_word],
-			(u32)hw->rkvdec_link_iova);
+			(u32)(hw->rkvdec_link_iova +
+			      2 * hw->rkvdec_link_node_size));
 
 	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_stage_link_table(job2), 0);
 	KUNIT_EXPECT_TRUE(test, job2->rkvdec_link_active);
 	KUNIT_EXPECT_EQ(test, job2->rkvdec_link_index, 0U);
 	KUNIT_EXPECT_TRUE(test, test_bit(0, used));
 	KUNIT_EXPECT_EQ(test, ((u32 *)job1->rkvdec_link_vaddr)[info->next_word],
-			(u32)job2->rkvdec_link_iova);
+			(u32)(hw->rkvdec_link_iova +
+			      2 * hw->rkvdec_link_node_size));
 	KUNIT_EXPECT_EQ(test, ((u32 *)job2->rkvdec_link_vaddr)[info->next_word],
 			(u32)(hw->rkvdec_link_iova +
 			      2 * hw->rkvdec_link_node_size));
@@ -5800,7 +5767,6 @@ static void rk_mpp_hw_abort_ccu_dependents_kunit(struct kunit *test)
 	spin_lock_init(&ccu->lock);
 	INIT_LIST_HEAD(&ccu->link);
 	INIT_LIST_HEAD(&ccu->rkvdec_ccu_jobs);
-	INIT_LIST_HEAD(&ccu->rkvdec_link_jobs);
 	INIT_DELAYED_WORK(&ccu->timeout_work, rk_mpp_hw_timeout_work);
 
 	core0->dev = core0_dev;
@@ -5815,7 +5781,6 @@ static void rk_mpp_hw_abort_ccu_dependents_kunit(struct kunit *test)
 	spin_lock_init(&core0->lock);
 	INIT_LIST_HEAD(&core0->link);
 	INIT_LIST_HEAD(&core0->rkvdec_ccu_jobs);
-	INIT_LIST_HEAD(&core0->rkvdec_link_jobs);
 	INIT_DELAYED_WORK(&core0->timeout_work, rk_mpp_hw_timeout_work);
 
 	core1->dev = core1_dev;
@@ -5830,7 +5795,6 @@ static void rk_mpp_hw_abort_ccu_dependents_kunit(struct kunit *test)
 	spin_lock_init(&core1->lock);
 	INIT_LIST_HEAD(&core1->link);
 	INIT_LIST_HEAD(&core1->rkvdec_ccu_jobs);
-	INIT_LIST_HEAD(&core1->rkvdec_link_jobs);
 	INIT_DELAYED_WORK(&core1->timeout_work, rk_mpp_hw_timeout_work);
 
 	list_add_tail(&core0->link, &srv->hw_list);
@@ -5845,7 +5809,6 @@ static void rk_mpp_hw_abort_ccu_dependents_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&queued->session_link);
 	INIT_LIST_HEAD(&queued->sched_link);
 	INIT_LIST_HEAD(&queued->rkvdec_ccu_node);
-	INIT_LIST_HEAD(&queued->rkvdec_link_node);
 	list_add_tail(&queued->session_link, &session->active_jobs);
 	list_add_tail(&queued->sched_link, &srv->queued_jobs);
 	atomic_set(&core0->queued_job_count, 1);
@@ -5859,7 +5822,6 @@ static void rk_mpp_hw_abort_ccu_dependents_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&active->session_link);
 	INIT_LIST_HEAD(&active->sched_link);
 	INIT_LIST_HEAD(&active->rkvdec_ccu_node);
-	INIT_LIST_HEAD(&active->rkvdec_link_node);
 	list_add_tail(&active->session_link, &session->active_jobs);
 	core1->active_job = active;
 
@@ -7679,7 +7641,6 @@ static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&queued->session_link);
 	INIT_LIST_HEAD(&queued->sched_link);
 	INIT_LIST_HEAD(&queued->rkvdec_ccu_node);
-	INIT_LIST_HEAD(&queued->rkvdec_link_node);
 	list_add_tail(&queued->session_link, &session.active_jobs);
 	list_add_tail(&queued->sched_link, &srv.queued_jobs);
 	atomic_set(&hw->queued_job_count, 1);
@@ -7693,7 +7654,6 @@ static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&active->session_link);
 	INIT_LIST_HEAD(&active->sched_link);
 	INIT_LIST_HEAD(&active->rkvdec_ccu_node);
-	INIT_LIST_HEAD(&active->rkvdec_link_node);
 	list_add_tail(&active->session_link, &session.active_jobs);
 
 	rk_mpp_session_abort_jobs(&session);
@@ -7737,7 +7697,12 @@ static void rk_mpp_session_abort_hw_active_kunit(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, dev);
 	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, hw);
-	active = kunit_kzalloc(test, sizeof(*active), GFP_KERNEL);
+	/*
+	 * The exercised abort path drops both job references and frees the
+	 * job with kfree() in rk_mpp_job_release(), so the allocation must
+	 * not be KUnit-managed or teardown double-frees it.
+	 */
+	active = kzalloc(sizeof(*active), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, active);
 
 	device_initialize(dev);
@@ -7771,7 +7736,6 @@ static void rk_mpp_session_abort_hw_active_kunit(struct kunit *test)
 	spin_lock_init(&hw->lock);
 	mutex_init(&hw->run_lock);
 	INIT_LIST_HEAD(&hw->rkvdec_ccu_jobs);
-	INIT_LIST_HEAD(&hw->rkvdec_link_jobs);
 	INIT_DELAYED_WORK(&hw->timeout_work, rk_mpp_hw_timeout_work);
 	INIT_WORK(&hw->iommu_fault_work, rk_mpp_hw_iommu_fault_work);
 	ret = kunit_add_action_or_reset(test, rk_mpp_kunit_cancel_hw_work,
@@ -7787,7 +7751,6 @@ static void rk_mpp_session_abort_hw_active_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&active->session_link);
 	INIT_LIST_HEAD(&active->sched_link);
 	INIT_LIST_HEAD(&active->rkvdec_ccu_node);
-	INIT_LIST_HEAD(&active->rkvdec_link_node);
 	list_add_tail(&active->session_link, &session->active_jobs);
 	hw->active_job = active;
 
@@ -7858,7 +7821,6 @@ static void rk_mpp_reset_session_public_cleanup_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&queued->session_link);
 	INIT_LIST_HEAD(&queued->sched_link);
 	INIT_LIST_HEAD(&queued->rkvdec_ccu_node);
-	INIT_LIST_HEAD(&queued->rkvdec_link_node);
 	list_add_tail(&queued->session_link, &session.active_jobs);
 	list_add_tail(&queued->sched_link, &srv->queued_jobs);
 	atomic_set(&hw.queued_job_count, 1);
@@ -7872,7 +7834,6 @@ static void rk_mpp_reset_session_public_cleanup_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&active->session_link);
 	INIT_LIST_HEAD(&active->sched_link);
 	INIT_LIST_HEAD(&active->rkvdec_ccu_node);
-	INIT_LIST_HEAD(&active->rkvdec_link_node);
 	list_add_tail(&active->session_link, &session.active_jobs);
 
 	KUNIT_EXPECT_EQ(test,
@@ -7948,7 +7909,6 @@ static void rk_mpp_reset_session_hw_active_import_kunit(struct kunit *test)
 	spin_lock_init(&hw.lock);
 	mutex_init(&hw.run_lock);
 	INIT_LIST_HEAD(&hw.rkvdec_ccu_jobs);
-	INIT_LIST_HEAD(&hw.rkvdec_link_jobs);
 	INIT_DELAYED_WORK_ONSTACK(&hw.timeout_work, rk_mpp_hw_timeout_work);
 
 	import->fd = 9;
@@ -7967,7 +7927,6 @@ static void rk_mpp_reset_session_hw_active_import_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&active->session_link);
 	INIT_LIST_HEAD(&active->sched_link);
 	INIT_LIST_HEAD(&active->rkvdec_ccu_node);
-	INIT_LIST_HEAD(&active->rkvdec_link_node);
 	list_add_tail(&active->session_link, &session->active_jobs);
 	hw.active_job = active;
 
@@ -8028,7 +7987,6 @@ static void rk_mpp_file_release_public_cleanup_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&active->session_link);
 	INIT_LIST_HEAD(&active->sched_link);
 	INIT_LIST_HEAD(&active->rkvdec_ccu_node);
-	INIT_LIST_HEAD(&active->rkvdec_link_node);
 	list_add_tail(&active->session_link, &session->active_jobs);
 
 	KUNIT_EXPECT_EQ(test, rk_mpp_release(NULL, &file), 0);
@@ -9267,7 +9225,6 @@ rk_mpp_batch_get_job(struct rk_mpp_batch_state *batch,
 	INIT_LIST_HEAD(&job->sched_link);
 	INIT_LIST_HEAD(&job->abort_link);
 	INIT_LIST_HEAD(&job->rkvdec_ccu_node);
-	INIT_LIST_HEAD(&job->rkvdec_link_node);
 	list_add_tail(&job->link, &batch->jobs);
 	batch->cur_job = job;
 
@@ -9326,7 +9283,7 @@ static bool rk_mpp_job_dequeue(struct rk_mpp_job *job)
 static void rk_mpp_hw_abort_queued_matching(struct rk_mpp_hw *target,
 					    bool ccu_dependents, int result)
 {
-	struct rk_mpp_service *srv = &rk_mpp_srv;
+	struct rk_mpp_service *srv = target->srv;
 	struct rk_mpp_job *job, *tmp;
 	LIST_HEAD(aborted);
 
@@ -9377,7 +9334,7 @@ static void rk_mpp_hw_quarantine_irq(struct rk_mpp_hw *hw)
 
 static void rk_mpp_hw_handle_reset_failure(struct rk_mpp_hw *hw, int error)
 {
-	struct rk_mpp_service *srv = &rk_mpp_srv;
+	struct rk_mpp_service *srv = hw->srv;
 	struct rk_mpp_hw *dependent;
 	bool ccu_failure;
 	bool newly_failed = false;
@@ -10085,7 +10042,7 @@ static int rk_mpp_hw_reset_active(struct rk_mpp_hw *hw)
 	if (!hw->resets)
 		return 0;
 
-	atomic_inc(&rk_mpp_srv.reset_count);
+	atomic_inc(&hw->srv->reset_count);
 	ret = reset_control_assert(hw->resets);
 	if (ret)
 		goto err_reset;
@@ -10509,6 +10466,15 @@ static void rk_mpp_hw_abort_job(struct rk_mpp_job *job)
 		 * own cleanup ownership after clearing active_job.
 		 */
 		rk_mpp_rkvdec2_release_link_table(job);
+		/*
+		 * Unlike IRQ completion, abort idles the core without going
+		 * through rk_mpp_job_complete(), so other sessions' queued
+		 * jobs waiting for this core need their own dispatch kick.
+		 * A racing enqueue kicks the scheduler itself, so an empty
+		 * check without sched_lock cannot lose a waiter.
+		 */
+		if (!list_empty(&hw->srv->queued_jobs))
+			schedule_work(&hw->srv->sched_work);
 	}
 out_unlock_core:
 	rk_mpp_hw_enable_irq(hw, irq_disabled);
@@ -11282,7 +11248,7 @@ static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu)
 				1, RK_MPP_CCU_STOP_TIMEOUT_US);
 		}
 		if (hw->resets) {
-			atomic_inc(&rk_mpp_srv.reset_count);
+			atomic_inc(&hw->srv->reset_count);
 			reset_ret = reset_control_assert(hw->resets);
 			cores[i].reset_asserted = !reset_ret;
 		}
@@ -11301,7 +11267,7 @@ static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu)
 	}
 
 	if (ccu->resets) {
-		atomic_inc(&rk_mpp_srv.reset_count);
+		atomic_inc(&ccu->srv->reset_count);
 		ccu_assert_ret = reset_control_assert(ccu->resets);
 		ccu_reset_asserted = !ccu_assert_ret;
 	}
@@ -11578,7 +11544,7 @@ static int rk_mpp_iommu_fault_handler(struct iommu_domain *domain,
 
 static int rk_mpp_iommu_register_fault_handler(struct rk_mpp_hw *hw)
 {
-	struct rk_mpp_service *srv = &rk_mpp_srv;
+	struct rk_mpp_service *srv = hw->srv;
 	unsigned long flags;
 	int ret;
 
@@ -11602,7 +11568,7 @@ static int rk_mpp_iommu_register_fault_handler(struct rk_mpp_hw *hw)
 
 static void rk_mpp_iommu_unregister_fault_handler(struct rk_mpp_hw *hw)
 {
-	struct rk_mpp_service *srv = &rk_mpp_srv;
+	struct rk_mpp_service *srv = hw->srv;
 	unsigned long flags;
 	int ret;
 
@@ -12143,7 +12109,7 @@ static irqreturn_t rk_mpp_rkvenc2_irq(struct rk_mpp_hw *hw)
 	status = readl_relaxed(hw->regs[0] + RK_MPP_RKVENC_INT_STA_BASE);
 	if (!status)
 		return IRQ_NONE;
-	atomic_inc(&rk_mpp_srv.irq_count);
+	atomic_inc(&hw->srv->irq_count);
 
 	if (rk_mpp_hw_reg_range_valid(hw, 0, RK_MPP_RKVENC_INT_CLR_BASE,
 				      sizeof(u32)))
@@ -12186,8 +12152,8 @@ static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 	mutex_lock(&hw->run_lock);
 	job = rk_mpp_hw_take_active_job(hw, &irq_status);
 	if (!job) {
-		atomic_inc(&rk_mpp_srv.spurious_irq_count);
-		rk_mpp_debug_record_values(&rk_mpp_srv, hw,
+		atomic_inc(&hw->srv->spurious_irq_count);
+		rk_mpp_debug_record_values(hw->srv, hw,
 					   RK_MPP_DEBUG_SPURIOUS_IRQ,
 					   0, 0, RK_MPP_DEVICE_RKVENC,
 					   -ENOENT, irq_status, 0);
@@ -12380,7 +12346,7 @@ static irqreturn_t rk_mpp_rkvdec2_irq(struct rk_mpp_hw *hw)
 
 		if (rk_mpp_rkvdec2_link_irq_decode(irq_val, core_status,
 						   &status)) {
-			atomic_inc(&rk_mpp_srv.irq_count);
+			atomic_inc(&hw->srv->irq_count);
 			writel(rk_mpp_rkvdec2_link_irq_ack(irq_val),
 			       link + link_info->irq_base);
 			spin_lock_irqsave(&hw->lock, flags);
@@ -12398,7 +12364,7 @@ static irqreturn_t rk_mpp_rkvdec2_irq(struct rk_mpp_hw *hw)
 	status = readl_relaxed(hw->regs[0] + RK_MPP_RKVDEC_INT_STA_BASE);
 	if (!(status & RK_MPP_RKVDEC_IRQ_RAW))
 		return IRQ_NONE;
-	atomic_inc(&rk_mpp_srv.irq_count);
+	atomic_inc(&hw->srv->irq_count);
 
 	writel(0, hw->regs[0] + RK_MPP_RKVDEC_INT_STA_BASE);
 	spin_lock_irqsave(&hw->lock, flags);
@@ -12420,10 +12386,10 @@ static irqreturn_t rk_mpp_rkvdec2_hard_ccu_thread(struct rk_mpp_hw *hw)
 	hw->irq_status = 0;
 	spin_unlock_irqrestore(&hw->lock, flags);
 
-	ccu = rk_mpp_hw_get_ccu_for_core(&rk_mpp_srv, hw);
+	ccu = rk_mpp_hw_get_ccu_for_core(hw->srv, hw);
 	if (!ccu) {
-		atomic_inc(&rk_mpp_srv.spurious_irq_count);
-		rk_mpp_debug_record_values(&rk_mpp_srv, hw,
+		atomic_inc(&hw->srv->spurious_irq_count);
+		rk_mpp_debug_record_values(hw->srv, hw,
 					   RK_MPP_DEBUG_SPURIOUS_IRQ,
 					   0, 0, RK_MPP_DEVICE_RKVDEC,
 					   -ENODEV, irq_status, 0);
@@ -12440,8 +12406,8 @@ static irqreturn_t rk_mpp_rkvdec2_hard_ccu_thread(struct rk_mpp_hw *hw)
 	completed = rk_mpp_rkvdec2_drain_ccu_done_jobs(ccu);
 	mutex_unlock(&ccu->ccu_recovery_lock);
 	if (!completed) {
-		atomic_inc(&rk_mpp_srv.spurious_irq_count);
-		rk_mpp_debug_record_values(&rk_mpp_srv, hw,
+		atomic_inc(&hw->srv->spurious_irq_count);
+		rk_mpp_debug_record_values(hw->srv, hw,
 					   RK_MPP_DEBUG_SPURIOUS_IRQ,
 					   0, 0, RK_MPP_DEVICE_RKVDEC,
 					   -ENOENT, irq_status, 0);
@@ -12466,8 +12432,8 @@ static irqreturn_t rk_mpp_rkvdec2_thread(struct rk_mpp_hw *hw)
 	mutex_lock(&hw->run_lock);
 	job = rk_mpp_hw_take_active_job(hw, &irq_status);
 	if (!job) {
-		atomic_inc(&rk_mpp_srv.spurious_irq_count);
-		rk_mpp_debug_record_values(&rk_mpp_srv, hw,
+		atomic_inc(&hw->srv->spurious_irq_count);
+		rk_mpp_debug_record_values(hw->srv, hw,
 					   RK_MPP_DEBUG_SPURIOUS_IRQ,
 					   0, 0, RK_MPP_DEVICE_RKVDEC,
 					   -ENOENT, irq_status, 0);
@@ -13880,7 +13846,6 @@ static int rk_mpp_hw_probe(struct platform_device *pdev)
 	atomic_set(&hw->power_count, 0);
 	INIT_LIST_HEAD(&hw->fault_link);
 	INIT_LIST_HEAD(&hw->rkvdec_ccu_jobs);
-	INIT_LIST_HEAD(&hw->rkvdec_link_jobs);
 	INIT_DELAYED_WORK(&hw->timeout_work, rk_mpp_hw_timeout_work);
 	INIT_WORK(&hw->iommu_fault_work, rk_mpp_hw_iommu_fault_work);
 
@@ -14071,7 +14036,7 @@ static void rk_mpp_hw_remove(struct platform_device *pdev)
 		 */
 		ccu = rk_mpp_hw_get_active_ccu_if(hw, NULL, 0);
 		if (!ccu)
-			ccu = rk_mpp_hw_get_ccu_for_core(&rk_mpp_srv, hw);
+			ccu = rk_mpp_hw_get_ccu_for_core(hw->srv, hw);
 	}
 	if (ccu) {
 		mutex_lock(&rk_mpp_srv.hw_lock);
