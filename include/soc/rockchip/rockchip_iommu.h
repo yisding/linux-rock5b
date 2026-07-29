@@ -21,9 +21,14 @@ int rockchip_iommu_force_reset(struct device *dev);
 void rockchip_iommu_mask_irq(struct device *dev);
 void rockchip_iommu_unmask_irq(struct device *dev);
 int rockchip_pagefault_done(struct device *dev);
-/* Passing NULL unregisters and waits for in-flight provider IRQ callbacks. */
+/*
+ * Atomic-safe; passing NULL unregisters without waiting. Teardown paths that
+ * free the token must call rockchip_iommu_sync_fault_handler() afterwards.
+ */
 int rockchip_iommu_set_fault_handler(struct device *dev,
 				     iommu_fault_handler_t handler, void *token);
+/* Waits (sleeps) until no in-flight provider IRQ callback can be running. */
+int rockchip_iommu_sync_fault_handler(struct device *dev);
 #else
 static inline int rockchip_iommu_enable(struct device *dev)
 {
@@ -61,6 +66,11 @@ static inline int rockchip_pagefault_done(struct device *dev)
 static inline int rockchip_iommu_set_fault_handler(struct device *dev,
 					  iommu_fault_handler_t handler,
 					  void *token)
+{
+	return -ENODEV;
+}
+
+static inline int rockchip_iommu_sync_fault_handler(struct device *dev)
 {
 	return -ENODEV;
 }

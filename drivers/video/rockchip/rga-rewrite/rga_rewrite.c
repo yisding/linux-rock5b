@@ -22582,6 +22582,9 @@ static void rk_rga_iommu_unregister_fault_handler(struct rk_rga_hw *hw)
 	if (ret)
 		dev_warn(hw->dev, "failed to clear IOMMU fault handler: %pe\n",
 			 ERR_PTR(ret));
+	else
+		/* rga may be freed after unbind; wait out in-flight callbacks. */
+		rockchip_iommu_sync_fault_handler(hw->dev);
 	hw->iommu_fault_handler_registered = false;
 }
 

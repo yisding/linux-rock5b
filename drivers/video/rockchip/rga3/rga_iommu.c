@@ -329,6 +329,8 @@ static void rga_iommu_clear_fault_handler(struct rga_iommu_info *info)
 
 	if (info->rockchip_fault_handler) {
 		rockchip_iommu_set_fault_handler(info->dev, NULL, NULL);
+		/* Unbind-only path; the scheduler token dies with the driver. */
+		rockchip_iommu_sync_fault_handler(info->dev);
 		info->rockchip_fault_handler = false;
 	}
 
