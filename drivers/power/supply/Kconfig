@@ -141,6 +141,20 @@ config BATTERY_CW2015
 	  This driver can also be built as a module. If so, the module will be
 	  called cw2015_battery.
 
+config BATTERY_CW221X
+	tristate "CW221x Battery Fuel Gauge"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  Say Y here to enable support for the CellWise CW2215, CW2217 and
+	  CW2218 battery fuel gauges. These devices report state of charge,
+	  voltage, current, temperature, cycle count and state of health
+	  over I2C. The chip variant is detected at runtime from the firmware
+	  version register.
+
+	  This driver can also be built as a module. If so, the module will be
+	  called cw221x_battery.
+
 config BATTERY_DS2760
 	tristate "DS2760 battery driver (HP iPAQ & others)"
 	depends on W1
