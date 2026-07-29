@@ -2918,10 +2918,18 @@ static void rkvdec2_hard_ccu_resend_tasks(struct mpp_dev *mpp, struct mpp_taskqu
 
 		tbl = list_first_entry_or_null(&dec->ccu->unused_list,
 				struct mpp_dma_buffer, link);
-		WARN_ON(!tbl);
+		/*
+		 * An empty unused_list is the ordinary state of a saturated
+		 * pipeline, so a reset arriving then is not a kernel bug. The
+		 * caller already copes with a missing table; splatting (and
+		 * rebooting a panic_on_warn box) helps nobody.
+		 */
 		if (tbl) {
 			tb_reg = (u32 *)task_pre->table->vaddr;
 			tb_reg[dec->link_dec->info->tb_reg_next] = tbl->iova;
+		} else {
+			dev_warn_ratelimited(mpp->dev,
+					     "no free link table for resend\n");
 		}
 	}
 
