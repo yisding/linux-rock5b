@@ -212,6 +212,28 @@
 		vin-supply = <&vcc_3v3_s3>;
 	};
 
+	saradc_keys: adc-keys {
+		compatible = "adc-keys";
+		io-channels = <&saradc 0>;
+		io-channel-names = "buttons";
+		keyup-threshold-microvolt = <1800000>;
+		poll-interval = <100>;
+
+		button-back {
+			label = "back";
+			linux,code = <KEY_BACK>;
+			press-threshold-microvolt = <17000>;
+		};
+	};
+
+	sdio_pwrseq: sdio-pwrseq {
+		compatible = "mmc-pwrseq-simple";
+		pinctrl-names = "default";
+		pinctrl-0 = <&wifi_poweren_gpio>;
+		post-power-on-delay-ms = <200>;
+		reset-gpios = <&gpio1 RK_PC2 GPIO_ACTIVE_LOW>;
+	};
+
 	sound {
 		compatible = "simple-audio-card";
 		pinctrl-names = "default";
@@ -304,6 +326,7 @@
 		    <&eth0m0_rx_bus2>,
 		    <&eth0m0_rgmii_clk>,
 		    <&eth0m0_rgmii_bus>;
+	tx_delay = <0x21>;
 	status = "okay";
 };
 
@@ -318,6 +341,7 @@
 		    <&eth1m0_rx_bus2>,
 		    <&eth1m0_rgmii_clk>,
 		    <&eth1m0_rgmii_bus>;
+	tx_delay = <0x20>;
 	status = "okay";
 };
 
@@ -875,6 +899,22 @@
 			rockchip,pins = <0 RK_PD1 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
 	};
+
+	wireless-bluetooth {
+		uart5_gpios: uart5-gpios {
+			rockchip,pins = <3 RK_PD6 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
+	wireless-wlan {
+		wifi_host_wake_irq: wifi-host-wake-irq {
+			rockchip,pins = <0 RK_PB0 RK_FUNC_GPIO &pcfg_pull_down>;
+		};
+
+		wifi_poweren_gpio: wifi-poweren-gpio {
+			rockchip,pins = <1 RK_PC2 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+	};
 };
 
 &sai2 {
@@ -887,6 +927,24 @@
 
 &saradc {
 	vref-supply = <&vcca_1v8_s0>;
+	status = "okay";
+};
+
+&sdio {
+	bus-width = <4>;
+	cap-sdio-irq;
+	keep-power-in-suspend;
+	max-frequency = <200000000>;
+	mmc-pwrseq = <&sdio_pwrseq>;
+	no-mmc;
+	no-sd;
+	non-removable;
+	pinctrl-names = "default";
+	pinctrl-0 = <&sdmmc1m0_bus4>, <&sdmmc1m0_clk>, <&sdmmc1m0_cmd>;
+	sd-uhs-sdr104;
+	vmmc-supply = <&vcc_3v3_s3>;
+	vqmmc-supply = <&vcc_1v8_s3>;
+	wakeup-source;
 	status = "okay";
 };
 
@@ -943,6 +1001,31 @@
 	status = "okay";
 };
 
+&uart3 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart3m0_xfer>;
+	status = "okay";
+};
+
+&uart5 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart5m0_xfer>, <&uart5m0_ctsn>, <&uart5m0_rtsn>;
+	status = "okay";
+
+	bluetooth {
+		compatible = "realtek,rtl8822cs-bt";
+		device-wake-gpios = <&gpio3 RK_PD0 GPIO_ACTIVE_HIGH>;
+		enable-gpios = <&gpio3 RK_PC7 GPIO_ACTIVE_HIGH>;
+		host-wake-gpios = <&gpio0 RK_PB1 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+&uart8 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart8m1_xfer>;
+	status = "okay";
+};
+
 &ufshc {
 	vcc-supply = <&vcc_3v3_s3>;
 	vccq-supply = <&vcc1v2_ufs_vccq>;
@@ -956,8 +1039,7 @@
 };
 
 &usb_drd0_dwc3 {
-	dr_mode = "otg";
-	extcon = <&u2phy0>;
+	dr_mode = "host";
 	status = "okay";
 };
 

@@ -373,6 +373,14 @@
 		pinctrl-names = "default";
 		pinctrl-0 = <&dc_det_pin>;
 	};
+
+	typec_extcon_bridge: typec-extcon {
+		compatible = "linux,typec-extcon-bridge";
+		usb-role-switch;
+		orientation-switch;
+		mode-switch;
+		svid = /bits/ 16 <0xff01>;
+	};
 };
 
 &cpu_b0 {
@@ -397,6 +405,12 @@
 
 &cpu_l3 {
 	cpu-supply = <&vdd_cpu_l>;
+};
+
+&cdn_dp {
+	status = "okay";
+	extcon = <&typec_extcon_bridge>;
+	phys = <&tcphy0_dp>;
 };
 
 &edp {
@@ -679,6 +693,7 @@
 		pinctrl-names = "default";
 		pinctrl-0 = <&fusb0_int_pin>;
 		vbus-supply = <&vbus_typec>;
+		extcon = <&typec_extcon_bridge>;
 
 		connector {
 			compatible = "usb-c-connector";
@@ -687,10 +702,19 @@
 			op-sink-microwatt = <1000000>;
 			power-role = "dual";
 			sink-pdos =
-				<PDO_FIXED(5000, 2500, PDO_FIXED_USB_COMM)>;
+				<PDO_FIXED(5000, 2500, PDO_FIXED_USB_COMM | PDO_FIXED_DUAL_ROLE | PDO_FIXED_DATA_SWAP)>;
 			source-pdos =
-				<PDO_FIXED(5000, 1400, PDO_FIXED_USB_COMM)>;
+				<PDO_FIXED(5000, 1400, PDO_FIXED_USB_COMM | PDO_FIXED_DUAL_ROLE | PDO_FIXED_DATA_SWAP)>;
 			try-power-role = "sink";
+			mode-switch = <&typec_extcon_bridge>;
+			orientation-switch = <&typec_extcon_bridge>;
+
+			altmodes {
+				dp {
+					svid = /bits/ 16 <0xff01>;
+					vdo = <0x1c46>;
+				};
+			};
 
 			ports {
 				#address-cells = <1>;
@@ -957,6 +981,7 @@
 };
 
 &tcphy0 {
+	extcon = <&typec_extcon_bridge>;
 	status = "okay";
 };
 
@@ -990,6 +1015,8 @@
 
 &u2phy0 {
 	status = "okay";
+	extcon = <&typec_extcon_bridge>;
+	extcon,ignore-usb;
 
 	u2phy0_otg: otg-port {
 		status = "okay";
@@ -1066,7 +1093,9 @@
 };
 
 &usbdrd_dwc3_0 {
-	dr_mode = "host";
+	dr_mode = "otg";
+	extcon = <&typec_extcon_bridge>;
+	snps,usb3-phy-reset-quirk;
 	status = "okay";
 };
 

@@ -34,6 +34,34 @@
 		};
 	};
 
+	acodec-sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,format = "i2s";
+		simple-audio-card,name = "rockchip,rk3308-acodec";
+		simple-audio-card,mclk-fs = <256>;
+		simple-audio-card,codec-hp-det;
+		simple-audio-card,widgets =
+		"Headphone", "Headphones";
+		simple-audio-card,cpu {
+			sound-dai = <&i2s_8ch_2>;
+		};
+		simple-audio-card,codec {
+			sound-dai = <&codec>;
+		};
+	};
+
+	board_antenna: board-antenna {
+		compatible = "regulator-fixed";
+		enable-active-low;
+		gpio = <&gpio0 RK_PA5 GPIO_ACTIVE_LOW>;
+		regulator-always-on;
+		regulator-boot-on;
+		pinctrl-0 = <&board_antenna_power>;
+		pinctrl-names = "default";
+		regulator-name = "board_antenna_power";
+		status = "okay";
+	};
+
 	vdd_log: regulator-1v04-vdd-log {
 		compatible = "regulator-fixed";
 		regulator-name = "vdd_log";
@@ -74,23 +102,6 @@
 		vin-supply = <&vcc5v0_sys>;
 	};
 
-	/*
-	 * HW revision prior to v1.2 must pull GPIO4_D6 low to access sdmmc.
-	 * This is modeled as an always-on active low fixed regulator.
-	 */
-	vcc_sd: regulator-3v3-vcc-sd {
-		compatible = "regulator-fixed";
-		gpios = <&gpio4 RK_PD6 GPIO_ACTIVE_LOW>;
-		pinctrl-names = "default";
-		pinctrl-0 = <&sdmmc_2030>;
-		regulator-name = "vcc_sd";
-		regulator-always-on;
-		regulator-boot-on;
-		regulator-min-microvolt = <3300000>;
-		regulator-max-microvolt = <3300000>;
-		vin-supply = <&vcc_io>;
-	};
-
 	vcc5v0_sys: regulator-5v0-vcc-sys {
 		compatible = "regulator-fixed";
 		regulator-name = "vcc5v0_sys";
@@ -118,6 +129,11 @@
 		pinctrl-0 = <&wifi_reg_on>;
 		reset-gpios = <&gpio0 RK_PA2 GPIO_ACTIVE_LOW>;
 	};
+};
+
+&codec {
+	#sound-dai-cells = <0>;
+	status = "okay";
 };
 
 &cpu0 {
@@ -158,6 +174,18 @@
 	};
 };
 
+&i2s_8ch_0 {
+	#sound-dai-cells = <0>;
+	assigned-clocks = <&cru SCLK_I2S0_8CH_RX>;
+	assigned-clock-parents = <&cru SCLK_I2S0_8CH_TX_MUX>;
+	rockchip,clk-trcm = <1>;
+};
+
+&i2s_8ch_2 {
+	#sound-dai-cells = <0>;
+	status = "okay";
+};
+
 &io_domains {
 	vccio0-supply = <&vcc_io>;
 	vccio1-supply = <&vcc_io>;
@@ -171,6 +199,14 @@
 &pinctrl {
 	pinctrl-names = "default";
 	pinctrl-0 = <&rtc_32k>;
+
+	antenna {
+
+		board_antenna_power: board-antenna-power {
+			rockchip,pins = <0 RK_PA5 RK_FUNC_GPIO &pcfg_pull_down>;
+		};
+
+	};
 
 	bluetooth {
 		bt_reg_on: bt-reg-on {
@@ -213,6 +249,7 @@
 			rockchip,pins = <0 RK_PA0 RK_FUNC_GPIO &pcfg_pull_down>;
 		};
 	};
+
 };
 
 &pwm0 {
@@ -256,7 +293,13 @@
 	cap-mmc-highspeed;
 	cap-sd-highspeed;
 	disable-wp;
-	vmmc-supply = <&vcc_sd>;
+	vmmc-supply = <&vcc_io>;
+	status = "okay";
+};
+
+&tsadc {
+	rockchip,hw-tshut-mode = <0>;		/* 0:CRU */
+	rockchip,hw-tshut-polarity = <1>;	/* 1:HIGH */
 	status = "okay";
 };
 

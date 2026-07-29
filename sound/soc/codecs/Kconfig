@@ -55,6 +55,7 @@ config SND_SOC_ALL_CODECS
 	imply SND_SOC_AUDIO_IIO_AUX
 	imply SND_SOC_AW8738
 	imply SND_SOC_AW87390
+	imply SND_SOC_AW87391
 	imply SND_SOC_AW88395
 	imply SND_SOC_AW88081
 	imply SND_SOC_AW88166
@@ -717,6 +718,17 @@ config SND_SOC_AW88081
 
 config SND_SOC_AW87390
 	tristate "Soc Audio for awinic aw87390"
+	depends on I2C
+	select REGMAP_I2C
+	select SND_SOC_AW88395_LIB
+	help
+	  The awinic aw87390 is specifically designed to improve
+	  the musical output dynamic range, enhance the overall
+	  sound quality, which is a new high efficiency, low
+	  noise, constant large volume, 6th Smart K audio amplifier.
+
+config SND_SOC_AW87391
+	tristate "Soc Audio for awinic aw87391"
 	depends on I2C
 	select REGMAP_I2C
 	select SND_SOC_AW88395_LIB
@@ -1860,7 +1872,7 @@ config SND_SOC_RT5645
 	depends on I2C
 
 config SND_SOC_RT5651
-	tristate
+	tristate "Realtek RT5651 Codec"
 	depends on I2C
 
 config SND_SOC_RT5659

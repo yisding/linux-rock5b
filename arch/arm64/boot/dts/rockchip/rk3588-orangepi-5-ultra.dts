@@ -52,6 +52,13 @@
 	status = "okay";
 };
 
+&hdmi_receiver {
+	pinctrl-0 = <&hdmim2_rx_cec &hdmim2_rx_hpdin &hdmim2_rx_scl &hdmim2_rx_sda &hdmirx_hpd>;
+	pinctrl-names = "default";
+	hpd-gpios = <&gpio3 RK_PD3 GPIO_ACTIVE_LOW>;
+	status = "okay";
+};
+
 &i2s6_8ch {
 	status = "okay";
 };
@@ -68,6 +75,12 @@
 	hdmi {
 		hdmi1_tx_on_h: hdmi1-tx-on-h {
 			rockchip,pins = <4 RK_PB2 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
+	hdmirx {
+		hdmirx_hpd: hdmirx-5v-detection {
+			rockchip,pins = <3 RK_PD3 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
 	};
 

@@ -2035,6 +2035,9 @@ static void tcpm_register_partner_altmodes(struct tcpm_port *port)
 		return;
 
 	for (i = 0; i < modep->altmodes; i++) {
+		typec_unregister_altmode(port->partner_altmode[i]);
+		port->partner_altmode[i] = NULL;
+
 		altmode = typec_partner_register_altmode(port->partner,
 						&modep->altmode_desc[i]);
 		if (IS_ERR(altmode)) {
@@ -3311,20 +3314,22 @@ static int tcpm_register_source_caps(struct tcpm_port *port)
 {
 	struct usb_power_delivery_desc desc = { port->negotiated_rev };
 	struct usb_power_delivery_capabilities_desc caps = { };
-	struct usb_power_delivery_capabilities *cap = port->partner_source_caps;
+	struct usb_power_delivery_capabilities *cap;
+	struct usb_power_delivery *partner_pd;
 
-	if (!port->partner_pd)
-		port->partner_pd = usb_power_delivery_register(NULL, &desc);
-	if (IS_ERR(port->partner_pd))
-		return PTR_ERR(port->partner_pd);
+	if (!port->partner_pd) {
+		partner_pd = usb_power_delivery_register(NULL, &desc);
+		if (IS_ERR(partner_pd))
+			return PTR_ERR(partner_pd);
+
+		port->partner_pd = partner_pd;
+	}
 
 	memcpy(caps.pdo, port->source_caps, sizeof(u32) * port->nr_source_caps);
 	caps.role = TYPEC_SOURCE;
 
-	if (cap) {
-		usb_power_delivery_unregister_capabilities(cap);
-		port->partner_source_caps = NULL;
-	}
+	usb_power_delivery_unregister_capabilities(port->partner_source_caps);
+	port->partner_source_caps = NULL;
 
 	cap = usb_power_delivery_register_capabilities(port->partner_pd, &caps);
 	if (IS_ERR(cap))
@@ -3340,14 +3345,21 @@ static int tcpm_register_sink_caps(struct tcpm_port *port)
 	struct usb_power_delivery_desc desc = { port->negotiated_rev };
 	struct usb_power_delivery_capabilities_desc caps = { };
 	struct usb_power_delivery_capabilities *cap;
+	struct usb_power_delivery *partner_pd;
 
-	if (!port->partner_pd)
-		port->partner_pd = usb_power_delivery_register(NULL, &desc);
-	if (IS_ERR(port->partner_pd))
-		return PTR_ERR(port->partner_pd);
+	if (!port->partner_pd) {
+		partner_pd = usb_power_delivery_register(NULL, &desc);
+		if (IS_ERR(partner_pd))
+			return PTR_ERR(partner_pd);
+
+		port->partner_pd = partner_pd;
+	}
 
 	memcpy(caps.pdo, port->sink_caps, sizeof(u32) * port->nr_sink_caps);
 	caps.role = TYPEC_SINK;
+
+	usb_power_delivery_unregister_capabilities(port->partner_sink_caps);
+	port->partner_sink_caps = NULL;
 
 	cap = usb_power_delivery_register_capabilities(port->partner_pd, &caps);
 	if (IS_ERR(cap))
@@ -7753,9 +7765,16 @@ static int tcpm_port_register_pd(struct tcpm_port *port)
 		port->pds[i] = usb_power_delivery_register(port->dev, &desc);
 		if (IS_ERR(port->pds[i])) {
 			ret = PTR_ERR(port->pds[i]);
+			port->pds[i] = NULL;
 			goto err_unregister;
 		}
 		port->pd_list[i]->pd = port->pds[i];
+
+		usb_power_delivery_unregister_capabilities(port->pd_list[i]->source_cap);
+		port->pd_list[i]->source_cap = NULL;
+
+		usb_power_delivery_unregister_capabilities(port->pd_list[i]->sink_cap);
+		port->pd_list[i]->sink_cap = NULL;
 
 		if (port->pd_list[i]->source_desc.pdo[0]) {
 			cap = usb_power_delivery_register_capabilities(port->pds[i],

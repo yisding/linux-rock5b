@@ -24,9 +24,13 @@
 #include <linux/of_pci.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
+#include <linux/moduleparam.h>
 
 #include "../pci.h"
 #include "pcie-rockchip.h"
+
+static int bus_scan_delay = -1;
+module_param_named(bus_scan_delay, bus_scan_delay, int, S_IRUGO);
 
 static void rockchip_pcie_enable_bw_int(struct rockchip_pcie *rockchip)
 {
@@ -923,12 +927,63 @@ err_disable_0v9:
 	return err;
 }
 
+extern bool rk3399_pcie_ignore_serror_enabled;
 static int rockchip_pcie_probe(struct platform_device *pdev)
 {
+	/*
+	 * When a PCIe device sends an unknown message,
+	 * the RK3399 triggers either a synchronous error or an SError.
+	 * If triggered by the A72 (via memory-mapped I/O), it results in an SError,
+	 * whereas the A53 results in a synchronous error.
+	 * To allow the RK3399 to continue PCIe enumeration, we can hijack and ignore these errors.
+	 * Since hijacking SErrors is simpler—requiring only a modification to the do_serror function,
+	 * we should pin the PCIe probe process to CPU4 (A72).
+	 * More detail, see:
+	 * https://forum.pine64.org/showthread.php?tid=6329&pid=65064
+	 * https://lore.kernel.org/linux-pci/CAMdYzYoTwjKz4EN8PtD5pZfu3+SX+68JL+dfvmCrSnLL=K6Few@mail.gmail.com/
+	 * https://lkml.org/lkml/2020/4/27/1041
+	 */
+	if (rk3399_pcie_ignore_serror_enabled) {
+		int try_count = 0;
+		unsigned long start_jiffies = jiffies;
+		int max_retries = 50; // Wait for a maximum of 50 × 10 = 500ms
+
+		dev_info(&pdev->dev, "Checking CPU4 availability...\n");
+
+		while (!cpu_online(4) && try_count < max_retries) {
+			try_count++;
+			dev_info(&pdev->dev,
+				 "Wait CPU4: try=%d, elapsed=%u ms\n",
+				 try_count,
+				 jiffies_to_msecs(jiffies - start_jiffies));
+			msleep(10);
+		}
+
+		if (cpu_online(4)) {
+			struct cpumask mask;
+			cpumask_clear(&mask);
+			cpumask_set_cpu(4, &mask);
+
+			if (set_cpus_allowed_ptr(current, &mask) == 0) {
+				dev_info(
+					&pdev->dev,
+					"Success: Probe migrated to CPU4 at try %d (%u ms)\n",
+					try_count,
+					jiffies_to_msecs(jiffies -
+							 start_jiffies));
+			}
+		} else {
+			dev_err(&pdev->dev,
+				"Fail: CPU4 timeout after %d tries. Probing on CPU%d\n",
+				try_count, smp_processor_id());
+		}
+	}
+
 	struct rockchip_pcie *rockchip;
 	struct device *dev = &pdev->dev;
 	struct pci_host_bridge *bridge;
 	int err;
+	u32 delay = 0;
 
 	if (!dev->of_node)
 		return -ENODEV;
@@ -977,6 +1032,26 @@ static int rockchip_pcie_probe(struct platform_device *pdev)
 
 	bridge->sysdata = rockchip;
 	bridge->ops = &rockchip_pcie_ops;
+
+	/* Checking if bus scan delay was given from command line and prefer
+	 * that over the value in device tree (which defaults to 0 if not set).
+	 */
+	if (bus_scan_delay >= 0) {
+		delay = bus_scan_delay;
+		dev_info(dev, "wait %u ms (from command-line) before bus scan\n", delay);
+	} else {
+		delay = rockchip->bus_scan_delay;
+		dev_info(dev, "wait %u ms (from device tree) before bus scan\n", delay);
+	}
+	/* Workaround for some devices crashing on pci_host_probe / pci_scan_root_bus_bridge
+	 * calls: sleep a bit before bus scan. Call trace gets to rockchip_pcie_rd_conf when
+	 * trying to read vendor id (pci_bus_generic_read_dev_vendor_id is in call stack)
+	 * before panicing. I have no idea why this works or what causes the panic. I just
+	 * found this hack by luck when trying to "make it break differently if possible".
+	 */
+	if (delay > 0) {
+		msleep(delay);
+	}
 
 	err = rockchip_pcie_setup_irq(rockchip);
 	if (err)

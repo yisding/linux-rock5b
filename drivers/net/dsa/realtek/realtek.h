@@ -74,7 +74,6 @@ struct realtek_priv {
 	 * over FDB.
 	 */
 	struct mutex		l2_lock;
-	struct mii_bus		*user_mii_bus;
 	struct mii_bus		*bus;
 	int			mdio_addr;
 

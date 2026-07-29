@@ -540,6 +540,10 @@
 	status = "okay";
 };
 
+&sata2_port0 {
+	target-supply = <&vcc3v3_pcie30>;
+};
+
 &sdhci {
 	bus-width = <8>;
 	cap-mmc-highspeed;

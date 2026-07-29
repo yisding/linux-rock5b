@@ -9,8 +9,11 @@
  */
 
 #include <linux/delay.h>
+#include <linux/extcon.h>
+#include <linux/extcon-provider.h>
 #include <linux/mutex.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/property.h>
 #include <linux/usb/pd_vdo.h>
 #include <linux/usb/typec_dp.h>
@@ -81,6 +84,57 @@ struct dp_altmode {
 	struct typec_altmode *plug_prime;
 };
 
+/* Notify DP hotplug change via extcon. Current rockchip cdn-dp driver need this signal
+ * to reset DP link. */
+static void dp_altmode_update_extcon_hpd_status(struct dp_altmode *dp, bool new_hpd) {
+	struct device *dev = &dp->alt->dev;
+	struct extcon_dev* edev = NULL;
+	int ret;
+
+	/* skip if hpd is not changed */
+	if (dp->hpd == new_hpd)
+		return;
+
+	/* find the extcon associated with cdn-dp
+	 * an unrelated extcon might be found, but this is a workaround anyway */
+	while (dev) {
+		/* Case1: dev is the extcon provider */
+		edev = extcon_find_edev_by_node(dev->of_node);
+		if (!IS_ERR(edev)) {
+			break;
+		}
+
+		/* Case2: dev links to one extcon */
+		if (of_property_present(dev->of_node, "extcon")) {
+			edev = extcon_get_edev_by_phandle(dev, 0);
+			if (!IS_ERR(edev)) {
+				break;
+			}
+		}
+
+		dev = dev->parent;
+	}
+
+	if (IS_ERR_OR_NULL(edev)) {
+		dev_info(&dp->alt->dev,
+			"no extcon found for current port, not notifying hpd change");
+		return;
+	}
+
+	ret = extcon_set_property_capability(edev, EXTCON_DISP_DP, EXTCON_PROP_DISP_HPD);
+	if (ret) {
+		dev_info(&dp->alt->dev,
+			"updating hpd on target extcon is not supported(%d)\n", ret);
+		return;
+	}
+
+	dev_info(&dp->alt->dev, "dp-hpd=%d (port=%x alt=%x)\n",
+		(int)new_hpd, dp->port->vdo, dp->alt->vdo);
+	extcon_set_property(edev, EXTCON_DISP_DP, EXTCON_PROP_DISP_HPD,
+		(union extcon_property_value)(int)new_hpd);
+	extcon_sync(edev, EXTCON_DISP_DP);
+}
+
 static int dp_altmode_notify(struct dp_altmode *dp)
 {
 	unsigned long conf;
@@ -128,10 +182,28 @@ static int dp_altmode_configure(struct dp_altmode *dp, u8 con)
 		/* Account for active cable capabilities */
 		if (dp->plug_prime)
 			pin_assign &= DP_CAP_UFP_D_PIN_ASSIGN(dp->plug_prime->vdo);
+
+		/*
+		 * The Display Port Alt mode standard is not publicly available,
+		 * so this is based on guesswork and real VDOs received from
+		 * receptacle based and plug based Type-C alt mode supporting
+		 * docks to make configuration work in practice:
+		 *
+		 * Plug (captive cable) based dock: port=c46 alt=c05
+		 * Recpetacle based dock: port=c46 alt=c0045
+		 *
+		pin_assign = DP_CAP_DFP_D_PIN_ASSIGN(dp->port->vdo);
+		pin_assign &= dp->alt->vdo & DP_CAP_RECEPTACLE ?
+			DP_CAP_UFP_D_PIN_ASSIGN(dp->alt->vdo) :
+			DP_CAP_DFP_D_PIN_ASSIGN(dp->alt->vdo);
+		 */
 		break;
 	default:
 		break;
 	}
+
+	dev_info(&dp->alt->dev, "con=%d pin_assign=%x (port=%x alt=%x)\n",
+		 (int)con, (unsigned)pin_assign, dp->port->vdo, dp->alt->vdo);
 
 	/* Determining the initial pin assignment. */
 	if (!DP_CONF_GET_PIN_ASSIGN(dp->data.conf)) {
@@ -180,6 +252,7 @@ static int dp_altmode_status_update(struct dp_altmode *dp)
 			dp->state = dp->plug_prime ? DP_STATE_CONFIGURE_PRIME :
 						     DP_STATE_CONFIGURE;
 			if (dp->hpd != hpd) {
+				dp_altmode_update_extcon_hpd_status(dp, hpd);
 				dp->hpd = hpd;
 				dp->pending_hpd = true;
 			}
@@ -190,6 +263,7 @@ static int dp_altmode_status_update(struct dp_altmode *dp)
 		drm_connector_oob_hotplug_event(dp->connector_fwnode,
 						hpd ? connector_status_connected :
 						      connector_status_disconnected);
+		dp_altmode_update_extcon_hpd_status(dp, hpd);
 		dp->hpd = hpd;
 		sysfs_notify(&dp->alt->dev.kobj, "displayport", "hpd");
 		if (hpd && irq_hpd) {
@@ -398,6 +472,7 @@ static int dp_altmode_vdm(struct typec_altmode *alt,
 			if (dp->hpd) {
 				drm_connector_oob_hotplug_event(dp->connector_fwnode,
 								connector_status_disconnected);
+				dp_altmode_update_extcon_hpd_status(dp, false);
 				dp->hpd = false;
 				sysfs_notify(&dp->alt->dev.kobj, "displayport", "hpd");
 			}
@@ -764,16 +839,38 @@ int dp_altmode_probe(struct typec_altmode *alt)
 	struct typec_altmode *plug = typec_altmode_get_plug(alt, TYPEC_PLUG_SOP_P);
 	struct fwnode_handle *fwnode;
 	struct dp_altmode *dp;
+	u32 port_pins, alt_pins;
 
 	/* Port can only be DFP_U. */
 	if (typec_altmode_get_data_role(alt) != TYPEC_HOST)
 		return -EPROTO;
 
-	/* Make sure we have compatible pin configurations */
-	if (!(DP_CAP_PIN_ASSIGN_DFP_D(port->vdo) &
-	      DP_CAP_PIN_ASSIGN_UFP_D(alt->vdo)) &&
-	    !(DP_CAP_PIN_ASSIGN_UFP_D(port->vdo) &
-	      DP_CAP_PIN_ASSIGN_DFP_D(alt->vdo))) {
+	/*
+	 * When port is a receptacle DP_CAP_xFP_D_PIN_ASSIGN macros have the
+	 * regular meaning. When the port is a plug, the meaning is swapped.
+	 *
+	 * Check if we have any matching DFP_D<->UFP_D or UFP_D<->DFP_D pin assignment.
+	 */
+	port_pins = port->vdo & DP_CAP_RECEPTACLE ?
+		DP_CAP_DFP_D_PIN_ASSIGN(port->vdo) | DP_CAP_UFP_D_PIN_ASSIGN(port->vdo) << 8 :
+		DP_CAP_UFP_D_PIN_ASSIGN(port->vdo) | DP_CAP_DFP_D_PIN_ASSIGN(port->vdo) << 8;
+
+	alt_pins = alt->vdo & DP_CAP_RECEPTACLE ?
+		DP_CAP_UFP_D_PIN_ASSIGN(alt->vdo) | DP_CAP_DFP_D_PIN_ASSIGN(alt->vdo) << 8 :
+		DP_CAP_DFP_D_PIN_ASSIGN(alt->vdo) | DP_CAP_UFP_D_PIN_ASSIGN(alt->vdo) << 8;
+
+	/* Can't plug plug into a plug */
+	if (!(port->vdo & DP_CAP_RECEPTACLE) && !(alt->vdo & DP_CAP_RECEPTACLE)) {
+		dev_warn(&alt->dev, "Our Alt-DP VDO 0x%06x and peer port VDO 0x%06x are not compatible (both are reported as plugs!)\n",
+			 port->vdo, alt->vdo);
+		typec_altmode_put_plug(plug);
+		return -ENODEV;
+	}
+
+	/* Make sure we have compatiple pin configurations */
+	if (!(port_pins & alt_pins)) {
+		dev_warn(&alt->dev, "Our Alt-DP VDO 0x%06x and peer port VDO 0x%06x are not compatible (no shared pinconf %04x<->%04x (UUDD))\n",
+			 port->vdo, alt->vdo, port_pins, alt_pins);
 		typec_altmode_put_plug(plug);
 		return -ENODEV;
 	}

@@ -307,7 +307,18 @@
 				<PDO_FIXED(5000, 1000, PDO_FIXED_USB_COMM)>;
 			source-pdos =
 				<PDO_FIXED(5000, 3000, PDO_FIXED_USB_COMM)>;
-			try-power-role = "source";
+			try-power-role = "sink";
+
+			altmodes {
+			    #address-cells = <1>;
+			    #size-cells = <0>;
+
+			    altmode@0 {
+				reg = <0>;
+				svid = <0xff01>;
+				vdo = <0xffffffff>;
+			    };
+			};
 
 			ports {
 				#address-cells = <1>;
@@ -826,6 +837,7 @@
 };
 
 &u2phy0_otg {
+	vbus-supply = <&vbus_typec>;
 	status = "okay";
 };
 

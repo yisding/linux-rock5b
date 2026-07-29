@@ -21,6 +21,7 @@
 #include <linux/in.h>
 #include <linux/io.h>
 #include <linux/ip.h>
+#include <linux/of.h>
 #include <linux/tcp.h>
 #include <linux/interrupt.h>
 #include <linux/dma-mapping.h>
@@ -2505,6 +2506,15 @@ void r8169_apply_firmware(struct rtl8169_private *tp)
 	}
 }
 
+static void rtl8168_led_of_init(struct rtl8169_private *tp)
+{
+	struct device *d = tp_to_dev(tp);
+	u32 val;
+
+	if (!of_property_read_u32(d->of_node, "realtek,led-data", &val))
+		RTL_W16(tp, LED_CTRL, val);
+}
+
 static void rtl_rar_exgmac_set(struct rtl8169_private *tp, const u8 *addr)
 {
 	rtl_eri_write(tp, 0xe0, ERIAR_MASK_1111, get_unaligned_le32(addr));
@@ -3441,6 +3451,8 @@ static void rtl_hw_start_8168g(struct rtl8169_private *tp)
 
 	rtl_eri_write(tp, 0xc0, ERIAR_MASK_0011, 0x0000);
 	rtl_eri_write(tp, 0xb8, ERIAR_MASK_0011, 0x0000);
+
+	rtl8168_led_of_init(tp);
 
 	rtl_w0w1_eri(tp, 0x2fc, 0x01, 0x06);
 	rtl_eri_clear_bits(tp, 0x1b0, BIT(12));

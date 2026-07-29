@@ -3,7 +3,6 @@
  * Copyright (c) 2019 Akash Gajjar <akash@openedev.com>
  * Copyright (c) 2019 Jagan Teki <jagan@openedev.com>
  * Copyright (C) 2024 TheSnowfield <thesnowfield@sakurapi.org>
- * Copyright (C) 2025 Hsun Lai <i@chainsx.cn>
  */
 
 /dts-v1/;
@@ -12,16 +11,23 @@
 
 / {
 	model = "Sakura Pi RK3308B";
-	compatible = "sakurapi,rk3308-sakurapi-rk3308b", "rockchip,rk3308";
-
-	aliases {
-		mmc0 = &emmc;
-		mmc1 = &sdmmc;
-		mmc2 = &sdio;
-	};
+	compatible = "rockchip,rk3308";
 
 	chosen {
 		stdout-path = "serial2:1500000n8";
+	};
+
+	sdio_pwrseq: sdio-pwrseq {
+		compatible = "mmc-pwrseq-simple";
+		pinctrl-0 = <&wifi_enable_h>;
+		pinctrl-names = "default";
+		/*
+		 * On the module itself this is one of these (depending
+		 * on the actual card populated):
+		 * - SDIO_RESET_L_WL_REG_ON
+		 * - PDN (power down when low)
+		 */
+		reset-gpios = <&gpio0 RK_PA2 GPIO_ACTIVE_LOW>;
 	};
 
 	vcc5v0_sys: regulator-vcc5v0-sys {
@@ -39,6 +45,7 @@
 		regulator-name = "vdd_core";
 		regulator-min-microvolt = <827000>;
 		regulator-max-microvolt = <1340000>;
+		regulator-init-microvolt = <1015000>;
 		regulator-settling-time-up-us = <250>;
 		regulator-always-on;
 		regulator-boot-on;
@@ -94,27 +101,41 @@
 
 	vcc5v0_otg: regulator-vcc5v0-otg {
 		compatible = "regulator-fixed";
-		enable-active-high;
-		gpio = <&gpio0 RK_PC5 GPIO_ACTIVE_HIGH>;
-		pinctrl-names = "default";
-		pinctrl-0 = <&otg_vbus_drv>;
 		regulator-name = "vcc5v0_otg";
 		regulator-always-on;
+		gpio = <&gpio0 RK_PC5 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		pinctrl-names = "default";
+		pinctrl-0 = <&otg_vbus_drv>;
 		vin-supply = <&vcc5v0_sys>;
 	};
 
-	sdio_pwrseq: sdio-pwrseq {
-		compatible = "mmc-pwrseq-simple";
-		pinctrl-0 = <&wifi_enable_h>;
-		pinctrl-names = "default";
-		/*
-		 * On the module itself this is one of these (depending
-		 * on the actual card populated):
-		 * - SDIO_RESET_L_WL_REG_ON
-		 * - PDN (power down when low)
-		 */
-		reset-gpios = <&gpio0 RK_PA2 GPIO_ACTIVE_LOW>;
+	backlight: backlight {
+		status = "okay";
+		compatible = "pwm-backlight";
+		pwms = <&pwm3 0 25000 0>;
+		brightness-levels = <0 255>;
+		default-brightness-level = <255>;
 	};
+
+	display: panel {
+		compatible = "edt,et070080dh6";
+		backlight = <&backlight>;
+		enable-gpios = <&gpio0 RK_PB0 GPIO_ACTIVE_HIGH>;
+		enable-delay-ms = <20>;
+		status = "okay";
+
+		panel_in: port {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			panel_in_rgb: endpoint {
+				reg = <0>;
+				remote-endpoint = <&vop_out_rgb>;
+			};
+		};
+	};
+
 };
 
 &cpu0 {
@@ -124,6 +145,7 @@
 &emmc {
 	bus-width = <8>;
 	cap-mmc-highspeed;
+	mmc-hs200-1_8v;
 	non-removable;
 	status = "okay";
 };
@@ -132,9 +154,88 @@
 	status = "okay";
 };
 
+&sdmmc {
+	cap-mmc-highspeed;
+	cap-sd-highspeed;
+	sd-uhs-sdr25;
+	sd-uhs-sdr50;
+	sd-uhs-sdr104;
+	disable-wp;
+	broken-cd;
+	pinctrl-0 = <&sdmmc_clk &sdmmc_cmd &sdmmc_det &sdmmc_bus4>;
+	card-detect-delay = <800>;
+	status = "okay";
+};
+
+&sdio {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	cap-sd-highspeed;
+	cap-sdio-irq;
+	keep-power-in-suspend;
+	mmc-pwrseq = <&sdio_pwrseq>;
+	non-removable;
+	no-mmc;
+	status = "okay";
+
+	brcmf: wifi@1 {
+		compatible = "brcm,bcm43455-fmac";
+		reg = <1>;
+		interrupt-parent = <&gpio0>;
+		interrupts = <RK_PA3 GPIO_ACTIVE_HIGH>;
+		interrupt-names = "host-wake";
+		pinctrl-names = "default";
+		pinctrl-0 = <&wifi_host_wake>;
+	};
+};
+
+&dmac0 {
+	status = "okay";
+};
+
+/* SPI0 for external gpio pin */
+&spi0 {
+	status = "okay";
+
+	spi_dev@0 {
+		compatible = "spidev";
+		reg = <0>;
+		spi-max-frequency = <0x2faf080>;
+	};
+};
+
+/* SPI1 for ws2812*/
+&spi1 {
+	status = "okay";
+
+	spi_dev@0 {
+		compatible = "spidev";
+		reg = <0>;
+		spi-max-frequency = <0x2faf080>;
+	};
+};
+
 &pinctrl {
 	pinctrl-names = "default";
 	pinctrl-0 = <&rtc_32k>;
+
+	usb {
+		otg_vbus_drv: otg-vbus-drv {
+			rockchip,pins = <0 RK_PC5 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
+	sdio-pwrseq {
+		wifi_enable_h: wifi-enable-h {
+			rockchip,pins = <0 RK_PA2 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
+	wifi {
+		wifi_host_wake: wifi-host-wake {
+			rockchip,pins = <0 RK_PA0 RK_FUNC_GPIO &pcfg_pull_down>;
+		};
+	};
 
 	bluetooth {
 		bt_reg_on: bt-reg-on {
@@ -149,24 +250,6 @@
 			rockchip,pins = <4 RK_PB2 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
 	};
-
-	sdio-pwrseq {
-		wifi_enable_h: wifi-enable-h {
-			rockchip,pins = <0 RK_PA2 RK_FUNC_GPIO &pcfg_pull_none>;
-		};
-	};
-
-	usb {
-		otg_vbus_drv: otg-vbus-drv {
-			rockchip,pins = <0 RK_PC5 RK_FUNC_GPIO &pcfg_pull_none>;
-		};
-	};
-
-	wifi {
-		wifi_host_wake: wifi-host-wake {
-			rockchip,pins = <0 RK_PA0 RK_FUNC_GPIO &pcfg_pull_down>;
-		};
-	};
 };
 
 &pwm0 {
@@ -174,44 +257,34 @@
 	pinctrl-0 = <&pwm0_pin_pull_down>;
 };
 
-&pwm3 {
-	status = "okay";
-};
-
 &saradc {
 	vref-supply = <&vcc_1v8>;
 	status = "okay";
 };
 
-&sdio {
-	#address-cells = <1>;
-	#size-cells = <0>;
-	cap-sd-highspeed;
-	cap-sdio-irq;
-	keep-power-in-suspend;
-	mmc-pwrseq = <&sdio_pwrseq>;
-	non-removable;
-	no-mmc;
-	no-sd;
+&vop {
 	status = "okay";
 
-	brcmf: wifi@1 {
-		compatible = "brcm,bcm43455-fmac", "brcm,bcm4329-fmac";
-		reg = <1>;
-		interrupt-parent = <&gpio0>;
-		interrupts = <RK_PA3 IRQ_TYPE_LEVEL_HIGH>;
-		interrupt-names = "host-wake";
-		pinctrl-names = "default";
-		pinctrl-0 = <&wifi_host_wake>;
+	vop_out: port {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		vop_out_rgb: endpoint@0 {
+			reg = <0>;
+			remote-endpoint = <&panel_in_rgb>;
+		};
 	};
 };
 
-&sdmmc {
-	cap-mmc-highspeed;
-	cap-sd-highspeed;
-	disable-wp;
-	pinctrl-0 = <&sdmmc_clk &sdmmc_cmd &sdmmc_det &sdmmc_bus4>;
-	card-detect-delay = <800>;
+&pwm3 {
+	status = "okay";
+};
+
+&display_subsystem {
+	status = "okay";
+};
+
+&i2c1 {
 	status = "okay";
 };
 
@@ -239,6 +312,15 @@
 	};
 };
 
+&tsadc{
+  status = "okay";
+};
+
+&usb20_otg {
+	dr_mode = "peripheral";
+	status = "okay";
+};
+
 &u2phy {
 	status = "okay";
 };
@@ -251,15 +333,10 @@
 	status = "okay";
 };
 
-&usb20_otg {
-	dr_mode = "peripheral";
-	status = "okay";
-};
-
 &usb_host_ehci {
 	status = "okay";
 };
 
-&usb_host_ohci {
+&usb_host_ohci{
 	status = "okay";
 };

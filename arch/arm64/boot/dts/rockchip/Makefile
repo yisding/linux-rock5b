@@ -331,3 +331,122 @@ rk3588-rock-5b-plus-radxa-4k-cam-dtbs := rk3588-rock-5b-plus.dtb \
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-tiger-haikou-haikou-video-demo.dtb
 rk3588-tiger-haikou-haikou-video-demo-dtbs := rk3588-tiger-haikou.dtb \
 	rk3588-tiger-haikou-video-demo.dtbo
+
+
+# Added by Armbian autopatcher in add-only:true mode
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-nanopc-t6-lts-plus.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-orangepi-5b.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3399-nanopi-m4v2.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3328-dusun-dsom-010r.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-blueberry-r58-4x4.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3399-rock-pi-4.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-hinlink-h88k.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3328-qidi-x6.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-mixtile-core3588e.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3566-jp-tvbox.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3399-xiaobao-nas.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3328-nanopi-neo3-rev02.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-youyeetoo-yy3588.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3328-mkspi.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-nanopi-m6.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3568-hinlink-h66k.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3576-bananapi-m5-pro.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3318-box.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3568-yy3568.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3576-nanopi-r76s.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3328-nanopi-r2-rev06.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3399-orangepi-4.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3308-sakurapi-rk3308b.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3566-lckfb-tspi.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3328-z28pro.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3576-recomputer-devkit.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-cyber-aib.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3568-hinlink-hnas.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-easepi-r2.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-orangepi-5-pro.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3568-easepi-a2.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3328-nanopi-r2-rev00.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-mixtile-blade3.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-bananapi-m7.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3328-mksklipad50.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3566-panther-x2.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3566-nanopi-r3s-lts.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3566-h96-tvbox.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-blueberry-edge-v12-linux.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3399-nanopi-r4se.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3568-mixtile-edge2.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-lubancat-5io.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3568-hinlink-h68k.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3328-nanopi-r2s-plus-rev00.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3399-am40.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-mekotronics-r58x-pro.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3528-radxa-e24c-spi.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3328-nanopi-r2-rev20.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3399-emb-3531.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3308-luckfox-nova.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588s-youyeetoo-r1.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3399-fine3399.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3528-radxa-e24c.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3328-heltec.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3399-orangepi-4-lts.dtb
+
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3399-tinker-2.dtb
+
+
+# Added by Armbian autopatcher for DT overlay
+subdir-y       := $(dts-dirs) overlay

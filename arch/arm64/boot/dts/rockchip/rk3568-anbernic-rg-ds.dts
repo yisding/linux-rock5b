@@ -883,6 +883,7 @@
 	touch1: touchscreen@14 {
 		compatible = "goodix,gt911";
 		reg = <0x14>;
+		goodix,no-cfg-from-disk;
 		AVDD28-supply = <&vcc2v8_dvp>;
 		interrupt-parent = <&gpio0>;
 		interrupts = <RK_PC0 IRQ_TYPE_LEVEL_LOW>;
@@ -908,6 +909,7 @@
 	touch0: touchscreen@14 {
 		compatible = "goodix,gt911";
 		reg = <0x14>;
+		goodix,no-cfg-from-disk;
 		AVDD28-supply = <&vcc2v8_dvp>;
 		interrupt-parent = <&gpio0>;
 		interrupts = <RK_PB6 IRQ_TYPE_LEVEL_LOW>;
@@ -1217,7 +1219,7 @@
 };
 
 &usb_host0_xhci {
-	dr_mode = "peripheral";
+	dr_mode = "otg";
 	phy-names = "usb2-phy";
 	phys = <&usb2phy0_otg>;
 	maximum-speed = "high-speed";
@@ -1237,6 +1239,7 @@
 };
 
 &usb2phy0_otg {
+	phy-supply = <&otg_switch>;
 	status = "okay";
 };
 
