@@ -958,6 +958,12 @@ int mpp_iommu_remove(struct mpp_iommu_info *info)
 		mpp_iommu_attach(info);
 
 	mpp_iommu_clear_fault_handler(info);
+	/*
+	 * Clearing is atomic-safe and does not wait; here the device goes
+	 * away, so wait out any fault callback still using it as token.
+	 */
+	rockchip_iommu_sync_fault_handler(info->dev);
+	vsi_iommu_sync_fault_handler(info->dev);
 	iommu_group_put(info->group);
 	platform_device_put(info->pdev);
 
