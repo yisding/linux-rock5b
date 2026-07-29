@@ -36,6 +36,8 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 
+#include <soc/rockchip/vsi_iommu.h>
+
 #include "iommu-pages.h"
 
 struct vsi_iommu {
@@ -47,6 +49,9 @@ struct vsi_iommu {
 	struct list_head node; /* entry in vsi_iommu_domain.iommus */
 	struct iommu_domain *domain; /* domain to which iommu is attached */
 	spinlock_t lock; /* lock to protect vsi_iommu fields */
+	spinlock_t fault_lock; /* lock to protect fault-handler fields */
+	iommu_fault_handler_t fault_handler;
+	void *fault_handler_token;
 	int irq;
 	bool enable;
 };
@@ -189,14 +194,48 @@ static u32 vsi_iova_page_offset(u32 iova)
 	return (iova & VSI_IOVA_PAGE_MASK) >> VSI_IOVA_PAGE_SHIFT;
 }
 
+static int vsi_iommu_call_fault_handler(struct vsi_iommu *iommu,
+					struct iommu_domain *domain,
+					dma_addr_t iova, int flags)
+{
+	iommu_fault_handler_t handler;
+	unsigned long irq_flags;
+	void *token;
+
+	spin_lock_irqsave(&iommu->fault_lock, irq_flags);
+	handler = iommu->fault_handler;
+	token = iommu->fault_handler_token;
+	spin_unlock_irqrestore(&iommu->fault_lock, irq_flags);
+
+	if (!handler || !domain || domain == &vsi_identity_domain)
+		return -EOPNOTSUPP;
+
+	return handler(domain, iommu->dev, iova, flags, token);
+}
+
+static void vsi_iommu_mask_irq_locked(struct vsi_iommu *iommu)
+{
+	writel(0, iommu->regs + VSI_MMU_AHB_EXCEPTION_BASE);
+}
+
+static int vsi_iommu_fault_flags(u32 status)
+{
+	/* The VSI status bits are provider-specific; do not pass them as IOMMU flags. */
+	return IOMMU_FAULT_READ;
+}
+
 static irqreturn_t vsi_iommu_irq(int irq, void *dev_id)
 {
 	struct vsi_iommu *iommu = dev_id;
+	struct iommu_domain *domain = NULL;
 	unsigned long flags;
-	dma_addr_t iova;
+	dma_addr_t iova = 0;
 	u32 status;
+	bool fault = false;
+	int ret;
 
-	if (pm_runtime_resume_and_get(iommu->dev) < 0)
+	ret = pm_runtime_get_if_in_use(iommu->dev);
+	if (ret <= 0)
 		return IRQ_NONE;
 
 	spin_lock_irqsave(&iommu->lock, flags);
@@ -205,25 +244,57 @@ static irqreturn_t vsi_iommu_irq(int irq, void *dev_id)
 	if (status & VSI_MMU_IRQ_MASK) {
 		dev_err(iommu->dev, "unexpected int_status=%08x\n", status);
 		iova = readl(iommu->regs + VSI_MMU_PAGE_FAULT_ADDR);
-		report_iommu_fault(iommu->domain, iommu->dev, iova, status);
+		domain = iommu->domain;
+		fault = true;
+		vsi_iommu_mask_irq_locked(iommu);
 	}
 	writel(0, iommu->regs + VSI_MMU_STATUS_BASE);
 
 	spin_unlock_irqrestore(&iommu->lock, flags);
+
+	if (fault) {
+		int fault_flags = vsi_iommu_fault_flags(status);
+		int fault_ret;
+
+		fault_ret = vsi_iommu_call_fault_handler(iommu, domain, iova,
+							 fault_flags);
+		if (fault_ret) {
+			if (domain && domain != &vsi_identity_domain)
+				report_iommu_fault(domain, iommu->dev, iova,
+						   fault_flags);
+			else
+				dev_err(iommu->dev,
+					"fault without active paging domain\n");
+		}
+	}
 	pm_runtime_put_autosuspend(iommu->dev);
 
 	return IRQ_HANDLED;
 }
 
-static struct vsi_iommu *vsi_iommu_get_from_dev(struct device *dev)
+static struct vsi_iommu *vsi_iommu_get_from_dev(struct device *dev,
+						struct device **provider_dev)
 {
 	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
-	struct device *iommu_dev = bus_find_device_by_fwnode(&platform_bus_type,
-							     fwspec->iommu_fwnode);
+	struct device *iommu_dev;
+	struct vsi_iommu *iommu;
 
-	put_device(iommu_dev);
+	if (!fwspec || !fwspec->iommu_fwnode)
+		return ERR_PTR(-ENODEV);
 
-	return iommu_dev ? dev_get_drvdata(iommu_dev) : NULL;
+	iommu_dev = bus_find_device_by_fwnode(&platform_bus_type,
+					      fwspec->iommu_fwnode);
+	if (!iommu_dev)
+		return ERR_PTR(-EPROBE_DEFER);
+
+	iommu = dev_get_drvdata(iommu_dev);
+	if (!iommu) {
+		put_device(iommu_dev);
+		return ERR_PTR(-EPROBE_DEFER);
+	}
+
+	*provider_dev = iommu_dev;
+	return iommu;
 }
 
 static struct iommu_domain *vsi_iommu_domain_alloc_paging(struct device *dev)
@@ -616,13 +687,33 @@ static void vsi_iommu_domain_free(struct iommu_domain *domain)
 
 static struct iommu_device *vsi_iommu_probe_device(struct device *dev)
 {
-	struct vsi_iommu *iommu = vsi_iommu_get_from_dev(dev);
+	struct device *provider_dev;
+	struct vsi_iommu *iommu = vsi_iommu_get_from_dev(dev, &provider_dev);
 	struct device_link *link;
 
-	link = device_link_add(dev, iommu->dev,
+	if (IS_ERR(iommu))
+		return ERR_CAST(iommu);
+
+	link = device_link_add(dev, provider_dev,
 			       DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME);
 	if (!link)
-		dev_err(dev, "Unable to link %s\n", dev_name(iommu->dev));
+		dev_err(dev, "Unable to link %s\n", dev_name(provider_dev));
+	put_device(provider_dev);
+
+	/*
+	 * MPP dma-buf imports pass a single IOVA/size pair to the hardware.
+	 * Allow the DMA API to merge mappings across the full 32-bit aperture.
+	 */
+	if (!dev->dma_parms)
+		dev->dma_parms = devm_kzalloc(dev, sizeof(*dev->dma_parms),
+					      GFP_KERNEL);
+	if (!dev->dma_parms) {
+		if (link)
+			device_link_del(link);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	dma_set_max_seg_size(dev, DMA_BIT_MASK(32));
 
 	dev_iommu_priv_set(dev, iommu);
 	return &iommu->iommu;
@@ -631,6 +722,9 @@ static struct iommu_device *vsi_iommu_probe_device(struct device *dev)
 static void vsi_iommu_release_device(struct device *dev)
 {
 	struct vsi_iommu *iommu = dev_iommu_priv_get(dev);
+
+	if (!iommu)
+		return;
 
 	device_link_remove(dev, iommu->dev);
 }
@@ -658,6 +752,107 @@ static const struct iommu_ops vsi_iommu_ops = {
 	}
 };
 
+static struct vsi_iommu *vsi_iommu_from_dev_checked(struct device *dev)
+{
+	if (!dev || !dev->iommu || !dev->iommu->iommu_dev ||
+	    dev->iommu->iommu_dev->ops != &vsi_iommu_ops)
+		return NULL;
+
+	return dev_iommu_priv_get(dev);
+}
+
+/*
+ * Disable and re-enable translation for the paging domain the device is
+ * attached to, restoring the fault source the provider IRQ masked, then
+ * flush the TLB. Used by the media fault-recovery path after it has stopped
+ * the failing DMA master.
+ */
+int vsi_iommu_refresh(struct device *dev)
+{
+	struct vsi_iommu *iommu = vsi_iommu_from_dev_checked(dev);
+	struct vsi_iommu_domain *vsi_domain;
+	unsigned long flags;
+	int ret;
+
+	if (!iommu || !iommu->domain || iommu->domain == &vsi_identity_domain)
+		return -ENODEV;
+
+	ret = pm_runtime_resume_and_get(iommu->dev);
+	if (ret < 0)
+		return ret;
+
+	vsi_domain = to_vsi_domain(iommu->domain);
+	spin_lock_irqsave(&vsi_domain->lock, flags);
+	spin_lock(&iommu->lock);
+	vsi_iommu_disable(iommu);
+	vsi_iommu_enable(iommu, iommu->domain);
+	writel(VSI_MMU_BIT_FLUSH, iommu->regs + VSI_MMU_FLUSH_BASE);
+	writel(0, iommu->regs + VSI_MMU_FLUSH_BASE);
+	spin_unlock(&iommu->lock);
+	spin_unlock_irqrestore(&vsi_domain->lock, flags);
+
+	pm_runtime_put_autosuspend(iommu->dev);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(vsi_iommu_refresh);
+
+void vsi_iommu_mask_irq(struct device *dev)
+{
+	struct vsi_iommu *iommu = vsi_iommu_from_dev_checked(dev);
+	unsigned long flags;
+
+	if (!iommu)
+		return;
+
+	spin_lock_irqsave(&iommu->lock, flags);
+	vsi_iommu_mask_irq_locked(iommu);
+	spin_unlock_irqrestore(&iommu->lock, flags);
+}
+EXPORT_SYMBOL_GPL(vsi_iommu_mask_irq);
+
+/*
+ * Atomic-safe: media drivers install and clear the handler from hard-IRQ
+ * context. Clearing does NOT wait for an in-flight callback; teardown paths
+ * that free the token must follow up with vsi_iommu_sync_fault_handler().
+ */
+int vsi_iommu_set_fault_handler(struct device *dev,
+				iommu_fault_handler_t handler, void *token)
+{
+	struct vsi_iommu *iommu = vsi_iommu_from_dev_checked(dev);
+	unsigned long flags;
+
+	if (!iommu)
+		return -ENODEV;
+
+	spin_lock_irqsave(&iommu->fault_lock, flags);
+	iommu->fault_handler = handler;
+	iommu->fault_handler_token = token;
+	spin_unlock_irqrestore(&iommu->fault_lock, flags);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(vsi_iommu_set_fault_handler);
+
+/*
+ * The fault callback is invoked outside fault_lock, so clearing the handler
+ * cannot itself guarantee no callback still runs with the old token. Sleeps.
+ */
+int vsi_iommu_sync_fault_handler(struct device *dev)
+{
+	struct vsi_iommu *iommu = vsi_iommu_from_dev_checked(dev);
+
+	might_sleep();
+
+	if (!iommu)
+		return -ENODEV;
+
+	synchronize_irq(iommu->irq);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(vsi_iommu_sync_fault_handler);
+
 static const struct of_device_id vsi_iommu_dt_ids[] = {
 	{
 		.compatible = "verisilicon,iommu-1.2",
@@ -678,6 +873,7 @@ static int vsi_iommu_probe(struct platform_device *pdev)
 
 	iommu->dev = dev;
 	spin_lock_init(&iommu->lock);
+	spin_lock_init(&iommu->fault_lock);
 	INIT_LIST_HEAD(&iommu->node);
 
 	iommu->regs = devm_platform_ioremap_resource(pdev, 0);
@@ -757,7 +953,7 @@ static int __maybe_unused vsi_iommu_resume(struct device *dev)
 	if (ret)
 		return ret;
 
-	if (iommu->domain) {
+	if (iommu->domain && iommu->domain != &vsi_identity_domain) {
 		struct vsi_iommu_domain *vsi_domain = to_vsi_domain(iommu->domain);
 
 		spin_lock_irqsave(&vsi_domain->lock, flags);
