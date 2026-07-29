@@ -1422,6 +1422,7 @@ static void rk_rga_service_state_init(struct rk_rga_service *rga)
 }
 
 static int rk_rga_release(struct inode *inode, struct file *file);
+static bool rk_rga_session_jobs_empty(struct rk_rga_session *session);
 static int rk_rga_task_hw_type_mask(struct rk_rga_job *job, u32 task_index,
 				    u32 *type_mask);
 
@@ -10681,6 +10682,13 @@ static void rk_rga_request_config_ioctl_acquire_kunit(struct kunit *test)
 				rk_rga_kunit_track_fence(test, fd_fence), 0);
 		kunit_release_action(test, rk_rga_kunit_fence_put, fd_fence);
 	}
+	/*
+	 * The config ioctl consumed and closed acquire_fd (user_close_fence
+	 * is 0), so the tracked close action must be canceled without
+	 * running: at teardown the number may already belong to a reused fd.
+	 */
+	kunit_remove_action(test, rk_rga_kunit_close_fd,
+			    (void *)(unsigned long)(acquire_fd + 1));
 
 	KUNIT_EXPECT_TRUE(test, rk_rga_request_remove_free(&session, 12));
 	kunit_release_action(test, rk_rga_kunit_fput, acquire_file);
@@ -11103,6 +11111,11 @@ static void rk_rga_last_hw_remove_pending_acquire_kunit(struct kunit *test)
 	hw->type = RK_RGA_HW_RGA3;
 	hw->core_mask = BIT(0);
 	INIT_LIST_HEAD(&hw->node);
+	INIT_LIST_HEAD(&hw->job_queue);
+	spin_lock_init(&hw->job_lock);
+	mutex_init(&hw->run_lock);
+	init_waitqueue_head(&hw->idle);
+	refcount_set(&hw->refs, 1);
 	list_add_tail(&hw->node, &session->rga->hw_list);
 	rk_rga_session_link(session);
 
@@ -11776,6 +11789,7 @@ static void rk_rga_legacy_blit_async_acquire_kunit(struct kunit *test)
 	struct dma_fence *fd_fence;
 	void __user *task_user;
 	unsigned long uncopied;
+	unsigned long deadline;
 	int acquire_fd;
 	int release_fd;
 	long ret;
@@ -11850,6 +11864,20 @@ static void rk_rga_legacy_blit_async_acquire_kunit(struct kunit *test)
 			dma_fence_wait_timeout(release_fence, false,
 					       msecs_to_jiffies(1000)),
 			0L);
+	/*
+	 * The release fence signals before acquire_work unlinks the job from
+	 * this on-stack session and drops its import references.  Reuse the
+	 * rk_rga_release() drain so the worker can never touch the session
+	 * after this function returns, then give its final import puts the
+	 * same 1 s budget the fence wait got so the refcount reads below are
+	 * deterministic.
+	 */
+	wait_event(session.job_wait, rk_rga_session_jobs_empty(&session));
+	deadline = jiffies + msecs_to_jiffies(1000);
+	while ((refcount_read(&src_import->refs) > 1 ||
+		refcount_read(&dst_import->refs) > 1) &&
+	       time_before(jiffies, deadline))
+		usleep_range(50, 200);
 	KUNIT_EXPECT_EQ(test, dma_fence_get_status(release_fence), -ENODEV);
 	KUNIT_EXPECT_EQ(test, refcount_read(&src_import->refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&dst_import->refs), 1);
@@ -11891,6 +11919,7 @@ static void rk_rga_request_submit_async_acquire_kunit(struct kunit *test)
 	void __user *task_user;
 	void __user *request_user;
 	unsigned long uncopied;
+	unsigned long deadline;
 	int acquire_fd = -1;
 	int release_fd;
 	long ret;
@@ -11968,6 +11997,20 @@ static void rk_rga_request_submit_async_acquire_kunit(struct kunit *test)
 			dma_fence_wait_timeout(release_fence, false,
 					       msecs_to_jiffies(1000)),
 			0L);
+	/*
+	 * The release fence signals before acquire_work unlinks the job from
+	 * this on-stack session and drops its import references.  Reuse the
+	 * rk_rga_release() drain so the worker can never touch the session
+	 * after this function returns, then give its final import puts the
+	 * same 1 s budget the fence wait got so the refcount reads below are
+	 * deterministic.
+	 */
+	wait_event(session.job_wait, rk_rga_session_jobs_empty(&session));
+	deadline = jiffies + msecs_to_jiffies(1000);
+	while ((refcount_read(&src_import->refs) > 1 ||
+		refcount_read(&dst_import->refs) > 1) &&
+	       time_before(jiffies, deadline))
+		usleep_range(50, 200);
 	KUNIT_EXPECT_EQ(test, dma_fence_get_status(release_fence), -ENODEV);
 	KUNIT_EXPECT_EQ(test, refcount_read(&src_import->refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&dst_import->refs), 1);
@@ -14454,6 +14497,8 @@ static void rk_rga_userptr_shadow_copy_kunit(struct kunit *test)
 	u8 *original;
 	u8 *copy;
 
+	view.rga = rk_rga_kunit_alloc_service(test);
+	KUNIT_ASSERT_NOT_NULL(test, view.rga);
 	shadow->original = alloc_page(GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, shadow->original);
 	shadow->shadow = alloc_page(GFP_KERNEL);
@@ -14469,6 +14514,8 @@ static void rk_rga_userptr_shadow_copy_kunit(struct kunit *test)
 	kunmap_local(copy);
 
 	rk_rga_userptr_view_copy(&view, true);
+	KUNIT_EXPECT_EQ(test,
+			atomic64_read(&view.rga->shadow_copy_to_bytes), 31LL);
 	copy = kmap_local_page(shadow->shadow);
 	KUNIT_EXPECT_EQ(test, copy[16], (u8)0x5a);
 	KUNIT_EXPECT_EQ(test, copy[17], (u8)0xa5);
@@ -14478,6 +14525,9 @@ static void rk_rga_userptr_shadow_copy_kunit(struct kunit *test)
 	kunmap_local(copy);
 
 	rk_rga_userptr_view_copy(&view, false);
+	KUNIT_EXPECT_EQ(test,
+			atomic64_read(&view.rga->shadow_copy_from_bytes),
+			31LL);
 	original = kmap_local_page(shadow->original);
 	KUNIT_EXPECT_EQ(test, original[16], (u8)0xa5);
 	KUNIT_EXPECT_EQ(test, original[17], (u8)0xc3);
