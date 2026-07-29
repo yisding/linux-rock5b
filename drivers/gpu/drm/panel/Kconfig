@@ -877,6 +877,17 @@ config DRM_PANEL_RENESAS_R69328
 	  This panel controller can be found in LG Optimus 4X P895 smartphone
 	  in combination with LCD panel.
 
+config DRM_PANEL_ROCKNIX_GENERIC_DSI
+	tristate "Generic DSI panel (ROCKNIX, timings via DT panel_description)"
+	depends on OF
+	depends on DRM_MIPI_DSI
+	depends on BACKLIGHT_CLASS_DEVICE
+	help
+	  DSI panel driver whose modes and init sequence come from a
+	  "panel_description" device-tree string instead of a per-panel
+	  driver. Used by Anbernic/ROCKNIX handhelds
+	  (compatible "rocknix,generic-dsi").
+
 config DRM_PANEL_RONBO_RB070D30
 	tristate "Ronbo Electronics RB070D30 panel"
 	depends on OF
