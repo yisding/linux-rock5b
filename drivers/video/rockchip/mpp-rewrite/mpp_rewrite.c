@@ -7621,6 +7621,7 @@ static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&session.imports);
 	INIT_LIST_HEAD(&session.active_jobs);
 	init_waitqueue_head(&session.wait);
+	hw->srv = &srv;
 	spin_lock_init(&hw->lock);
 	mutex_init(&hw->run_lock);
 	INIT_DELAYED_WORK(&hw->timeout_work, rk_mpp_hw_timeout_work);
@@ -7794,6 +7795,7 @@ static void rk_mpp_reset_session_public_cleanup_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&session.active_jobs);
 	init_waitqueue_head(&session.wait);
 	INIT_LIST_HEAD(&batch.jobs);
+	hw.srv = srv;
 	spin_lock_init(&hw.lock);
 	mutex_init(&hw.run_lock);
 	INIT_DELAYED_WORK_ONSTACK(&hw.timeout_work, rk_mpp_hw_timeout_work);
@@ -7903,6 +7905,7 @@ static void rk_mpp_reset_session_hw_active_import_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&batch.jobs);
 
 	hw.dev = dev;
+	hw.srv = &srv;
 	hw.terminally_stopped = true;
 	refcount_set(&hw.refs, 1);
 	init_completion(&hw.released);
