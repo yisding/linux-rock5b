@@ -251,6 +251,8 @@ struct mpp_dev_var {
 	/* info for each hardware */
 	struct mpp_hw_info *hw_info;
 	struct mpp_trans_info *trans_info;
+	/* number of entries in trans_info[]; formats at or above it are invalid */
+	u32 trans_count;
 	struct mpp_hw_ops *hw_ops;
 	struct mpp_dev_ops *dev_ops;
 };
@@ -634,7 +636,9 @@ struct mpp_mem_region *
 mpp_task_attach_fd(struct mpp_task *task, int fd);
 int mpp_translate_reg_address(struct mpp_session *session,
 			      struct mpp_task *task, int fmt,
-			      u32 *reg, struct reg_offset_info *off_inf);
+			      u32 *reg, u32 reg_cnt,
+			      struct reg_offset_info *off_inf);
+struct mpp_trans_info *mpp_get_trans_info(struct mpp_dev *mpp, int fmt);
 
 int mpp_check_req(struct mpp_request *req, int base,
 		  int max_size, u32 off_s, u32 off_e);
@@ -644,7 +648,7 @@ int mpp_query_reg_offset_info(struct reg_offset_info *off_inf,
 			      u32 index);
 int mpp_translate_reg_offset_info(struct mpp_task *task,
 				  struct reg_offset_info *off_inf,
-				  u32 *reg);
+				  u32 *reg, u32 reg_cnt);
 int mpp_task_init(struct mpp_session *session,
 		  struct mpp_task *task);
 int mpp_task_finish(struct mpp_session *session,
