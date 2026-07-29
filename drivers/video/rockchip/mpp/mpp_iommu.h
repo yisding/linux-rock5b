@@ -18,17 +18,6 @@
 #include <linux/spinlock.h>
 #include <linux/stddef.h>
 
-/*
- * 6.18: struct iommu_dma_cookie (drivers/iommu/dma-iommu.c) dropped its
- * leading "enum iommu_dma_cookie_type type" member (the enum type itself was
- * deleted), so iovad now sits at offset 0. This shadow struct only exists to
- * reach iovad via iommu_domain->iova_cookie; the layout MUST keep iovad first.
- */
-struct mpp_iommu_dma_cookie {
-	/* Full allocator for the IOVA cookie; must stay at offset 0 */
-	struct iova_domain iovad;
-};
-
 struct mpp_dma_buffer {
 	/* link to dma session buffer list */
 	struct list_head link;

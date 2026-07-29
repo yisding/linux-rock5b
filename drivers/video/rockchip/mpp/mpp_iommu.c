@@ -124,18 +124,28 @@ static void mpp_dma_release_buffer(struct kref *ref)
 {
 	struct mpp_dma_buffer *buffer =
 		container_of(ref, struct mpp_dma_buffer, ref);
+	struct dma_buf_attachment *attach = buffer->attach;
+	struct dma_buf *dmabuf = buffer->dmabuf;
+	struct sg_table *sgt = buffer->sgt;
 
 	buffer->dma->buffer_count--;
 	list_move_tail(&buffer->link, &buffer->dma->unused_list);
 
-	/* 6.18: locked variant now asserts dma_resv held; use _unlocked */
-	dma_buf_unmap_attachment_unlocked(buffer->attach, buffer->sgt, buffer->dir);
-	dma_buf_detach(buffer->dmabuf, buffer->attach);
-	dma_buf_put(buffer->dmabuf);
-	buffer->dma = NULL;
+	/*
+	 * Clear the pointers before dropping what they point at. dma_buf_detach()
+	 * frees the attachment's scatterlist, so publishing NULL afterwards left
+	 * a window in which mpp_dma_buf_sync() -- which runs from the task worker
+	 * and the IRQ completion path -- could walk a freed sg table.
+	 */
 	buffer->dmabuf = NULL;
 	buffer->attach = NULL;
 	buffer->sgt = NULL;
+
+	/* 6.18: locked variant now asserts dma_resv held; use _unlocked */
+	dma_buf_unmap_attachment_unlocked(attach, sgt, buffer->dir);
+	dma_buf_detach(dmabuf, attach);
+	dma_buf_put(dmabuf);
+	buffer->dma = NULL;
 	buffer->copy_sgt = NULL;
 	buffer->iova = 0;
 	buffer->size = 0;
@@ -471,12 +481,27 @@ mpp_dma_session_create(struct device *dev, u32 max_buffers)
 void mpp_dma_buf_sync(struct mpp_dma_buffer *buffer, u32 offset, u32 length,
 		      enum dma_data_direction dir, bool for_cpu)
 {
-	struct device *dev = buffer->dma->dev;
-	struct sg_table *sgt = buffer->sgt;
-	struct scatterlist *sg = sgt->sgl;
-	dma_addr_t sg_dma_addr = sg_dma_address(sg);
+	struct device *dev;
+	struct sg_table *sgt;
+	struct scatterlist *sg;
+	dma_addr_t sg_dma_addr;
 	unsigned int len = 0;
 	int i;
+
+	/*
+	 * A buffer released concurrently has these cleared before its backing
+	 * is dropped, so catch the already-released case rather than walking a
+	 * freed sg table.
+	 */
+	if (!buffer || !buffer->dma)
+		return;
+	sgt = buffer->sgt;
+	if (!sgt || !sgt->sgl)
+		return;
+
+	dev = buffer->dma->dev;
+	sg = sgt->sgl;
+	sg_dma_addr = sg_dma_address(sg);
 
 	for_each_sgtable_sg(sgt, sg, i) {
 		unsigned int sg_offset, sg_left, size = 0;
@@ -1079,7 +1104,6 @@ int mpp_iommu_dev_deactivate(struct mpp_iommu_info *info, struct mpp_dev *dev)
 int mpp_iommu_reserve_iova(struct mpp_iommu_info *info, dma_addr_t iova, size_t size)
 {
 	struct iommu_domain *domain;
-	struct mpp_iommu_dma_cookie *cookie;
 	struct iova_domain *iovad;
 	unsigned long pfn_lo, pfn_hi;
 	u64 end;
@@ -1096,13 +1120,14 @@ int mpp_iommu_reserve_iova(struct mpp_iommu_info *info, dma_addr_t iova, size_t 
 	}
 
 	domain = info->domain;
-	if (!domain || !domain->iova_cookie)
+	/*
+	 * iova_cookie is one arm of a union discriminated by domain->cookie_type,
+	 * so a non-NULL test does not prove it is an iommu_dma_cookie. Use the
+	 * accessor that checks the discriminator, as RGA already does.
+	 */
+	iovad = iommu_dma_get_iova_domain(domain);
+	if (!iovad)
 		return -EINVAL;
-
-	/* 6.18: iovad must be the first member of iommu_dma_cookie */
-	BUILD_BUG_ON(offsetof(struct mpp_iommu_dma_cookie, iovad) != 0);
-	cookie = (struct mpp_iommu_dma_cookie *)domain->iova_cookie;
-	iovad = &cookie->iovad;
 
 	/* iova will be freed automatically by put_iova_domain() */
 	pfn_lo = iova_pfn(iovad, iova);
@@ -1117,19 +1142,15 @@ int mpp_iommu_reserve_iova(struct mpp_iommu_info *info, dma_addr_t iova, size_t 
 void mpp_iommu_unreserve_iova(struct mpp_iommu_info *info, dma_addr_t iova, size_t size)
 {
 	struct iommu_domain *domain;
-	struct mpp_iommu_dma_cookie *cookie;
 	struct iova_domain *iovad;
 
 	if (!info || !size)
 		return;
 
 	domain = info->domain;
-	if (!domain || !domain->iova_cookie)
+	iovad = iommu_dma_get_iova_domain(domain);
+	if (!iovad)
 		return;
-
-	BUILD_BUG_ON(offsetof(struct mpp_iommu_dma_cookie, iovad) != 0);
-	cookie = (struct mpp_iommu_dma_cookie *)domain->iova_cookie;
-	iovad = &cookie->iovad;
 
 	free_iova(iovad, iova_pfn(iovad, iova));
 }
