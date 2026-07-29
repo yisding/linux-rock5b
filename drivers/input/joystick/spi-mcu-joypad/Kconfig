@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config JOYSTICK_SPI_MCU_JOYPAD
+	tristate "SPI MCU Joypad (Anbernic analog sticks + RGB LEDs)"
+	depends on SPI
+	depends on LEDS_CLASS_MULTICOLOR
+	help
+	  Say Y here if you have an Anbernic handheld with analog sticks
+	  and RGB LEDs controlled by an MCU over SPI.
+
+	  The driver exposes six analog axes via the input subsystem and
+	  two RGB LED rings (one per stick) via the multicolor LED class.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called spi-mcu-joypad.

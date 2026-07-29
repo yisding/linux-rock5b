@@ -364,6 +364,8 @@ config JOYSTICK_PSXPAD_SPI_FF
 
 	  To drive rumble motor a dedicated power supply is required.
 
+source "drivers/input/joystick/spi-mcu-joypad/Kconfig"
+
 config JOYSTICK_PXRC
 	tristate "PhoenixRC Flight Controller Adapter"
 	depends on USB_ARCH_HAS_HCD
