@@ -1322,6 +1322,8 @@ struct rk_rga_hw {
 	u64 iommu_fault_generation;
 	atomic_t irq_disable_depth;
 	u32 queued_jobs;
+	/* job_lock-held count of clock-live power holders; gates IRQ MMIO */
+	unsigned int regs_live_count;
 #if IS_ENABLED(CONFIG_ROCKCHIP_RGA_REWRITE_KUNIT_TEST)
 	struct completion *kunit_job_queued;
 #endif
@@ -1359,8 +1361,6 @@ struct rk_rga_service {
 	struct rga_hw_versions_t hw_versions;
 	u32 hw_count;
 	u32 core_select_seq;
-	u64 fence_context;
-	u32 fence_seqno;
 	spinlock_t fence_lock;
 	atomic_t ioctl_count;
 	atomic_t import_count;
@@ -1419,7 +1419,6 @@ static void rk_rga_service_state_init(struct rk_rga_service *rga)
 	INIT_LIST_HEAD(&rga->sessions);
 	INIT_LIST_HEAD(&rga->fault_hws);
 	spin_lock_init(&rga->fence_lock);
-	rga->fence_context = dma_fence_context_alloc(1);
 }
 
 static int rk_rga_release(struct inode *inode, struct file *file);
@@ -1601,27 +1600,41 @@ static const char *rk_rga_fence_get_name(struct dma_fence *fence)
 	return "rockchip-rga-rewrite";
 }
 
+static void rk_rga_fence_release(struct dma_fence *fence)
+{
+	dma_fence_free(fence);
+	/*
+	 * Exported sync_file fds pin only the built-in sync core, not this
+	 * module, so each live fence holds a module reference to keep
+	 * fence->ops and the shared fence lock resident until the last
+	 * holder drops the fence.
+	 */
+	module_put(THIS_MODULE);
+}
+
 static const struct dma_fence_ops rk_rga_fence_ops = {
 	.get_driver_name = rk_rga_fence_get_name,
 	.get_timeline_name = rk_rga_fence_get_name,
+	.release = rk_rga_fence_release,
 };
 
 static struct dma_fence *rk_rga_fence_alloc(struct rk_rga_service *rga)
 {
 	struct dma_fence *fence;
-	unsigned long flags;
-	u32 seqno;
 
 	fence = kzalloc(sizeof(*fence), GFP_KERNEL);
 	if (!fence)
 		return ERR_PTR(-ENOMEM);
 
-	spin_lock_irqsave(&rga->fence_lock, flags);
-	seqno = ++rga->fence_seqno;
-	spin_unlock_irqrestore(&rga->fence_lock, flags);
-
+	/*
+	 * Jobs can complete on any core in any order, so a shared timeline
+	 * would signal out of order and let a sync_file merge collapse
+	 * distinct jobs into the highest seqno.  Give every fence its own
+	 * context so no cross-job ordering is ever claimed.
+	 */
+	__module_get(THIS_MODULE);
 	dma_fence_init(fence, &rk_rga_fence_ops, &rga->fence_lock,
-		       rga->fence_context, seqno);
+		       dma_fence_context_alloc(1), 1);
 	atomic_inc(&rga->release_fence_count);
 
 	return fence;
@@ -1788,6 +1801,7 @@ static bool rk_rga_hw_unreferenced(struct rk_rga_hw *hw)
 
 static int rk_rga_hw_power_on_internal(struct rk_rga_hw *hw, bool count_cycle)
 {
+	unsigned long flags;
 	int ret;
 
 	ret = pm_runtime_resume_and_get(hw->dev);
@@ -1799,6 +1813,10 @@ static int rk_rga_hw_power_on_internal(struct rk_rga_hw *hw, bool count_cycle)
 		pm_runtime_put_sync(hw->dev);
 		return ret;
 	}
+
+	spin_lock_irqsave(&hw->job_lock, flags);
+	hw->regs_live_count++;
+	spin_unlock_irqrestore(&hw->job_lock, flags);
 
 	if (count_cycle)
 		atomic_inc(&hw->rga->power_cycle_count);
@@ -1813,6 +1831,18 @@ static int rk_rga_hw_power_on(struct rk_rga_hw *hw)
 
 static void rk_rga_hw_power_off(struct rk_rga_hw *hw)
 {
+	unsigned long flags;
+
+	/*
+	 * Drop the regs-live count before gating clocks.  The hard IRQ
+	 * handler performs MMIO under job_lock only while this count is
+	 * nonzero, so taking the lock here means no handler is mid-read
+	 * when the clocks go down.
+	 */
+	spin_lock_irqsave(&hw->job_lock, flags);
+	hw->regs_live_count--;
+	spin_unlock_irqrestore(&hw->job_lock, flags);
+
 	clk_bulk_disable_unprepare(hw->num_clks, hw->clks);
 	pm_runtime_put_sync(hw->dev);
 }
@@ -3745,6 +3775,21 @@ static int rk_rga_resolve_direct_img(struct rk_rga_service *rga,
 	buffer.memory_parm.width = img->vir_w;
 	buffer.memory_parm.height = img->vir_h;
 	buffer.memory_parm.format = img->format;
+	/*
+	 * The width/height/format fallback derives a raster extent and
+	 * cannot see rd_mode: a compressed or tiled image needs its
+	 * header+payload layout, or materialization rejects the import
+	 * as too small.  Size the synthesized import from the image's
+	 * own layout instead.
+	 */
+	if (img->rd_mode) {
+		struct rk_rga_img_layout layout;
+
+		ret = rk_rga_img_layout(img, &layout);
+		if (ret)
+			return ret;
+		buffer.memory_parm.size = layout.total_size;
+	}
 
 	if (buffer.type == RGA_DMA_BUFFER) {
 		ret = rk_rga_import_dmabuf_fd(&buffer, &fd);
@@ -6982,8 +7027,6 @@ static int rk_rga2_fill_format_info(u32 format,
 	default:
 		return -EOPNOTSUPP;
 	}
-
-	return rk_rga2_format_info(format, true, &profile->dst_fmt);
 }
 
 static int rk_rga3_hw_rd_mode(u32 user_mode, u32 *hw_mode)
@@ -11578,6 +11621,7 @@ static void rk_rga_legacy_blit_sync_wait_kunit(struct kunit *test)
 	struct completion job_queued;
 	void __user *task_user;
 	unsigned long uncopied;
+	unsigned long completed;
 	unsigned long queued;
 	int ret;
 
@@ -11673,10 +11717,24 @@ static void rk_rga_legacy_blit_sync_wait_kunit(struct kunit *test)
 		rk_rga_hw_abort_session_jobs(hw, &session, -ETIMEDOUT);
 	}
 
-	KUNIT_EXPECT_GT(test,
-			wait_for_completion_timeout(&ioctl->completed,
-						    msecs_to_jiffies(1000)),
-			0UL);
+	completed = wait_for_completion_timeout(&ioctl->completed,
+						msecs_to_jiffies(1000));
+	KUNIT_EXPECT_GT(test, completed, 0UL);
+	if (!completed) {
+		unsigned long drain_flags;
+
+		/*
+		 * The worker still owns the on-stack session and the queued
+		 * completion.  Force it out before the teardown below frees
+		 * anything it can reach; blocking here turns a would-be
+		 * use-after-free into a plain test failure.
+		 */
+		spin_lock_irqsave(&hw->job_lock, drain_flags);
+		hw->removing = true;
+		spin_unlock_irqrestore(&hw->job_lock, drain_flags);
+		rk_rga_hw_abort_session_jobs(hw, &session, -ETIMEDOUT);
+		cancel_work_sync(&ioctl->work);
+	}
 	KUNIT_EXPECT_TRUE(test, READ_ONCE(ioctl->done));
 	KUNIT_EXPECT_EQ(test, ioctl->ret, 0L);
 	KUNIT_EXPECT_TRUE(test, list_empty(&hw->job_queue));
@@ -15282,8 +15340,15 @@ static void rk_rga_ffmpeg_rga3_profiles_kunit(struct kunit *test)
 
 	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
 					 RK_RGA_FORMAT_BGRA_8888);
+	/*
+	 * A faithful librga 90-degree transpose writes a portrait canvas
+	 * and submits the destination window pre-swapped.
+	 */
+	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_BGRA_8888,
+				    720, 1280);
 	task.rotate_mode = 1;
 	task.sina = 65536;
+	swap(task.dst.act_w, task.dst.act_h);
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
@@ -15331,6 +15396,8 @@ static void rk_rga_gstreamer_legacy_convert_profiles_kunit(struct kunit *test)
 	task.rotate_mode = 1;
 	task.sina = 65536;
 	task.cosa = 0;
+	/* librga submits the 90-degree destination window pre-swapped. */
+	swap(task.dst.act_w, task.dst.act_h);
 	type = 0;
 	job = (struct rk_rga_job) {
 		.tasks = &task,
@@ -15429,6 +15496,12 @@ rk_rga_gstreamer_legacy_convert_matrix_case(struct kunit *test,
 		task.rotate_mode = 1;
 		task.sina = 65536;
 		task.cosa = 0;
+		/*
+		 * librga's HAL_TRANSFORM_ROT_90 conversion submits the
+		 * destination window pre-swapped (act_w carries the canvas
+		 * height) while the vir strides stay in canvas orientation.
+		 */
+		swap(task.dst.act_w, task.dst.act_h);
 	}
 
 	job = (struct rk_rga_job) {
@@ -15789,6 +15862,8 @@ static void rk_rga_gstreamer_legacy_rotation_extrema_kunit(struct kunit *test)
 	task.rotate_mode = 1;
 	task.sina = -65536;
 	task.cosa = 0;
+	/* librga submits the 270-degree destination window pre-swapped. */
+	swap(task.dst.act_w, task.dst.act_h);
 	job.cmd_ready = false;
 	type = 0;
 
@@ -16087,6 +16162,8 @@ static void rk_rga3_librga_rotate_emit_kunit(struct kunit *test)
 	task.sina = 65536;
 	task.cosa = 0;
 	task.yuv2rgb_mode = 0;
+	/* librga submits the 90-degree destination window pre-swapped. */
+	swap(task.dst.act_w, task.dst.act_h);
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
@@ -16100,8 +16177,9 @@ static void rk_rga3_librga_rotate_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, ctrl & RK_RGA3_WIN0_YMIRROR);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_ACT_SIZE_OFFSET / 4],
 			720U | (1280U << 16));
+	/* The write window is canvas-oriented: 1280 wide, 720 tall. */
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
-			720U | (1280U << 16));
+			1280U | (720U << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_Y_BASE_OFFSET / 4],
 			lower_32_bits(task.dst.yrgb_addr));
 }
@@ -16130,6 +16208,8 @@ static void rk_rga3_librga_rotate_flip_emit_kunit(struct kunit *test)
 	task.sina = 65536;
 	task.cosa = 0;
 	task.yuv2rgb_mode = 0;
+	/* librga submits the 90-degree destination window pre-swapped. */
+	swap(task.dst.act_w, task.dst.act_h);
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
@@ -16143,8 +16223,9 @@ static void rk_rga3_librga_rotate_flip_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WIN0_YMIRROR);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_ACT_SIZE_OFFSET / 4],
 			720U | (1280U << 16));
+	/* The write window is canvas-oriented: 1280 wide, 720 tall. */
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
-			720U | (1280U << 16));
+			1280U | (720U << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_Y_BASE_OFFSET / 4],
 			lower_32_bits(task.dst.yrgb_addr));
 }
@@ -18237,6 +18318,9 @@ static void rk_rga2_display_xrgb_rotate_kunit(struct kunit *test)
 	u32 src_info;
 	u32 dst_info;
 
+	/* librga submits the 270-degree destination window pre-swapped. */
+	swap(task.dst.act_w, task.dst.act_h);
+
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
@@ -18268,12 +18352,16 @@ static void rk_rga2_display_xrgb_rotate_kunit(struct kunit *test)
 			FIELD_PREP(RK_RGA2_DST_FORMAT, 0x1));
 	KUNIT_EXPECT_FALSE(test, dst_info & RK_RGA2_DST_RB_SWAP);
 	KUNIT_EXPECT_TRUE(test, dst_info & RK_RGA2_DST_ALPHA_SWAP);
+	/*
+	 * The canvas-oriented 32x64 write window starts from the 270-degree
+	 * bottom-left corner: (act_h - 1) rows into the 128-byte stride.
+	 */
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_BASE0_OFFSET / 4],
-			lower_32_bits(task.dst.yrgb_addr + 31U * 128U));
+			lower_32_bits(task.dst.yrgb_addr + 63U * 128U));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_VIR_INFO_OFFSET / 4],
 			32U);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_ACT_INFO_OFFSET / 4],
-			63U | (31U << 16));
+			31U | (63U << 16));
 }
 
 static void rk_rga3_pattern_rotate_reject_kunit(struct kunit *test)
@@ -18728,15 +18816,21 @@ static void rk_rga3_alpha_rotate_emit_kunit(struct kunit *test)
 	task.bsfilter_flag = 0;
 	job.import_count = 2;
 	job.cmd_ready = false;
+	/*
+	 * The no-pattern A+B->B path models real librga traffic, which
+	 * submits the 90-degree destination window pre-swapped; the
+	 * emitted background and write windows are canvas-oriented.
+	 */
+	swap(task.dst.act_w, task.dst.act_h);
 
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
 	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_ACT_SIZE_OFFSET / 4],
-			720 | (1280 << 16));
+			1280 | (720 << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
-			720 | (1280 << 16));
+			1280 | (720 << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN1_DST_SIZE_OFFSET / 4],
-			720 | (1280 << 16));
+			1280 | (720 << 16));
 }
 
 static void rk_rga3_dst_offset_emit_kunit(struct kunit *test)
@@ -19573,10 +19667,17 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 	ret = rk_rga2_validate_image(&task->src, &profile->src_fmt);
 	if (ret)
 		return ret;
-	ret = rk_rga2_validate_image(&task->dst, &profile->dst_fmt);
+	/*
+	 * Validate the canvas-oriented destination: the legacy librga
+	 * transform path submits the 90/270-degree window pre-swapped while
+	 * the vir strides stay in canvas orientation, and the vendor driver
+	 * un-swaps before checking act against vir.  The raw wire form would
+	 * fail that bound for every genuine portrait rotate.
+	 */
+	rk_rga2_normalized_dst(task, &profile->transform, &dst);
+	ret = rk_rga2_validate_image(&dst, &profile->dst_fmt);
 	if (ret)
 		return ret;
-	rk_rga2_normalized_dst(task, &profile->transform, &dst);
 	if (uses_alpha_bitmap || uses_osd) {
 		ret = rk_rga2_validate_image(&task->pat, &profile->pat_fmt);
 		if (ret)
@@ -19652,6 +19753,7 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 		task->full_csc.flag == RK_RGA_FULL_CSC_ENABLE &&
 		task->yuv2rgb_mode == (3 << 2);
 	bool has_pat = rk_rga_img_has_addr(&task->pat);
+	struct rga_img_info_t dst;
 	int ret;
 
 	if (task->render_mode != RK_RGA_RENDER_BITBLT)
@@ -19695,6 +19797,23 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 	    rk_rga_format_is_rga3_yuv422_rotate_blocked(task->src.format))
 		return -EOPNOTSUPP;
 
+	/*
+	 * The legacy librga transform path submits the 90/270-degree
+	 * destination window pre-swapped (act_w carries the canvas height)
+	 * while the vir strides stay in canvas orientation, exactly as the
+	 * vendor driver expects before it un-swaps.  The emitters and the
+	 * scale check consume that wire form directly, but the rectangle,
+	 * tile, and subsampling-alignment validators below must see the
+	 * canvas orientation or every genuine rotate request fails the
+	 * act-versus-vir bound the vendor explicitly exempts.  The
+	 * pattern-blend rotate path keeps its historical canvas-form model;
+	 * its wire-form semantics remain unresolved against the vendor.
+	 */
+	dst = task->dst;
+	if ((profile->rotate_flags & RK_RGA3_ROT_BIT_ROT_90) &&
+	    !profile->pattern_blend)
+		swap(dst.act_w, dst.act_h);
+
 	ret = rk_rga3_hw_rd_mode(task->src.rd_mode, &profile->src_mode);
 	if (ret)
 		return ret;
@@ -19730,10 +19849,10 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 	if (ret)
 		return ret;
 
-	ret = rk_rga3_validate_image(&task->dst, true);
+	ret = rk_rga3_validate_image(&dst, true);
 	if (ret)
 		return ret;
-	ret = rk_rga3_validate_tile_image(&task->dst, false);
+	ret = rk_rga3_validate_tile_image(&dst, false);
 	if (ret)
 		return ret;
 	if (profile->pattern_blend) {
@@ -19770,8 +19889,7 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 				  &profile->dst_fmt);
 	if (ret)
 		return ret;
-	ret = rk_rga3_validate_semiplanar_geometry(&task->dst,
-						   &profile->dst_fmt);
+	ret = rk_rga3_validate_semiplanar_geometry(&dst, &profile->dst_fmt);
 	if (ret)
 		return ret;
 	if (task->full_csc.flag &&
@@ -19801,7 +19919,7 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 	if (ret)
 		return ret;
 	ret = rk_rga3_validate_semiplanar_geometry(profile->pattern_blend ?
-						   &task->pat : &task->dst,
+						   &task->pat : &dst,
 						   &profile->bg_fmt);
 	if (ret)
 		return ret;
@@ -21202,8 +21320,14 @@ static int rk_rga2_emit_simple_bitblt(struct rk_rga_job *job)
 	} else {
 		u32 src_global = 0;
 
-		if (task->gauss_config.size && task->feature.global_alpha_en)
-			src_global = task->fg_global_alpha;
+		/*
+		 * The vendor defaults the gauss path's source global alpha to
+		 * opaque when the caller does not enable a global alpha, so
+		 * an unset flag cannot zero the blurred output's alpha.
+		 */
+		if (task->gauss_config.size)
+			src_global = task->feature.global_alpha_en ?
+				     task->fg_global_alpha : 0xff;
 
 		rk_rga_cmd_write(job, RK_RGA2_ALPHA_CTRL0_OFFSET,
 				 FIELD_PREP(RK_RGA2_ALPHA_SRC_GLOBAL,
@@ -22125,6 +22249,16 @@ static irqreturn_t rk_rga_irq_handler(int irq, void *data)
 		return IRQ_HANDLED;
 
 	spin_lock_irqsave(&hw->job_lock, flags);
+	/*
+	 * A peer on the shared level line (the RGA3 IOMMU) can refire after
+	 * this core's clocks are gated, and probe registers the handler
+	 * before the first power-on.  An unpowered core cannot own the
+	 * interrupt, and reading its registers would stall the bus.
+	 */
+	if (!hw->regs_live_count) {
+		spin_unlock_irqrestore(&hw->job_lock, flags);
+		return IRQ_NONE;
+	}
 	job = hw->active_job;
 	if (job)
 		ret = rk_rga_hw_irq_status(hw, job);
@@ -22294,8 +22428,22 @@ static void rk_rga_hw_recover_active(struct rk_rga_hw *hw, bool iommu_fault,
 		result = -EIO;
 		dev_err(hw->dev, "job failed on IOMMU fault\n");
 	} else {
-		result = -EBUSY;
+		bool done = hw->type == RK_RGA_HW_RGA3 ?
+			    !!(job->intr_status & RK_RGA3_INT_DONE_MASK) :
+			    !!(job->intr_status & RK_RGA2_INT_DONE_MASK);
+
 		atomic_inc(&hw->rga->timeout_count);
+		if (done) {
+			/*
+			 * The blit finished while the watchdog held the IRQ
+			 * line masked, so the latched completion was never
+			 * delivered.  Report what the hardware actually did;
+			 * the recovery reset below still clears the latch.
+			 */
+			result = rk_rga_irq_completion_result(hw->type, job);
+		} else {
+			result = -EBUSY;
+		}
 	}
 
 	rk_rga_job_note_hw_done(job);

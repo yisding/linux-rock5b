@@ -19,7 +19,7 @@ config ROCKCHIP_MPP_REWRITE_KUNIT_TEST
 	help
 	  Unit tests for rewrite-local MPP ABI parser helpers, including
 	  command range classification and register-span validation.
-	  The in-source suite temporarily unbinds the built-in driver during
-	  boot, uses the service singleton as test-fixture storage, and restores
-	  the production driver before initramfs. Post-boot reruns are rejected
-	  so they cannot disturb live sessions.
+	  The in-source suite runs against KUnit-managed local service
+	  fixtures with assertion-safe cleanup; it does not unbind, reprobe,
+	  or otherwise disturb the production driver instance or its live
+	  sessions.
