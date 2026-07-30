@@ -5204,6 +5204,8 @@ static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
 	mutex_init(&ccu.run_lock);
 	hw.terminally_stopped = true;
 
+	/* The submit path holds ccu->run_lock across arm -> start. */
+	mutex_lock(&ccu.run_lock);
 	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_program_soft_ccu(&job), 0);
 	KUNIT_EXPECT_EQ(test,
 			link[info->irq_base / sizeof(*link)] &
@@ -5241,6 +5243,7 @@ static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test,
 			core_regs[RK_MPP_RKVDEC_START_BASE / sizeof(*core_regs)],
 			0x100U | RK_MPP_RKVDEC_START_EN);
+	mutex_unlock(&ccu.run_lock);
 
 	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_reset_soft_ccu_job(&job), 0);
 	KUNIT_EXPECT_EQ(test,
@@ -5251,7 +5254,9 @@ static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
 			hw.core_mask & RK_MPP_RKVDEC_CCU_CORE_RW_MASK);
 
 	hw.core_mask = 0;
+	mutex_lock(&ccu.run_lock);
 	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_program_soft_ccu(&job), -EINVAL);
+	mutex_unlock(&ccu.run_lock);
 }
 
 static void rk_mpp_rkvdec2_hard_ccu_dma_domain_kunit(struct kunit *test)
@@ -10735,6 +10740,7 @@ static int rk_mpp_rkvdec2_program_soft_ccu(struct rk_mpp_job *job)
 	if (!hw->core_mask)
 		return -EINVAL;
 
+	lockdep_assert_held(&ccu->run_lock);
 	link = hw->regs[RK_MPP_RKVDEC_LINK_REGION];
 	writel_relaxed(RK_MPP_RKVDEC_LINK_CORE_WORK_MODE |
 		       RK_MPP_RKVDEC_LINK_CCU_WORK_MODE,
@@ -10753,19 +10759,23 @@ static int rk_mpp_rkvdec2_program_soft_ccu(struct rk_mpp_job *job)
 
 /*
  * BSP contract (rkvdec2_soft_ccu_enqueue): CORE_STA is the last CCU word
- * before the start doorbell, written back-to-back with it. The BSP gets
- * that adjacency from its single taskqueue worker; ccu->run_lock is this
- * driver's substitute. The coordinator gates core clocks in CCU work mode:
- * leaving a core registered-but-unstarted across a sibling completion let
- * the CCU re-gate it, and the eventual START write stalled the
- * interconnect (silent dual-core mpi_dec_mt wedge, 2026-07-29).
+ * before the start doorbell, written back-to-back with it, and the whole
+ * arm -> core cache/task-register setup -> CORE_STA -> START sequence is
+ * one critical section. The BSP gets both from its single taskqueue
+ * worker; the submit path's continuous ccu->run_lock hold is this
+ * driver's substitute. The coordinator gates core clocks in CCU work
+ * mode: leaving a core registered across a sibling transition lets the
+ * CCU re-gate it, and any later write to the gated register file stalls
+ * the interconnect (silent dual-core mpi_dec_mt START wedge, 2026-07-29;
+ * mpi_dec_h265 first-submit wedge through the then-unlocked cache and
+ * task-register window, 2026-07-30). The caller holds ccu->run_lock from
+ * before rk_mpp_rkvdec2_program_soft_ccu() until this helper returns.
  */
 static int rk_mpp_rkvdec2_start_soft_ccu_job(struct rk_mpp_job *job,
 					     u32 start_value)
 {
 	struct rk_mpp_hw *hw = job->hw;
 	struct rk_mpp_hw *ccu = job->rkvdec_ccu;
-	int ret;
 
 	if (!ccu) {
 		rk_mpp_hw_schedule_timeout(hw);
@@ -10778,25 +10788,21 @@ static int rk_mpp_rkvdec2_start_soft_ccu_job(struct rk_mpp_job *job,
 	if (!rk_mpp_rkvdec2_soft_ccu_regs_ready(ccu))
 		return -EOPNOTSUPP;
 
-	mutex_lock(&ccu->run_lock);
+	lockdep_assert_held(&ccu->run_lock);
 	if (!rk_mpp_hw_usable(ccu) || !rk_mpp_hw_usable(hw) ||
-	    READ_ONCE(job->canceled)) {
-		ret = READ_ONCE(job->canceled) ? -ECANCELED : -ENODEV;
-		mutex_unlock(&ccu->run_lock);
-		return ret;
-	}
+	    READ_ONCE(job->canceled))
+		return READ_ONCE(job->canceled) ? -ECANCELED : -ENODEV;
 	writel_relaxed(hw->core_mask,
 		       ccu->regs[0] + RK_MPP_RKVDEC_CCU_CORE_STA_BASE);
 	rk_mpp_hw_schedule_timeout(hw);
 	wmb();
 	writel(start_value | RK_MPP_RKVDEC_START_EN,
 	       hw->regs[0] + RK_MPP_RKVDEC_START_BASE);
-	mutex_unlock(&ccu->run_lock);
 
 	return 0;
 }
 
-static int rk_mpp_rkvdec2_prepare_soft_ccu(struct rk_mpp_job *job)
+static int rk_mpp_rkvdec2_acquire_soft_ccu(struct rk_mpp_job *job)
 {
 	struct rk_mpp_hw *hw = job->hw;
 	struct rk_mpp_hw *ccu;
@@ -10824,15 +10830,7 @@ static int rk_mpp_rkvdec2_prepare_soft_ccu(struct rk_mpp_job *job)
 	if (!rk_mpp_hw_usable(ccu))
 		return -ENODEV;
 
-	mutex_lock(&ccu->run_lock);
-	if (!rk_mpp_hw_usable(ccu) || !rk_mpp_hw_usable(hw) ||
-	    READ_ONCE(job->canceled))
-		ret = READ_ONCE(job->canceled) ? -ECANCELED : -ENODEV;
-	else
-		ret = rk_mpp_rkvdec2_program_soft_ccu(job);
-	mutex_unlock(&ccu->run_lock);
-
-	return ret;
+	return 0;
 }
 
 static int rk_mpp_rkvdec2_ccu_core_mask(struct rk_mpp_service *srv,
@@ -13402,6 +13400,7 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 {
 	struct rk_mpp_hw *hw = job->hw;
 	struct rk_mpp_hw *ccu = NULL;
+	struct rk_mpp_hw *soft_ccu = NULL;
 	u32 start_value = 0;
 	bool start_seen;
 	bool hard_ccu;
@@ -13454,38 +13453,13 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 		goto err_power_off;
 	}
 
-	if (!hard_ccu) {
-		/*
-		 * BSP order: register the core with the coordinator (work
-		 * mode, WORK_EN, CORE_WORK) before any core-side setup, so
-		 * cache and task-register writes land on a core the CCU
-		 * already tracks as work-pending.
-		 */
-		ret = rk_mpp_rkvdec2_prepare_soft_ccu(job);
-		if (ret)
-			goto err_power_off;
-		ret = rk_mpp_rkvdec2_configure_cache(hw);
-		if (ret)
-			goto err_power_off;
-	}
-
 	rk_mpp_rkvdec2_prepare_ccu_regs(job);
-	if (!hard_ccu) {
-		ret = rk_mpp_job_write_regs(job, RK_MPP_RKVDEC_START_BASE,
-					    &start_value, &start_seen);
-		if (ret)
-			goto err_power_off;
-		if (!start_seen) {
-			ret = -EINVAL;
-			goto err_power_off;
-		}
-	}
-	if (!rk_mpp_hw_usable(hw) || READ_ONCE(job->canceled)) {
-		ret = READ_ONCE(job->canceled) ? -ECANCELED : -ENODEV;
-		goto err_power_off;
-	}
 
 	if (hard_ccu) {
+		if (!rk_mpp_hw_usable(hw) || READ_ONCE(job->canceled)) {
+			ret = READ_ONCE(job->canceled) ? -ECANCELED : -ENODEV;
+			goto err_power_off;
+		}
 		ret = rk_mpp_rkvdec2_stage_link_table(job);
 		if (ret)
 			goto err_power_off;
@@ -13498,14 +13472,77 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 		return 0;
 	}
 
-	ret = rk_mpp_rkvdec2_start_soft_ccu_job(job, start_value);
+	ret = rk_mpp_rkvdec2_acquire_soft_ccu(job);
 	if (ret)
 		goto err_power_off;
+	soft_ccu = job->rkvdec_ccu;
+
+	/*
+	 * BSP contract (rkvdec2_soft_ccu_enqueue): coordinator arming, core
+	 * cache and task-register setup, CORE_STA, and the START doorbell
+	 * form one serialized sequence — the BSP's single taskqueue worker
+	 * guarantees no sibling completion or teardown re-gates an armed
+	 * core mid-setup. Holding ccu->run_lock across the whole sequence
+	 * is this driver's equivalent. The 2026-07-29 fix serialized only
+	 * the arm and the CORE_STA/START pair; the core-side MMIO between
+	 * them ran unlocked, and a sibling transition in that window
+	 * re-gated the armed core and stalled the interconnect on the next
+	 * write (silent mpi_dec_h265 first-submit wedge, 2026-07-30).
+	 */
+	if (soft_ccu) {
+		mutex_lock(&soft_ccu->run_lock);
+		if (!rk_mpp_hw_usable(soft_ccu) || !rk_mpp_hw_usable(hw) ||
+		    READ_ONCE(job->canceled)) {
+			ret = READ_ONCE(job->canceled) ? -ECANCELED : -ENODEV;
+			goto err_unlock_soft_ccu;
+		}
+		/*
+		 * BSP order: register the core with the coordinator (work
+		 * mode, WORK_EN, CORE_WORK) before any core-side setup, so
+		 * cache and task-register writes land on a core the CCU
+		 * already tracks as work-pending.
+		 */
+		ret = rk_mpp_rkvdec2_program_soft_ccu(job);
+		if (ret)
+			goto err_unlock_soft_ccu;
+	} else if (!rk_mpp_hw_usable(hw) || READ_ONCE(job->canceled)) {
+		ret = READ_ONCE(job->canceled) ? -ECANCELED : -ENODEV;
+		goto err_power_off;
+	}
+	ret = rk_mpp_rkvdec2_configure_cache(hw);
+	if (ret)
+		goto err_deregister_soft_ccu;
+	ret = rk_mpp_job_write_regs(job, RK_MPP_RKVDEC_START_BASE,
+				    &start_value, &start_seen);
+	if (ret)
+		goto err_deregister_soft_ccu;
+	if (!start_seen) {
+		ret = -EINVAL;
+		goto err_deregister_soft_ccu;
+	}
+
+	ret = rk_mpp_rkvdec2_start_soft_ccu_job(job, start_value);
+	if (ret)
+		goto err_deregister_soft_ccu;
+	if (soft_ccu)
+		mutex_unlock(&soft_ccu->run_lock);
 	rk_mpp_count_started_core(job);
 	mutex_unlock(&hw->run_lock);
 
 	return 0;
 
+err_deregister_soft_ccu:
+	/*
+	 * Deregister the armed-but-unstarted core so the coordinator
+	 * returns to BSP-provable idle state (the soft-path error unwind
+	 * deferred from the 2026-07-29 review).
+	 */
+	if (soft_ccu && rk_mpp_rkvdec2_soft_ccu_regs_ready(soft_ccu))
+		writel(hw->core_mask,
+		       soft_ccu->regs[0] + RK_MPP_RKVDEC_CCU_CORE_IDLE_BASE);
+err_unlock_soft_ccu:
+	if (soft_ccu)
+		mutex_unlock(&soft_ccu->run_lock);
 err_power_off:
 	rk_mpp_hw_power_off(hw);
 err_clear_active:
