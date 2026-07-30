@@ -233,9 +233,16 @@ Implemented
   MMIO writes from the original ``SET_REG_WRITE`` spans, start-register
   deferral, IRQ-driven completion, retained ``SET_REG_READ`` register readback,
   BSP-style interrupt-status readback override, and decoder RLC decoded-length
-  adjustment.  AV1 uses the VCD completion IRQ plus a separately synchronized
-  AFBC IRQ, clears the three BSP cache-state registers after completion, and
-  derives 16x16-tiled AFBC parameters from the translated VCD image.  AFBC
+  adjustment.  AV1 uses the VCD completion IRQ plus a dedicated, exclusive
+  AFBC hard IRQ, clears the three BSP cache-state registers after completion,
+  and derives 16x16-tiled AFBC parameters from the translated VCD image.  The
+  VSI provider's final fault check, active-generation publication, VCD START,
+  and provider-IRQ restoration are one reserved admission transaction.  The
+  AFBC mask/status/generation/START handoff is one raw-spinlocked auxiliary
+  transaction; status must deassert before START or the engine is terminally
+  isolated.  AFBC status is observational only and does not complete the job.
+  Debug counters record software observation before/after the VCD hard IRQ,
+  at the VCD thread sample, and after final powered quiesce.  AFBC
   width, height, stride, header size, and payload address use checked
   arithmetic; the complete worst-case header-plus-payload span must fit inside
   the same retained dma-buf provenance as output register 505.  AFBC-class
@@ -335,9 +342,12 @@ Implemented
   watchdog when a stale target is discarded.
 * Public IOMMU fault callback registration for bound MPP cores.  Rockchip-IOMMU
   cores use the Rockchip provider callback; AV1 uses the VSI provider callback
-  and provider refresh operation.  Registration records the provider so
-  removal clears the matching callback and waits for any in-flight VSI IRQ
-  callback before releasing the hardware object.  A fault
+  and provider refresh/admission operations.  VSI retains one pending fault
+  record and one delivery claim across IRQ and synchronous replay paths;
+  paging-domain replacement retires that record and drains callbacks before
+  the old domain can be freed.  Registration records the provider so removal
+  clears the matching callback and waits for every in-flight VSI callback
+  origin before releasing the hardware object.  A fault
   records ``iommu_fault_count`` in debugfs, logs the IOVA/status, marks the
   active job for immediate recovery through the same serialized reset path,
   and completes the job with ``-EIO``.  This deliberately avoids private
@@ -360,7 +370,11 @@ Implemented
   busy until recovery finishes.  After DMA is stopped, recovery refreshes the
   provider even if completion or abort already removed the marked activation;
   this is required to re-enable VSI's fault source, which the provider masks
-  when reporting an exception.  A failed refresh quarantines the core.  If the
+  when reporting an exception.  A failed refresh quarantines the core.  If a
+  stop cannot prove DMA quiescence, recovery restores active-job/generation
+  ownership before quarantining the engine and failing queued work; the active
+  job's DMA-visible resources remain pinned for fail-stop remove/shutdown
+  retry.  If the
   descriptor cannot be matched, any active job
   in that HARD coordinator is used to enter the existing
   force-stop/coordinator-wide abort path instead of scheduling an empty peer
@@ -566,7 +580,8 @@ Implemented
   sparse AV1 request mapping and lazy allocation, all 103 exact region-based
   AV1 translation indices and dynamic metadata growth past 80 entries,
   post-offset address-table provenance, checked AFBC layout/address derivation,
-  worst-case dma-buf capacity, and floor-before-alignment payload placement,
+  worst-case dma-buf capacity, floor-before-alignment payload placement,
+  AFBC status-generation observation and stale-status START admission,
   exact IOMMU fault source matching
   plus HARD-CCU descriptor-owner/fail-closed fallback selection, exact
   IOMMU-fault activation attribution, fault-owned completion exclusion, and
