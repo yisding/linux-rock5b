@@ -5305,17 +5305,22 @@ static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
 {
 	const struct rk_mpp_rkvdec2_link_info *info =
 		&rk_mpp_rkvdec2_vdpu381_link_info;
-	struct rk_mpp_hw hw = {
-		.core_mask = 0x00030000,
-	};
-	struct rk_mpp_hw ccu = {};
-	struct rk_mpp_job job = {
-		.hw = &hw,
-		.rkvdec_ccu = &ccu,
-	};
+	struct rk_mpp_hw *hw;
+	struct rk_mpp_hw *ccu;
+	struct rk_mpp_job *job;
 	u32 *ccu_regs;
 	u32 *core_regs;
 	u32 *link;
+
+	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
+	ccu = kunit_kzalloc(test, sizeof(*ccu), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ccu);
+	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+	hw->core_mask = 0x00030000;
+	job->hw = hw;
+	job->rkvdec_ccu = ccu;
 
 	link = kunit_kcalloc(test, 0x60 / sizeof(*link), sizeof(*link),
 			     GFP_KERNEL);
@@ -5326,16 +5331,16 @@ static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
 				 sizeof(*ccu_regs), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, ccu_regs);
 
-	hw.regs[RK_MPP_RKVDEC_LINK_REGION] = (void __iomem *)link;
-	hw.reg_size[RK_MPP_RKVDEC_LINK_REGION] = 0x60;
-	ccu.regs[0] = (void __iomem *)ccu_regs;
-	ccu.reg_size[0] = RK_MPP_RKVDEC_CCU_CORE_ERR_BASE + sizeof(*ccu_regs);
-	mutex_init(&ccu.run_lock);
-	hw.terminally_stopped = true;
+	hw->regs[RK_MPP_RKVDEC_LINK_REGION] = (void __iomem *)link;
+	hw->reg_size[RK_MPP_RKVDEC_LINK_REGION] = 0x60;
+	ccu->regs[0] = (void __iomem *)ccu_regs;
+	ccu->reg_size[0] = RK_MPP_RKVDEC_CCU_CORE_ERR_BASE + sizeof(*ccu_regs);
+	mutex_init(&ccu->run_lock);
+	hw->terminally_stopped = true;
 
 	/* The submit path holds ccu->run_lock across arm -> start. */
-	mutex_lock(&ccu.run_lock);
-	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_program_soft_ccu(&job), 0);
+	mutex_lock(&ccu->run_lock);
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_program_soft_ccu(job), 0);
 	KUNIT_EXPECT_EQ(test,
 			link[info->irq_base / sizeof(*link)] &
 			(RK_MPP_RKVDEC_LINK_CORE_WORK_MODE |
@@ -5350,7 +5355,7 @@ static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
 			(u32)RK_MPP_RKVDEC_CCU_WORK_MODE);
 	KUNIT_EXPECT_EQ(test,
 			ccu_regs[RK_MPP_RKVDEC_CCU_CORE_WORK_BASE / sizeof(*ccu_regs)],
-			hw.core_mask);
+			hw->core_mask);
 	/* Arming must not mark the core started: CORE_STA stays clear. */
 	KUNIT_EXPECT_EQ(test,
 			ccu_regs[RK_MPP_RKVDEC_CCU_CORE_STA_BASE / sizeof(*ccu_regs)],
@@ -5359,33 +5364,33 @@ static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
 	core_regs = kunit_kcalloc(test, 0x60 / sizeof(*core_regs),
 				  sizeof(*core_regs), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, core_regs);
-	hw.regs[0] = (void __iomem *)core_regs;
-	hw.reg_size[0] = 0x60;
-	hw.online = true;
-	ccu.online = true;
-	spin_lock_init(&hw.lock);
+	hw->regs[0] = (void __iomem *)core_regs;
+	hw->reg_size[0] = 0x60;
+	hw->online = true;
+	ccu->online = true;
+	spin_lock_init(&hw->lock);
 	KUNIT_EXPECT_EQ(test,
-			rk_mpp_rkvdec2_start_soft_ccu_job(&job, 0x100), 0);
+			rk_mpp_rkvdec2_start_soft_ccu_job(job, 0x100), 0);
 	KUNIT_EXPECT_EQ(test,
 			ccu_regs[RK_MPP_RKVDEC_CCU_CORE_STA_BASE / sizeof(*ccu_regs)],
-			hw.core_mask);
+			hw->core_mask);
 	KUNIT_EXPECT_EQ(test,
 			core_regs[RK_MPP_RKVDEC_START_BASE / sizeof(*core_regs)],
 			0x100U | RK_MPP_RKVDEC_START_EN);
-	mutex_unlock(&ccu.run_lock);
+	mutex_unlock(&ccu->run_lock);
 
-	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_reset_soft_ccu_job(&job), 0);
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_reset_soft_ccu_job(job), 0);
 	KUNIT_EXPECT_EQ(test,
 			ccu_regs[RK_MPP_RKVDEC_CCU_CORE_ERR_BASE / sizeof(*ccu_regs)],
-			hw.core_mask & RK_MPP_RKVDEC_CCU_CORE_RW_MASK);
+			hw->core_mask & RK_MPP_RKVDEC_CCU_CORE_RW_MASK);
 	KUNIT_EXPECT_EQ(test,
 			ccu_regs[RK_MPP_RKVDEC_CCU_CORE_IDLE_BASE / sizeof(*ccu_regs)],
-			hw.core_mask & RK_MPP_RKVDEC_CCU_CORE_RW_MASK);
+			hw->core_mask & RK_MPP_RKVDEC_CCU_CORE_RW_MASK);
 
-	hw.core_mask = 0;
-	mutex_lock(&ccu.run_lock);
-	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_program_soft_ccu(&job), -EINVAL);
-	mutex_unlock(&ccu.run_lock);
+	hw->core_mask = 0;
+	mutex_lock(&ccu->run_lock);
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_program_soft_ccu(job), -EINVAL);
+	mutex_unlock(&ccu->run_lock);
 }
 
 static void rk_mpp_rkvdec2_hard_ccu_dma_domain_kunit(struct kunit *test)
