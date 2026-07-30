@@ -446,9 +446,21 @@ struct rk_mpp_service {
 	struct mutex hw_lock;
 	struct mutex dma_group_lock;
 	struct mutex sched_lock; /* protects queued_jobs */
+	/*
+	 * Lock order: core run_lock -> rkvenc_dchs_lifecycle_lock ->
+	 * rkvenc_dchs_lock. Serializes a consumer's DCHS patch-through-START
+	 * window against producer reset, completion, and power-off.
+	 */
+	struct mutex rkvenc_dchs_lifecycle_lock;
 	spinlock_t fault_lock; /* protects fault_hws in fault handler context */
 	spinlock_t rkvenc_dchs_lock;
-	spinlock_t debug_lock; /* protects the recent-event ring */
+	/*
+	 * Protects the recent-event ring. Raw because hard IRQ handlers
+	 * append events (e.g. the AV1 AFBC ack path): every section under
+	 * this lock must remain a bounded slot copy — no allocation, no
+	 * callbacks, no unbounded work may ever move under it.
+	 */
+	raw_spinlock_t debug_lock;
 	struct list_head hw_list;
 	struct list_head dma_groups;
 	struct list_head fault_hws;
@@ -750,9 +762,10 @@ static void rk_mpp_service_state_init(struct rk_mpp_service *srv)
 	mutex_init(&srv->hw_lock);
 	mutex_init(&srv->dma_group_lock);
 	mutex_init(&srv->sched_lock);
+	mutex_init(&srv->rkvenc_dchs_lifecycle_lock);
 	spin_lock_init(&srv->fault_lock);
 	spin_lock_init(&srv->rkvenc_dchs_lock);
-	spin_lock_init(&srv->debug_lock);
+	raw_spin_lock_init(&srv->debug_lock);
 	if (srv == &rk_mpp_srv) {
 		memset(rk_mpp_debug_events, 0, sizeof(rk_mpp_debug_events));
 		srv->debug_events = rk_mpp_debug_events;
@@ -826,14 +839,14 @@ static void rk_mpp_debug_ring_push(struct rk_mpp_service *srv,
 	if (WARN_ON_ONCE(!srv->debug_events))
 		return;
 
-	spin_lock_irqsave(&srv->debug_lock, flags);
+	raw_spin_lock_irqsave(&srv->debug_lock, flags);
 	event->seq = ++srv->debug_event_next_seq;
 	srv->debug_events[srv->debug_event_head] = *event;
 	srv->debug_event_head = (srv->debug_event_head + 1) %
 				RK_MPP_DEBUG_EVENT_COUNT;
 	if (srv->debug_event_count < RK_MPP_DEBUG_EVENT_COUNT)
 		srv->debug_event_count++;
-	spin_unlock_irqrestore(&srv->debug_lock, flags);
+	raw_spin_unlock_irqrestore(&srv->debug_lock, flags);
 }
 
 static void
@@ -7356,6 +7369,28 @@ static void rk_mpp_rkvenc2_watchdog_threshold_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, threshold, 0xcdffffffU);
 }
 
+static int rk_mpp_rkvenc2_dchs_patch_kunit_locked(struct rk_mpp_job *job)
+{
+	struct rk_mpp_service *srv = job->session->srv;
+	int ret;
+
+	mutex_lock(&srv->rkvenc_dchs_lifecycle_lock);
+	ret = rk_mpp_rkvenc2_dchs_patch(job);
+	mutex_unlock(&srv->rkvenc_dchs_lifecycle_lock);
+
+	return ret;
+}
+
+static void
+rk_mpp_rkvenc2_dchs_release_kunit_locked(struct rk_mpp_job *job)
+{
+	struct rk_mpp_service *srv = job->session->srv;
+
+	mutex_lock(&srv->rkvenc_dchs_lifecycle_lock);
+	rk_mpp_rkvenc2_dchs_release(job);
+	mutex_unlock(&srv->rkvenc_dchs_lifecycle_lock);
+}
+
 static void rk_mpp_rkvenc2_dchs_remap_kunit(struct kunit *test)
 {
 	struct rk_mpp_service *srv;
@@ -7397,6 +7432,7 @@ static void rk_mpp_rkvenc2_dchs_remap_kunit(struct kunit *test)
 	unrelated = kunit_kzalloc(test, sizeof(*unrelated), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, unrelated);
 
+	mutex_init(&srv->rkvenc_dchs_lifecycle_lock);
 	spin_lock_init(&srv->rkvenc_dchs_lock);
 	session0->srv = srv;
 	session0->client_type = RK_MPP_DEVICE_RKVENC;
@@ -7441,7 +7477,8 @@ static void rk_mpp_rkvenc2_dchs_remap_kunit(struct kunit *test)
 
 	producer_low = 2 << RK_MPP_RKVENC_DCHS_TXID_SHIFT;
 	producer->reg_image.regs[RK_MPP_RKVENC_DCHS_WORD] = producer_low;
-	KUNIT_ASSERT_EQ(test, rk_mpp_rkvenc2_dchs_patch(producer), 0);
+	KUNIT_ASSERT_EQ(test,
+			rk_mpp_rkvenc2_dchs_patch_kunit_locked(producer), 0);
 	producer_patched = producer->reg_image.regs[RK_MPP_RKVENC_DCHS_WORD];
 	KUNIT_EXPECT_TRUE(test, producer->rkvenc_dchs_active);
 	KUNIT_EXPECT_PTR_EQ(test, srv->rkvenc_dchs[0].job, producer);
@@ -7457,7 +7494,8 @@ static void rk_mpp_rkvenc2_dchs_remap_kunit(struct kunit *test)
 	unrelated_low = (2 << RK_MPP_RKVENC_DCHS_RXID_SHIFT) |
 			RK_MPP_RKVENC_DCHS_RXE;
 	unrelated->reg_image.regs[RK_MPP_RKVENC_DCHS_WORD] = unrelated_low;
-	KUNIT_ASSERT_EQ(test, rk_mpp_rkvenc2_dchs_patch(unrelated), 0);
+	KUNIT_ASSERT_EQ(test,
+			rk_mpp_rkvenc2_dchs_patch_kunit_locked(unrelated), 0);
 	unrelated_patched = unrelated->reg_image.regs[RK_MPP_RKVENC_DCHS_WORD];
 	KUNIT_EXPECT_TRUE(test, unrelated->rkvenc_dchs_active);
 	KUNIT_EXPECT_PTR_EQ(test, srv->rkvenc_dchs[2].job, unrelated);
@@ -7467,7 +7505,7 @@ static void rk_mpp_rkvenc2_dchs_remap_kunit(struct kunit *test)
 			1U << RK_MPP_RKVENC_DCHS_TXID_SHIFT);
 	KUNIT_EXPECT_EQ(test, unrelated_patched & RK_MPP_RKVENC_DCHS_RXID_MASK,
 			0U);
-	rk_mpp_rkvenc2_dchs_release(unrelated);
+	rk_mpp_rkvenc2_dchs_release_kunit_locked(unrelated);
 	KUNIT_EXPECT_FALSE(test, unrelated->rkvenc_dchs_active);
 	KUNIT_EXPECT_PTR_EQ(test, srv->rkvenc_dchs[2].job, NULL);
 
@@ -7475,7 +7513,8 @@ static void rk_mpp_rkvenc2_dchs_remap_kunit(struct kunit *test)
 		       (2 << RK_MPP_RKVENC_DCHS_RXID_SHIFT) |
 		       RK_MPP_RKVENC_DCHS_RXE;
 	consumer->reg_image.regs[RK_MPP_RKVENC_DCHS_WORD] = consumer_low;
-	KUNIT_ASSERT_EQ(test, rk_mpp_rkvenc2_dchs_patch(consumer), 0);
+	KUNIT_ASSERT_EQ(test,
+			rk_mpp_rkvenc2_dchs_patch_kunit_locked(consumer), 0);
 	consumer_patched = consumer->reg_image.regs[RK_MPP_RKVENC_DCHS_WORD];
 	KUNIT_EXPECT_TRUE(test, consumer->rkvenc_dchs_active);
 	KUNIT_EXPECT_PTR_EQ(test, srv->rkvenc_dchs[1].job, consumer);
@@ -7486,11 +7525,11 @@ static void rk_mpp_rkvenc2_dchs_remap_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, consumer_patched & RK_MPP_RKVENC_DCHS_RXID_MASK,
 			0U << RK_MPP_RKVENC_DCHS_RXID_SHIFT);
 
-	rk_mpp_rkvenc2_dchs_release(consumer);
+	rk_mpp_rkvenc2_dchs_release_kunit_locked(consumer);
 	KUNIT_EXPECT_FALSE(test, consumer->rkvenc_dchs_active);
 	KUNIT_EXPECT_PTR_EQ(test, srv->rkvenc_dchs[1].job, NULL);
 
-	rk_mpp_rkvenc2_dchs_release(producer);
+	rk_mpp_rkvenc2_dchs_release_kunit_locked(producer);
 	KUNIT_EXPECT_FALSE(test, producer->rkvenc_dchs_active);
 	KUNIT_EXPECT_PTR_EQ(test, srv->rkvenc_dchs[0].job, NULL);
 }
@@ -7512,6 +7551,7 @@ static void rk_mpp_rkvenc2_dchs_independent_cores_kunit(struct kunit *test)
 	ccu_node = kunit_kzalloc(test, sizeof(*ccu_node), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, ccu_node);
 
+	mutex_init(&srv->rkvenc_dchs_lifecycle_lock);
 	spin_lock_init(&srv->rkvenc_dchs_lock);
 	session->srv = srv;
 	session->client_type = RK_MPP_DEVICE_RKVENC;
@@ -7539,7 +7579,9 @@ static void rk_mpp_rkvenc2_dchs_independent_cores_kunit(struct kunit *test)
 
 		jobs[i]->reg_image.regs[RK_MPP_RKVENC_DCHS_WORD] =
 			i << RK_MPP_RKVENC_DCHS_TXID_SHIFT;
-		KUNIT_ASSERT_EQ(test, rk_mpp_rkvenc2_dchs_patch(jobs[i]), 0);
+		KUNIT_ASSERT_EQ(test,
+				rk_mpp_rkvenc2_dchs_patch_kunit_locked(jobs[i]),
+				0);
 		patched = jobs[i]->reg_image.regs[RK_MPP_RKVENC_DCHS_WORD];
 
 		KUNIT_EXPECT_TRUE(test, jobs[i]->rkvenc_dchs_active);
@@ -7551,18 +7593,22 @@ static void rk_mpp_rkvenc2_dchs_independent_cores_kunit(struct kunit *test)
 				patched & RK_MPP_RKVENC_DCHS_RXE, 0U);
 	}
 
-	KUNIT_EXPECT_EQ(test, rk_mpp_rkvenc2_dchs_patch(jobs[0]), -EBUSY);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_rkvenc2_dchs_patch_kunit_locked(jobs[0]),
+			-EBUSY);
 
-	rk_mpp_rkvenc2_dchs_release(jobs[0]);
+	rk_mpp_rkvenc2_dchs_release_kunit_locked(jobs[0]);
 	KUNIT_EXPECT_FALSE(test, jobs[0]->rkvenc_dchs_active);
 	KUNIT_EXPECT_PTR_EQ(test, srv->rkvenc_dchs[0].job, NULL);
 	srv->rkvenc_dchs[1].val |= RK_MPP_RKVENC_DCHS_RXE;
-	KUNIT_EXPECT_EQ(test, rk_mpp_rkvenc2_dchs_patch(jobs[0]), -ENOSPC);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_rkvenc2_dchs_patch_kunit_locked(jobs[0]),
+			-ENOSPC);
 	KUNIT_EXPECT_FALSE(test, jobs[0]->rkvenc_dchs_active);
 	KUNIT_EXPECT_PTR_EQ(test, srv->rkvenc_dchs[0].job, NULL);
 
 	for (i = 1; i < ARRAY_SIZE(jobs); i++) {
-		rk_mpp_rkvenc2_dchs_release(jobs[i]);
+		rk_mpp_rkvenc2_dchs_release_kunit_locked(jobs[i]);
 		KUNIT_EXPECT_FALSE(test, jobs[i]->rkvenc_dchs_active);
 		KUNIT_EXPECT_PTR_EQ(test, srv->rkvenc_dchs[i].job, NULL);
 	}
@@ -8811,7 +8857,7 @@ static void rk_mpp_debug_event_ring_kunit(struct kunit *test)
 	srv.debug_events = kunit_kcalloc(test, RK_MPP_DEBUG_EVENT_COUNT,
 					 sizeof(*srv.debug_events), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, srv.debug_events);
-	spin_lock_init(&srv.debug_lock);
+	raw_spin_lock_init(&srv.debug_lock);
 	for (i = 0; i < RK_MPP_DEBUG_EVENT_COUNT + 1; i++) {
 		event.job_id = i + 1;
 		rk_mpp_debug_ring_push(&srv, &event);
@@ -9763,6 +9809,24 @@ static int rk_mpp_rkvenc_dchs_find_id(u32 valid)
 	return -ENOSPC;
 }
 
+static bool rk_mpp_rkvenc2_dchs_lifecycle_lock(struct rk_mpp_job *job)
+{
+	if (job->client_type != RK_MPP_DEVICE_RKVENC || !job->hw ||
+	    !job->hw->ccu_node)
+		return false;
+
+	mutex_lock(&job->session->srv->rkvenc_dchs_lifecycle_lock);
+
+	return true;
+}
+
+static void
+rk_mpp_rkvenc2_dchs_lifecycle_unlock(struct rk_mpp_job *job, bool locked)
+{
+	if (locked)
+		mutex_unlock(&job->session->srv->rkvenc_dchs_lifecycle_lock);
+}
+
 static int rk_mpp_rkvenc2_dchs_patch(struct rk_mpp_job *job)
 {
 	struct rk_mpp_reg_image *image = &job->reg_image;
@@ -9791,6 +9855,8 @@ static int rk_mpp_rkvenc2_dchs_patch(struct rk_mpp_job *job)
 
 	if (!hw->ccu_node)
 		return 0;
+
+	lockdep_assert_held(&srv->rkvenc_dchs_lifecycle_lock);
 
 	core_id = hw->core_id;
 	if (core_id >= RK_MPP_RKVENC_MAX_DCHS_CORES) {
@@ -9884,6 +9950,9 @@ static void rk_mpp_rkvenc2_dchs_release(struct rk_mpp_job *job)
 	struct rk_mpp_service *srv = job->session->srv;
 	unsigned long flags;
 	u32 core_id = job->rkvenc_dchs_core_id;
+
+	if (job->rkvenc_dchs_active)
+		lockdep_assert_held(&srv->rkvenc_dchs_lifecycle_lock);
 
 	spin_lock_irqsave(&srv->rkvenc_dchs_lock, flags);
 	if (job->rkvenc_dchs_active) {
@@ -11541,6 +11610,7 @@ static void rk_mpp_hw_abort_job(struct rk_mpp_job *job)
 	struct rk_mpp_hw *hw = rk_mpp_job_get_hw(job);
 	struct rk_mpp_hw *ccu;
 	bool active_owned;
+	bool dchs_lifecycle_locked = false;
 	bool hard_ccu_abort = false;
 	bool irq_disabled;
 	int ccu_stop_ret = 0;
@@ -11583,7 +11653,8 @@ static void rk_mpp_hw_abort_job(struct rk_mpp_job *job)
 			goto out_unlock_core;
 	}
 	if (active_owned && rk_mpp_hw_clear_active_job(hw, job, NULL)) {
-		rk_mpp_rkvenc2_dchs_release(job);
+		dchs_lifecycle_locked =
+			rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
 		reset_ret = rk_mpp_hw_stop_active(hw);
 		if (reset_ret) {
 			rk_mpp_job_get(job);
@@ -11591,6 +11662,7 @@ static void rk_mpp_hw_abort_job(struct rk_mpp_job *job)
 				rk_mpp_job_put(job);
 			goto out_unlock_core;
 		}
+		rk_mpp_rkvenc2_dchs_release(job);
 		rk_mpp_hw_power_off(hw);
 		/*
 		 * The active owner is the only path allowed to tear down the
@@ -11609,6 +11681,7 @@ static void rk_mpp_hw_abort_job(struct rk_mpp_job *job)
 			schedule_work(&hw->srv->sched_work);
 	}
 out_unlock_core:
+	rk_mpp_rkvenc2_dchs_lifecycle_unlock(job, dchs_lifecycle_locked);
 	rk_mpp_hw_enable_irq(hw, irq_disabled);
 	mutex_unlock(&hw->run_lock);
 	if (hard_ccu_abort && !ccu_stop_ret) {
@@ -11956,6 +12029,7 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 	struct rk_mpp_hw *ccu = NULL;
 	bool irq_disabled;
 	bool hard_ccu_recovery;
+	bool dchs_lifecycle_locked = false;
 	bool ccu_done = false;
 	bool ccu_error = false;
 	int ccu_stop_ret = 0;
@@ -12008,6 +12082,7 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 	}
 	if (iommu_fault)
 		rk_mpp_hw_cancel_timeout(hw);
+	dchs_lifecycle_locked = rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
 	hard_ccu_recovery = ccu && job->rkvdec_ccu_started &&
 			    job->rkvdec_ccu == ccu;
 	if (hard_ccu_recovery) {
@@ -12071,6 +12146,8 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 		reset_ret = rk_mpp_hw_stop_active(hw);
 	if (reset_ret && !hard_ccu_recovery) {
 		if (WARN_ON_ONCE(!rk_mpp_hw_restore_active_job(hw, job))) {
+			rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
+							     dchs_lifecycle_locked);
 			rk_mpp_hw_enable_irq(hw, irq_disabled);
 			mutex_unlock(&hw->run_lock);
 			if (ccu)
@@ -12078,6 +12155,8 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 			rk_mpp_hw_put(ccu);
 			return;
 		}
+		rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
+						     dchs_lifecycle_locked);
 		rk_mpp_hw_enable_irq(hw, irq_disabled);
 		mutex_unlock(&hw->run_lock);
 		if (ccu)
@@ -12097,6 +12176,7 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 	}
 	rk_mpp_hw_power_off(hw);
 	rk_mpp_job_complete(job, result);
+	rk_mpp_rkvenc2_dchs_lifecycle_unlock(job, dchs_lifecycle_locked);
 	rk_mpp_hw_enable_irq(hw, irq_disabled);
 	mutex_unlock(&hw->run_lock);
 	rk_mpp_job_put(job);
@@ -12147,6 +12227,7 @@ static void rk_mpp_hw_iommu_fault_work(struct work_struct *work)
 static void rk_mpp_hw_abort_active(struct rk_mpp_hw *hw, int result)
 {
 	struct rk_mpp_job *job;
+	bool dchs_lifecycle_locked;
 	bool irq_disabled;
 	int stop_ret;
 
@@ -12162,15 +12243,19 @@ static void rk_mpp_hw_abort_active(struct rk_mpp_hw *hw, int result)
 		return;
 	}
 
+	dchs_lifecycle_locked = rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
 	stop_ret = rk_mpp_hw_stop_active(hw);
 	if (stop_ret) {
 		WARN_ON_ONCE(!rk_mpp_hw_restore_active_job(hw, job));
+		rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
+						     dchs_lifecycle_locked);
 		rk_mpp_hw_enable_irq(hw, irq_disabled);
 		mutex_unlock(&hw->run_lock);
 		return;
 	}
 	rk_mpp_hw_power_off(hw);
 	rk_mpp_job_complete(job, result);
+	rk_mpp_rkvenc2_dchs_lifecycle_unlock(job, dchs_lifecycle_locked);
 	rk_mpp_hw_enable_irq(hw, irq_disabled);
 	mutex_unlock(&hw->run_lock);
 	rk_mpp_job_put(job);
@@ -13107,6 +13192,7 @@ static int rk_mpp_rkvenc2_submit(struct rk_mpp_job *job)
 {
 	struct rk_mpp_hw *hw = job->hw;
 	u32 start_value = 0;
+	bool dchs_lifecycle_locked = false;
 	bool start_seen;
 	bool irq_disabled;
 	int ret;
@@ -13143,6 +13229,12 @@ static int rk_mpp_rkvenc2_submit(struct rk_mpp_job *job)
 				      sizeof(u32)))
 		writel_relaxed(0x2, hw->regs[0] + RK_MPP_RKVENC_COUNTER_CLR_BASE);
 
+	/*
+	 * A producer completion runs on another core's IRQ thread. Keep its
+	 * DCHS release, reset, and power-off outside the interval in which this
+	 * consumer copies the producer's TX id and makes RXE live in hardware.
+	 */
+	dchs_lifecycle_locked = rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
 	ret = rk_mpp_rkvenc2_dchs_patch(job);
 	if (ret)
 		goto err_power_off;
@@ -13167,6 +13259,7 @@ static int rk_mpp_rkvenc2_submit(struct rk_mpp_job *job)
 	wmb();
 	writel(start_value, hw->regs[0] + RK_MPP_RKVENC_START_BASE);
 	rk_mpp_count_started_core(job);
+	rk_mpp_rkvenc2_dchs_lifecycle_unlock(job, dchs_lifecycle_locked);
 	mutex_unlock(&hw->run_lock);
 
 	return 0;
@@ -13187,6 +13280,7 @@ err_power_off:
 	rk_mpp_hw_power_off(hw);
 	rk_mpp_hw_clear_active_job(hw, job, NULL);
 	rk_mpp_hw_enable_irq(hw, irq_disabled);
+	rk_mpp_rkvenc2_dchs_lifecycle_unlock(job, dchs_lifecycle_locked);
 	mutex_unlock(&hw->run_lock);
 	return ret;
 err_clear_active:
@@ -13376,6 +13470,7 @@ static irqreturn_t rk_mpp_rkvenc2_irq(struct rk_mpp_hw *hw)
 static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 {
 	struct rk_mpp_job *job;
+	bool dchs_lifecycle_locked;
 	bool fault_pending = false;
 	u32 irq_status = 0;
 	int reset_ret;
@@ -13404,10 +13499,13 @@ static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 		ret = rk_mpp_job_store_reg_word(job, RK_MPP_RKVENC_INT_STA_BASE,
 						irq_status);
 
+	dchs_lifecycle_locked = rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
 	if (rk_mpp_rkvenc2_irq_needs_reset(irq_status)) {
 		reset_ret = rk_mpp_hw_stop_active(hw);
 		if (reset_ret) {
 			WARN_ON_ONCE(!rk_mpp_hw_restore_active_job(hw, job));
+			rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
+							     dchs_lifecycle_locked);
 			mutex_unlock(&hw->run_lock);
 			return IRQ_HANDLED;
 		}
@@ -13416,6 +13514,7 @@ static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 	}
 	rk_mpp_hw_power_off(hw);
 	rk_mpp_job_complete(job, ret);
+	rk_mpp_rkvenc2_dchs_lifecycle_unlock(job, dchs_lifecycle_locked);
 	mutex_unlock(&hw->run_lock);
 	rk_mpp_job_put(job);
 
@@ -15157,14 +15256,14 @@ static int rk_mpp_debug_events_show(struct seq_file *s, void *unused)
 	if (!events)
 		return -ENOMEM;
 
-	spin_lock_irqsave(&srv->debug_lock, flags);
+	raw_spin_lock_irqsave(&srv->debug_lock, flags);
 	count = srv->debug_event_count;
 	first = (srv->debug_event_head + RK_MPP_DEBUG_EVENT_COUNT - count) %
 		RK_MPP_DEBUG_EVENT_COUNT;
 	for (i = 0; i < count; i++)
 		events[i] = srv->debug_events[(first + i) %
 					      RK_MPP_DEBUG_EVENT_COUNT];
-	spin_unlock_irqrestore(&srv->debug_lock, flags);
+	raw_spin_unlock_irqrestore(&srv->debug_lock, flags);
 
 	seq_puts(s, "# seq timestamp_ns event device hw core session job client result irq data\n");
 	for (i = 0; i < count; i++) {
@@ -15204,10 +15303,10 @@ static ssize_t rk_mpp_debug_events_clear(struct file *file,
 	if (!clear)
 		return -EINVAL;
 
-	spin_lock_irqsave(&srv->debug_lock, flags);
+	raw_spin_lock_irqsave(&srv->debug_lock, flags);
 	srv->debug_event_head = 0;
 	srv->debug_event_count = 0;
-	spin_unlock_irqrestore(&srv->debug_lock, flags);
+	raw_spin_unlock_irqrestore(&srv->debug_lock, flags);
 
 	return len;
 }
@@ -15238,10 +15337,10 @@ static int rk_mpp_debug_state_show(struct seq_file *s, void *unused)
 	u32 recent_events;
 	u32 i;
 
-	spin_lock_irqsave(&srv->debug_lock, flags);
+	raw_spin_lock_irqsave(&srv->debug_lock, flags);
 	recent_events = srv->debug_event_count;
 	next_event_seq = srv->debug_event_next_seq;
-	spin_unlock_irqrestore(&srv->debug_lock, flags);
+	raw_spin_unlock_irqrestore(&srv->debug_lock, flags);
 
 	seq_printf(s, "version=%s hw_support=%#x bound_hw=%u trace_mask=%#x\n",
 		   RK_MPP_REWRITE_VERSION, READ_ONCE(srv->hw_support),
