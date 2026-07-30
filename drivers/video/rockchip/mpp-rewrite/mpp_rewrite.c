@@ -1590,6 +1590,31 @@ static bool rk_mpp_hw_usable(const struct rk_mpp_hw *hw)
 	return READ_ONCE(hw->online) && !READ_ONCE(hw->recovery_failed);
 }
 
+/*
+ * Debug-build contract guard for the wedge class where a store to a
+ * clock-gated register file stalls the AXI/AHB interconnect and the CPU hangs
+ * mid-write — the 2026-07-29 soft-CCU arm/start split and the 2026-07-30
+ * group-power/autosuspend races both ended this way, silently, with no panic
+ * or trace. power_count is nonzero exactly while a block's clocks are enabled
+ * (rk_mpp_hw_power_on/off bracket it), so MMIO with power_count <= 0 is the
+ * precondition of that stall. Assert it loudly at the point of the write
+ * instead of hanging one store later. One atomic read; WARN_ONCE keeps a
+ * regressed hot path from flooding. Compiled only where the rewrite KUnit or
+ * lockdep debug config is on, so production builds carry no overhead.
+ */
+static inline void rk_mpp_hw_assert_powered(const struct rk_mpp_hw *hw)
+{
+#if IS_ENABLED(CONFIG_ROCKCHIP_MPP_REWRITE_KUNIT_TEST) || \
+	IS_ENABLED(CONFIG_PROVE_LOCKING)
+	if (!hw)
+		return;
+	WARN_ONCE(atomic_read(&hw->power_count) <= 0,
+		  "rk-mpp: MMIO to %s with clocks gated (power_count=%d)\n",
+		  hw->dev ? dev_name(hw->dev) : "<unbound>",
+		  atomic_read(&hw->power_count));
+#endif
+}
+
 static bool rk_mpp_hw_ccu_online_locked(struct rk_mpp_service *srv,
 					struct rk_mpp_hw *core)
 {
@@ -3170,6 +3195,7 @@ static int rk_mpp_rkvdec2_configure_cache(struct rk_mpp_hw *hw)
 			return -ENODEV;
 	}
 
+	rk_mpp_hw_assert_powered(hw);
 	for (i = 0; i < ARRAY_SIZE(cache_size_bases); i++)
 		writel_relaxed(RK_MPP_RKVDEC_CACHE_CFG,
 			       hw->regs[0] + cache_size_bases[i]);
@@ -5337,6 +5363,11 @@ static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
 	ccu->reg_size[0] = RK_MPP_RKVDEC_CCU_CORE_ERR_BASE + sizeof(*ccu_regs);
 	mutex_init(&ccu->run_lock);
 	hw->terminally_stopped = true;
+	/* Simulate a powered core+coordinator so the MMIO power assertions
+	 * (rk_mpp_hw_assert_powered) are satisfied on the arm/start/reset path.
+	 */
+	atomic_set(&hw->power_count, 1);
+	atomic_set(&ccu->power_count, 1);
 
 	/* The submit path holds ccu->run_lock across arm -> start. */
 	mutex_lock(&ccu->run_lock);
@@ -6359,6 +6390,8 @@ static void rk_mpp_rkvdec2_cache_config_kunit(struct kunit *test)
 			0U);
 
 	hw.reg_size[0] = RK_MPP_RKVDEC2_MIN_REG_SIZE;
+	/* The success path issues MMIO; simulate powered clocks for the assert. */
+	atomic_set(&hw.power_count, 1);
 	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_configure_cache(&hw), 0);
 	KUNIT_EXPECT_EQ(test,
 			regs[RK_MPP_RKVDEC_CACHE0_SIZE_BASE / sizeof(*regs)],
@@ -10974,6 +11007,9 @@ static int rk_mpp_rkvdec2_program_soft_ccu(struct rk_mpp_job *job)
 		return -EINVAL;
 
 	lockdep_assert_held(&ccu->run_lock);
+	/* Arming writes the core's link regs and the coordinator regs. */
+	rk_mpp_hw_assert_powered(hw);
+	rk_mpp_hw_assert_powered(ccu);
 	link = hw->regs[RK_MPP_RKVDEC_LINK_REGION];
 	writel_relaxed(RK_MPP_RKVDEC_LINK_CORE_WORK_MODE |
 		       RK_MPP_RKVDEC_LINK_CCU_WORK_MODE,
@@ -11011,6 +11047,7 @@ static int rk_mpp_rkvdec2_start_soft_ccu_job(struct rk_mpp_job *job,
 	struct rk_mpp_hw *ccu = job->rkvdec_ccu;
 
 	if (!ccu) {
+		rk_mpp_hw_assert_powered(hw);
 		rk_mpp_hw_schedule_timeout(hw);
 		wmb();
 		writel(start_value | RK_MPP_RKVDEC_START_EN,
@@ -11025,6 +11062,9 @@ static int rk_mpp_rkvdec2_start_soft_ccu_job(struct rk_mpp_job *job,
 	if (!rk_mpp_hw_usable(ccu) || !rk_mpp_hw_usable(hw) ||
 	    READ_ONCE(job->canceled))
 		return READ_ONCE(job->canceled) ? -ECANCELED : -ENODEV;
+	/* CORE_STA hits the coordinator; START hits the core. */
+	rk_mpp_hw_assert_powered(ccu);
+	rk_mpp_hw_assert_powered(hw);
 	writel_relaxed(hw->core_mask,
 		       ccu->regs[0] + RK_MPP_RKVDEC_CCU_CORE_STA_BASE);
 	rk_mpp_hw_schedule_timeout(hw);
@@ -11440,6 +11480,8 @@ static int rk_mpp_rkvdec2_reset_soft_ccu_job(struct rk_mpp_job *job)
 
 	core_mask = hw->core_mask & RK_MPP_RKVDEC_CCU_CORE_RW_MASK;
 	mutex_lock(&ccu->run_lock);
+	/* CORE_IDLE/CORE_ERR deregistration writes the coordinator regs. */
+	rk_mpp_hw_assert_powered(ccu);
 	writel(hw->core_mask,
 	       ccu->regs[0] + RK_MPP_RKVDEC_CCU_CORE_IDLE_BASE);
 	ret = rk_mpp_hw_stop_active(hw);
@@ -13234,6 +13276,8 @@ static int rk_mpp_job_write_regs(struct rk_mpp_job *job, u32 start_offset,
 
 	*start_seen = false;
 
+	/* Task-register writes land in the core's own register file. */
+	rk_mpp_hw_assert_powered(hw);
 	for (i = 0; i < job->req_cnt; i++) {
 		const struct mpp_request *req = &job->reqs[i].req;
 		struct rk_mpp_reg_region *region;
