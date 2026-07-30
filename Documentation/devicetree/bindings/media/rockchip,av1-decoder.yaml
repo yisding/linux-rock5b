@@ -61,14 +61,26 @@ properties:
     description: Normal operating rates for the AXI and AHB clocks.
 
   resets:
-    items:
-      - description: AXI reset
-      - description: AHB reset
+    oneOf:
+      - items:
+          - description: AXI reset
+          - description: AHB reset
+      - items:
+          - description: AXI reset
+          - description: AHB reset
+          - description: AXI bus-interface reset
+          - description: AHB bus-interface reset
 
   reset-names:
-    items:
-      - const: video_a
-      - const: video_h
+    oneOf:
+      - items:
+          - const: video_a
+          - const: video_h
+      - items:
+          - const: video_a
+          - const: video_h
+          - const: video_a_biu
+          - const: video_h_biu
 
   iommus:
     maxItems: 1
