@@ -101,8 +101,9 @@
 	interrupt-names = "irq_av1d", "irq_cache", "irq_afbc";
 	clock-names = "aclk_vcodec", "hclk_vcodec";
 	rockchip,normal-rates = <400000000>, <400000000>;
-	resets = <&cru SRST_A_AV1>, <&cru SRST_P_AV1>;
-	reset-names = "video_a", "video_h";
+	resets = <&cru SRST_A_AV1>, <&cru SRST_P_AV1>,
+		 <&cru SRST_A_AV1_BIU>, <&cru SRST_P_AV1_BIU>;
+	reset-names = "video_a", "video_h", "video_a_biu", "video_h_biu";
 	rockchip,srv = <&mpp_srv>;
 	rockchip,taskqueue-node = <11>;
 	rockchip,skip-pmu-idle-request;
