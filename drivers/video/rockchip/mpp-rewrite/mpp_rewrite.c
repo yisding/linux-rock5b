@@ -352,6 +352,7 @@ struct rk_mpp_hw_match {
 	bool contributes_support;
 	bool requires_clocks;
 	bool requires_core_mask;
+	bool reset_requires_terminal_isolation;
 	resource_size_t min_reg_size;
 	const struct rk_mpp_reg_layout *reg_layout;
 	const struct rk_mpp_aux_irq_desc *aux_irqs;
@@ -392,11 +393,17 @@ struct rk_mpp_hw {
 	struct mutex run_lock; /* serializes start, abort, timeout, and completion */
 	struct mutex ccu_recovery_lock; /* serializes shared-CCU recovery/admission */
 	spinlock_t lock;
+	raw_spinlock_t aux_lock; /* hard/thread IRQ auxiliary MMIO and state */
 	struct rk_mpp_job *active_job;
 	struct rk_mpp_job *timeout_job;
 	u64 active_generation;
 	u64 timeout_generation;
 	u64 iommu_fault_generation;
+	u64 av1_afbc_armed_generation;
+	u64 av1_afbc_status_generation;
+	u64 av1_start_ns;
+	u64 av1_afbc_status_ns;
+	u64 av1_vcd_irq_ns;
 	atomic_t irq_disable_depth;
 	atomic_t power_count;
 	struct device_node *ccu_node;
@@ -430,9 +437,14 @@ struct rk_mpp_hw {
 	u8 aux_irq_count;
 	enum rk_mpp_iommu_provider iommu_provider;
 	bool iommu_fault_handler_registered;
+	bool iommu_fault_pending;
 	bool irq_registered;
 	bool aux_irqs_active;
 	bool online;
+	bool suspended;
+	bool suspend_was_online;
+	bool suspend_irq_disabled;
+	bool suspend_fault_handler_unregistered;
 	bool recovery_failed;
 	bool terminally_stopped;
 	bool terminal_power_drained;
@@ -496,6 +508,18 @@ struct rk_mpp_service {
 	atomic_t timeout_count;
 	atomic_t iommu_fault_count;
 	atomic_t iommu_refresh_count;
+	atomic_t iommu_idle_fault_count;
+	atomic_t av1_afbc_irq_count;
+	atomic_t av1_afbc_prestart_status_count;
+	atomic_t av1_afbc_stale_status_timeout_count;
+	atomic_t av1_afbc_before_vcd_count;
+	atomic_t av1_afbc_after_vcd_count;
+	atomic_t av1_afbc_observed_at_vcd_count;
+	atomic_t av1_afbc_not_observed_at_vcd_count;
+	atomic_t av1_afbc_observed_at_quiesce_count;
+	atomic_t av1_afbc_not_observed_at_quiesce_count;
+	atomic_t av1_reset_idle_unproven_count;
+	atomic64_t av1_vcd_to_afbc_observed_max_ns;
 	atomic_t next_session_id;
 	struct rk_mpp_debug_event *debug_events;
 	u64 debug_event_next_seq;
@@ -650,6 +674,7 @@ struct rk_mpp_job {
 	bool rkvenc_slice_mode;
 	bool rkvenc_slice_done;
 	bool rkvenc_slice_overflow;
+	bool av1_afbc_enabled;
 	bool session_initialized;
 	u64 hw_start_ns;
 	u64 hw_elapsed_ns;
@@ -702,11 +727,12 @@ static void rk_mpp_hw_timeout_work(struct work_struct *work);
 static void rk_mpp_hw_iommu_fault_work(struct work_struct *work);
 static bool rk_mpp_hw_mark_iommu_fault(struct rk_mpp_hw *hw);
 static struct rk_mpp_job *
-rk_mpp_hw_take_iommu_fault_job(struct rk_mpp_hw *hw);
+rk_mpp_hw_take_iommu_fault_job(struct rk_mpp_hw *hw, bool *consumed);
+static bool rk_mpp_hw_restore_iommu_fault_job(struct rk_mpp_hw *hw,
+					      struct rk_mpp_job *job);
 static void rk_mpp_hw_cancel_timeout(struct rk_mpp_hw *hw);
 static void rk_mpp_hw_cancel_timeout_sync(struct rk_mpp_hw *hw);
 static void rk_mpp_hw_schedule_timeout(struct rk_mpp_hw *hw);
-static void rk_mpp_hw_activate_aux_irqs(struct rk_mpp_hw *hw);
 static void rk_mpp_hw_deactivate_aux_irqs(struct rk_mpp_hw *hw);
 static void rk_mpp_hw_handle_reset_failure(struct rk_mpp_hw *hw, int error);
 static bool rk_mpp_hw_terminal_drain_power(struct rk_mpp_hw *hw);
@@ -1203,6 +1229,7 @@ static const struct rk_mpp_hw_match rk_mpp_av1_core = {
 	.type = RK_MPP_DEVICE_AV1DEC,
 	.contributes_support = true,
 	.requires_clocks = true,
+	.reset_requires_terminal_isolation = true,
 	.min_reg_size = RK_MPP_AV1_VCD_MIN_REG_SIZE,
 	.reg_layout = &rk_mpp_av1_reg_layout,
 	.aux_irqs = rk_mpp_av1_aux_irqs,
@@ -1694,7 +1721,7 @@ static bool rk_mpp_hw_is_idle(struct rk_mpp_hw *hw)
 	bool idle;
 
 	spin_lock_irqsave(&hw->lock, flags);
-	idle = !hw->active_job && !hw->iommu_fault_generation;
+	idle = !hw->active_job && !hw->iommu_fault_pending;
 	spin_unlock_irqrestore(&hw->lock, flags);
 
 	return idle;
@@ -3720,6 +3747,11 @@ rk_mpp_av1_build_afbc_config(struct rk_mpp_job *job,
 static int
 rk_mpp_av1_afbc_required_span(u32 width, u32 height, u32 bits_per_pixel,
 			      u64 header_size, u64 *required_span);
+static bool
+rk_mpp_av1_afbc_ack_locked(struct rk_mpp_hw *hw,
+			   bool *generation_observed);
+static int rk_mpp_av1_start(struct rk_mpp_hw *hw, u64 generation,
+			    bool afbc_enabled, u32 start_value);
 static int rk_mpp_job_select_hw(struct rk_mpp_job *job);
 static void rk_mpp_kunit_device_release(struct device *dev);
 
@@ -4713,6 +4745,90 @@ static void rk_mpp_av1_afbc_config_kunit(struct kunit *test)
 	job->reg_image.reg_bytes = 320 * sizeof(*regs);
 	KUNIT_ASSERT_EQ(test, rk_mpp_av1_build_afbc_config(job, &config), 0);
 	KUNIT_EXPECT_FALSE(test, config.enabled);
+}
+
+static void rk_mpp_av1_afbc_status_observation_kunit(struct kunit *test)
+{
+	struct rk_mpp_service srv = {};
+	struct rk_mpp_hw hw = {
+		.srv = &srv,
+	};
+	void __iomem *afbc;
+	void __iomem *vcd;
+	void *regs;
+	void *vcd_regs;
+	unsigned long flags;
+	bool generation_observed = false;
+	bool observed;
+
+	regs = kunit_kzalloc(test, RK_MPP_AV1_AFBC_MIN_REG_SIZE, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, regs);
+	vcd_regs = kunit_kzalloc(test, RK_MPP_AV1_IRQ_BASE + sizeof(u32),
+				 GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, vcd_regs);
+	afbc = (void __iomem *)regs;
+	vcd = (void __iomem *)vcd_regs;
+	hw.regs[0] = vcd;
+	hw.reg_size[0] = RK_MPP_AV1_IRQ_BASE + sizeof(u32);
+	hw.regs[RK_MPP_AV1_AFBC_REGION] = afbc;
+	hw.reg_size[RK_MPP_AV1_AFBC_REGION] =
+		RK_MPP_AV1_AFBC_MIN_REG_SIZE;
+	raw_spin_lock_init(&hw.aux_lock);
+
+	writel(RK_MPP_AV1_AFBC_CONTROL_STREAMS,
+	       afbc + RK_MPP_AV1_AFBC_CONTROL);
+	writel(BIT(0), afbc + RK_MPP_AV1_AFBC_ACKNOWLEDGE);
+	raw_spin_lock_irqsave(&hw.aux_lock, flags);
+	observed = rk_mpp_av1_afbc_ack_locked(&hw,
+					      &generation_observed);
+	raw_spin_unlock_irqrestore(&hw.aux_lock, flags);
+	KUNIT_EXPECT_TRUE(test, observed);
+	KUNIT_EXPECT_FALSE(test, generation_observed);
+	KUNIT_EXPECT_EQ(test,
+			atomic_read(&srv.av1_afbc_prestart_status_count), 1);
+	KUNIT_EXPECT_EQ(test, hw.av1_afbc_status_generation, 0ULL);
+
+	writel(0, afbc + RK_MPP_AV1_AFBC_ACKNOWLEDGE);
+	hw.av1_afbc_armed_generation = 5;
+	hw.av1_start_ns = 1;
+	writel(BIT(0), afbc + RK_MPP_AV1_AFBC_ACKNOWLEDGE);
+	raw_spin_lock_irqsave(&hw.aux_lock, flags);
+	observed = rk_mpp_av1_afbc_ack_locked(&hw,
+					      &generation_observed);
+	raw_spin_unlock_irqrestore(&hw.aux_lock, flags);
+	KUNIT_EXPECT_TRUE(test, observed);
+	KUNIT_EXPECT_TRUE(test, generation_observed);
+	KUNIT_EXPECT_EQ(test, hw.av1_afbc_status_generation, 5ULL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&srv.av1_afbc_before_vcd_count), 1);
+
+	writel(0, afbc + RK_MPP_AV1_AFBC_ACKNOWLEDGE);
+	generation_observed = false;
+	raw_spin_lock_irqsave(&hw.aux_lock, flags);
+	observed = rk_mpp_av1_afbc_ack_locked(&hw,
+					      &generation_observed);
+	raw_spin_unlock_irqrestore(&hw.aux_lock, flags);
+	KUNIT_EXPECT_FALSE(test, observed);
+	KUNIT_EXPECT_TRUE(test, generation_observed);
+
+	hw.av1_afbc_armed_generation = 0;
+	hw.av1_afbc_status_generation = 0;
+	hw.av1_start_ns = 0;
+	writel(0, afbc + RK_MPP_AV1_AFBC_ACKNOWLEDGE);
+	KUNIT_ASSERT_EQ(test, rk_mpp_av1_start(&hw, 6, true, 0x1234), 0);
+	KUNIT_EXPECT_EQ(test, hw.av1_afbc_armed_generation, 6ULL);
+	KUNIT_EXPECT_EQ(test, readl(vcd + RK_MPP_AV1_IRQ_BASE), 0x1234U);
+
+	hw.av1_afbc_armed_generation = 0;
+	hw.av1_afbc_status_generation = 0;
+	hw.av1_start_ns = 0;
+	writel(0, vcd + RK_MPP_AV1_IRQ_BASE);
+	writel(BIT(0), afbc + RK_MPP_AV1_AFBC_ACKNOWLEDGE);
+	KUNIT_EXPECT_EQ(test, rk_mpp_av1_start(&hw, 7, true, 0x5678),
+			-ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, readl(vcd + RK_MPP_AV1_IRQ_BASE), 0U);
+	KUNIT_EXPECT_EQ(test,
+			atomic_read(&srv.av1_afbc_stale_status_timeout_count),
+			1);
 }
 
 static void rk_mpp_hw_id_kunit(struct kunit *test)
@@ -6329,11 +6445,13 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	hw.active_job = job0;
 	hw.active_generation = 7;
 	hw.irq_status = 0x1234;
+	hw.iommu_fault_pending = true;
 	hw.iommu_fault_generation = 7;
 
 	KUNIT_EXPECT_FALSE(test, rk_mpp_hw_prepare_active_retry(&hw, job1));
 	KUNIT_EXPECT_PTR_EQ(test, hw.active_job, job0);
 	KUNIT_EXPECT_EQ(test, hw.irq_status, 0x1234U);
+	KUNIT_EXPECT_TRUE(test, hw.iommu_fault_pending);
 	KUNIT_EXPECT_EQ(test, hw.iommu_fault_generation, 7ULL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->iommu_refresh_count), 0);
 
@@ -6341,6 +6459,7 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, hw.active_job, job0);
 	KUNIT_EXPECT_EQ(test, hw.active_generation, 8ULL);
 	KUNIT_EXPECT_EQ(test, hw.irq_status, 0U);
+	KUNIT_EXPECT_FALSE(test, hw.iommu_fault_pending);
 	KUNIT_EXPECT_EQ(test, hw.iommu_fault_generation, 0ULL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->iommu_refresh_count), 0);
 
@@ -6358,6 +6477,7 @@ static void rk_mpp_iommu_fault_generation_kunit(struct kunit *test)
 	struct rk_mpp_job *target;
 	struct rk_mpp_job *replacement;
 	struct rk_mpp_job *taken;
+	bool consumed = false;
 	bool fault_pending = false;
 	bool queued;
 	u32 irq_status = 0;
@@ -6382,20 +6502,46 @@ static void rk_mpp_iommu_fault_generation_kunit(struct kunit *test)
 	hw->active_generation = 1;
 	hw->irq_status = 0x1234;
 	KUNIT_ASSERT_TRUE(test, rk_mpp_hw_mark_iommu_fault(hw));
+	KUNIT_EXPECT_TRUE(test, hw->iommu_fault_pending);
+	KUNIT_EXPECT_FALSE(test, rk_mpp_hw_mark_iommu_fault(hw));
 	taken = rk_mpp_hw_take_irq_job(hw, &irq_status, &fault_pending);
 	KUNIT_EXPECT_PTR_EQ(test, taken, NULL);
 	KUNIT_EXPECT_TRUE(test, fault_pending);
 	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, target);
 	KUNIT_EXPECT_EQ(test, hw->irq_status, 0x1234U);
 	KUNIT_EXPECT_FALSE(test, rk_mpp_hw_is_idle(hw));
-	taken = rk_mpp_hw_take_iommu_fault_job(hw);
+	taken = rk_mpp_hw_take_iommu_fault_job(hw, &consumed);
+	KUNIT_EXPECT_TRUE(test, consumed);
 	KUNIT_EXPECT_PTR_EQ(test, taken, target);
 	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, NULL);
+	KUNIT_EXPECT_FALSE(test, hw->iommu_fault_pending);
 	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 0ULL);
+	KUNIT_ASSERT_TRUE(test,
+			  rk_mpp_hw_restore_iommu_fault_job(hw, target));
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, target);
+	KUNIT_EXPECT_TRUE(test, hw->iommu_fault_pending);
+	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 1ULL);
+	taken = rk_mpp_hw_take_irq_job(hw, &irq_status, &fault_pending);
+	KUNIT_EXPECT_PTR_EQ(test, taken, NULL);
+	KUNIT_EXPECT_TRUE(test, fault_pending);
+	taken = rk_mpp_hw_take_iommu_fault_job(hw, &consumed);
+	KUNIT_EXPECT_TRUE(test, consumed);
+	KUNIT_EXPECT_PTR_EQ(test, taken, target);
+
+	hw->iommu_provider = RK_MPP_IOMMU_VSI;
+	KUNIT_ASSERT_TRUE(test, rk_mpp_hw_mark_iommu_fault(hw));
+	KUNIT_EXPECT_TRUE(test, hw->iommu_fault_pending);
+	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 0ULL);
+	KUNIT_EXPECT_FALSE(test, rk_mpp_hw_is_idle(hw));
+	KUNIT_EXPECT_FALSE(test, rk_mpp_hw_mark_iommu_fault(hw));
+	taken = rk_mpp_hw_take_iommu_fault_job(hw, &consumed);
+	KUNIT_EXPECT_TRUE(test, consumed);
+	KUNIT_EXPECT_PTR_EQ(test, taken, NULL);
+	KUNIT_EXPECT_FALSE(test, hw->iommu_fault_pending);
+	KUNIT_EXPECT_TRUE(test, rk_mpp_hw_is_idle(hw));
 
 	hw->active_job = replacement;
 	hw->active_generation = 2;
-	hw->iommu_fault_generation = 1;
 	queued = schedule_delayed_work(&hw->timeout_work,
 				       msecs_to_jiffies(60000));
 	KUNIT_ASSERT_TRUE(test, queued);
@@ -6403,6 +6549,7 @@ static void rk_mpp_iommu_fault_generation_kunit(struct kunit *test)
 	rk_mpp_hw_iommu_fault_work(&hw->iommu_fault_work);
 
 	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, replacement);
+	KUNIT_EXPECT_FALSE(test, hw->iommu_fault_pending);
 	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 0ULL);
 	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&hw->timeout_work));
 	kunit_release_action(test, rk_mpp_kunit_cancel_hw_work, hw);
@@ -8711,14 +8858,19 @@ static void rk_mpp_reset_session_hw_active_import_kunit(struct kunit *test)
 	};
 	struct rk_mpp_import *import;
 	struct rk_mpp_job *active;
+	int ret;
 
 	session = kunit_kzalloc(test, sizeof(*session), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, session);
 	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, dev);
 	import = kzalloc(sizeof(*import), GFP_KERNEL);
+	ret = kunit_add_action_or_reset(test, rk_mpp_kunit_kfree, import);
+	KUNIT_ASSERT_EQ(test, ret, 0);
 	KUNIT_ASSERT_NOT_NULL(test, import);
 	active = kzalloc(sizeof(*active), GFP_KERNEL);
+	ret = kunit_add_action_or_reset(test, rk_mpp_kunit_kfree, active);
+	KUNIT_ASSERT_EQ(test, ret, 0);
 	KUNIT_ASSERT_NOT_NULL(test, active);
 
 	device_initialize(dev);
@@ -8761,6 +8913,9 @@ static void rk_mpp_reset_session_hw_active_import_kunit(struct kunit *test)
 	active->hw = &hw;
 	/* Freed with the job by the production release path. */
 	active->imports = kcalloc(1, sizeof(*active->imports), GFP_KERNEL);
+	ret = kunit_add_action_or_reset(test, rk_mpp_kunit_kfree,
+					active->imports);
+	KUNIT_ASSERT_EQ(test, ret, 0);
 	KUNIT_ASSERT_NOT_NULL(test, active->imports);
 	active->imports[0] = import;
 	active->import_count = 1;
@@ -8775,6 +8930,9 @@ static void rk_mpp_reset_session_hw_active_import_kunit(struct kunit *test)
 	list_add_tail(&active->session_link, &session->active_jobs);
 	hw.active_job = active;
 
+	kunit_remove_action(test, rk_mpp_kunit_kfree, active->imports);
+	kunit_remove_action(test, rk_mpp_kunit_kfree, active);
+	kunit_remove_action(test, rk_mpp_kunit_kfree, import);
 	KUNIT_EXPECT_EQ(test,
 			rk_mpp_process_request(session, &req, &batch),
 			0);
@@ -8891,6 +9049,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_av1_dynamic_metadata_kunit),
 	KUNIT_CASE(rk_mpp_av1_post_offset_provenance_kunit),
 	KUNIT_CASE(rk_mpp_av1_afbc_config_kunit),
+	KUNIT_CASE(rk_mpp_av1_afbc_status_observation_kunit),
 	KUNIT_CASE(rk_mpp_hw_id_kunit),
 	KUNIT_CASE(rk_mpp_core_topology_kunit),
 	KUNIT_CASE(rk_mpp_core_identity_kunit),
@@ -10461,7 +10620,7 @@ static void rk_mpp_hw_handle_reset_failure(struct rk_mpp_hw *hw, int error)
 		return;
 
 	atomic_inc(&srv->recovery_failure_count);
-	dev_err(hw->dev, "%s core %d quarantined after reset failure: %d\n",
+	dev_err(hw->dev, "%s core %d quarantined after recovery failure: %d\n",
 		hw->match->name, hw->core_id, error);
 	if (ccu_failure)
 		rk_mpp_hw_abort_ccu_queued(hw, -EIO);
@@ -11055,7 +11214,6 @@ static int rk_mpp_hw_power_on(struct rk_mpp_hw *hw)
 	if (ret)
 		goto err_pm_put;
 	atomic_inc(&hw->power_count);
-	rk_mpp_hw_activate_aux_irqs(hw);
 
 	return 0;
 
@@ -11066,10 +11224,13 @@ err_pm_put:
 
 static void rk_mpp_hw_power_off(struct rk_mpp_hw *hw)
 {
-	if (atomic_dec_if_positive(&hw->power_count) < 0)
+	if (atomic_read(&hw->power_count) <= 0)
 		return;
 
 	rk_mpp_hw_deactivate_aux_irqs(hw);
+	if (atomic_dec_if_positive(&hw->power_count) < 0)
+		return;
+
 	clk_bulk_disable_unprepare(hw->num_clks, hw->clks);
 	pm_runtime_mark_last_busy(hw->dev);
 	pm_runtime_put_autosuspend(hw->dev);
@@ -11224,6 +11385,8 @@ static int rk_mpp_hw_stop_active(struct rk_mpp_hw *hw)
 		return 0;
 	if (READ_ONCE(hw->terminal_power_drained))
 		return rk_mpp_hw_terminal_isolate(hw);
+
+	rk_mpp_hw_deactivate_aux_irqs(hw);
 	if (!hw->resets) {
 		ret = -EOPNOTSUPP;
 		rk_mpp_hw_handle_reset_failure(hw, ret);
@@ -11232,8 +11395,20 @@ static int rk_mpp_hw_stop_active(struct rk_mpp_hw *hw)
 	}
 
 	ret = rk_mpp_hw_reset_active(hw);
-	if (!ret)
+	if (!ret && !hw->match->reset_requires_terminal_isolation)
 		return 0;
+	if (!ret) {
+		/*
+		 * AV1 exposes no documented idle handshake proving that its
+		 * reset pulse has retired every VCD/AFBC DMA transaction.  Keep
+		 * abnormal recovery fail-closed until hardware evidence supplies
+		 * such a proof.
+		 */
+		atomic_inc(&hw->srv->av1_reset_idle_unproven_count);
+		rk_mpp_hw_handle_reset_failure(hw, -EOPNOTSUPP);
+		isolate_ret = rk_mpp_hw_terminal_isolate(hw);
+		return isolate_ret;
+	}
 
 	isolate_ret = rk_mpp_hw_terminal_isolate(hw);
 	return isolate_ret ?: 0;
@@ -11290,7 +11465,7 @@ static int rk_mpp_hw_begin_active_job(struct rk_mpp_hw *hw,
 		ret = -ECANCELED;
 	} else if (hw->active_job) {
 		ret = -EBUSY;
-	} else if (hw->iommu_fault_generation) {
+	} else if (hw->iommu_fault_pending) {
 		/*
 		 * A provider fault worker owns the idle-looking slot until it
 		 * has reset the engine and refreshed the IOMMU.  Admitting a
@@ -11303,6 +11478,7 @@ static int rk_mpp_hw_begin_active_job(struct rk_mpp_hw *hw,
 		hw->active_generation++;
 		if (!hw->active_generation)
 			hw->active_generation++;
+		hw->iommu_fault_pending = false;
 		hw->iommu_fault_generation = 0;
 		hw->irq_status = 0;
 	}
@@ -11363,8 +11539,7 @@ rk_mpp_hw_take_irq_job(struct rk_mpp_hw *hw, u32 *irq_status,
 	bool pending;
 
 	spin_lock_irqsave(&hw->lock, flags);
-	pending = hw->active_job && hw->iommu_fault_generation &&
-		  hw->iommu_fault_generation == hw->active_generation;
+	pending = hw->iommu_fault_pending;
 	if (!pending) {
 		job = hw->active_job;
 		if (irq_status)
@@ -11381,6 +11556,28 @@ rk_mpp_hw_take_irq_job(struct rk_mpp_hw *hw, u32 *irq_status,
 	return job;
 }
 
+static struct rk_mpp_job *
+rk_mpp_hw_peek_irq_job(struct rk_mpp_hw *hw, u32 *irq_status,
+		       u64 *generation, bool *fault_pending)
+{
+	struct rk_mpp_job *job = NULL;
+	unsigned long flags;
+
+	lockdep_assert_held(&hw->run_lock);
+	spin_lock_irqsave(&hw->lock, flags);
+	if (irq_status)
+		*irq_status = hw->irq_status;
+	if (generation)
+		*generation = hw->active_generation;
+	if (fault_pending)
+		*fault_pending = hw->iommu_fault_pending;
+	if (!hw->iommu_fault_pending)
+		job = hw->active_job;
+	spin_unlock_irqrestore(&hw->lock, flags);
+
+	return job;
+}
+
 static bool rk_mpp_hw_take_active_if(struct rk_mpp_hw *hw,
 				     struct rk_mpp_job *match,
 				     u32 *irq_status)
@@ -11389,9 +11586,7 @@ static bool rk_mpp_hw_take_active_if(struct rk_mpp_hw *hw,
 	bool taken = false;
 
 	spin_lock_irqsave(&hw->lock, flags);
-	if (hw->active_job == match &&
-	    (!hw->iommu_fault_generation ||
-	     hw->iommu_fault_generation != hw->active_generation)) {
+	if (hw->active_job == match && !hw->iommu_fault_pending) {
 		if (irq_status)
 			*irq_status = hw->irq_status;
 		hw->active_job = NULL;
@@ -11414,8 +11609,7 @@ rk_mpp_hw_take_active_if_generation(struct rk_mpp_hw *hw,
 	spin_lock_irqsave(&hw->lock, flags);
 	if (generation && hw->active_job == match &&
 	    hw->active_generation == generation &&
-	    (!hw->iommu_fault_generation ||
-	     hw->iommu_fault_generation != hw->active_generation)) {
+	    !hw->iommu_fault_pending) {
 		if (irq_status)
 			*irq_status = hw->irq_status;
 		hw->active_job = NULL;
@@ -11427,8 +11621,9 @@ rk_mpp_hw_take_active_if_generation(struct rk_mpp_hw *hw,
 	return taken;
 }
 
-static bool rk_mpp_hw_restore_active_job(struct rk_mpp_hw *hw,
-					 struct rk_mpp_job *job)
+static bool __rk_mpp_hw_restore_active_job(struct rk_mpp_hw *hw,
+					   struct rk_mpp_job *job,
+					   bool force_iommu_fault)
 {
 	unsigned long flags;
 	bool restored = false;
@@ -11437,11 +11632,27 @@ static bool rk_mpp_hw_restore_active_job(struct rk_mpp_hw *hw,
 	if (!hw->active_job) {
 		hw->active_job = job;
 		hw->irq_status = 0;
+		if (force_iommu_fault)
+			hw->iommu_fault_pending = true;
+		if (hw->iommu_fault_pending)
+			hw->iommu_fault_generation = hw->active_generation;
 		restored = true;
 	}
 	spin_unlock_irqrestore(&hw->lock, flags);
 
 	return restored;
+}
+
+static bool rk_mpp_hw_restore_active_job(struct rk_mpp_hw *hw,
+					 struct rk_mpp_job *job)
+{
+	return __rk_mpp_hw_restore_active_job(hw, job, false);
+}
+
+static bool rk_mpp_hw_restore_iommu_fault_job(struct rk_mpp_hw *hw,
+					      struct rk_mpp_job *job)
+{
+	return __rk_mpp_hw_restore_active_job(hw, job, true);
 }
 
 static struct rk_mpp_job *
@@ -11485,8 +11696,13 @@ static bool rk_mpp_hw_mark_iommu_fault(struct rk_mpp_hw *hw)
 	bool marked = false;
 
 	spin_lock_irqsave(&hw->lock, flags);
-	if (hw->active_job && hw->active_generation) {
-		hw->iommu_fault_generation = hw->active_generation;
+	if (!hw->iommu_fault_pending &&
+	    (hw->active_job || hw->iommu_provider == RK_MPP_IOMMU_VSI)) {
+		hw->iommu_fault_pending = true;
+		hw->iommu_fault_generation =
+			hw->active_job ? hw->active_generation : 0;
+		if (!hw->active_job && hw->srv)
+			atomic_inc(&hw->srv->iommu_idle_fault_count);
 		marked = true;
 	}
 	spin_unlock_irqrestore(&hw->lock, flags);
@@ -11495,14 +11711,17 @@ static bool rk_mpp_hw_mark_iommu_fault(struct rk_mpp_hw *hw)
 }
 
 static struct rk_mpp_job *
-rk_mpp_hw_take_iommu_fault_job(struct rk_mpp_hw *hw)
+rk_mpp_hw_take_iommu_fault_job(struct rk_mpp_hw *hw, bool *consumed)
 {
 	struct rk_mpp_job *job = NULL;
 	unsigned long flags;
 	u64 generation;
 
 	spin_lock_irqsave(&hw->lock, flags);
+	if (consumed)
+		*consumed = hw->iommu_fault_pending;
 	generation = hw->iommu_fault_generation;
+	hw->iommu_fault_pending = false;
 	hw->iommu_fault_generation = 0;
 	if (generation && hw->active_job &&
 	    generation == hw->active_generation) {
@@ -11527,6 +11746,7 @@ static bool rk_mpp_hw_prepare_active_retry(struct rk_mpp_hw *hw,
 		if (!hw->active_generation)
 			hw->active_generation++;
 		hw->irq_status = 0;
+		hw->iommu_fault_pending = false;
 		hw->iommu_fault_generation = 0;
 		active = true;
 	}
@@ -11543,6 +11763,9 @@ static int rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw,
 	int ret = 0;
 
 	if (!hw->iommu_domain)
+		return 0;
+	if (READ_ONCE(hw->terminally_stopped) ||
+	    READ_ONCE(hw->terminal_power_drained))
 		return 0;
 
 	if (hw->iommu_provider == RK_MPP_IOMMU_VSI)
@@ -12030,6 +12253,8 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 	bool irq_disabled;
 	bool hard_ccu_recovery;
 	bool dchs_lifecycle_locked = false;
+	bool fault_consumed = true;
+	bool restored;
 	bool ccu_done = false;
 	bool ccu_error = false;
 	int ccu_stop_ret = 0;
@@ -12051,7 +12276,7 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 		mutex_lock(&ccu->ccu_recovery_lock);
 	mutex_lock(&hw->run_lock);
 	if (iommu_fault)
-		job = rk_mpp_hw_take_iommu_fault_job(hw);
+		job = rk_mpp_hw_take_iommu_fault_job(hw, &fault_consumed);
 	else if (timeout_job &&
 		 rk_mpp_hw_take_active_if_generation(hw, timeout_job,
 						      timeout_generation, NULL))
@@ -12059,6 +12284,14 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 	else
 		job = NULL;
 	if (!job) {
+		if (iommu_fault && !fault_consumed) {
+			rk_mpp_hw_enable_irq(hw, irq_disabled);
+			mutex_unlock(&hw->run_lock);
+			if (ccu)
+				mutex_unlock(&ccu->ccu_recovery_lock);
+			rk_mpp_hw_put(ccu);
+			return;
+		}
 		/*
 		 * Completion or abort may have stopped the marked generation
 		 * before this worker acquired run_lock.  VSI masks its fault
@@ -12093,13 +12326,17 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 			 * storage if neither register polling nor reset asserted
 			 * that the shared engine is quiescent.
 			 */
-			if (WARN_ON_ONCE(!rk_mpp_hw_restore_active_job(hw, job))) {
+			restored = iommu_fault ?
+				rk_mpp_hw_restore_iommu_fault_job(hw, job) :
+				rk_mpp_hw_restore_active_job(hw, job);
+			if (WARN_ON_ONCE(!restored)) {
 				rk_mpp_hw_enable_irq(hw, irq_disabled);
 				mutex_unlock(&hw->run_lock);
 				mutex_unlock(&ccu->ccu_recovery_lock);
 				rk_mpp_hw_put(ccu);
 				return;
 			}
+			rk_mpp_hw_handle_reset_failure(ccu, ccu_stop_ret);
 			rk_mpp_hw_enable_irq(hw, irq_disabled);
 			mutex_unlock(&hw->run_lock);
 			mutex_unlock(&ccu->ccu_recovery_lock);
@@ -12145,7 +12382,10 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 	else
 		reset_ret = rk_mpp_hw_stop_active(hw);
 	if (reset_ret && !hard_ccu_recovery) {
-		if (WARN_ON_ONCE(!rk_mpp_hw_restore_active_job(hw, job))) {
+		restored = iommu_fault ?
+			rk_mpp_hw_restore_iommu_fault_job(hw, job) :
+			rk_mpp_hw_restore_active_job(hw, job);
+		if (WARN_ON_ONCE(!restored)) {
 			rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
 							     dchs_lifecycle_locked);
 			rk_mpp_hw_enable_irq(hw, irq_disabled);
@@ -12155,6 +12395,7 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 			rk_mpp_hw_put(ccu);
 			return;
 		}
+		rk_mpp_hw_handle_reset_failure(hw, reset_ret);
 		rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
 						     dchs_lifecycle_locked);
 		rk_mpp_hw_enable_irq(hw, irq_disabled);
@@ -12224,7 +12465,7 @@ static void rk_mpp_hw_iommu_fault_work(struct work_struct *work)
 	rk_mpp_hw_recover_active(hw, true, NULL, 0);
 }
 
-static void rk_mpp_hw_abort_active(struct rk_mpp_hw *hw, int result)
+static int rk_mpp_hw_abort_active(struct rk_mpp_hw *hw, int result)
 {
 	struct rk_mpp_job *job;
 	bool dchs_lifecycle_locked;
@@ -12240,7 +12481,7 @@ static void rk_mpp_hw_abort_active(struct rk_mpp_hw *hw, int result)
 	if (!job) {
 		rk_mpp_hw_enable_irq(hw, irq_disabled);
 		mutex_unlock(&hw->run_lock);
-		return;
+		return 0;
 	}
 
 	dchs_lifecycle_locked = rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
@@ -12251,7 +12492,7 @@ static void rk_mpp_hw_abort_active(struct rk_mpp_hw *hw, int result)
 						     dchs_lifecycle_locked);
 		rk_mpp_hw_enable_irq(hw, irq_disabled);
 		mutex_unlock(&hw->run_lock);
-		return;
+		return stop_ret;
 	}
 	rk_mpp_hw_power_off(hw);
 	rk_mpp_job_complete(job, result);
@@ -12259,6 +12500,8 @@ static void rk_mpp_hw_abort_active(struct rk_mpp_hw *hw, int result)
 	rk_mpp_hw_enable_irq(hw, irq_disabled);
 	mutex_unlock(&hw->run_lock);
 	rk_mpp_job_put(job);
+
+	return 0;
 }
 
 /*
@@ -12795,24 +13038,24 @@ static int rk_mpp_iommu_register_fault_handler(struct rk_mpp_hw *hw)
 
 	/*
 	 * Publish the lookup entry before the provider can invoke the callback.
-	 * Unregistration removes it first and then drains provider IRQs.
+	 * Provider identity must also be visible before making that callback
+	 * callable, including a pending-fault replay performed by the setter.
 	 */
 	spin_lock_irqsave(&srv->fault_lock, flags);
 	list_add_tail(&hw->fault_link, &srv->fault_hws);
 	spin_unlock_irqrestore(&srv->fault_lock, flags);
 
+	WRITE_ONCE(hw->iommu_provider, RK_MPP_IOMMU_ROCKCHIP);
 	ret = rockchip_iommu_set_fault_handler(hw->dev,
 					       rk_mpp_iommu_fault_handler, srv);
-	if (!ret) {
-		hw->iommu_provider = RK_MPP_IOMMU_ROCKCHIP;
-	} else if (ret == -ENODEV) {
+	if (ret == -ENODEV) {
+		WRITE_ONCE(hw->iommu_provider, RK_MPP_IOMMU_VSI);
 		ret = vsi_iommu_set_fault_handler(hw->dev,
 						  rk_mpp_iommu_fault_handler,
 						  srv);
-		if (!ret)
-			hw->iommu_provider = RK_MPP_IOMMU_VSI;
 	}
 	if (ret) {
+		WRITE_ONCE(hw->iommu_provider, RK_MPP_IOMMU_NONE);
 		spin_lock_irqsave(&srv->fault_lock, flags);
 		list_del_init(&hw->fault_link);
 		spin_unlock_irqrestore(&srv->fault_lock, flags);
@@ -12824,22 +13067,24 @@ static int rk_mpp_iommu_register_fault_handler(struct rk_mpp_hw *hw)
 	return 0;
 }
 
-static void rk_mpp_iommu_unregister_fault_handler(struct rk_mpp_hw *hw)
+static int
+rk_mpp_iommu_unregister_fault_handler(struct rk_mpp_hw *hw,
+				      bool dma_quiesced)
 {
 	struct rk_mpp_service *srv = hw->srv;
+	enum rk_mpp_iommu_provider provider = hw->iommu_provider;
 	unsigned long flags;
 	int ret;
 
 	if (!hw->iommu_fault_handler_registered)
-		return;
+		return 0;
 
-	spin_lock_irqsave(&srv->fault_lock, flags);
-	if (!list_empty(&hw->fault_link))
-		list_del_init(&hw->fault_link);
-	spin_unlock_irqrestore(&srv->fault_lock, flags);
-
-	/* Provider callbacks are per IOMMU, even when the DMA domain is shared. */
-	switch (hw->iommu_provider) {
+	/*
+	 * Reverse registration: stop future callbacks, drain any callback that
+	 * already snapshotted the handler while fault_link is still visible,
+	 * then unpublish the lookup entry and finish its refresh owner work.
+	 */
+	switch (provider) {
 	case RK_MPP_IOMMU_ROCKCHIP:
 		ret = rockchip_iommu_set_fault_handler(hw->dev, NULL, NULL);
 		break;
@@ -12851,17 +13096,33 @@ static void rk_mpp_iommu_unregister_fault_handler(struct rk_mpp_hw *hw)
 		break;
 	}
 	if (ret) {
-		dev_warn(hw->dev, "failed to clear IOMMU fault handler: %pe\n",
-			 ERR_PTR(ret));
-	} else {
-		/* srv may be freed after unbind; wait out in-flight callbacks. */
-		if (hw->iommu_provider == RK_MPP_IOMMU_VSI)
-			vsi_iommu_sync_fault_handler(hw->dev);
-		else
-			rockchip_iommu_sync_fault_handler(hw->dev);
+		dev_err(hw->dev, "failed to clear IOMMU fault handler: %pe\n",
+			ERR_PTR(ret));
+		return ret;
 	}
-	hw->iommu_provider = RK_MPP_IOMMU_NONE;
+
+	if (provider == RK_MPP_IOMMU_VSI)
+		ret = vsi_iommu_sync_fault_handler(hw->dev);
+	else
+		ret = rockchip_iommu_sync_fault_handler(hw->dev);
+	if (ret) {
+		dev_err(hw->dev, "failed to synchronize IOMMU fault handler: %pe\n",
+			ERR_PTR(ret));
+		return ret;
+	}
+
+	spin_lock_irqsave(&srv->fault_lock, flags);
+	if (!list_empty(&hw->fault_link))
+		list_del_init(&hw->fault_link);
+	spin_unlock_irqrestore(&srv->fault_lock, flags);
+
+	flush_work(&hw->iommu_fault_work);
+	if (provider == RK_MPP_IOMMU_VSI && dma_quiesced)
+		vsi_iommu_clear_fault(hw->dev);
+	WRITE_ONCE(hw->iommu_provider, RK_MPP_IOMMU_NONE);
 	hw->iommu_fault_handler_registered = false;
+
+	return 0;
 }
 
 static int rk_mpp_job_store_reg_word(struct rk_mpp_job *job, u32 offset,
@@ -14031,12 +14292,23 @@ rk_mpp_av1_build_afbc_config(struct rk_mpp_job *job,
 	return 0;
 }
 
-static bool rk_mpp_av1_afbc_ack(struct rk_mpp_hw *hw)
+static bool
+rk_mpp_av1_afbc_ack_locked(struct rk_mpp_hw *hw,
+			   bool *generation_observed)
 {
 	void __iomem *afbc = hw->regs[2];
+	struct rk_mpp_service *srv = hw->srv;
+	atomic64_t *observed_max_ns;
 	u32 control;
 	u32 status;
+	u64 status_delta;
+	u64 status_ns;
 
+	lockdep_assert_held(&hw->aux_lock);
+	if (generation_observed)
+		*generation_observed = hw->av1_afbc_armed_generation &&
+			hw->av1_afbc_status_generation ==
+			hw->av1_afbc_armed_generation;
 	if (!rk_mpp_hw_reg_range_valid(hw, 2,
 				       RK_MPP_AV1_AFBC_ACKNOWLEDGE,
 				       sizeof(u32)) ||
@@ -14049,19 +14321,62 @@ static bool rk_mpp_av1_afbc_ack(struct rk_mpp_hw *hw)
 		return false;
 
 	control = readl(afbc + RK_MPP_AV1_AFBC_CONTROL);
-	writel_relaxed(control | BIT(0), afbc + RK_MPP_AV1_AFBC_CONTROL);
+	writel(control | BIT(0), afbc + RK_MPP_AV1_AFBC_CONTROL);
+	readl(afbc + RK_MPP_AV1_AFBC_ACKNOWLEDGE);
+	if (hw->av1_afbc_armed_generation && hw->av1_start_ns) {
+		if (hw->av1_afbc_status_generation !=
+		    hw->av1_afbc_armed_generation) {
+			status_ns = ktime_get_mono_fast_ns();
+			hw->av1_afbc_status_generation =
+				hw->av1_afbc_armed_generation;
+			hw->av1_afbc_status_ns = status_ns;
+			if (srv && hw->av1_vcd_irq_ns) {
+				atomic_inc(&srv->av1_afbc_after_vcd_count);
+				observed_max_ns =
+					&srv->av1_vcd_to_afbc_observed_max_ns;
+				if (status_ns > hw->av1_vcd_irq_ns) {
+					status_delta =
+						status_ns - hw->av1_vcd_irq_ns;
+					rk_mpp_atomic64_max(observed_max_ns,
+							    status_delta);
+				}
+			} else if (srv) {
+				atomic_inc(&srv->av1_afbc_before_vcd_count);
+			}
+		}
+		if (generation_observed)
+			*generation_observed = true;
+	} else if (srv) {
+		atomic_inc(&srv->av1_afbc_prestart_status_count);
+	}
 
 	return true;
+}
+
+static bool rk_mpp_av1_afbc_ack(struct rk_mpp_hw *hw)
+{
+	unsigned long flags;
+	bool observed;
+
+	raw_spin_lock_irqsave(&hw->aux_lock, flags);
+	observed = rk_mpp_av1_afbc_ack_locked(hw, NULL);
+	raw_spin_unlock_irqrestore(&hw->aux_lock, flags);
+
+	return observed;
 }
 
 static void rk_mpp_av1_quiesce_aux_irqs(struct rk_mpp_hw *hw)
 {
 	void __iomem *afbc = hw->regs[2];
+	struct rk_mpp_service *srv = hw->srv;
+	unsigned long flags;
+	bool observed;
 
 	if (!rk_mpp_hw_reg_range_valid(hw, 2, RK_MPP_AV1_AFBC_INT_ENABLE,
 				       sizeof(u32)))
 		return;
 
+	raw_spin_lock_irqsave(&hw->aux_lock, flags);
 	/*
 	 * Stop the level source while clocks are still available.  The read
 	 * flushes the mask before the acknowledge and before the generic path
@@ -14069,28 +14384,38 @@ static void rk_mpp_av1_quiesce_aux_irqs(struct rk_mpp_hw *hw)
 	 */
 	writel(0, afbc + RK_MPP_AV1_AFBC_INT_ENABLE);
 	readl(afbc + RK_MPP_AV1_AFBC_INT_ENABLE);
-	rk_mpp_av1_afbc_ack(hw);
+	rk_mpp_av1_afbc_ack_locked(hw, NULL);
+	observed = hw->av1_afbc_armed_generation &&
+		   hw->av1_afbc_status_generation ==
+		   hw->av1_afbc_armed_generation;
+	if (hw->av1_afbc_armed_generation) {
+		if (observed)
+			atomic_inc(&srv->av1_afbc_observed_at_quiesce_count);
+		else
+			atomic_inc(&srv->av1_afbc_not_observed_at_quiesce_count);
+	}
+	hw->av1_afbc_armed_generation = 0;
+	raw_spin_unlock_irqrestore(&hw->aux_lock, flags);
 }
 
 static irqreturn_t rk_mpp_av1_afbc_irq(struct rk_mpp_hw *hw)
 {
 	bool handled;
-	int ret;
-
-	ret = pm_runtime_get_if_in_use(hw->dev);
-	if (ret <= 0)
-		return IRQ_NONE;
 
 	handled = READ_ONCE(hw->aux_irqs_active) &&
 		  rk_mpp_av1_afbc_ack(hw);
-	pm_runtime_put_noidle(hw->dev);
 	if (handled) {
 		atomic_inc(&hw->srv->irq_count);
+		atomic_inc(&hw->srv->av1_afbc_irq_count);
 		rk_mpp_debug_record_active(hw, RK_MPP_DEBUG_IRQ, 0,
 					   BIT(0), 2);
 	}
 
-	return handled ? IRQ_HANDLED : IRQ_NONE;
+	/*
+	 * The line is dedicated. A VCD-thread maintenance ACK can consume the
+	 * level status after GIC latches it but before this handler runs.
+	 */
+	return IRQ_HANDLED;
 }
 
 static int
@@ -14098,6 +14423,7 @@ rk_mpp_av1_program_afbc(struct rk_mpp_hw *hw,
 			const struct rk_mpp_av1_afbc_config *config)
 {
 	void __iomem *afbc = hw->regs[2];
+	unsigned long flags;
 	u32 i;
 
 	if (!config->enabled)
@@ -14107,9 +14433,10 @@ rk_mpp_av1_program_afbc(struct rk_mpp_hw *hw,
 				       sizeof(u32), sizeof(u32)))
 		return -ENODEV;
 
+	raw_spin_lock_irqsave(&hw->aux_lock, flags);
 	writel_relaxed(RK_MPP_AV1_AFBC_CONTROL_STREAMS,
 		       afbc + RK_MPP_AV1_AFBC_CONTROL);
-	writel_relaxed(1, afbc + RK_MPP_AV1_AFBC_INT_ENABLE);
+	raw_spin_unlock_irqrestore(&hw->aux_lock, flags);
 	for (i = 0; i < 2; i++) {
 		u32 offset = i * sizeof(u32);
 
@@ -14131,13 +14458,98 @@ rk_mpp_av1_program_afbc(struct rk_mpp_hw *hw,
 
 	/* Publish every AFBC parameter before pulsing the update latch. */
 	wmb();
+	raw_spin_lock_irqsave(&hw->aux_lock, flags);
 	writel(RK_MPP_AV1_AFBC_CONTROL_STREAMS |
 	       RK_MPP_AV1_AFBC_CONTROL_UPDATE,
 	       afbc + RK_MPP_AV1_AFBC_CONTROL);
 	writel(RK_MPP_AV1_AFBC_CONTROL_STREAMS,
 	       afbc + RK_MPP_AV1_AFBC_CONTROL);
+	raw_spin_unlock_irqrestore(&hw->aux_lock, flags);
 
 	return 0;
+}
+
+static void rk_mpp_av1_disarm_afbc(struct rk_mpp_hw *hw)
+{
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&hw->aux_lock, flags);
+	hw->av1_afbc_armed_generation = 0;
+	hw->av1_afbc_status_generation = 0;
+	hw->av1_start_ns = 0;
+	hw->av1_afbc_status_ns = 0;
+	hw->av1_vcd_irq_ns = 0;
+	raw_spin_unlock_irqrestore(&hw->aux_lock, flags);
+}
+
+static int rk_mpp_av1_start(struct rk_mpp_hw *hw, u64 generation,
+			    bool afbc_enabled, u32 start_value)
+{
+	void __iomem *afbc = hw->regs[2];
+	unsigned long flags;
+	u32 status;
+	int ret;
+
+	if (!afbc_enabled) {
+		/* Publish every decoder register before the START doorbell. */
+		wmb();
+		writel(start_value, hw->regs[0] + RK_MPP_AV1_IRQ_BASE);
+		return 0;
+	}
+
+	raw_spin_lock_irqsave(&hw->aux_lock, flags);
+	/*
+	 * Keep the dedicated AFBC source masked while stale UPDATE status is
+	 * drained and this generation is published.  START and unmask are in
+	 * the same hard-IRQ-safe critical section: an old status cannot satisfy
+	 * the new observation, and a real status cannot be cleared as
+	 * pre-start.
+	 */
+	rk_mpp_av1_afbc_ack_locked(hw, NULL);
+	ret = readl_poll_timeout_atomic(afbc + RK_MPP_AV1_AFBC_ACKNOWLEDGE,
+					status, !(status & BIT(0)), 1, 100);
+	if (ret) {
+		raw_spin_unlock_irqrestore(&hw->aux_lock, flags);
+		atomic_inc(&hw->srv->av1_afbc_stale_status_timeout_count);
+		dev_err_ratelimited(hw->dev,
+				    "AFBC status did not deassert before START\n");
+		return ret;
+	}
+	hw->av1_afbc_armed_generation = generation;
+	hw->av1_afbc_status_generation = 0;
+	hw->av1_start_ns = ktime_get_mono_fast_ns();
+	WRITE_ONCE(hw->aux_irqs_active, true);
+	/* Publish all decoder/AFBC registers and the owner before START. */
+	wmb();
+	writel(start_value, hw->regs[0] + RK_MPP_AV1_IRQ_BASE);
+	writel(1, afbc + RK_MPP_AV1_AFBC_INT_ENABLE);
+	readl(afbc + RK_MPP_AV1_AFBC_INT_ENABLE);
+	raw_spin_unlock_irqrestore(&hw->aux_lock, flags);
+
+	return 0;
+}
+
+static void rk_mpp_av1_observe_afbc_at_vcd(struct rk_mpp_hw *hw,
+					   u64 generation)
+{
+	struct rk_mpp_service *srv = hw->srv;
+	unsigned long flags;
+	bool done;
+
+	/*
+	 * ACK bit 0 is not documented as a final per-frame DMA fence and the
+	 * BSP does not use it as one.  Record ordering evidence without
+	 * promoting an ambiguous UPDATE/frame status into a completion proof.
+	 */
+	raw_spin_lock_irqsave(&hw->aux_lock, flags);
+	done = hw->av1_afbc_status_generation == generation;
+	raw_spin_unlock_irqrestore(&hw->aux_lock, flags);
+	if (!done) {
+		atomic_inc(&srv->av1_afbc_not_observed_at_vcd_count);
+		return;
+	}
+
+	atomic_inc(&srv->av1_afbc_observed_at_vcd_count);
 }
 
 static void rk_mpp_av1_clear_cache(struct rk_mpp_hw *hw)
@@ -14184,22 +14596,35 @@ static int rk_mpp_av1_submit(struct rk_mpp_job *job)
 	struct rk_mpp_av1_afbc_config config;
 	struct rk_mpp_hw *hw = job->hw;
 	u32 start_value = 0;
+	bool active_owned = false;
+	bool iommu_reserved = false;
 	bool irq_disabled;
+	bool start_failed_untrusted = false;
 	bool start_seen;
+	int stop_ret;
 	int ret;
 
 	ret = rk_mpp_av1_build_afbc_config(job, &config);
 	if (ret)
 		return ret;
+	job->av1_afbc_enabled = config.enabled;
 
 	mutex_lock(&hw->run_lock);
-	ret = rk_mpp_hw_begin_active_job(hw, job);
-	if (ret)
+	if (!rk_mpp_hw_usable(hw) || READ_ONCE(job->canceled)) {
+		ret = READ_ONCE(job->canceled) ? -ECANCELED : -ENODEV;
 		goto err_unlock;
+	}
 
 	ret = rk_mpp_hw_power_on(hw);
 	if (ret)
-		goto err_clear_active;
+		goto err_unlock;
+	rk_mpp_hw_deactivate_aux_irqs(hw);
+	rk_mpp_av1_disarm_afbc(hw);
+	if (hw->iommu_provider == RK_MPP_IOMMU_VSI) {
+		ret = vsi_iommu_prepare_dma(hw->dev);
+		if (ret)
+			goto err_power_off;
+	}
 	if (!rk_mpp_hw_usable(hw) || READ_ONCE(job->canceled)) {
 		ret = READ_ONCE(job->canceled) ? -ECANCELED : -ENODEV;
 		goto err_power_off;
@@ -14216,33 +14641,68 @@ static int rk_mpp_av1_submit(struct rk_mpp_job *job)
 	ret = rk_mpp_av1_program_afbc(hw, &config);
 	if (ret)
 		goto err_power_off;
+	if (hw->iommu_provider == RK_MPP_IOMMU_VSI) {
+		ret = vsi_iommu_reserve_dma(hw->dev);
+		if (ret)
+			goto err_power_off;
+		iommu_reserved = true;
+	}
+	if (!rk_mpp_hw_usable(hw) || READ_ONCE(job->canceled)) {
+		ret = READ_ONCE(job->canceled) ? -ECANCELED : -ENODEV;
+		goto err_power_off;
+	}
+	ret = rk_mpp_hw_begin_active_job(hw, job);
+	if (ret)
+		goto err_power_off;
+	active_owned = true;
 	if (!rk_mpp_hw_usable(hw) || READ_ONCE(job->canceled)) {
 		ret = READ_ONCE(job->canceled) ? -ECANCELED : -ENODEV;
 		goto err_power_off;
 	}
 
 	rk_mpp_hw_schedule_timeout(hw);
-	/* Publish every decoder and AFBC register before the start doorbell. */
-	wmb();
-	writel(start_value, hw->regs[0] + RK_MPP_AV1_IRQ_BASE);
+	ret = rk_mpp_av1_start(hw, hw->active_generation, config.enabled,
+			       start_value);
+	if (iommu_reserved) {
+		vsi_iommu_release_dma(hw->dev);
+		iommu_reserved = false;
+	}
+	if (ret) {
+		start_failed_untrusted = config.enabled;
+		goto err_power_off;
+	}
 	rk_mpp_count_started_core(job);
 	mutex_unlock(&hw->run_lock);
 
 	return 0;
 
 err_power_off:
+	if (iommu_reserved)
+		vsi_iommu_release_dma(hw->dev);
+	if (active_owned)
+		rk_mpp_hw_cancel_timeout(hw);
 	irq_disabled = rk_mpp_hw_disable_irq_nosync(hw);
 	rk_mpp_hw_synchronize_hardirq(hw);
+	if (start_failed_untrusted && active_owned) {
+		stop_ret = rk_mpp_hw_stop_active(hw);
+		if (stop_ret) {
+			rk_mpp_hw_handle_reset_failure(hw, stop_ret);
+			/*
+			 * Submission now owns a quarantined active job. Report
+			 * acceptance so the scheduler does not complete it and
+			 * drop job->hw while DMA quiescence remains unproved.
+			 * Remove/shutdown retains and retries this ownership.
+			 */
+			mutex_unlock(&hw->run_lock);
+			return 0;
+		}
+	}
 	rk_mpp_hw_power_off(hw);
-	rk_mpp_hw_clear_active_job(hw, job, NULL);
+	if (active_owned)
+		rk_mpp_hw_clear_active_job(hw, job, NULL);
 	rk_mpp_hw_enable_irq(hw, irq_disabled);
 	mutex_unlock(&hw->run_lock);
 	return ret;
-err_clear_active:
-	irq_disabled = rk_mpp_hw_disable_irq_nosync(hw);
-	rk_mpp_hw_synchronize_hardirq(hw);
-	rk_mpp_hw_clear_active_job(hw, job, NULL);
-	rk_mpp_hw_enable_irq(hw, irq_disabled);
 err_unlock:
 	mutex_unlock(&hw->run_lock);
 	return ret;
@@ -14263,6 +14723,9 @@ static irqreturn_t rk_mpp_av1_irq(struct rk_mpp_hw *hw)
 	atomic_inc(&hw->srv->irq_count);
 	writel(0, hw->regs[0] + RK_MPP_AV1_IRQ_BASE);
 
+	raw_spin_lock_irqsave(&hw->aux_lock, flags);
+	hw->av1_vcd_irq_ns = ktime_get_mono_fast_ns();
+	raw_spin_unlock_irqrestore(&hw->aux_lock, flags);
 	spin_lock_irqsave(&hw->lock, flags);
 	hw->irq_status |= status;
 	spin_unlock_irqrestore(&hw->lock, flags);
@@ -14274,12 +14737,18 @@ static irqreturn_t rk_mpp_av1_thread(struct rk_mpp_hw *hw)
 {
 	struct rk_mpp_job *job;
 	bool fault_pending = false;
+	u64 generation = 0;
 	u32 irq_status = 0;
 	u32 pp_config = 0;
 	int reset_ret;
 	int ret;
 
 	mutex_lock(&hw->run_lock);
+	job = rk_mpp_hw_peek_irq_job(hw, &irq_status,
+				     &generation, &fault_pending);
+	if (job && job->av1_afbc_enabled &&
+	    !(irq_status & RK_MPP_AV1_ERR_MASK))
+		rk_mpp_av1_observe_afbc_at_vcd(hw, generation);
 	job = rk_mpp_hw_take_irq_job(hw, &irq_status, &fault_pending);
 	if (!job) {
 		if (fault_pending) {
@@ -14297,17 +14766,19 @@ static irqreturn_t rk_mpp_av1_thread(struct rk_mpp_hw *hw)
 	rk_mpp_debug_record_job(job, RK_MPP_DEBUG_IRQ, 0, irq_status, 0);
 	rk_mpp_hw_cancel_timeout(hw);
 
-	ret = rk_mpp_job_read_regs(job);
-	if (!ret)
-		ret = rk_mpp_job_store_reg_word(job, RK_MPP_AV1_IRQ_BASE,
-						irq_status);
 	rk_mpp_av1_clear_cache(hw);
 	if (!rk_mpp_av1_required_word(job, RK_MPP_AV1_PP_CONFIG_WORD,
 				      &pp_config) &&
 	    (pp_config & RK_MPP_AV1_PP_TILE_MASK) ==
 	    RK_MPP_AV1_PP_TILE_16X16)
 		rk_mpp_av1_afbc_ack(hw);
+	ret = rk_mpp_job_read_regs(job);
+	if (!ret)
+		ret = rk_mpp_job_store_reg_word(job, RK_MPP_AV1_IRQ_BASE,
+						irq_status);
 
+	if (!ret && (irq_status & RK_MPP_AV1_ERR_MASK))
+		ret = -EIO;
 	if (irq_status & RK_MPP_AV1_ERR_MASK) {
 		reset_ret = rk_mpp_hw_stop_active(hw);
 		if (reset_ret) {
@@ -14348,12 +14819,6 @@ static const struct rk_mpp_backend_ops rk_mpp_av1_backend_ops = {
 	.quiesce_aux_irqs = rk_mpp_av1_quiesce_aux_irqs,
 };
 
-static void rk_mpp_hw_activate_aux_irqs(struct rk_mpp_hw *hw)
-{
-	if (hw->aux_irq_count)
-		WRITE_ONCE(hw->aux_irqs_active, true);
-}
-
 static void rk_mpp_hw_deactivate_aux_irqs(struct rk_mpp_hw *hw)
 {
 	u32 i;
@@ -14361,7 +14826,7 @@ static void rk_mpp_hw_deactivate_aux_irqs(struct rk_mpp_hw *hw)
 	if (!hw->aux_irq_count)
 		return;
 
-	if (READ_ONCE(hw->aux_irqs_active) && hw->match->ops &&
+	if (atomic_read(&hw->power_count) > 0 && hw->match->ops &&
 	    hw->match->ops->quiesce_aux_irqs)
 		hw->match->ops->quiesce_aux_irqs(hw);
 	WRITE_ONCE(hw->aux_irqs_active, false);
@@ -14378,7 +14843,7 @@ static irqreturn_t rk_mpp_hw_aux_irq(int irq, void *data)
 
 	if (!READ_ONCE(hw->aux_irqs_active) ||
 	    unlikely(READ_ONCE(hw->recovery_failed)))
-		return IRQ_NONE;
+		return IRQ_HANDLED;
 	if (!aux->desc || !aux->desc->handler)
 		return IRQ_NONE;
 
@@ -15355,15 +15820,27 @@ static int rk_mpp_debug_state_show(struct seq_file *s, void *unused)
 		   atomic_read(&srv->completed_job_count),
 		   atomic_read(&srv->failed_job_count),
 		   atomic_read(&srv->aborted_job_count));
-	seq_printf(s, "errors unsupported=%d timeout=%d reset=%d recovery_failure=%d iommu_fault=%d iommu_refresh=%d irq=%d spurious_irq=%d\n",
+	seq_printf(s, "errors unsupported=%d timeout=%d reset=%d recovery_failure=%d iommu_fault=%d iommu_refresh=%d iommu_idle_fault=%d irq=%d spurious_irq=%d av1_afbc_irq=%d av1_afbc_prestart_status=%d av1_afbc_stale_status_timeout=%d av1_afbc_before_vcd=%d av1_afbc_after_vcd=%d av1_afbc_observed_at_vcd=%d av1_afbc_not_observed_at_vcd=%d av1_afbc_observed_at_quiesce=%d av1_afbc_not_observed_at_quiesce=%d av1_reset_idle_unproven=%d av1_vcd_to_afbc_observed_max_ns=%lld\n",
 		   atomic_read(&srv->unsupported_count),
 		   atomic_read(&srv->timeout_count),
 		   atomic_read(&srv->reset_count),
 		   atomic_read(&srv->recovery_failure_count),
 		   atomic_read(&srv->iommu_fault_count),
 		   atomic_read(&srv->iommu_refresh_count),
+		   atomic_read(&srv->iommu_idle_fault_count),
 		   atomic_read(&srv->irq_count),
-		   atomic_read(&srv->spurious_irq_count));
+		   atomic_read(&srv->spurious_irq_count),
+		   atomic_read(&srv->av1_afbc_irq_count),
+		   atomic_read(&srv->av1_afbc_prestart_status_count),
+		   atomic_read(&srv->av1_afbc_stale_status_timeout_count),
+		   atomic_read(&srv->av1_afbc_before_vcd_count),
+		   atomic_read(&srv->av1_afbc_after_vcd_count),
+		   atomic_read(&srv->av1_afbc_observed_at_vcd_count),
+		   atomic_read(&srv->av1_afbc_not_observed_at_vcd_count),
+		   atomic_read(&srv->av1_afbc_observed_at_quiesce_count),
+		   atomic_read(&srv->av1_afbc_not_observed_at_quiesce_count),
+		   atomic_read(&srv->av1_reset_idle_unproven_count),
+		   atomic64_read(&srv->av1_vcd_to_afbc_observed_max_ns));
 	seq_printf(s, "io ioctl=%d imports=%d recent_events=%u next_event_seq=%llu\n",
 		   atomic_read(&srv->ioctl_count), atomic_read(&srv->import_count),
 		   recent_events, next_event_seq);
@@ -15743,6 +16220,7 @@ static int rk_mpp_hw_probe(struct platform_device *pdev)
 	mutex_init(&hw->run_lock);
 	mutex_init(&hw->ccu_recovery_lock);
 	spin_lock_init(&hw->lock);
+	raw_spin_lock_init(&hw->aux_lock);
 	if (match->type == RK_MPP_DEVICE_BUTT) {
 		lockdep_set_class(&hw->run_lock, &rk_mpp_ccu_run_lock_key);
 		lockdep_set_class(&hw->lock, &rk_mpp_ccu_hw_lock_key);
@@ -15886,8 +16364,8 @@ static int rk_mpp_hw_probe(struct platform_device *pdev)
 			return aux->irq;
 		aux->hw = hw;
 		aux->desc = desc;
-		ret = devm_request_irq(dev, aux->irq, rk_mpp_hw_aux_irq,
-				       IRQF_SHARED, desc->name, aux);
+		ret = devm_request_irq(dev, aux->irq, rk_mpp_hw_aux_irq, 0,
+				       desc->name, aux);
 		if (ret)
 			return ret;
 		aux->registered = true;
@@ -15940,8 +16418,11 @@ err_unlock_identity:
 	mutex_unlock(&rk_mpp_srv.hw_lock);
 	rk_mpp_dma_group_unregister(hw);
 err_unregister_fault_handler:
-	rk_mpp_iommu_unregister_fault_handler(hw);
-	cancel_work_sync(&hw->iommu_fault_work);
+	while (rk_mpp_iommu_unregister_fault_handler(hw, true)) {
+		dev_crit(dev,
+			 "probe unwind blocked until IOMMU callback ownership is released\n");
+		msleep(1000);
+	}
 
 	return dev_err_probe(dev, ret,
 			     "duplicate, invalid, or exhausted core identity\n");
@@ -15953,6 +16434,7 @@ static void rk_mpp_hw_remove(struct platform_device *pdev)
 	struct rk_mpp_hw *ccu = NULL;
 	bool ccu_was_online = false;
 	bool dma_unquiesced = false;
+	unsigned int stop_attempt = 0;
 	int stop_ret = 0;
 
 	mutex_lock(&rk_mpp_srv.hw_lock);
@@ -15960,7 +16442,6 @@ static void rk_mpp_hw_remove(struct platform_device *pdev)
 	list_del_init(&hw->link);
 	rk_mpp_refresh_hw_support_locked(&rk_mpp_srv);
 	mutex_unlock(&rk_mpp_srv.hw_lock);
-	rk_mpp_hw_deactivate_aux_irqs(hw);
 
 	if (hw->match->contributes_support && hw->ccu_node) {
 		/*
@@ -15971,6 +16452,9 @@ static void rk_mpp_hw_remove(struct platform_device *pdev)
 		if (!ccu)
 			ccu = rk_mpp_hw_get_ccu_for_core(hw->srv, hw);
 	}
+retry_stop:
+	dma_unquiesced = false;
+	stop_ret = 0;
 	if (ccu) {
 		mutex_lock(&rk_mpp_srv.hw_lock);
 		if (ccu->online && !list_empty(&ccu->link)) {
@@ -15981,8 +16465,6 @@ static void rk_mpp_hw_remove(struct platform_device *pdev)
 		mutex_unlock(&rk_mpp_srv.hw_lock);
 	}
 
-	rk_mpp_iommu_unregister_fault_handler(hw);
-	cancel_work_sync(&hw->iommu_fault_work);
 	if (ccu) {
 		mutex_lock(&ccu->ccu_recovery_lock);
 		if (rk_mpp_rkvdec2_hard_ccu_enabled(hw))
@@ -16004,14 +16486,35 @@ static void rk_mpp_hw_remove(struct platform_device *pdev)
 		mutex_unlock(&hw->ccu_recovery_lock);
 	}
 	rk_mpp_hw_abort_queued(hw, -ENODEV);
-	if (!dma_unquiesced)
-		rk_mpp_hw_abort_active(hw, -ENODEV);
+	if (!dma_unquiesced) {
+		stop_ret = rk_mpp_hw_abort_active(hw, -ENODEV);
+		if (stop_ret)
+			dma_unquiesced = true;
+	}
 	/*
 	 * A submitter already holding run_lock can arm timeout_work after
 	 * abort_active()'s initial cancellation but before its job is taken.
 	 * With online already false, no new submit can pass after this drain.
 	 */
 	rk_mpp_hw_cancel_timeout_sync(hw);
+	if (dma_unquiesced) {
+		if (!(stop_attempt++ % 10))
+			dev_crit(hw->dev,
+				 "unbind retrying: active DMA is not yet stopped or isolated\n");
+		/*
+		 * Keep the initial hardware reference and provider callback
+		 * alive while retrying. Returning would let devres free
+		 * MMIO/IRQs below a DMA master whose quiescence was not proved.
+		 */
+		msleep(1000);
+		goto retry_stop;
+	}
+	while (rk_mpp_iommu_unregister_fault_handler(hw, true)) {
+		if (!(stop_attempt++ % 10))
+			dev_crit(hw->dev,
+				 "unbind retrying until IOMMU callback ownership is released\n");
+		msleep(1000);
+	}
 	if (ccu) {
 		if (ccu_was_online && !dma_unquiesced) {
 			mutex_lock(&rk_mpp_srv.hw_lock);
@@ -16041,17 +16544,208 @@ static void rk_mpp_hw_remove(struct platform_device *pdev)
 	rk_mpp_dma_group_unregister(hw);
 }
 
+static void rk_mpp_hw_set_suspend_online(struct rk_mpp_hw *hw, bool online)
+{
+	mutex_lock(&rk_mpp_srv.hw_lock);
+	if (!list_empty(&hw->link))
+		WRITE_ONCE(hw->online, online);
+	rk_mpp_refresh_hw_support_locked(&rk_mpp_srv);
+	mutex_unlock(&rk_mpp_srv.hw_lock);
+}
+
+static int rk_mpp_iommu_sync_registered_handler(struct rk_mpp_hw *hw)
+{
+	if (!hw->iommu_fault_handler_registered)
+		return 0;
+
+	switch (READ_ONCE(hw->iommu_provider)) {
+	case RK_MPP_IOMMU_ROCKCHIP:
+		return rockchip_iommu_sync_fault_handler(hw->dev);
+	case RK_MPP_IOMMU_VSI:
+		return vsi_iommu_sync_fault_handler(hw->dev);
+	default:
+		return -ENODEV;
+	}
+}
+
+static int rk_mpp_hw_suspend(struct device *dev)
+{
+	struct rk_mpp_hw *hw = dev_get_drvdata(dev);
+	unsigned long flags;
+	bool busy;
+	int ret;
+
+	if (!hw)
+		return 0;
+
+	hw->suspend_was_online = READ_ONCE(hw->online);
+	WRITE_ONCE(hw->suspended, true);
+	rk_mpp_hw_set_suspend_online(hw, false);
+
+	mutex_lock(&hw->run_lock);
+	spin_lock_irqsave(&hw->lock, flags);
+	busy = hw->active_job || hw->iommu_fault_pending;
+	spin_unlock_irqrestore(&hw->lock, flags);
+	busy |= atomic_read(&hw->queued_job_count) > 0;
+	busy |= atomic_read(&hw->power_count) > 0;
+	mutex_unlock(&hw->run_lock);
+	if (busy) {
+		ret = -EBUSY;
+		goto restore_online;
+	}
+
+	rk_mpp_hw_cancel_timeout_sync(hw);
+	flush_work(&hw->iommu_fault_work);
+	if (hw->iommu_provider == RK_MPP_IOMMU_VSI) {
+		ret = vsi_iommu_prepare_dma(hw->dev);
+		if (ret == -EBUSY) {
+			flush_work(&hw->iommu_fault_work);
+			ret = vsi_iommu_prepare_dma(hw->dev);
+		}
+		if (ret)
+			goto restore_online;
+	}
+	ret = rk_mpp_iommu_sync_registered_handler(hw);
+	if (ret)
+		goto restore_online;
+	flush_work(&hw->iommu_fault_work);
+
+	/*
+	 * The device is offline, so the second check closes the interval in
+	 * which a provider callback already in flight could publish fault work
+	 * after the first idle snapshot.
+	 */
+	mutex_lock(&hw->run_lock);
+	spin_lock_irqsave(&hw->lock, flags);
+	busy = hw->active_job || hw->iommu_fault_pending;
+	spin_unlock_irqrestore(&hw->lock, flags);
+	busy |= atomic_read(&hw->queued_job_count) > 0;
+	busy |= atomic_read(&hw->power_count) > 0;
+	mutex_unlock(&hw->run_lock);
+	if (busy) {
+		ret = -EBUSY;
+		goto restore_online;
+	}
+
+	ret = rk_mpp_iommu_unregister_fault_handler(hw, true);
+	if (ret) {
+		rk_mpp_hw_handle_reset_failure(hw, ret);
+		goto restore_online;
+	}
+	hw->suspend_fault_handler_unregistered = true;
+	hw->suspend_irq_disabled = rk_mpp_hw_disable_irq(hw);
+	ret = pm_runtime_force_suspend(dev);
+	if (ret) {
+		int register_ret;
+
+		rk_mpp_hw_enable_irq(hw, hw->suspend_irq_disabled);
+		hw->suspend_irq_disabled = false;
+		register_ret = rk_mpp_iommu_register_fault_handler(hw);
+		if (!register_ret)
+			hw->suspend_fault_handler_unregistered = false;
+		else
+			rk_mpp_hw_handle_reset_failure(hw, register_ret);
+		goto restore_online;
+	}
+
+	return 0;
+
+restore_online:
+	WRITE_ONCE(hw->suspended, false);
+	if (hw->suspend_was_online && !READ_ONCE(hw->recovery_failed) &&
+	    !READ_ONCE(hw->terminally_stopped)) {
+		rk_mpp_hw_set_suspend_online(hw, true);
+		schedule_work(&hw->srv->sched_work);
+	}
+	return ret;
+}
+
+static int rk_mpp_hw_resume(struct device *dev)
+{
+	struct rk_mpp_hw *hw = dev_get_drvdata(dev);
+	int ret;
+
+	if (!hw)
+		return 0;
+
+	ret = pm_runtime_force_resume(dev);
+	if (ret)
+		return ret;
+	if (hw->suspend_fault_handler_unregistered) {
+		ret = rk_mpp_iommu_register_fault_handler(hw);
+		if (ret) {
+			rk_mpp_hw_handle_reset_failure(hw, ret);
+			return ret;
+		}
+		hw->suspend_fault_handler_unregistered = false;
+	}
+	rk_mpp_hw_enable_irq(hw, hw->suspend_irq_disabled);
+	hw->suspend_irq_disabled = false;
+
+	WRITE_ONCE(hw->suspended, false);
+	if (hw->suspend_was_online && !READ_ONCE(hw->recovery_failed) &&
+	    !READ_ONCE(hw->terminally_stopped)) {
+		rk_mpp_hw_set_suspend_online(hw, true);
+		schedule_work(&hw->srv->sched_work);
+	}
+
+	return 0;
+}
+
+static void rk_mpp_hw_shutdown(struct platform_device *pdev)
+{
+	struct rk_mpp_hw *hw = platform_get_drvdata(pdev);
+	unsigned int stop_attempt = 0;
+	int stop_ret;
+
+	if (!hw)
+		return;
+
+	rk_mpp_hw_set_suspend_online(hw, false);
+	rk_mpp_hw_abort_queued(hw, -ESHUTDOWN);
+retry_stop:
+	stop_ret = rk_mpp_hw_abort_active(hw, -ESHUTDOWN);
+	rk_mpp_hw_cancel_timeout_sync(hw);
+	if (stop_ret) {
+		if (!(stop_attempt++ % 10))
+			dev_crit(hw->dev,
+				 "shutdown retrying until active DMA is stopped or isolated: %d\n",
+				 stop_ret);
+		msleep(1000);
+		goto retry_stop;
+	}
+
+	rk_mpp_hw_disable_irq(hw);
+	while (rk_mpp_iommu_unregister_fault_handler(hw, true)) {
+		if (!(stop_attempt++ % 10))
+			dev_crit(hw->dev,
+				 "shutdown retrying until IOMMU callback ownership is released\n");
+		msleep(1000);
+	}
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(rk_mpp_hw_pm_ops,
+				rk_mpp_hw_suspend, rk_mpp_hw_resume);
+
 static struct platform_driver rk_mpp_hw_driver = {
 	.probe = rk_mpp_hw_probe,
 	.remove = rk_mpp_hw_remove,
+	.shutdown = rk_mpp_hw_shutdown,
 	.driver = {
 		.name = "rk-mpp-rewrite-hw",
 		.of_match_table = rk_mpp_hw_of_match,
+		.pm = pm_ptr(&rk_mpp_hw_pm_ops),
 	},
 };
 
 static int rk_mpp_runtime_register(void)
 {
+	atomic64_t *av1_observed_max_ns =
+		&rk_mpp_srv.av1_vcd_to_afbc_observed_max_ns;
+	atomic_t *av1_observed_at_quiesce =
+		&rk_mpp_srv.av1_afbc_observed_at_quiesce_count;
+	atomic_t *av1_not_observed_at_quiesce =
+		&rk_mpp_srv.av1_afbc_not_observed_at_quiesce_count;
 	int ret;
 
 	rk_mpp_service_state_init(&rk_mpp_srv);
@@ -16143,6 +16837,41 @@ static int rk_mpp_runtime_register(void)
 	debugfs_create_atomic_t("iommu_refresh_count", 0444,
 				rk_mpp_srv.debugfs_root,
 				&rk_mpp_srv.iommu_refresh_count);
+	debugfs_create_atomic_t("iommu_idle_fault_count", 0444,
+				rk_mpp_srv.debugfs_root,
+				&rk_mpp_srv.iommu_idle_fault_count);
+	debugfs_create_atomic_t("av1_afbc_irq_count", 0444,
+				rk_mpp_srv.debugfs_root,
+				&rk_mpp_srv.av1_afbc_irq_count);
+	debugfs_create_atomic_t("av1_afbc_prestart_status_count", 0444,
+				rk_mpp_srv.debugfs_root,
+				&rk_mpp_srv.av1_afbc_prestart_status_count);
+	debugfs_create_atomic_t("av1_afbc_stale_status_timeout_count", 0444,
+				rk_mpp_srv.debugfs_root,
+				&rk_mpp_srv.av1_afbc_stale_status_timeout_count);
+	debugfs_create_atomic_t("av1_afbc_before_vcd_count", 0444,
+				rk_mpp_srv.debugfs_root,
+				&rk_mpp_srv.av1_afbc_before_vcd_count);
+	debugfs_create_atomic_t("av1_afbc_observed_at_vcd_count", 0444,
+				rk_mpp_srv.debugfs_root,
+				&rk_mpp_srv.av1_afbc_observed_at_vcd_count);
+	debugfs_create_atomic_t("av1_afbc_after_vcd_count", 0444,
+				rk_mpp_srv.debugfs_root,
+				&rk_mpp_srv.av1_afbc_after_vcd_count);
+	debugfs_create_atomic_t("av1_afbc_not_observed_at_vcd_count", 0444,
+				rk_mpp_srv.debugfs_root,
+				&rk_mpp_srv.av1_afbc_not_observed_at_vcd_count);
+	debugfs_create_atomic_t("av1_afbc_observed_at_quiesce_count", 0444,
+				rk_mpp_srv.debugfs_root,
+				av1_observed_at_quiesce);
+	debugfs_create_atomic_t("av1_afbc_not_observed_at_quiesce_count", 0444,
+				rk_mpp_srv.debugfs_root,
+				av1_not_observed_at_quiesce);
+	debugfs_create_atomic_t("av1_reset_idle_unproven_count", 0444,
+				rk_mpp_srv.debugfs_root,
+				&rk_mpp_srv.av1_reset_idle_unproven_count);
+	rk_mpp_debugfs_create_atomic64("av1_vcd_to_afbc_observed_max_ns",
+				       av1_observed_max_ns);
 
 	pr_info("registered /dev/mpp_service (%s), hw_support=0x%08x\n",
 		RK_MPP_REWRITE_VERSION, rk_mpp_srv.hw_support);
