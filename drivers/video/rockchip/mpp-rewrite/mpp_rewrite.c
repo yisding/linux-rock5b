@@ -504,6 +504,13 @@ struct rk_mpp_session {
 	struct list_head imports;
 	struct list_head active_jobs;
 	wait_queue_head_t wait;
+	/*
+	 * Bumped (then wait is woken) after every poll-visible state change.
+	 * Poll paths snapshot it before their locked check and sleep on it
+	 * changing, so the wait_event predicate never has to take
+	 * session->lock with the task state already set to !TASK_RUNNING.
+	 */
+	atomic64_t poll_seq;
 	refcount_t refs;
 	u32 client_type;
 	u16 trans_table[RK_MPP_MAX_REG_TRANS_NUM];
@@ -698,6 +705,8 @@ static int
 rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(struct rk_mpp_hw *ccu);
 static u32 rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu);
 static int rk_mpp_rkvdec2_reset_soft_ccu_job(struct rk_mpp_job *job);
+static int rk_mpp_rkvdec2_start_soft_ccu_job(struct rk_mpp_job *job,
+					     u32 start_value);
 static int rk_mpp_hw_abort_ccu_dependents(struct rk_mpp_hw *ccu);
 static void
 rk_mpp_hw_abort_ccu_active_dependents(struct rk_mpp_hw *ccu,
@@ -712,6 +721,7 @@ static int rk_mpp_job_apply_rcb_info(struct rk_mpp_job *job);
 static void rk_mpp_scheduler_work(struct work_struct *work);
 static void rk_mpp_session_abort_jobs(struct rk_mpp_session *session);
 static int rk_mpp_session_poll_job(struct rk_mpp_session *session, u32 flags);
+static void rk_mpp_session_poll_notify(struct rk_mpp_session *session);
 static int rk_mpp_session_poll_irq(struct rk_mpp_session *session,
 				   const struct mpp_request *req,
 				   u32 flags);
@@ -5175,6 +5185,7 @@ static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
 		.rkvdec_ccu = &ccu,
 	};
 	u32 *ccu_regs;
+	u32 *core_regs;
 	u32 *link;
 
 	link = kunit_kcalloc(test, 0x60 / sizeof(*link), sizeof(*link),
@@ -5209,9 +5220,27 @@ static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test,
 			ccu_regs[RK_MPP_RKVDEC_CCU_CORE_WORK_BASE / sizeof(*ccu_regs)],
 			hw.core_mask);
+	/* Arming must not mark the core started: CORE_STA stays clear. */
+	KUNIT_EXPECT_EQ(test,
+			ccu_regs[RK_MPP_RKVDEC_CCU_CORE_STA_BASE / sizeof(*ccu_regs)],
+			0U);
+
+	core_regs = kunit_kcalloc(test, 0x60 / sizeof(*core_regs),
+				  sizeof(*core_regs), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, core_regs);
+	hw.regs[0] = (void __iomem *)core_regs;
+	hw.reg_size[0] = 0x60;
+	hw.online = true;
+	ccu.online = true;
+	spin_lock_init(&hw.lock);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_rkvdec2_start_soft_ccu_job(&job, 0x100), 0);
 	KUNIT_EXPECT_EQ(test,
 			ccu_regs[RK_MPP_RKVDEC_CCU_CORE_STA_BASE / sizeof(*ccu_regs)],
 			hw.core_mask);
+	KUNIT_EXPECT_EQ(test,
+			core_regs[RK_MPP_RKVDEC_START_BASE / sizeof(*core_regs)],
+			0x100U | RK_MPP_RKVDEC_START_EN);
 
 	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_reset_soft_ccu_job(&job), 0);
 	KUNIT_EXPECT_EQ(test,
@@ -10235,7 +10264,7 @@ static void rk_mpp_job_complete(struct rk_mpp_job *job, int result)
 	rk_mpp_rkvenc2_dchs_release(job);
 	rk_mpp_rkvdec2_release_link_table(job);
 	rk_mpp_job_drop_hw(job);
-	wake_up_all(&session->wait);
+	rk_mpp_session_poll_notify(session);
 	schedule_work(&session->srv->sched_work);
 }
 
@@ -10714,8 +10743,51 @@ static int rk_mpp_rkvdec2_program_soft_ccu(struct rk_mpp_job *job)
 		       ccu_regs + RK_MPP_RKVDEC_CCU_WORK_MODE_BASE);
 	writel_relaxed(hw->core_mask,
 		       ccu_regs + RK_MPP_RKVDEC_CCU_CORE_WORK_BASE);
+
+	return 0;
+}
+
+/*
+ * BSP contract (rkvdec2_soft_ccu_enqueue): CORE_STA is the last CCU word
+ * before the start doorbell, written back-to-back with it. The BSP gets
+ * that adjacency from its single taskqueue worker; ccu->run_lock is this
+ * driver's substitute. The coordinator gates core clocks in CCU work mode:
+ * leaving a core registered-but-unstarted across a sibling completion let
+ * the CCU re-gate it, and the eventual START write stalled the
+ * interconnect (silent dual-core mpi_dec_mt wedge, 2026-07-29).
+ */
+static int rk_mpp_rkvdec2_start_soft_ccu_job(struct rk_mpp_job *job,
+					     u32 start_value)
+{
+	struct rk_mpp_hw *hw = job->hw;
+	struct rk_mpp_hw *ccu = job->rkvdec_ccu;
+	int ret;
+
+	if (!ccu) {
+		rk_mpp_hw_schedule_timeout(hw);
+		wmb();
+		writel(start_value | RK_MPP_RKVDEC_START_EN,
+		       hw->regs[0] + RK_MPP_RKVDEC_START_BASE);
+		return 0;
+	}
+
+	if (!rk_mpp_rkvdec2_soft_ccu_regs_ready(ccu))
+		return -EOPNOTSUPP;
+
+	mutex_lock(&ccu->run_lock);
+	if (!rk_mpp_hw_usable(ccu) || !rk_mpp_hw_usable(hw) ||
+	    READ_ONCE(job->canceled)) {
+		ret = READ_ONCE(job->canceled) ? -ECANCELED : -ENODEV;
+		mutex_unlock(&ccu->run_lock);
+		return ret;
+	}
 	writel_relaxed(hw->core_mask,
-		       ccu_regs + RK_MPP_RKVDEC_CCU_CORE_STA_BASE);
+		       ccu->regs[0] + RK_MPP_RKVDEC_CCU_CORE_STA_BASE);
+	rk_mpp_hw_schedule_timeout(hw);
+	wmb();
+	writel(start_value | RK_MPP_RKVDEC_START_EN,
+	       hw->regs[0] + RK_MPP_RKVDEC_START_BASE);
+	mutex_unlock(&ccu->run_lock);
 
 	return 0;
 }
@@ -13261,7 +13333,7 @@ static irqreturn_t rk_mpp_rkvenc2_irq(struct rk_mpp_hw *hw)
 		if (status & RK_MPP_RKVENC_INT_BS_OVERFLOW)
 			rk_mpp_rkvenc2_handle_bs_overflow(hw, job);
 		if (slice_ready)
-			wake_up_all(&job->session->wait);
+			rk_mpp_session_poll_notify(job->session);
 		rk_mpp_job_put(job);
 	}
 
@@ -13380,6 +13452,15 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 	}
 
 	if (!hard_ccu) {
+		/*
+		 * BSP order: register the core with the coordinator (work
+		 * mode, WORK_EN, CORE_WORK) before any core-side setup, so
+		 * cache and task-register writes land on a core the CCU
+		 * already tracks as work-pending.
+		 */
+		ret = rk_mpp_rkvdec2_prepare_soft_ccu(job);
+		if (ret)
+			goto err_power_off;
 		ret = rk_mpp_rkvdec2_configure_cache(hw);
 		if (ret)
 			goto err_power_off;
@@ -13414,14 +13495,9 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 		return 0;
 	}
 
-	ret = rk_mpp_rkvdec2_prepare_soft_ccu(job);
+	ret = rk_mpp_rkvdec2_start_soft_ccu_job(job, start_value);
 	if (ret)
 		goto err_power_off;
-
-	rk_mpp_hw_schedule_timeout(hw);
-	wmb();
-	writel(start_value | RK_MPP_RKVDEC_START_EN,
-	       hw->regs[0] + RK_MPP_RKVDEC_START_BASE);
 	rk_mpp_count_started_core(job);
 	mutex_unlock(&hw->run_lock);
 
@@ -14184,7 +14260,7 @@ static void rk_mpp_session_abort_jobs(struct rk_mpp_session *session)
 	}
 	session->active_job_count = 0;
 	mutex_unlock(&session->lock);
-	wake_up_all(&session->wait);
+	rk_mpp_session_poll_notify(session);
 
 	list_for_each_entry_safe(job, tmp, &aborted, session_link) {
 		list_del_init(&job->session_link);
@@ -14266,47 +14342,26 @@ static int rk_mpp_job_pop_rkvenc_slice(struct rk_mpp_job *job, u32 *value)
 	return ret;
 }
 
-static bool rk_mpp_session_irq_poll_ready(struct rk_mpp_session *session)
+/*
+ * Publish a poll-visible state change. The increment must follow the state
+ * update and precede the wakeup: a poller that sampled the old sequence then
+ * missed the update under session->lock is guaranteed to see the sequence
+ * move rather than sleeping across the change.
+ */
+static void rk_mpp_session_poll_notify(struct rk_mpp_session *session)
 {
-	struct rk_mpp_job *job;
-	bool ready;
-
-	mutex_lock(&session->lock);
-	job = list_first_entry_or_null(&session->active_jobs,
-				       struct rk_mpp_job, session_link);
-	if (!job) {
-		ready = true;
-	} else if (job->state == RK_MPP_JOB_DONE || !job->rkvenc_slice_mode) {
-		ready = true;
-	} else {
-		ready = rk_mpp_job_rkvenc_slice_ready(job) ||
-			rk_mpp_job_rkvenc_slice_done(job);
-	}
-	mutex_unlock(&session->lock);
-
-	return ready;
-}
-
-static bool rk_mpp_session_done_or_empty(struct rk_mpp_session *session)
-{
-	struct rk_mpp_job *job;
-	bool ready;
-
-	mutex_lock(&session->lock);
-	job = list_first_entry_or_null(&session->active_jobs,
-				       struct rk_mpp_job, session_link);
-	ready = !job || job->state == RK_MPP_JOB_DONE;
-	mutex_unlock(&session->lock);
-
-	return ready;
+	atomic64_inc(&session->poll_seq);
+	wake_up_all(&session->wait);
 }
 
 static int rk_mpp_session_poll_job(struct rk_mpp_session *session, u32 flags)
 {
 	struct rk_mpp_job *job;
+	u64 seq;
 	int ret;
 
 	for (;;) {
+		seq = atomic64_read(&session->poll_seq);
 		mutex_lock(&session->lock);
 		job = list_first_entry_or_null(&session->active_jobs,
 					       struct rk_mpp_job, session_link);
@@ -14331,7 +14386,8 @@ static int rk_mpp_session_poll_job(struct rk_mpp_session *session, u32 flags)
 			return -EAGAIN;
 
 		ret = wait_event_interruptible(session->wait,
-					       rk_mpp_session_done_or_empty(session));
+					       atomic64_read(&session->poll_seq) !=
+					       seq);
 		if (ret)
 			return ret;
 	}
@@ -14386,7 +14442,9 @@ static int rk_mpp_session_poll_irq(struct rk_mpp_session *session,
 	for (;;) {
 		struct rk_mpp_job *job;
 		u32 slice_info = 0;
+		u64 seq;
 
+		seq = atomic64_read(&session->poll_seq);
 		job = rk_mpp_session_first_job_get(session);
 		if (!job)
 			return -EIO;
@@ -14445,7 +14503,8 @@ static int rk_mpp_session_poll_irq(struct rk_mpp_session *session,
 			return -EAGAIN;
 
 		ret = wait_event_interruptible(session->wait,
-					       rk_mpp_session_irq_poll_ready(session));
+					       atomic64_read(&session->poll_seq) !=
+					       seq);
 		if (ret)
 			return ret;
 	}
@@ -14984,6 +15043,7 @@ static int rk_mpp_open(struct inode *inode, struct file *filp)
 	mutex_init(&session->lock);
 	mutex_init(&session->explicit_map_lock);
 	init_waitqueue_head(&session->wait);
+	atomic64_set(&session->poll_seq, 0);
 	refcount_set(&session->refs, 1);
 	INIT_LIST_HEAD(&session->imports);
 	INIT_LIST_HEAD(&session->active_jobs);
@@ -15475,6 +15535,15 @@ static int rk_mpp_hw_read_id(struct rk_mpp_hw *hw)
 	return 0;
 }
 
+/*
+ * Coordinator (CCU) devices are rk_mpp_hw instances whose run_lock and lock
+ * nest inside their cores' same-named locks. Distinct lockdep classes let
+ * the core -> coordinator ordering be validated instead of reported as
+ * same-class recursion, which would also disable lockdep for the boot.
+ */
+static struct lock_class_key rk_mpp_ccu_run_lock_key;
+static struct lock_class_key rk_mpp_ccu_hw_lock_key;
+
 static int rk_mpp_hw_probe(struct platform_device *pdev)
 {
 	const struct rk_mpp_hw_match *match;
@@ -15509,6 +15578,10 @@ static int rk_mpp_hw_probe(struct platform_device *pdev)
 	mutex_init(&hw->run_lock);
 	mutex_init(&hw->ccu_recovery_lock);
 	spin_lock_init(&hw->lock);
+	if (match->type == RK_MPP_DEVICE_BUTT) {
+		lockdep_set_class(&hw->run_lock, &rk_mpp_ccu_run_lock_key);
+		lockdep_set_class(&hw->lock, &rk_mpp_ccu_hw_lock_key);
+	}
 	atomic_set(&hw->irq_disable_depth, 0);
 	atomic_set(&hw->power_count, 0);
 	INIT_LIST_HEAD(&hw->fault_link);
