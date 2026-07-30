@@ -2993,7 +2993,8 @@ static bool rk_mpp_rkvdec2_move_powered_ccu_cores(struct rk_mpp_job *from,
 	return true;
 }
 
-static int rk_mpp_rkvdec2_power_on_ccu_cores(struct rk_mpp_job *job)
+static int rk_mpp_rkvdec2_power_on_ccu_cores(struct rk_mpp_job *job,
+					     u32 core_mask)
 {
 	struct rk_mpp_hw *cores[RK_MPP_RKVDEC_MAX_CCU_CORES];
 	struct rk_mpp_service *srv = job->session->srv;
@@ -3011,8 +3012,7 @@ static int rk_mpp_rkvdec2_power_on_ccu_cores(struct rk_mpp_job *job)
 		if (!rk_mpp_hw_usable(hw) ||
 		    hw->ccu_node != ccu->dev->of_node ||
 		    hw->iommu_domain != job->hw->iommu_domain ||
-		    (hw->core_mask & job->rkvdec_ccu_core_work) !=
-			    hw->core_mask)
+		    (hw->core_mask & core_mask) != hw->core_mask)
 			continue;
 		if (count >= ARRAY_SIZE(cores)) {
 			ret = -EOPNOTSUPP;
@@ -10830,6 +10830,31 @@ static int rk_mpp_rkvdec2_acquire_soft_ccu(struct rk_mpp_job *job)
 	if (!rk_mpp_hw_usable(ccu))
 		return -ENODEV;
 
+	/*
+	 * BSP contract (rkvdec2_ccu_power_on/off): while the coordinator is
+	 * in work mode, every core it may schedule stays powered; cores and
+	 * coordinator power off together only when the queue idles. Without
+	 * the group hold, a sibling left registered in CORE_WORK by the
+	 * previous session autosuspends ~200 ms after that session closes —
+	 * inside the next session's first-frame window — and the coordinator
+	 * poke at the gated register file stalls the interconnect
+	 * (mpi_dec_mt_h264 -> mpi_dec_h265 first-submit wedge, 2026-07-30;
+	 * mpi_dec_h265 alone passes on a fresh boot). The references are
+	 * job-owned and released with the job's coordinator reference in the
+	 * common CCU-release path.
+	 */
+	if (!job->rkvdec_ccu_powered_core_count) {
+		u32 ccu_cores = 0;
+
+		ret = rk_mpp_rkvdec2_ccu_core_mask(job->session->srv, ccu,
+						   hw, &ccu_cores);
+		if (ret)
+			return ret;
+		ret = rk_mpp_rkvdec2_power_on_ccu_cores(job, ccu_cores);
+		if (ret)
+			return ret;
+	}
+
 	return 0;
 }
 
@@ -11685,7 +11710,8 @@ static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
 
 	if (!add_mode) {
 		if (!job->rkvdec_ccu_powered_core_count) {
-			ret = rk_mpp_rkvdec2_power_on_ccu_cores(job);
+			ret = rk_mpp_rkvdec2_power_on_ccu_cores(job,
+					job->rkvdec_ccu_core_work);
 			if (ret)
 				goto err_unlock_ccu;
 			cores_powered_now = true;
