@@ -480,6 +480,7 @@ struct rk_mpp_service {
 	struct work_struct sched_work;
 	atomic_t ioctl_count;
 	atomic_t unsupported_count;
+	atomic_t rejected_job_count;
 	atomic_t import_count;
 	atomic_t submitted_job_count;
 	atomic_t scheduled_job_count;
@@ -609,6 +610,14 @@ struct rk_mpp_reg_image {
 	u32 rcb_count;
 	u32 rkvdec_perf_sel[RK_MPP_RKVDEC_PERF_SEL_NUM];
 	bool translated;
+	/*
+	 * Register index that failed translation or offset apply, or -1.
+	 * The deepest helper that rejects a register records the index here
+	 * so the single translate-fail event names the offending register
+	 * instead of the image size.  First failure wins; the helpers return
+	 * immediately, so later indices cannot be more relevant.
+	 */
+	s32 fail_index;
 };
 
 struct rk_mpp_trans_table {
@@ -851,6 +860,12 @@ static u32 rk_mpp_debug_event_trace_bit(enum rk_mpp_debug_event_type type)
 	case RK_MPP_DEBUG_DONE:
 		return RK_MPP_DEBUG_TRACE_LIFECYCLE;
 	case RK_MPP_DEBUG_IRQ:
+	case RK_MPP_DEBUG_SPURIOUS_IRQ:
+		/*
+		 * A spurious interrupt is interrupt activity, not a job error.
+		 * Tracing interrupts without it hides the pathology the IRQ
+		 * trace bit exists to find.
+		 */
 		return RK_MPP_DEBUG_TRACE_IRQ;
 	default:
 		return RK_MPP_DEBUG_TRACE_ERROR;
@@ -1608,8 +1623,9 @@ static inline void rk_mpp_hw_assert_powered(const struct rk_mpp_hw *hw)
 	IS_ENABLED(CONFIG_PROVE_LOCKING)
 	if (!hw)
 		return;
+	/* WARN bypasses pr_fmt, so spell the module prefix out to match. */
 	WARN_ONCE(atomic_read(&hw->power_count) <= 0,
-		  "rk-mpp: MMIO to %s with clocks gated (power_count=%d)\n",
+		  KBUILD_MODNAME ": MMIO to %s with clocks gated (power_count=%d)\n",
 		  hw->dev ? dev_name(hw->dev) : "<unbound>",
 		  atomic_read(&hw->power_count));
 #endif
@@ -2289,7 +2305,18 @@ static int rk_mpp_import_iova_at_offset(const struct rk_mpp_import *import,
 {
 	if (!import || !import->dmabuf || !iova)
 		return -EINVAL;
-	if (offset >= import->dmabuf->size)
+	/*
+	 * One past the end is a legal end-exclusive limit pointer, not an
+	 * access.  The VEPU580 bitstream-top register (172) has been programmed
+	 * as base + full buffer size since 2021; libmpp only switched to
+	 * size - 1 in April 2026, so rejecting it here would break encode for
+	 * every release up to and including 1.0.11.  The hardware dereferences
+	 * that address only when the bitstream wraps, and an IOMMU fault
+	 * contains that case.  Anything genuinely past the end is still
+	 * refused, as is the reverse IOVA lookup, where one past the end of one
+	 * import aliases the base of the next.
+	 */
+	if (offset > import->dmabuf->size)
 		return -ERANGE;
 	if (check_add_overflow(import->iova, (dma_addr_t)offset, iova) ||
 	    upper_32_bits(*iova))
@@ -4337,8 +4364,12 @@ static void rk_mpp_dma_contiguous_span_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test,
 			rk_mpp_import_iova_at_offset(&import, 0x1fff, &iova), 0);
 	KUNIT_EXPECT_EQ(test, iova, (dma_addr_t)0x2fff);
+	/* Exactly one past the end is the legal end-exclusive limit pointer. */
 	KUNIT_EXPECT_EQ(test,
-			rk_mpp_import_iova_at_offset(&import, 0x2000, &iova),
+			rk_mpp_import_iova_at_offset(&import, 0x2000, &iova), 0);
+	KUNIT_EXPECT_EQ(test, iova, (dma_addr_t)0x3000);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_import_iova_at_offset(&import, 0x2001, &iova),
 			-ERANGE);
 
 	dmabuf->size = 2;
@@ -4653,10 +4684,19 @@ static void rk_mpp_av1_post_offset_provenance_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, binding.offset, 0x40U);
 	KUNIT_EXPECT_EQ(test, regs[65], 0x80000040U);
 
+	/* The end-exclusive limit pointer survives the post-offset recheck. */
 	job->reg_image.translated = false;
 	binding.offset = 0;
 	regs[65] = lower_32_bits(import.iova);
-	job->reg_image.offsets[0].offset = dmabuf.size;
+	job->reg_image.offsets[0].offset = (u32)dmabuf.size;
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_translate_reg_image(job), 0);
+	KUNIT_EXPECT_EQ(test, binding.offset, (u32)dmabuf.size);
+
+	/* One byte further is a genuine out-of-bounds address. */
+	job->reg_image.translated = false;
+	binding.offset = 0;
+	regs[65] = lower_32_bits(import.iova);
+	job->reg_image.offsets[0].offset = (u32)dmabuf.size + 1;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_translate_reg_image(job), -ERANGE);
 }
 
@@ -5143,17 +5183,38 @@ static void rk_mpp_reg_offset_dma_bounds_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, job->reg_image.bindings[0].offset, 0xff0U);
 	KUNIT_EXPECT_EQ(test, job->reg_image.regs[1], 0xffffeff0U);
 
+	/*
+	 * 0xff0 + 0x10 is exactly the end of the mapping: the end-exclusive
+	 * limit pointer libmpp has programmed on register 172 since 2021.
+	 */
 	job->reg_image.offsets[0].offset = 0x10;
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_reg_offsets(job), 0);
+	KUNIT_EXPECT_EQ(test, job->reg_image.bindings[0].offset, 0x1000U);
+	KUNIT_EXPECT_EQ(test, job->reg_image.regs[1], 0xfffff000U);
+
+	/* One byte past it is rejected, and names the register. */
+	job->reg_image.fail_index = -1;
+	job->reg_image.bindings[0].offset = 0xff0;
+	job->reg_image.regs[1] = 0xffffeff0U;
+	job->reg_image.offsets[0].offset = 0x11;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_reg_offsets(job), -ERANGE);
 	KUNIT_EXPECT_EQ(test, job->reg_image.bindings[0].offset, 0xff0U);
 	KUNIT_EXPECT_EQ(test, job->reg_image.regs[1], 0xffffeff0U);
+	KUNIT_EXPECT_EQ(test, job->reg_image.fail_index, 1);
+
+	/* The first rejected index wins over any later one. */
+	job->reg_image.fail_index = 7;
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_reg_offsets(job), -ERANGE);
+	KUNIT_EXPECT_EQ(test, job->reg_image.fail_index, 7);
 
 	dmabuf->size = 2;
 	import.iova = U32_MAX;
+	job->reg_image.fail_index = -1;
 	job->reg_image.bindings[0].offset = 0;
 	job->reg_image.offsets[0].offset = 1;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_reg_offsets(job), -EOVERFLOW);
 	KUNIT_EXPECT_EQ(test, job->reg_image.bindings[0].offset, 0U);
+	KUNIT_EXPECT_EQ(test, job->reg_image.fail_index, 1);
 }
 
 static void rk_mpp_request_check_reg_span_kunit(struct kunit *test)
@@ -9478,6 +9539,25 @@ rk_mpp_job_append_reg_binding(struct rk_mpp_job *job)
 	return &image->bindings[image->binding_count++];
 }
 
+/*
+ * Name the register a rejected job died on.  Userspace drives these paths, so
+ * the log is ratelimited; the debug event and its counter are always recorded.
+ * KUnit builds jobs without hardware, so the device pointer may be NULL.
+ */
+static void rk_mpp_job_reject_reg(struct rk_mpp_job *job, u32 index, u32 offset,
+				  const struct rk_mpp_import *import, int ret)
+{
+	struct rk_mpp_reg_image *image = &job->reg_image;
+	size_t size = import && import->dmabuf ? import->dmabuf->size : 0;
+
+	if (image->fail_index < 0)
+		image->fail_index = index;
+
+	dev_err_ratelimited(job->hw ? job->hw->dev : NULL,
+			    "reject reg %u offset %#x: %d (dma-buf size %zu)\n",
+			    index, offset, ret, size);
+}
+
 static int rk_mpp_job_hold_explicit_iova(struct rk_mpp_job *job, u32 index)
 {
 	struct rk_mpp_reg_binding *binding;
@@ -9496,9 +9576,17 @@ static int rk_mpp_job_hold_explicit_iova(struct rk_mpp_job *job, u32 index)
 	if (binding) {
 		ret = rk_mpp_import_iova_at_offset(binding->import,
 						   binding->offset, &iova);
-		if (ret)
+		if (ret) {
+			rk_mpp_job_reject_reg(job, index, binding->offset,
+					      binding->import, ret);
 			return ret;
-		return *word == lower_32_bits(iova) ? 0 : -ERANGE;
+		}
+		if (*word != lower_32_bits(iova)) {
+			rk_mpp_job_reject_reg(job, index, binding->offset,
+					      binding->import, -ERANGE);
+			return -ERANGE;
+		}
+		return 0;
 	}
 	if (!job->hw)
 		return -ENODEV;
@@ -9514,8 +9602,12 @@ static int rk_mpp_job_hold_explicit_iova(struct rk_mpp_job *job, u32 index)
 	mutex_unlock(&job->session->explicit_map_lock);
 
 	/* Zero is the hardware's conventional empty optional-address value. */
-	if (!import)
-		return iova ? -ERANGE : 0;
+	if (!import) {
+		if (!iova)
+			return 0;
+		rk_mpp_job_reject_reg(job, index, 0, NULL, -ERANGE);
+		return -ERANGE;
+	}
 
 	if (iova < import->iova ||
 	    iova - import->iova > U32_MAX) {
@@ -9607,6 +9699,7 @@ static int rk_mpp_job_translate_reg(struct rk_mpp_job *job, u32 index)
 
 	ret = rk_mpp_import_iova_at_offset(import, embedded_offset, &iova);
 	if (ret) {
+		rk_mpp_job_reject_reg(job, index, embedded_offset, import, ret);
 		rk_mpp_import_put(import);
 		return ret;
 	}
@@ -9669,19 +9762,35 @@ static int rk_mpp_job_apply_reg_offsets(struct rk_mpp_job *job)
 		binding = rk_mpp_job_find_reg_binding(job, index);
 		if (!binding) {
 			if (check_add_overflow(*word,
-					       image->offsets[i].offset, &offset))
+					       image->offsets[i].offset, &offset)) {
+				rk_mpp_job_reject_reg(job, index,
+						      image->offsets[i].offset,
+						      NULL, -EOVERFLOW);
 				return -EOVERFLOW;
+			}
 			*word = offset;
 			continue;
 		}
 
 		if (check_add_overflow(binding->offset,
-				       image->offsets[i].offset, &offset))
+				       image->offsets[i].offset, &offset)) {
+			rk_mpp_job_reject_reg(job, index,
+					      image->offsets[i].offset,
+					      binding->import, -EOVERFLOW);
 			return -EOVERFLOW;
+		}
 		ret = rk_mpp_import_iova_at_offset(binding->import, offset,
 						   &iova);
-		if (ret)
+		if (ret) {
+			rk_mpp_job_reject_reg(job, index, offset,
+					      binding->import, ret);
 			return ret;
+		}
+		if (binding->import->dmabuf &&
+		    offset == binding->import->dmabuf->size)
+			dev_notice_once(job->hw ? job->hw->dev : NULL,
+					"reg %u points one past its mapping (offset %#x): libmpp before the 2026-04 bitstream-top fix does this, and it faults only if the hardware wraps\n",
+					index, offset);
 
 		binding->offset = offset;
 		*word = lower_32_bits(iova);
@@ -10057,9 +10166,10 @@ static int rk_mpp_rkvenc2_dchs_patch(struct rk_mpp_job *job)
 
 	core_id = hw->core_id;
 	if (core_id >= RK_MPP_RKVENC_MAX_DCHS_CORES) {
-		if (hw->dev)
-			dev_err(hw->dev, "invalid RKVENC2 DCHS core id %u\n",
-				core_id);
+		dev_err_ratelimited(hw->dev,
+				    "reject DCHS core %u: %d (max %u)\n",
+				    core_id, -EINVAL,
+				    RK_MPP_RKVENC_MAX_DCHS_CORES);
 		return -EINVAL;
 	}
 
@@ -10071,10 +10181,13 @@ static int rk_mpp_rkvenc2_dchs_patch(struct rk_mpp_job *job)
 
 	entry = &srv->rkvenc_dchs[core_id];
 	if (entry->job) {
+		u32 owner_job = entry->job->id;
+		u32 owner_session = upper_32_bits(entry->val);
+
 		spin_unlock_irqrestore(&srv->rkvenc_dchs_lock, flags);
-		if (hw->dev)
-			dev_err(hw->dev, "RKVENC2 DCHS core %u is still active\n",
-				core_id);
+		dev_err_ratelimited(hw->dev,
+				    "reject DCHS core %u: %d (held by job %u session %u)\n",
+				    core_id, -EBUSY, owner_job, owner_session);
 		return -EBUSY;
 	}
 
@@ -10110,9 +10223,10 @@ static int rk_mpp_rkvenc2_dchs_patch(struct rk_mpp_job *job)
 	txid_map = rk_mpp_rkvenc_dchs_find_id(id_valid);
 	if (txid_map < 0) {
 		spin_unlock_irqrestore(&srv->rkvenc_dchs_lock, flags);
-		if (hw->dev)
-			dev_err(hw->dev, "job %u session %u failed to allocate DCHS tx id\n",
-				job->id, job->session->id);
+		dev_err_ratelimited(hw->dev,
+				    "reject DCHS tx id for job %u session %u: %d (free id mask %#x)\n",
+				    job->id, job->session->id, txid_map,
+				    id_valid);
 		return txid_map;
 	}
 
@@ -10171,6 +10285,9 @@ static int rk_mpp_job_translate_reg_image(struct rk_mpp_job *job)
 		return 0;
 	if (!rk_mpp_job_has_reg_image(job) && !image->offset_count)
 		return 0;
+
+	image->fail_index = -1;
+
 	if (job->flags & MPP_FLAGS_REG_FD_NO_TRANS) {
 		ret = rk_mpp_job_validate_explicit_iovas(job);
 		if (!ret)
@@ -10491,6 +10608,8 @@ rk_mpp_batch_get_job(struct rk_mpp_batch_state *batch,
 
 	job->session = session;
 	job->state = RK_MPP_JOB_STAGED;
+	/* Zero is a valid register index, so "none" cannot be the kzalloc value. */
+	job->reg_image.fail_index = -1;
 	refcount_set(&job->refs, 1);
 	mutex_lock(&session->lock);
 	job->session_seq = session->state_seq;
@@ -10870,7 +10989,7 @@ static void rk_mpp_dma_groups_destroy(void)
 
 	list_for_each_entry_safe(dma_group, tmp, &orphaned, link) {
 		list_del_init(&dma_group->link);
-		WARN_ON(dma_group->member_count);
+		WARN_ON_ONCE(dma_group->member_count);
 		if (dma_group->isolated) {
 			/*
 			 * The group still references this domain. Leaking the
@@ -12409,19 +12528,22 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 	if (iommu_fault) {
 		result = -EIO;
 		recovery_result = result;
-		dev_err(hw->dev, "session client %u job %u failed on IOMMU fault\n",
-			job->client_type, job->id);
+		dev_err_ratelimited(hw->dev,
+				    "client %u job %u failed on IOMMU fault\n",
+				    job->client_type, job->id);
 	} else if (ccu_done) {
 		recovery_result = ccu_error ? -EIO : -ETIMEDOUT;
 		if (result)
-			dev_err(hw->dev, "session client %u job %u hard-CCU readback failed: %d\n",
-				job->client_type, job->id, result);
+			dev_err_ratelimited(hw->dev,
+					    "client %u job %u hard-CCU readback failed: %d\n",
+					    job->client_type, job->id, result);
 	} else {
 		result = -ETIMEDOUT;
 		recovery_result = result;
 		atomic_inc(&job->session->srv->timeout_count);
-		dev_err(hw->dev, "session client %u job %u timed out\n",
-			job->client_type, job->id);
+		dev_err_ratelimited(hw->dev,
+				    "client %u job %u timed out\n",
+				    job->client_type, job->id);
 	}
 
 	if (rk_mpp_rkvdec2_soft_ccu_enabled(hw))
@@ -12457,8 +12579,9 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 	if (iommu_fault) {
 		refresh_ret = rk_mpp_hw_refresh_iommu(hw, job);
 		if (refresh_ret) {
-			dev_err(hw->dev, "IOMMU refresh failed after fault: %d\n",
-				refresh_ret);
+			dev_err_ratelimited(hw->dev,
+					    "IOMMU refresh failed after fault: %d\n",
+					    refresh_ret);
 			rk_mpp_hw_handle_reset_failure(hw, refresh_ret);
 		}
 	}
@@ -14561,7 +14684,8 @@ static int rk_mpp_av1_start(struct rk_mpp_hw *hw, u64 generation,
 		raw_spin_unlock_irqrestore(&hw->aux_lock, flags);
 		atomic_inc(&hw->srv->av1_afbc_stale_status_timeout_count);
 		dev_err_ratelimited(hw->dev,
-				    "AFBC status did not deassert before START\n");
+				    "AFBC status did not deassert before START: %d (status %#x)\n",
+				    ret, status);
 		return ret;
 	}
 	hw->av1_afbc_armed_generation = generation;
@@ -15202,16 +15326,31 @@ static int rk_mpp_job_add_request(struct rk_mpp_session *session,
 	if (IS_ERR(job))
 		return PTR_ERR(job);
 
+	/*
+	 * These reject malformed userspace requests, so they record the same
+	 * request-fail event as a materialize failure below rather than
+	 * failing silently.
+	 */
 	if (job->req_cnt >= RK_MPP_MAX_MSG_NUM)
-		return -EINVAL;
-	if (req->size > RK_MPP_MAX_JOB_PAYLOAD)
-		return -ENOMEM;
-	if (req->size && !req->data)
-		return -EINVAL;
+		ret = -EINVAL;
+	else if (req->size > RK_MPP_MAX_JOB_PAYLOAD)
+		ret = -ENOMEM;
+	else if (req->size && !req->data)
+		ret = -EINVAL;
+	else
+		ret = 0;
+	if (ret) {
+		rk_mpp_debug_record_job(job, RK_MPP_DEBUG_REQUEST_FAIL, ret,
+					0, req->cmd);
+		return ret;
+	}
 
 	copy_payload = rk_mpp_cmd_copies_payload(req->cmd);
-	if (req->size && !copy_payload && !access_ok(req->data, req->size))
+	if (req->size && !copy_payload && !access_ok(req->data, req->size)) {
+		rk_mpp_debug_record_job(job, RK_MPP_DEBUG_REQUEST_FAIL, -EFAULT,
+					0, req->cmd);
 		return -EFAULT;
+	}
 
 	job_req = &job->reqs[job->req_cnt];
 	job_req->req = *req;
@@ -15222,6 +15361,8 @@ static int rk_mpp_job_add_request(struct rk_mpp_session *session,
 
 			job_req->payload = NULL;
 			memset(job_req, 0, sizeof(*job_req));
+			rk_mpp_debug_record_job(job, RK_MPP_DEBUG_REQUEST_FAIL,
+						PTR_ERR(payload), 0, req->cmd);
 			return PTR_ERR(payload);
 		}
 	}
@@ -15283,30 +15424,45 @@ static int rk_mpp_execute_jobs(struct rk_mpp_batch_state *batch)
 		if (job->set_cnt) {
 			ret = rk_mpp_job_session_status(job);
 			if (ret) {
+				/*
+				 * The job was staged against an older session
+				 * epoch; record that epoch so the rejection can
+				 * be tied to the reset that superseded it.
+				 */
 				rk_mpp_debug_record_job(job,
 							RK_MPP_DEBUG_SUBMIT_FAIL,
 							ret, 0,
-							MPP_CMD_INIT_CLIENT_TYPE);
-				return ret;
+							job->session_seq);
+				goto rejected;
 			}
 			ret = rk_mpp_job_select_hw(job);
 			if (ret) {
+				/*
+				 * Explicit-IOVA and ordinary selection both fail
+				 * with -ENODEV; the flags separate them.
+				 */
 				rk_mpp_debug_record_job(job, RK_MPP_DEBUG_SELECT_FAIL,
-							ret, 0, 0);
-				return ret;
+							ret, 0, job->flags);
+				goto rejected;
 			}
 			ret = rk_mpp_job_translate_reg_image(job);
 			if (ret) {
+				/*
+				 * Report the rejected register index when a
+				 * helper named one; a translate failure with no
+				 * index is a whole-image rejection.
+				 */
 				rk_mpp_debug_record_job(job,
 							RK_MPP_DEBUG_TRANSLATE_FAIL,
-							ret, 0, job->reg_image.reg_words);
-				return ret;
+							ret, 0,
+							(u32)job->reg_image.fail_index);
+				goto rejected;
 			}
 			ret = rk_mpp_job_apply_rcb_info(job);
 			if (ret) {
 				rk_mpp_debug_record_job(job, RK_MPP_DEBUG_RCB_FAIL,
 							ret, 0, job->reg_image.rcb_count);
-				return ret;
+				goto rejected;
 			}
 			ret = rk_mpp_job_submit(job);
 			if (ret) {
@@ -15314,7 +15470,7 @@ static int rk_mpp_execute_jobs(struct rk_mpp_batch_state *batch)
 					atomic_inc(&job->session->srv->unsupported_count);
 				rk_mpp_debug_record_job(job, RK_MPP_DEBUG_SUBMIT_FAIL,
 							ret, 0, job->req_cnt);
-				return ret;
+				goto rejected;
 			}
 		}
 	}
@@ -15348,6 +15504,14 @@ static int rk_mpp_execute_jobs(struct rk_mpp_batch_state *batch)
 		}
 	}
 
+	return ret;
+
+rejected:
+	/*
+	 * One count per job refused during assembly, before any hardware work.
+	 * A conformance run can gate on this without parsing the event ring.
+	 */
+	atomic_inc(&job->session->srv->rejected_job_count);
 	return ret;
 }
 
@@ -15869,8 +16033,9 @@ static int rk_mpp_debug_state_show(struct seq_file *s, void *unused)
 		   atomic_read(&srv->completed_job_count),
 		   atomic_read(&srv->failed_job_count),
 		   atomic_read(&srv->aborted_job_count));
-	seq_printf(s, "errors unsupported=%d timeout=%d reset=%d recovery_failure=%d iommu_fault=%d iommu_refresh=%d iommu_idle_fault=%d irq=%d spurious_irq=%d av1_afbc_irq=%d av1_afbc_prestart_status=%d av1_afbc_stale_status_timeout=%d av1_afbc_before_vcd=%d av1_afbc_after_vcd=%d av1_afbc_observed_at_vcd=%d av1_afbc_not_observed_at_vcd=%d av1_afbc_observed_at_quiesce=%d av1_afbc_not_observed_at_quiesce=%d av1_reset_idle_unproven=%d av1_vcd_to_afbc_observed_max_ns=%lld\n",
+	seq_printf(s, "errors unsupported=%d rejected=%d timeout=%d reset=%d recovery_failure=%d iommu_fault=%d iommu_refresh=%d iommu_idle_fault=%d irq=%d spurious_irq=%d av1_afbc_irq=%d av1_afbc_prestart_status=%d av1_afbc_stale_status_timeout=%d av1_afbc_before_vcd=%d av1_afbc_after_vcd=%d av1_afbc_observed_at_vcd=%d av1_afbc_not_observed_at_vcd=%d av1_afbc_observed_at_quiesce=%d av1_afbc_not_observed_at_quiesce=%d av1_reset_idle_unproven=%d av1_vcd_to_afbc_observed_max_ns=%lld\n",
 		   atomic_read(&srv->unsupported_count),
+		   atomic_read(&srv->rejected_job_count),
 		   atomic_read(&srv->timeout_count),
 		   atomic_read(&srv->reset_count),
 		   atomic_read(&srv->recovery_failure_count),
@@ -16830,6 +16995,9 @@ static int rk_mpp_runtime_register(void)
 				&rk_mpp_srv.ioctl_count);
 	debugfs_create_atomic_t("unsupported_count", 0444, rk_mpp_srv.debugfs_root,
 				&rk_mpp_srv.unsupported_count);
+	debugfs_create_atomic_t("rejected_job_count", 0444,
+				rk_mpp_srv.debugfs_root,
+				&rk_mpp_srv.rejected_job_count);
 	debugfs_create_atomic_t("import_count", 0444, rk_mpp_srv.debugfs_root,
 				&rk_mpp_srv.import_count);
 	debugfs_create_atomic_t("submitted_job_count", 0444,
