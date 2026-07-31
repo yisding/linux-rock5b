@@ -7551,6 +7551,9 @@ static void rk_mpp_rkvenc_slice_fifo_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, value, RK_MPP_RKVENC_SLICE_LAST | 0x1234);
 	KUNIT_EXPECT_FALSE(test, rk_mpp_job_rkvenc_slice_ready(last_job));
 	KUNIT_EXPECT_TRUE(test, rk_mpp_job_rkvenc_slice_done(last_job));
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_job_pop_rkvenc_slice(last_job, &value),
+			-ENODATA);
 
 	spin_lock_init(&full_job->rkvenc_slice_lock);
 	INIT_KFIFO(full_job->rkvenc_slice_fifo);
@@ -7574,6 +7577,20 @@ static void rk_mpp_rkvenc_slice_fifo_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test,
 			rk_mpp_job_pop_rkvenc_slice(full_job, &value), 0);
 	KUNIT_EXPECT_EQ(test, value, 0U);
+
+	/*
+	 * Drain the rest: the dropped last record must still terminate the
+	 * stream with -ENODATA once the fifo is empty, not -EAGAIN.
+	 */
+	for (i = 1; i < RK_MPP_RKVENC_MAX_SLICE_FIFO; i++) {
+		KUNIT_EXPECT_EQ(test,
+				rk_mpp_job_pop_rkvenc_slice(full_job, &value),
+				0);
+		KUNIT_EXPECT_EQ(test, value, (u32)i);
+	}
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_job_pop_rkvenc_slice(full_job, &value),
+			-ENODATA);
 }
 
 static void rk_mpp_rkvenc_bs_overflow_kunit(struct kunit *test)
@@ -15134,6 +15151,16 @@ static bool rk_mpp_job_rkvenc_slice_done(struct rk_mpp_job *job)
 	return done;
 }
 
+/*
+ * Returns 0 with a dequeued record, -EOVERFLOW once after the fifo dropped
+ * records, -ENODATA when the fifo is empty and the last slice has already
+ * been queued (the stream is complete), or -EAGAIN when more slices are
+ * still expected.  The stream-complete decision must be made under the same
+ * lock as the emptiness observation: a caller that saw the fifo empty and
+ * then checked rkvenc_slice_done separately would race with the IRQ pushing
+ * the remaining slices in between, and conclude the stream ended while
+ * undelivered records sit in the fifo.
+ */
 static int rk_mpp_job_pop_rkvenc_slice(struct rk_mpp_job *job, u32 *value)
 {
 	unsigned long flags;
@@ -15145,6 +15172,8 @@ static int rk_mpp_job_pop_rkvenc_slice(struct rk_mpp_job *job, u32 *value)
 		ret = -EOVERFLOW;
 	} else if (kfifo_out(&job->rkvenc_slice_fifo, value, 1) == 1) {
 		ret = 0;
+	} else if (job->rkvenc_slice_done) {
+		ret = -ENODATA;
 	}
 	spin_unlock_irqrestore(&job->rkvenc_slice_lock, flags);
 
@@ -15250,6 +15279,7 @@ static int rk_mpp_session_poll_irq(struct rk_mpp_session *session,
 
 	for (;;) {
 		struct rk_mpp_job *job;
+		bool done_before_pop;
 		u32 slice_info = 0;
 		u64 seq;
 
@@ -15271,6 +15301,20 @@ static int rk_mpp_session_poll_irq(struct rk_mpp_session *session,
 			}
 			req_validated = true;
 		}
+
+		/*
+		 * Sample completion before draining the fifo.  Slice records
+		 * are pushed from the hard IRQ strictly before the threaded
+		 * handler completes the job, so once the job is observed done
+		 * the fifo can no longer grow and a subsequent empty pop is
+		 * conclusive.  Sampling after the pop would let the IRQ push
+		 * the remaining slices and complete the job inside the window,
+		 * and the stale empty result would end the stream with
+		 * undelivered slices still queued -- userspace never sees the
+		 * last flag, keeps polling, and consumes the next job's
+		 * slices as this frame's.
+		 */
+		done_before_pop = rk_mpp_job_is_done(job);
 
 		ret = rk_mpp_job_pop_rkvenc_slice(job, &slice_info);
 		if (!ret) {
@@ -15296,15 +15340,14 @@ static int rk_mpp_session_poll_irq(struct rk_mpp_session *session,
 			continue;
 		}
 
+		if (ret == -ENODATA || (ret == -EAGAIN && done_before_pop)) {
+			rk_mpp_job_put(job);
+			return rk_mpp_session_poll_job(session, flags);
+		}
+
 		if (ret != -EAGAIN) {
 			rk_mpp_job_put(job);
 			return ret;
-		}
-
-		if (rk_mpp_job_is_done(job) ||
-		    rk_mpp_job_rkvenc_slice_done(job)) {
-			rk_mpp_job_put(job);
-			return rk_mpp_session_poll_job(session, flags);
 		}
 		rk_mpp_job_put(job);
 
