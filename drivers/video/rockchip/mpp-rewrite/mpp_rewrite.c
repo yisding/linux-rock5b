@@ -14070,6 +14070,12 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 	ret = rk_mpp_rkvdec2_configure_cache(hw);
 	if (ret)
 		goto err_deregister_soft_ccu;
+	/*
+	 * Match rkvdec2_soft_ccu_enqueue(): invalidate the shared IOTLB after
+	 * cache setup and before the task-register writes, CORE_STA, and START.
+	 */
+	if (soft_ccu && hw->iommu_domain && hw->iommu_domain->ops)
+		iommu_flush_iotlb_all(hw->iommu_domain);
 	ret = rk_mpp_job_write_regs(job, RK_MPP_RKVDEC_START_BASE,
 				    &start_value, &start_seen);
 	if (ret)
