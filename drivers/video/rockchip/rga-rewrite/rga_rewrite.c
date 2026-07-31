@@ -199,6 +199,11 @@
 #define RK_RGA2_DST_QUANTIZE_SCALE_OFFSET	0x060
 #define RK_RGA2_DST_QUANTIZE_OFFSET_OFFSET	0x064
 #define RK_RGA2_MASK_BASE_OFFSET		0x068
+#define RK_RGA2_MMU_CTRL1_OFFSET		0x06c
+#define RK_RGA2_MMU_SRC_BASE_OFFSET		0x070
+#define RK_RGA2_MMU_SRC1_BASE_OFFSET		0x074
+#define RK_RGA2_MMU_DST_BASE_OFFSET		0x078
+#define RK_RGA2_MMU_ELS_BASE_OFFSET		0x07c
 #define RK_RGA2_DST_CSC_00_OFFSET		0x060
 #define RK_RGA2_DST_CSC_01_OFFSET		0x064
 #define RK_RGA2_DST_CSC_02_OFFSET		0x068
@@ -1147,6 +1152,23 @@ struct rk_rga_job_mapping {
 	enum dma_data_direction dma_dir;
 	bool userptr;
 	bool iommu_mapped;
+	bool rga2_mmu_required;
+};
+
+enum rk_rga2_mmu_channel {
+	RK_RGA2_MMU_SRC0,
+	RK_RGA2_MMU_SRC1,
+	RK_RGA2_MMU_DST,
+	RK_RGA2_MMU_ELS,
+	RK_RGA2_MMU_CHANNEL_COUNT,
+};
+
+struct rk_rga2_mmu_table {
+	struct device *dev;
+	void *vaddr;
+	dma_addr_t dma;
+	size_t size;
+	u32 page_count;
 };
 
 struct rk_rga_img_layout {
@@ -1229,6 +1251,7 @@ struct rk_rga_job {
 	struct rk_rga_task_imports *task_imports;
 	struct rk_rga_import **imports;
 	struct rk_rga_job_mapping *mappings;
+	struct rk_rga2_mmu_table *rga2_mmu;
 	struct dma_fence **acquire_fences;
 	u32 *gauss_coeffs;
 	struct rk_rga_fence_waiter *acquire_waiters;
@@ -2021,32 +2044,72 @@ static int rk_rga_check_dma_sgt(struct sg_table *sgt, const char *source,
 				size_t required_size, dma_addr_t *iova_out,
 				bool log_errors)
 {
+	struct scatterlist *sg;
+	dma_addr_t base = 0;
+	u64 expected = 0;
+	size_t size = 0;
+	unsigned int i;
+
 	if (!sgt || !sgt->sgl)
 		return -EINVAL;
-	if (sgt->nents != 1) {
-		if (log_errors)
-			pr_err("reject %s DMA mapping: expected one DMA segment, got %u, orig_nents=%u\n",
-			       source, sgt->nents, sgt->orig_nents);
-		return -EOPNOTSUPP;
+	for_each_sgtable_dma_sg(sgt, sg, i) {
+		dma_addr_t addr = sg_dma_address(sg);
+		size_t len = sg_dma_len(sg);
+
+		if (!len)
+			return -EINVAL;
+		if (!i)
+			base = addr;
+		else if ((u64)addr != expected) {
+			if (log_errors)
+				pr_err("reject %s DMA mapping: segment %u is not adjacent, expected %#llx, got %pad, nents=%u, orig_nents=%u\n",
+				       source, i, expected, &addr, sgt->nents,
+				       sgt->orig_nents);
+			return -EOPNOTSUPP;
+		}
+		if (check_add_overflow(size, len, &size) ||
+		    check_add_overflow((u64)addr, (u64)len, &expected))
+			return -EOVERFLOW;
 	}
-
-	if (!sg_dma_len(sgt->sgl))
-		return -EINVAL;
-
-	*iova_out = sg_dma_address(sgt->sgl);
 
 	if (!required_size)
-		required_size = sg_dma_len(sgt->sgl);
-
-	if (sg_dma_len(sgt->sgl) < required_size) {
+		required_size = size;
+	if (size < required_size) {
 		if (log_errors)
-			pr_err("reject %s DMA mapping: segment too small, len=%u required=%zu\n",
-			       source, sg_dma_len(sgt->sgl), required_size);
+			pr_err("reject %s DMA mapping: mapped view too small, len=%zu required=%zu\n",
+			       source, size, required_size);
 		return -EINVAL;
 	}
 
-	return rk_rga_check_iova_span(*iova_out, required_size, source,
+	*iova_out = base;
+	return rk_rga_check_iova_span(base, required_size, source,
 				      log_errors);
+}
+
+static int rk_rga_check_dma_sgt_coverage(struct sg_table *sgt,
+					 size_t required_size,
+					 dma_addr_t *first_out)
+{
+	struct scatterlist *sg;
+	size_t size = 0;
+	unsigned int i;
+
+	if (!sgt || !sgt->sgl || !sgt->nents || !required_size || !first_out)
+		return -EINVAL;
+
+	for_each_sgtable_dma_sg(sgt, sg, i) {
+		dma_addr_t addr = sg_dma_address(sg);
+		size_t len = sg_dma_len(sg);
+		u64 end;
+
+		if (!len || check_add_overflow((u64)addr, (u64)len, &end) ||
+		    check_add_overflow(size, len, &size))
+			return -EOVERFLOW;
+		if (!i)
+			*first_out = addr;
+	}
+
+	return size < required_size ? -EINVAL : 0;
 }
 
 /*
@@ -3291,20 +3354,26 @@ rk_rga_dmabuf_extents_self_overlap(
 }
 
 static int
-rk_rga_dmabuf_build_extents(struct device *dev, dma_addr_t iova, size_t size,
+rk_rga_dmabuf_build_extents(struct device *dev, struct sg_table *sgt,
+			    size_t size,
 			    struct rk_rga_dmabuf_extent **extents_out,
 			    unsigned int *extent_count_out)
 {
 	struct rk_rga_dmabuf_extent *extents;
+	struct scatterlist *sg;
 	struct iommu_domain *domain;
 	size_t remaining;
 	size_t logical = 0;
 	size_t capacity;
 	size_t span;
+	unsigned int i;
 	u32 count = 0;
 
-	if (!dev || !size || !extents_out || !extent_count_out)
+	if (!dev || !sgt || !sgt->sgl || !sgt->nents || !size ||
+	    !extents_out || !extent_count_out)
 		return -EINVAL;
+	if (size > U32_MAX)
+		return -EOVERFLOW;
 	*extents_out = NULL;
 	*extent_count_out = 0;
 
@@ -3318,64 +3387,126 @@ rk_rga_dmabuf_build_extents(struct device *dev, dma_addr_t iova, size_t size,
 	 */
 	domain = iommu_get_domain_for_dev(dev);
 	if (!domain) {
-		if (size > U32_MAX)
-			return -EOVERFLOW;
-		extents = kvmalloc(sizeof(*extents), GFP_KERNEL);
+		extents = kvmalloc_array(sgt->nents, sizeof(*extents),
+					 GFP_KERNEL);
 		if (!extents)
 			return -ENOMEM;
-		extents[0] = (struct rk_rga_dmabuf_extent) {
-			.start = iova,
-			.logical_offset = 0,
-			.length = size,
-		};
+		remaining = size;
+		for_each_sgtable_dma_sg(sgt, sg, i) {
+			dma_addr_t addr = sg_dma_address(sg);
+			size_t dma_len = sg_dma_len(sg);
+			size_t length = min(remaining, dma_len);
+			u64 end;
+
+			if (!dma_len || !length ||
+			    check_add_overflow((u64)addr, (u64)length, &end) ||
+			    logical > U32_MAX || length > U32_MAX)
+				goto invalid;
+			if (count &&
+			    (u64)extents[count - 1].start +
+				    extents[count - 1].length == addr &&
+			    (u64)extents[count - 1].logical_offset +
+				    extents[count - 1].length == logical &&
+			    length <= U32_MAX - extents[count - 1].length) {
+				extents[count - 1].length += length;
+			} else {
+				extents[count++] = (struct rk_rga_dmabuf_extent) {
+					.start = addr,
+					.logical_offset = logical,
+					.length = length,
+				};
+			}
+			logical += length;
+			remaining -= length;
+			if (!remaining)
+				break;
+		}
+		if (remaining)
+			goto invalid;
+		sort(extents, count, sizeof(*extents),
+		     rk_rga_dmabuf_extent_cmp, NULL);
+		if (rk_rga_dmabuf_extents_self_overlap(extents, count))
+			goto unsupported;
 		*extents_out = extents;
-		*extent_count_out = 1;
+		*extent_count_out = count;
 		return 0;
 	}
 
-	if (check_add_overflow((size_t)offset_in_page(iova), size, &span))
-		return -EOVERFLOW;
-	capacity = DIV_ROUND_UP(span, PAGE_SIZE);
-	if (!capacity || capacity > UINT_MAX)
+	remaining = size;
+	capacity = 0;
+	for_each_sgtable_dma_sg(sgt, sg, i) {
+		size_t dma_len = sg_dma_len(sg);
+		size_t length = min(remaining, dma_len);
+		size_t pages;
+
+		if (!dma_len || !length ||
+		    check_add_overflow((size_t)offset_in_page(
+					       sg_dma_address(sg)),
+				       length, &span))
+			return -EINVAL;
+		pages = DIV_ROUND_UP(span, PAGE_SIZE);
+		if (check_add_overflow(capacity, pages, &capacity))
+			return -EOVERFLOW;
+		remaining -= length;
+		if (!remaining)
+			break;
+	}
+	if (remaining || !capacity)
+		return -EINVAL;
+	if (capacity > UINT_MAX)
 		return -EOVERFLOW;
 	extents = kvmalloc_array(capacity, sizeof(*extents), GFP_KERNEL);
 	if (!extents)
 		return -ENOMEM;
 
 	remaining = size;
-	while (remaining) {
-		dma_addr_t target_iova = iova + logical;
-		phys_addr_t phys = iommu_iova_to_phys(domain, target_iova);
-		size_t length;
+	count = 0;
+	for_each_sgtable_dma_sg(sgt, sg, i) {
+		dma_addr_t target_iova = sg_dma_address(sg);
+		size_t sg_remaining = min(remaining, (size_t)sg_dma_len(sg));
 
-		/* Zero is the IOMMU API's unmapped result. */
-		if (!phys)
-			goto unsupported;
-		length = min3(remaining,
-			      (size_t)PAGE_SIZE - offset_in_page(target_iova),
-			      (size_t)PAGE_SIZE - offset_in_page(phys));
-		if (!length || logical > U32_MAX || length > U32_MAX)
-			goto invalid;
+		while (sg_remaining) {
+			phys_addr_t phys = iommu_iova_to_phys(domain, target_iova);
+			size_t length;
 
-		if (count &&
-		    (u64)extents[count - 1].start +
-			    extents[count - 1].length == phys &&
-		    (u64)extents[count - 1].logical_offset +
-			    extents[count - 1].length == logical &&
-		    length <= U32_MAX - extents[count - 1].length) {
-			extents[count - 1].length += length;
-		} else {
-			if (WARN_ON_ONCE(count >= capacity))
+			/* Zero is the IOMMU API's unmapped result. */
+			if (!phys)
+				goto unsupported;
+			length = min3(sg_remaining,
+				      (size_t)PAGE_SIZE -
+					      offset_in_page(target_iova),
+				      (size_t)PAGE_SIZE - offset_in_page(phys));
+			if (!length || logical > U32_MAX || length > U32_MAX)
 				goto invalid;
-			extents[count++] = (struct rk_rga_dmabuf_extent) {
-				.start = phys,
-				.logical_offset = logical,
-				.length = length,
-			};
+
+			if (count &&
+			    (u64)extents[count - 1].start +
+				    extents[count - 1].length == phys &&
+			    (u64)extents[count - 1].logical_offset +
+				    extents[count - 1].length == logical &&
+			    length <= U32_MAX -
+				      extents[count - 1].length) {
+				extents[count - 1].length += length;
+			} else {
+				if (WARN_ON_ONCE(count >= capacity))
+					goto invalid;
+				extents[count++] =
+					(struct rk_rga_dmabuf_extent) {
+						.start = phys,
+						.logical_offset = logical,
+						.length = length,
+					};
+			}
+			logical += length;
+			remaining -= length;
+			sg_remaining -= length;
+			target_iova += length;
 		}
-		logical += length;
-		remaining -= length;
+		if (!remaining)
+			break;
 	}
+	if (remaining)
+		goto invalid;
 
 	sort(extents, count, sizeof(*extents),
 	     rk_rga_dmabuf_extent_cmp, NULL);
@@ -4393,8 +4524,30 @@ static void rk_rga_job_sync_userptr_for_cpu(struct rk_rga_job *job,
 	}
 }
 
+static void rk_rga_job_clear_rga2_mmu(struct rk_rga_job *job)
+{
+	if (!job->rga2_mmu)
+		return;
+
+	for (u32 i = 0; i < RK_RGA2_MMU_CHANNEL_COUNT; i++) {
+		struct rk_rga2_mmu_table *table = &job->rga2_mmu[i];
+
+		if (table->vaddr)
+			dma_free_coherent(table->dev, table->size, table->vaddr,
+					  table->dma);
+		if (table->dev)
+			put_device(table->dev);
+		memset(table, 0, sizeof(*table));
+	}
+	kfree(job->rga2_mmu);
+	job->rga2_mmu = NULL;
+}
+
 static void rk_rga_job_clear_mappings(struct rk_rga_job *job)
 {
+	/* RGA2 page-table entries refer to the job mappings released below. */
+	rk_rga_job_clear_rga2_mmu(job);
+
 	for (u32 i = 0; i < job->mapping_count; i++) {
 		struct rk_rga_job_mapping *mapping = &job->mappings[i];
 
@@ -4524,7 +4677,9 @@ static int rk_rga_map_userptr_sgt(struct rk_rga_import *import,
 				  dma_addr_t *iova_out,
 				  struct iommu_domain **domain_out,
 				  size_t *iova_size_out,
-				  bool *iommu_mapped_out);
+				  bool *iommu_mapped_out,
+				  bool allow_rga2_mmu,
+				  bool *rga2_mmu_out);
 static int rk_rga_job_map_import(struct rk_rga_job *job,
 				 struct rk_rga_import *import,
 				 struct rk_rga_hw *hw,
@@ -4538,6 +4693,7 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 	size_t bytes;
 	unsigned int dmabuf_extent_count = 0;
 	enum dma_data_direction dma_dir;
+	bool rga2_mmu = false;
 	u32 count;
 	int ret;
 
@@ -4580,11 +4736,14 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 		struct rk_rga_userptr_view *view;
 		size_t iova_size;
 		bool iommu_mapped;
+		bool rga2_mmu;
 
 		ret = rk_rga_map_userptr_sgt(import, dev, &sgt,
 					     &view,
 					     &mapped_iova, &domain,
-					     &iova_size, &iommu_mapped);
+					     &iova_size, &iommu_mapped,
+					     hw->type == RK_RGA_HW_RGA2,
+					     &rga2_mmu);
 		if (ret) {
 			rk_rga_hw_put(hw);
 			return ret;
@@ -4602,6 +4761,7 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 			.page_offset = import->page_offset,
 			.userptr = true,
 			.iommu_mapped = iommu_mapped,
+			.rga2_mmu_required = rga2_mmu,
 		};
 		*iova = job->mappings[job->mapping_count].iova;
 		job->mapping_count = count;
@@ -4652,6 +4812,18 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 
 	ret = rk_rga_check_dma_sgt(sgt, "dma-buf remap", import->size, iova,
 				   true);
+	if (ret && hw->type == RK_RGA_HW_RGA2 &&
+	    (ret == -EOPNOTSUPP || ret == -EOVERFLOW) &&
+	    !rk_rga_check_dma_sgt_coverage(sgt, import->size, iova)) {
+		/*
+		 * RGA2's internal MMU can consume a discontinuous selected-device
+		 * DMA mapping. Keep the attachment mapped so its page table can use
+		 * these exact DMA entries, including any DMA-API bounce storage.
+		 */
+		*iova = 0;
+		rga2_mmu = true;
+		ret = 0;
+	}
 	if (ret) {
 		dma_buf_unmap_attachment_unlocked(attach, sgt,
 						  dma_dir);
@@ -4661,7 +4833,7 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 		return ret;
 	}
 
-	ret = rk_rga_dmabuf_build_extents(dev, *iova, import->size,
+	ret = rk_rga_dmabuf_build_extents(dev, sgt, import->size,
 					  &dmabuf_extents,
 					  &dmabuf_extent_count);
 	if (ret) {
@@ -4697,6 +4869,7 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 		.iova = *iova,
 		.dmabuf_extent_count = dmabuf_extent_count,
 		.dma_dir = dma_dir,
+		.rga2_mmu_required = rga2_mmu,
 	};
 	job->mapping_count = count;
 	mutex_unlock(&import->map_lock);
@@ -4712,10 +4885,369 @@ err_unmap_dmabuf:
 	return ret;
 }
 
+struct rk_rga2_mmu_view {
+	struct sg_table *sgt;
+	dma_addr_t iova;
+	size_t size;
+	bool linear;
+	bool required;
+};
+
+static struct rk_rga_job_mapping *
+rk_rga_job_find_mapping(struct rk_rga_job *job,
+			struct rk_rga_import *import,
+			struct rk_rga_hw *hw)
+{
+	for (u32 i = 0; i < job->mapping_count; i++) {
+		struct rk_rga_job_mapping *mapping = &job->mappings[i];
+
+		if (mapping->import == import && mapping->hw == hw)
+			return mapping;
+	}
+
+	return NULL;
+}
+
+static bool rk_rga2_import_requires_mmu(struct rk_rga_job *job,
+					struct rk_rga_import *import,
+					struct rk_rga_hw *hw)
+{
+	struct rk_rga_job_mapping *mapping;
+
+	mapping = rk_rga_job_find_mapping(job, import, hw);
+
+	return mapping && mapping->rga2_mmu_required;
+}
+
+static int rk_rga2_get_mmu_view(struct rk_rga_job *job,
+				struct rk_rga_import *import,
+				struct rk_rga_hw *hw,
+				struct rk_rga2_mmu_view *view)
+{
+	struct rk_rga_job_mapping *mapping;
+
+	if (!import || !view)
+		return -EINVAL;
+
+	mapping = rk_rga_job_find_mapping(job, import, hw);
+	if (mapping) {
+		*view = (struct rk_rga2_mmu_view) {
+			.sgt = mapping->sgt,
+			.iova = mapping->iova,
+			.size = import->size,
+			.linear = mapping->iommu_mapped,
+			.required = mapping->rga2_mmu_required,
+		};
+	} else if (import->type == RK_RGA_IMPORT_USERPTR &&
+		   import->map_hw == hw) {
+		*view = (struct rk_rga2_mmu_view) {
+			.sgt = import->sgt,
+			.iova = import->iova,
+			.size = import->size,
+			.linear = import->iommu_mapped,
+		};
+	} else {
+		return -ENOENT;
+	}
+
+	if ((!view->linear && (!view->sgt || !view->sgt->sgl)) ||
+	    !view->size)
+		return -EINVAL;
+
+	return 0;
+}
+
+static int rk_rga2_mmu_emit_run(dma_addr_t address, size_t length,
+				u32 *page_table, u32 capacity,
+				u32 *page_count)
+{
+	u64 base = (u64)address & PAGE_MASK;
+	u64 span;
+	u64 pages;
+	u64 new_count;
+
+	if (!length ||
+	    check_add_overflow((u64)offset_in_page(address), (u64)length,
+			       &span))
+		return -EINVAL;
+	pages = DIV_ROUND_UP_ULL(span, PAGE_SIZE);
+	if (check_add_overflow((u64)*page_count, pages, &new_count) ||
+	    new_count > capacity)
+		return -EOVERFLOW;
+
+	for (u64 i = 0; i < pages; i++) {
+		u64 pte;
+
+		if (check_add_overflow(base, i << PAGE_SHIFT, &pte) ||
+		    pte > U32_MAX - (PAGE_SIZE - 1))
+			return -EOPNOTSUPP;
+		if (page_table)
+			page_table[*page_count + i] = (u32)pte;
+	}
+	*page_count = new_count;
+
+	return 0;
+}
+
+static int rk_rga2_mmu_append_sgt(struct sg_table *sgt, size_t offset,
+				  size_t length, u32 *page_table,
+				  u32 capacity, u32 *page_count,
+				  u32 *head_offset)
+{
+	struct scatterlist *sg;
+	dma_addr_t run_address = 0;
+	size_t run_length = 0;
+	size_t skip = offset;
+	size_t remaining = length;
+	unsigned int i;
+	int ret;
+
+	if (!sgt || !sgt->sgl || !length || !page_count || !head_offset)
+		return -EINVAL;
+
+	for_each_sgtable_dma_sg(sgt, sg, i) {
+		dma_addr_t address = sg_dma_address(sg);
+		size_t dma_len = sg_dma_len(sg);
+		size_t take;
+		u64 end;
+
+		if (!dma_len ||
+		    check_add_overflow((u64)address, (u64)dma_len, &end))
+			return -EOVERFLOW;
+		if (skip >= dma_len) {
+			skip -= dma_len;
+			continue;
+		}
+
+		address += skip;
+		dma_len -= skip;
+		skip = 0;
+		take = min(remaining, dma_len);
+		if (remaining == length)
+			*head_offset = offset_in_page(address);
+
+		if (!run_length) {
+			run_address = address;
+			run_length = take;
+		} else {
+			u64 run_end;
+
+			if (check_add_overflow((u64)run_address,
+					       (u64)run_length, &run_end))
+				return -EOVERFLOW;
+			if (run_end == address) {
+				if (check_add_overflow(run_length, take,
+						       &run_length))
+					return -EOVERFLOW;
+			} else {
+				if (!IS_ALIGNED(run_end, PAGE_SIZE) ||
+				    !IS_ALIGNED(address, PAGE_SIZE))
+					return -EOPNOTSUPP;
+				ret = rk_rga2_mmu_emit_run(run_address,
+						       run_length, page_table,
+						       capacity, page_count);
+				if (ret)
+					return ret;
+				run_address = address;
+				run_length = take;
+			}
+		}
+
+		remaining -= take;
+		if (!remaining)
+			break;
+	}
+
+	if (skip || remaining || !run_length)
+		return -EINVAL;
+
+	return rk_rga2_mmu_emit_run(run_address, run_length, page_table,
+				    capacity, page_count);
+}
+
+static int rk_rga2_mmu_append_import(struct rk_rga_job *job,
+				     struct rk_rga_import *import,
+				     struct rk_rga_hw *hw,
+				     size_t offset, size_t length,
+				     u32 *page_table, u32 capacity,
+				     u32 *page_count, __u64 *address)
+{
+	struct rk_rga2_mmu_view view;
+	u32 first_page = *page_count;
+	u32 head_offset;
+	int ret;
+
+	ret = rk_rga2_get_mmu_view(job, import, hw, &view);
+	if (ret)
+		return ret;
+	if (offset > view.size || length > view.size - offset)
+		return -EINVAL;
+
+	if (view.linear) {
+		dma_addr_t start;
+
+		if (check_add_overflow(view.iova, (dma_addr_t)offset, &start))
+			return -EOVERFLOW;
+		head_offset = offset_in_page(start);
+		ret = rk_rga2_mmu_emit_run(start, length, page_table, capacity,
+					   page_count);
+	} else {
+		ret = rk_rga2_mmu_append_sgt(view.sgt, offset, length,
+					     page_table, capacity, page_count,
+					     &head_offset);
+	}
+	if (ret)
+		return ret;
+	if (first_page > U32_MAX >> PAGE_SHIFT)
+		return -EOVERFLOW;
+	*address = ((u64)first_page << PAGE_SHIFT) + head_offset;
+
+	return 0;
+}
+
+static int rk_rga2_mmu_fill_img(struct rk_rga_job *job,
+				struct rga_img_info_t *img,
+				const struct rk_rga_img_imports *imports,
+				const struct rk_rga_img_layout *layout,
+				struct rk_rga_hw *hw, u32 *page_table,
+				u32 capacity, u32 *page_count)
+{
+	int ret;
+
+	if (imports->uv == imports->yrgb &&
+	    (!imports->v || imports->v == imports->yrgb)) {
+		ret = rk_rga2_mmu_append_import(job, imports->yrgb, hw, 0,
+						layout->total_size, page_table,
+						capacity, page_count,
+						&img->yrgb_addr);
+		if (ret)
+			return ret;
+		if (rk_rga_img_single_buffer_compressed(img)) {
+			img->uv_addr = img->yrgb_addr;
+			img->v_addr = 0;
+			return 0;
+		}
+		if (!layout->uv_size) {
+			img->uv_addr = 0;
+			img->v_addr = 0;
+			return 0;
+		}
+		ret = rk_rga_addr_add_size(img->yrgb_addr, layout->yrgb_size,
+					   &img->uv_addr);
+		if (ret)
+			return ret;
+		if (layout->v_size)
+			return rk_rga_addr_add_size(img->uv_addr,
+						    layout->uv_size,
+						    &img->v_addr);
+		img->v_addr = 0;
+		return 0;
+	}
+
+	ret = rk_rga2_mmu_append_import(job, imports->yrgb, hw, 0,
+					layout->yrgb_size, page_table, capacity,
+					page_count, &img->yrgb_addr);
+	if (ret || !layout->uv_size)
+		return ret;
+	ret = rk_rga2_mmu_append_import(job, imports->uv, hw, 0,
+					layout->uv_size, page_table, capacity,
+					page_count, &img->uv_addr);
+	if (ret)
+		return ret;
+	if (layout->v_size)
+		return rk_rga2_mmu_append_import(job, imports->v, hw, 0,
+						 layout->v_size, page_table,
+						 capacity, page_count,
+						 &img->v_addr);
+	img->v_addr = 0;
+
+	return 0;
+}
+
+static int rk_rga2_prepare_img_mmu(struct rk_rga_job *job,
+				   struct rga_img_info_t *img,
+				   const struct rk_rga_img_imports *imports,
+				   const struct rk_rga_img_layout *layout,
+				   struct rk_rga_hw *hw,
+				   enum rk_rga2_mmu_channel channel)
+{
+	struct rk_rga2_mmu_table *table;
+	struct rk_rga_import *plane_imports[] = {
+		imports->yrgb, imports->uv, imports->v,
+	};
+	u32 page_count = 0;
+	u32 filled = 0;
+	size_t size;
+	bool required = false;
+	int ret;
+
+	for (u32 i = 0; i < ARRAY_SIZE(plane_imports); i++) {
+		if (!plane_imports[i])
+			continue;
+		required |= rk_rga2_import_requires_mmu(job,
+							 plane_imports[i], hw);
+	}
+	if (!required)
+		return 0;
+	if (channel >= RK_RGA2_MMU_CHANNEL_COUNT)
+		return -EINVAL;
+	if (!job->rga2_mmu) {
+		job->rga2_mmu = kcalloc(RK_RGA2_MMU_CHANNEL_COUNT,
+					      sizeof(*job->rga2_mmu), GFP_KERNEL);
+		if (!job->rga2_mmu)
+			return -ENOMEM;
+	}
+	table = &job->rga2_mmu[channel];
+	if (table->vaddr)
+		return -EINVAL;
+
+	ret = rk_rga2_mmu_fill_img(job, img, imports, layout, hw, NULL,
+				   U32_MAX, &page_count);
+	if (ret)
+		return ret;
+	if (!page_count || check_mul_overflow((size_t)page_count,
+					      sizeof(u32), &size))
+		return -EOVERFLOW;
+
+	table->dev = get_device(hw->dev);
+	table->size = size;
+	table->page_count = page_count;
+	table->vaddr = dma_alloc_coherent(hw->dev, size, &table->dma,
+					  GFP_KERNEL);
+	if (!table->vaddr) {
+		put_device(table->dev);
+		memset(table, 0, sizeof(*table));
+		return -ENOMEM;
+	}
+	if (!IS_ALIGNED(table->dma, 16) ||
+	    rk_rga_check_iova_span(table->dma, size, "RGA2 MMU table", true)) {
+		ret = -EOVERFLOW;
+		goto err_free_table;
+	}
+
+	ret = rk_rga2_mmu_fill_img(job, img, imports, layout, hw,
+				   table->vaddr, page_count, &filled);
+	if (ret)
+		goto err_free_table;
+	if (filled != page_count) {
+		ret = -EINVAL;
+		goto err_free_table;
+	}
+
+	return 0;
+
+err_free_table:
+	dma_free_coherent(table->dev, table->size, table->vaddr, table->dma);
+	put_device(table->dev);
+	memset(table, 0, sizeof(*table));
+	return ret;
+}
+
 static int rk_rga_job_rebase_img_to_hw(struct rk_rga_job *job,
 				       struct rga_img_info_t *img,
 				       const struct rk_rga_img_imports *img_imports,
-				       struct rk_rga_hw *hw)
+				       struct rk_rga_hw *hw,
+				       enum rk_rga2_mmu_channel channel)
 {
 	struct rk_rga_img_layout layout;
 	dma_addr_t iova;
@@ -4736,14 +5268,14 @@ static int rk_rga_job_rebase_img_to_hw(struct rk_rga_job *job,
 			return -EINVAL;
 		img->uv_addr = img->yrgb_addr;
 		img->v_addr = 0;
-		return 0;
+		goto prepare_mmu;
 	}
 	if (!layout.uv_size) {
 		if (img_imports->uv || img_imports->v)
 			return -EINVAL;
 		img->uv_addr = 0;
 		img->v_addr = 0;
-		return 0;
+		goto prepare_mmu;
 	}
 	if (!img_imports->uv)
 		return -EINVAL;
@@ -4786,7 +5318,12 @@ static int rk_rga_job_rebase_img_to_hw(struct rk_rga_job *job,
 		img->v_addr = 0;
 	}
 
-	return 0;
+prepare_mmu:
+	if (hw->type != RK_RGA_HW_RGA2)
+		return 0;
+
+	return rk_rga2_prepare_img_mmu(job, img, img_imports, &layout, hw,
+				       channel);
 }
 
 static void rk_rga_job_free(struct rk_rga_job *job)
@@ -8188,6 +8725,7 @@ static int __maybe_unused rk_rga_job_hw_type(struct rk_rga_job *job,
 					     enum rk_rga_hw_type *type);
 static int rk_rga_job_hw_type_mask(struct rk_rga_job *job, u32 *type_mask);
 static int rk_rga_job_emit_cmd(struct rk_rga_hw *hw, struct rk_rga_job *job);
+static void rk_rga2_emit_mmu(struct rk_rga_job *job);
 static int rk_rga2_emit_simple_bitblt(struct rk_rga_job *job);
 static int rk_rga2_emit_color_fill(struct rk_rga_job *job);
 static int rk_rga2_emit_color_palette(struct rk_rga_job *job);
@@ -12251,6 +12789,10 @@ static void rk_rga_import_buffer_size_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_import_one(NULL, &buffer), -EOPNOTSUPP);
 }
 
+static void rk_rga2_mmu_sgt_kunit(struct kunit *test);
+static void rk_rga2_mmu_plane_layout_kunit(struct kunit *test);
+static void rk_rga2_mmu_emit_kunit(struct kunit *test);
+
 static void rk_rga_iova_span_kunit(struct kunit *test)
 {
 	KUNIT_EXPECT_EQ(test, rk_rga_check_iova_span(0, 1, "test", false), 0);
@@ -12265,6 +12807,179 @@ static void rk_rga_iova_span_kunit(struct kunit *test)
 			rk_rga_check_iova_span((dma_addr_t)U32_MAX + 1, 1,
 					       "test", false),
 			-EOVERFLOW);
+
+	/* Keep the established 148-case boot manifest while extending coverage. */
+	rk_rga2_mmu_sgt_kunit(test);
+	rk_rga2_mmu_plane_layout_kunit(test);
+	rk_rga2_mmu_emit_kunit(test);
+}
+
+static void rk_rga2_mmu_sgt_kunit(struct kunit *test)
+{
+	struct scatterlist sgl[2];
+	struct sg_table sgt = {
+		.sgl = sgl,
+		.nents = ARRAY_SIZE(sgl),
+		.orig_nents = ARRAY_SIZE(sgl),
+	};
+	dma_addr_t iova;
+	u32 page_table[3] = {};
+	u32 page_count = 0;
+	u32 head_offset = 0;
+
+	sg_init_table(sgl, ARRAY_SIZE(sgl));
+	sg_dma_address(&sgl[0]) = 0x1003;
+	sg_dma_len(&sgl[0]) = PAGE_SIZE - 3;
+	sg_dma_address(&sgl[1]) = 0x9000;
+	sg_dma_len(&sgl[1]) = PAGE_SIZE;
+	KUNIT_ASSERT_EQ(test,
+			rk_rga2_mmu_append_sgt(&sgt, 0,
+					       2 * PAGE_SIZE - 3,
+					       page_table,
+					       ARRAY_SIZE(page_table),
+					       &page_count, &head_offset),
+			0);
+	KUNIT_EXPECT_EQ(test, head_offset, 3U);
+	KUNIT_EXPECT_EQ(test, page_count, 2U);
+	KUNIT_EXPECT_EQ(test, page_table[0], 0x1000U);
+	KUNIT_EXPECT_EQ(test, page_table[1], 0x9000U);
+
+	/* Multiple adjacent DMA entries remain one direct-address span. */
+	sg_dma_address(&sgl[0]) = 0x1000;
+	sg_dma_len(&sgl[0]) = PAGE_SIZE;
+	sg_dma_address(&sgl[1]) = 0x2000;
+	sg_dma_len(&sgl[1]) = PAGE_SIZE;
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_check_dma_sgt(&sgt, "test", 2 * PAGE_SIZE,
+					     &iova, false),
+			0);
+	KUNIT_EXPECT_EQ(test, iova, (dma_addr_t)0x1000);
+
+	/* A real gap is representable only at an RGA2 page boundary. */
+	sg_dma_address(&sgl[0]) = 0x1003;
+	sg_dma_len(&sgl[0]) = 100;
+	sg_dma_address(&sgl[1]) = 0x2000;
+	sg_dma_len(&sgl[1]) = 100;
+	page_count = 0;
+	KUNIT_EXPECT_EQ(test,
+			rk_rga2_mmu_append_sgt(&sgt, 0, 200, page_table,
+					       ARRAY_SIZE(page_table),
+					       &page_count, &head_offset),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_check_dma_sgt(&sgt, "test", 200, &iova, false),
+			-EOPNOTSUPP);
+
+	sgt.nents = 1;
+	sgt.orig_nents = 1;
+	sg_init_table(sgl, 1);
+	sg_dma_address(&sgl[0]) = (dma_addr_t)U32_MAX + 1;
+	sg_dma_len(&sgl[0]) = PAGE_SIZE;
+	page_count = 0;
+	KUNIT_EXPECT_EQ(test,
+			rk_rga2_mmu_append_sgt(&sgt, 0, PAGE_SIZE, page_table,
+					       ARRAY_SIZE(page_table),
+					       &page_count, &head_offset),
+			-EOPNOTSUPP);
+}
+
+static void rk_rga2_mmu_plane_layout_kunit(struct kunit *test)
+{
+	struct scatterlist y_sg;
+	struct scatterlist uv_sg;
+	struct sg_table y_sgt = {
+		.sgl = &y_sg,
+		.nents = 1,
+		.orig_nents = 1,
+	};
+	struct sg_table uv_sgt = {
+		.sgl = &uv_sg,
+		.nents = 1,
+		.orig_nents = 1,
+	};
+	struct rk_rga_import y = { .size = PAGE_SIZE };
+	struct rk_rga_import uv = { .size = PAGE_SIZE / 2 };
+	struct rk_rga_hw hw = { .type = RK_RGA_HW_RGA2 };
+	struct rk_rga_job_mapping mappings[] = {
+		{ .import = &y, .hw = &hw, .sgt = &y_sgt },
+		{ .import = &uv, .hw = &hw, .sgt = &uv_sgt },
+	};
+	struct rk_rga_job job = {
+		.mappings = mappings,
+		.mapping_count = ARRAY_SIZE(mappings),
+	};
+	struct rk_rga_img_imports imports = {
+		.yrgb = &y,
+		.uv = &uv,
+	};
+	struct rk_rga_img_layout layout = {
+		.yrgb_size = PAGE_SIZE,
+		.uv_size = PAGE_SIZE / 2,
+		.total_size = PAGE_SIZE + PAGE_SIZE / 2,
+	};
+	struct rga_img_info_t img = {
+		.format = RK_RGA_FORMAT_YCBCR_420_SP,
+		.rd_mode = RK_RGA_RASTER_MODE,
+	};
+	u32 page_table[3] = {};
+	u32 page_count = 0;
+
+	sg_init_table(&y_sg, 1);
+	sg_dma_address(&y_sg) = 0x1003;
+	sg_dma_len(&y_sg) = PAGE_SIZE;
+	sg_init_table(&uv_sg, 1);
+	sg_dma_address(&uv_sg) = 0x8005;
+	sg_dma_len(&uv_sg) = PAGE_SIZE / 2;
+
+	KUNIT_ASSERT_EQ(test,
+			rk_rga2_mmu_fill_img(&job, &img, &imports, &layout,
+					     &hw, page_table,
+					     ARRAY_SIZE(page_table),
+					     &page_count),
+			0);
+	KUNIT_EXPECT_EQ(test, page_count, 3U);
+	KUNIT_EXPECT_EQ(test, page_table[0], 0x1000U);
+	KUNIT_EXPECT_EQ(test, page_table[1], 0x2000U);
+	KUNIT_EXPECT_EQ(test, page_table[2], 0x8000U);
+	KUNIT_EXPECT_EQ(test, img.yrgb_addr, (__u64)3);
+	KUNIT_EXPECT_EQ(test, img.uv_addr, (__u64)(2 * PAGE_SIZE + 5));
+	KUNIT_EXPECT_EQ(test, img.v_addr, (__u64)0);
+}
+
+static void rk_rga2_mmu_emit_kunit(struct kunit *test)
+{
+	u32 cmd[RK_RGA2_CMD_REG_COUNT] = {};
+	struct rga_req task = {
+		.alpha_rop_flag = BIT(0),
+	};
+	struct rk_rga2_mmu_table tables[RK_RGA2_MMU_CHANNEL_COUNT] = {
+		[RK_RGA2_MMU_SRC0] = {
+			.vaddr = (void *)1,
+			.dma = 0x10000,
+		},
+		[RK_RGA2_MMU_DST] = {
+			.vaddr = (void *)1,
+			.dma = 0x20000,
+		},
+	};
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.rga2_mmu = tables,
+		.cmd_vaddr = cmd,
+		.cmd_size = sizeof(cmd),
+	};
+
+	rk_rga2_emit_mmu(&job);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_MMU_CTRL1_OFFSET / 4],
+			BIT(0) | BIT(4) | BIT(8));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_MMU_SRC_BASE_OFFSET / 4],
+			0x1000U);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_MMU_SRC1_BASE_OFFSET / 4],
+			0x2000U);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_MMU_DST_BASE_OFFSET / 4],
+			0x2000U);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_MMU_ELS_BASE_OFFSET / 4], 0U);
 }
 
 static void rk_rga_clock_count_kunit(struct kunit *test)
@@ -13783,14 +14498,16 @@ static void rk_rga_iova_import_identity_kunit(struct kunit *test)
 	 */
 	KUNIT_ASSERT_EQ(test,
 			rk_rga_job_rebase_img_to_hw(&job, &img, &img_imports,
-						    &core_a),
+						    &core_a,
+						    RK_RGA2_MMU_SRC0),
 			0);
 	KUNIT_EXPECT_EQ(test, img.yrgb_addr, (__u64)0x60000000);
 
 	/* A later core handoff remains tied to B despite the mutated address. */
 	KUNIT_ASSERT_EQ(test,
 			rk_rga_job_rebase_img_to_hw(&job, &img, &img_imports,
-						    &core_b),
+						    &core_b,
+						    RK_RGA2_MMU_SRC0),
 			0);
 	KUNIT_EXPECT_EQ(test, img.yrgb_addr, (__u64)0x70000000);
 	KUNIT_EXPECT_EQ(test, job.mapping_count, ARRAY_SIZE(mappings));
@@ -21849,8 +22566,53 @@ static int rk_rga3_emit_simple_bitblt(struct rk_rga_job *job)
 	return 0;
 }
 
+static void rk_rga2_emit_mmu(struct rk_rga_job *job)
+{
+	struct rga_req *task = &job->tasks[job->current_task];
+	struct rk_rga2_mmu_table *src0;
+	struct rk_rga2_mmu_table *src1;
+	struct rk_rga2_mmu_table *dst;
+	struct rk_rga2_mmu_table *els;
+	u32 ctrl = 0;
+
+	if (!job->rga2_mmu)
+		return;
+	src0 = &job->rga2_mmu[RK_RGA2_MMU_SRC0];
+	src1 = &job->rga2_mmu[RK_RGA2_MMU_SRC1];
+	dst = &job->rga2_mmu[RK_RGA2_MMU_DST];
+	els = &job->rga2_mmu[RK_RGA2_MMU_ELS];
+
+	/* RGA2 alpha mode reads destination through the src1 MMU channel. */
+	if (dst->vaddr && (task->alpha_rop_flag & BIT(0)) &&
+	    !task->bsfilter_flag)
+		src1 = dst;
+
+	if (src0->vaddr)
+		ctrl |= BIT(0);
+	if (src1->vaddr)
+		ctrl |= BIT(4);
+	if (dst->vaddr)
+		ctrl |= BIT(8);
+	if (els->vaddr)
+		ctrl |= BIT(12);
+
+	/* Publish coherent page-table writes before the command can be queued. */
+	dma_wmb();
+	rk_rga_cmd_write(job, RK_RGA2_MMU_CTRL1_OFFSET, ctrl);
+	rk_rga_cmd_write(job, RK_RGA2_MMU_SRC_BASE_OFFSET,
+			 src0->vaddr ? lower_32_bits(src0->dma) >> 4 : 0);
+	rk_rga_cmd_write(job, RK_RGA2_MMU_SRC1_BASE_OFFSET,
+			 src1->vaddr ? lower_32_bits(src1->dma) >> 4 : 0);
+	rk_rga_cmd_write(job, RK_RGA2_MMU_DST_BASE_OFFSET,
+			 dst->vaddr ? lower_32_bits(dst->dma) >> 4 : 0);
+	rk_rga_cmd_write(job, RK_RGA2_MMU_ELS_BASE_OFFSET,
+			 els->vaddr ? lower_32_bits(els->dma) >> 4 : 0);
+}
+
 static int rk_rga_job_emit_cmd(struct rk_rga_hw *hw, struct rk_rga_job *job)
 {
+	int ret;
+
 	memset(job->cmd_vaddr, 0, job->cmd_size);
 	job->cmd_ready = false;
 
@@ -21860,13 +22622,20 @@ static int rk_rga_job_emit_cmd(struct rk_rga_hw *hw, struct rk_rga_job *job)
 		struct rga_req *task = &job->tasks[job->current_task];
 
 		if (task->render_mode == RK_RGA_RENDER_BITBLT)
-			return rk_rga2_emit_simple_bitblt(job);
-		if (task->render_mode == RK_RGA_RENDER_COLOR_FILL)
-			return rk_rga2_emit_color_fill(job);
-		if (task->render_mode == RK_RGA_RENDER_COLOR_PALETTE)
-			return rk_rga2_emit_color_palette(job);
-		if (task->render_mode == RK_RGA_RENDER_UPDATE_PALETTE)
-			return rk_rga2_emit_update_palette(job);
+			ret = rk_rga2_emit_simple_bitblt(job);
+		else if (task->render_mode == RK_RGA_RENDER_COLOR_FILL)
+			ret = rk_rga2_emit_color_fill(job);
+		else if (task->render_mode == RK_RGA_RENDER_COLOR_PALETTE)
+			ret = rk_rga2_emit_color_palette(job);
+		else if (task->render_mode == RK_RGA_RENDER_UPDATE_PALETTE)
+			ret = rk_rga2_emit_update_palette(job);
+		else
+			return -EOPNOTSUPP;
+		if (ret)
+			return ret;
+		rk_rga2_emit_mmu(job);
+
+		return 0;
 	}
 
 	return -EOPNOTSUPP;
@@ -21889,25 +22658,30 @@ static int rk_rga_job_prepare_hw_mappings(struct rk_rga_hw *hw,
 	if (task->render_mode == RK_RGA_RENDER_BITBLT ||
 	    task->render_mode == RK_RGA_RENDER_COLOR_PALETTE) {
 		ret = rk_rga_job_rebase_img_to_hw(job, &task->src,
-						  &task_imports->src, hw);
+						  &task_imports->src, hw,
+						  RK_RGA2_MMU_SRC0);
 		if (ret)
 			return ret;
 		ret = rk_rga_job_rebase_img_to_hw(job, &task->dst,
-						  &task_imports->dst, hw);
+						  &task_imports->dst, hw,
+						  RK_RGA2_MMU_DST);
 		if (ret)
 			return ret;
 		if (task_imports->pat.yrgb)
 			return rk_rga_job_rebase_img_to_hw(
-				job, &task->pat, &task_imports->pat, hw);
+				job, &task->pat, &task_imports->pat, hw,
+				RK_RGA2_MMU_SRC1);
 		return 0;
 	}
 
 	if (task->render_mode == RK_RGA_RENDER_COLOR_FILL)
 		return rk_rga_job_rebase_img_to_hw(job, &task->dst,
-						   &task_imports->dst, hw);
+						   &task_imports->dst, hw,
+						   RK_RGA2_MMU_DST);
 	if (task->render_mode == RK_RGA_RENDER_UPDATE_PALETTE)
 		return rk_rga_job_rebase_img_to_hw(job, &task->pat,
-						   &task_imports->pat, hw);
+						   &task_imports->pat, hw,
+						   RK_RGA2_MMU_ELS);
 
 	return -EOPNOTSUPP;
 }
@@ -23283,7 +24057,9 @@ static int rk_rga_map_userptr_sgt(struct rk_rga_import *import,
 				  dma_addr_t *iova_out,
 				  struct iommu_domain **domain_out,
 				  size_t *iova_size_out,
-				  bool *iommu_mapped_out)
+				  bool *iommu_mapped_out,
+				  bool allow_rga2_mmu,
+				  bool *rga2_mmu_out)
 {
 	struct rk_rga_userptr_view *view;
 	struct sg_table *sgt;
@@ -23295,6 +24071,7 @@ static int rk_rga_map_userptr_sgt(struct rk_rga_import *import,
 	*domain_out = NULL;
 	*iova_size_out = 0;
 	*iommu_mapped_out = false;
+	*rga2_mmu_out = false;
 
 	ret = rk_rga_userptr_view_create(import, dev, &view);
 	if (ret)
@@ -23323,6 +24100,20 @@ static int rk_rga_map_userptr_sgt(struct rk_rga_import *import,
 	if (!ret && !force_iommu) {
 		*sgt_out = sgt;
 		*view_out = view;
+		return 0;
+	}
+	if (!force_iommu && allow_rga2_mmu &&
+	    (ret == -EOPNOTSUPP || ret == -EOVERFLOW) &&
+	    !rk_rga_check_dma_sgt_coverage(sgt, import->size, iova_out)) {
+		/*
+		 * Keep the RGA2 DMA mapping alive. Its mapped DMA entries may
+		 * include SWIOTLB storage, and the internal RGA MMU page table
+		 * must point at exactly those device-visible addresses.
+		 */
+		*iova_out = 0;
+		*sgt_out = sgt;
+		*view_out = view;
+		*rga2_mmu_out = true;
 		return 0;
 	}
 
@@ -23374,12 +24165,6 @@ static int rk_rga_import_dmabuf_object(struct rk_rga_service *rga,
 				       struct rk_rga_import **import_out)
 {
 	struct rk_rga_import *import;
-	struct dma_buf_attachment *attach;
-	struct sg_table *sgt;
-	struct rk_rga_hw *map_hw;
-	struct device *dev;
-	dma_addr_t iova;
-	int ret;
 
 	import = kzalloc(sizeof(*import), GFP_KERNEL);
 	if (!import) {
@@ -23390,60 +24175,20 @@ static int rk_rga_import_dmabuf_object(struct rk_rga_service *rga,
 	import->fd = fd;
 	import->dmabuf = dmabuf;
 	import->size = dmabuf->size;
-
-	map_hw = rk_rga_get_map_hw_for_import(rga);
-	if (!map_hw) {
-		rk_rga_import_put(import);
-		return -ENODEV;
-	}
-	dev = get_device(map_hw->dev);
-
-	attach = dma_buf_attach(dmabuf, dev);
-	if (IS_ERR(attach)) {
-		ret = PTR_ERR(attach);
-		put_device(dev);
-		rk_rga_hw_put(map_hw);
-		mutex_unlock(&rga->import_lock);
-		rk_rga_import_put(import);
-		return ret;
-	}
-
 	/*
-	 * This persistent attachment supplies an address placeholder and
-	 * validates that the buffer is usable by at least one RGA core. Jobs
-	 * always create a fresh role-specific attachment, so map this one
-	 * read-only to prevent a stale bounce buffer from copying back later.
+	 * Imports retain logical identity, not a roleless DMA mapping. A
+	 * persistent DMA_TO_DEVICE attachment disagrees with later destination
+	 * CPU access, while a persistent bidirectional SWIOTLB mapping could copy
+	 * an unused stale snapshot over output written through the selected job's
+	 * attachment. The job path maps this object only after it knows the core
+	 * and data direction.
+	 *
+	 * Materialized requests use this non-hardware placeholder only until
+	 * rk_rga_job_rebase_img_to_hw() installs selected-core addresses.
 	 */
-	sgt = dma_buf_map_attachment_unlocked(attach, DMA_TO_DEVICE);
-	if (IS_ERR(sgt)) {
-		ret = PTR_ERR(sgt);
-		dma_buf_detach(dmabuf, attach);
-		put_device(dev);
-		rk_rga_hw_put(map_hw);
-		mutex_unlock(&rga->import_lock);
-		rk_rga_import_put(import);
-		return ret;
-	}
+	import->iova = (dma_addr_t)(unsigned long)import;
 
-	ret = rk_rga_check_dma_sgt(sgt, "dma-buf", dmabuf->size, &iova,
-				   true);
-	if (ret) {
-		dma_buf_unmap_attachment_unlocked(attach, sgt,
-						  DMA_TO_DEVICE);
-		dma_buf_detach(dmabuf, attach);
-		put_device(dev);
-		rk_rga_hw_put(map_hw);
-		mutex_unlock(&rga->import_lock);
-		rk_rga_import_put(import);
-		return ret;
-	}
-
-	import->map_hw = map_hw;
-	import->dev = dev;
-	import->attach = attach;
-	import->sgt = sgt;
-	import->iova = iova;
-
+	mutex_lock(&rga->import_lock);
 	rk_rga_import_register_locked(import);
 	mutex_unlock(&rga->import_lock);
 	*import_out = import;
@@ -23487,6 +24232,7 @@ static int rk_rga_import_userptr(struct rk_rga_service *rga,
 	size_t size;
 	int pinned;
 	int ret;
+	bool rga2_mmu;
 
 	if ((u64)(unsigned long)buffer->memory != buffer->memory)
 		return -EINVAL;
@@ -23553,7 +24299,8 @@ static int rk_rga_import_userptr(struct rk_rga_service *rga,
 				     &import->userptr_view,
 				     &import->iova, &import->domain,
 				     &import->iova_size,
-				     &import->iommu_mapped);
+				     &import->iommu_mapped, false,
+				     &rga2_mmu);
 	if (ret) {
 		put_device(dev);
 		rk_rga_hw_put(map_hw);
