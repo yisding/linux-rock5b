@@ -40,6 +40,12 @@ static int rga_dma_check_iova_span(dma_addr_t dma_addr, size_t size,
 static int rga_dma_check_iova_contract(struct sg_table *sgt,
 				       const char *source, bool log_errors)
 {
+	struct scatterlist *sg;
+	dma_addr_t base = 0;
+	u64 expected = 0;
+	size_t size = 0;
+	unsigned int i;
+
 	if (!sgt || !sgt->sgl) {
 		if (log_errors)
 			rga_err("reject %s DMA mapping: empty sg table\n",
@@ -47,16 +53,31 @@ static int rga_dma_check_iova_contract(struct sg_table *sgt,
 		return -EINVAL;
 	}
 
-	if (sgt->nents != 1) {
-		if (log_errors)
-			rga_err("reject %s DMA mapping: expected one DMA segment, got %u, orig_nents = %u\n",
-				source, sgt->nents, sgt->orig_nents);
-		return -EOPNOTSUPP;
+	for_each_sgtable_dma_sg(sgt, sg, i) {
+		dma_addr_t addr = sg_dma_address(sg);
+		size_t len = sg_dma_len(sg);
+
+		if (!len) {
+			if (log_errors)
+				rga_err("reject %s DMA mapping: zero-length segment %u\n",
+					source, i);
+			return -EINVAL;
+		}
+		if (!i)
+			base = addr;
+		else if ((u64)addr != expected) {
+			if (log_errors)
+				rga_err("reject %s DMA mapping: segment %u is not adjacent, expected 0x%llx, got %pad, nents = %u, orig_nents = %u\n",
+					source, i, expected, &addr, sgt->nents,
+					sgt->orig_nents);
+			return -EOPNOTSUPP;
+		}
+		if (check_add_overflow(size, len, &size) ||
+		    check_add_overflow((u64)addr, (u64)len, &expected))
+			return -EOVERFLOW;
 	}
 
-	return rga_dma_check_iova_span(sg_dma_address(sgt->sgl),
-				       sg_dma_len(sgt->sgl), source,
-				       log_errors);
+	return rga_dma_check_iova_span(base, size, source, log_errors);
 }
 
 static void rga_dma_reset_sgt_dma_state(struct sg_table *sgt)
@@ -358,15 +379,15 @@ static int rga_dma_set_buffer_mapping(struct sg_table *sgt,
 		ret = rga_dma_check_page_granular_contract(sgt, source);
 		if (ret)
 			return ret;
-
-		for_each_sgtable_dma_sg(sgt, sg, i)
-			size += sg_dma_len(sg);
 	} else {
 		ret = rga_dma_check_iova_contract(sgt, source, true);
 		if (ret)
 			return ret;
+	}
 
-		size = sg_dma_len(sgt->sgl);
+	for_each_sgtable_dma_sg(sgt, sg, i) {
+		if (check_add_overflow(size, (size_t)sg_dma_len(sg), &size))
+			return -EOVERFLOW;
 	}
 
 	buffer->sgt = sgt;
