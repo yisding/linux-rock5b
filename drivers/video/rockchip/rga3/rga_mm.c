@@ -1532,68 +1532,102 @@ static int rga_mm_set_mmu_flag(struct rga_job *job,
 	return 0;
 }
 
+static int rga_mm_emit_page_table_run(u64 address, u64 length,
+				      uint32_t *page_table,
+				      uint32_t page_count,
+				      uint32_t *mapped_count)
+{
+	u64 base = address & PAGE_MASK;
+	u64 span;
+	u64 pages;
+	u64 i;
+
+	if (!length || check_add_overflow((u64)offset_in_page(address),
+					 length, &span))
+		return -EINVAL;
+	pages = DIV_ROUND_UP_ULL(span, PAGE_SIZE);
+
+	for (i = 0; i < pages && *mapped_count < page_count; i++) {
+		u64 pte;
+
+		if (check_add_overflow(base, i << PAGE_SHIFT, &pte))
+			return -EOVERFLOW;
+		/* RGA2 PTEs contain full 32-bit page addresses. */
+		if (pte > SZ_4G - PAGE_SIZE)
+			return -EOPNOTSUPP;
+		page_table[(*mapped_count)++] = (uint32_t)pte;
+	}
+
+	return 0;
+}
+
 static int rga_mm_sgt_to_page_table(struct sg_table *sg,
 				    uint32_t *page_table,
 				    int32_t pageCount,
 				    int32_t use_dma_address)
 {
-	uint32_t i;
-	unsigned long Address;
-	uint32_t mapped_size = 0;
-	uint32_t len;
-	struct scatterlist *sgl = sg->sgl;
-	uint32_t sg_num = 0;
-	uint32_t break_flag = 0;
+	struct scatterlist *sgl;
+	u64 run_address = 0;
+	u64 run_length = 0;
+	u32 mapped_count = 0;
+	unsigned int i;
+	int ret;
 
-	do {
-		/*
-		 *   The length of each sgl is expected to be obtained here, not
-		 * the length of the entire dma_buf, so sg_dma_len() is not used.
-		 */
-		len = (sgl->length + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
+	if (!sg || !sg->sgl || !page_table || pageCount <= 0)
+		return -EINVAL;
 
-		if (use_dma_address)
-			/*
-			 *   The fd passed by user space gets sg through
-			 * dma_buf_map_attachment, so dma_address can
-			 * be use here.
-			 *   When the mapped device does not have iommu, it will
-			 * return the first address of the real physical page
-			 * when it meets the requirements of the current device,
-			 * and will trigger swiotlb when it does not meet the
-			 * requirements to obtain a software-mapped physical
-			 * address that is mapped to meet the device address
-			 * requirements.
-			 */
-			Address = sg_dma_address(sgl);
-		else
-			Address = sg_phys(sgl);
+#define RGA_MM_ACCUMULATE_ENTRY(_address, _length) do { \
+		u64 __address = (_address); \
+		u64 __length = (_length); \
+		u64 __run_end; \
+		if (!__length || check_add_overflow(__address, __length, &__run_end)) \
+			return -EINVAL; \
+		if (!run_length) { \
+			run_address = __address; \
+			run_length = __length; \
+		} else { \
+			u64 __previous_end; \
+			if (check_add_overflow(run_address, run_length, &__previous_end)) \
+				return -EOVERFLOW; \
+			if (__address == __previous_end) { \
+				if (check_add_overflow(run_length, __length, &run_length)) \
+					return -EOVERFLOW; \
+			} else { \
+				ret = rga_mm_emit_page_table_run(run_address, run_length, \
+							       page_table, pageCount, \
+							       &mapped_count); \
+				if (ret || mapped_count == pageCount) \
+					return ret; \
+				if (!IS_ALIGNED(__previous_end, PAGE_SIZE) || \
+				    !IS_ALIGNED(__address, PAGE_SIZE)) \
+					return -EOPNOTSUPP; \
+				run_address = __address; \
+				run_length = __length; \
+			} \
+		} \
+	} while (0)
 
-		Address &= PAGE_MASK;
+	if (use_dma_address) {
+		for_each_sgtable_dma_sg(sg, sgl, i)
+			RGA_MM_ACCUMULATE_ENTRY(sg_dma_address(sgl),
+						 sg_dma_len(sgl));
+	} else {
+		for_each_sg(sg->sgl, sgl, sg->orig_nents, i)
+			RGA_MM_ACCUMULATE_ENTRY(sg_phys(sgl), sgl->length);
+	}
 
-		for (i = 0; i < len; i++) {
-			if (mapped_size + i >= pageCount) {
-				break_flag = 1;
-				break;
-			}
-			/*
-			 * RGA2 MMU entries are 32-bit page addresses; an
-			 * entry above 4 GiB would be silently truncated and
-			 * make the hardware fetch an unrelated page (observed
-			 * as an RGA2 bus error on >4G userptr pages).  Fail
-			 * closed instead; below-4G and swiotlb-bounced
-			 * dma-buf paths are unaffected.
-			 */
-			if ((Address + ((unsigned long)i << PAGE_SHIFT)) >
-			    (SZ_4G - PAGE_SIZE))
-				return -EOPNOTSUPP;
-			page_table[mapped_size + i] = (uint32_t)(Address + (i << PAGE_SHIFT));
-		}
-		if (break_flag)
-			break;
-		mapped_size += len;
-		sg_num += 1;
-	} while ((sgl = sg_next(sgl)) && (mapped_size < pageCount) && (sg_num < sg->orig_nents));
+#undef RGA_MM_ACCUMULATE_ENTRY
+
+	if (run_length) {
+		ret = rga_mm_emit_page_table_run(run_address, run_length,
+					       page_table, pageCount,
+					       &mapped_count);
+		if (ret)
+			return ret;
+	}
+
+	if (mapped_count != pageCount)
+		return -EINVAL;
 
 	return 0;
 }
