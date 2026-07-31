@@ -627,6 +627,9 @@ extra logging and do not emit per-job kernel messages unless tracing is enabled.
   age), the software dispatch queue with each job's queued age, and active
   RKVENC2 DCHS slots.  Counts include jobs discarded by reset/close, hardware
   reset attempts, and first reset failures that caused permanent quarantine.
+  ``rejected`` (also ``rejected_job_count``) counts jobs refused during
+  assembly, before any hardware work, so a malformed or incompatible userspace
+  is visible without reading the event journal.
   The ``io imports`` value, also exposed as ``import_count``, is a live mapping
   gauge rather than a cumulative counter and returns to zero after cached and
   job-held imports are released.
@@ -642,8 +645,8 @@ extra logging and do not emit per-job kernel messages unless tracing is enabled.
 
 ``trace_mask``
   Opt-in live kernel-log tracing of the same structured events: bit 0 is job
-  lifecycle, bit 1 is IRQ, and bit 2 is rejection/error/recovery.  The default
-  is zero.  Use ``7`` only for a short reproduction because successful
+  lifecycle, bit 1 is IRQ including spurious IRQs, and bit 2 is
+  rejection/error/recovery.  The default is zero.  Use ``7`` only for a short reproduction because successful
   high-throughput jobs intentionally generate several lifecycle records.
 
 For a minimal failure capture::
@@ -654,11 +657,28 @@ For a minimal failure capture::
   cat /sys/kernel/debug/rk_mpp_rewrite/state
   cat /sys/kernel/debug/rk_mpp_rewrite/events
 
-The event ``data`` column is currently the rejected command/request count or
-register-word count for setup failures, the poll command for ``poll-fail``, the
-queue depth for ``queued``, hardware elapsed nanoseconds for ``done``, a
-hard-CCU completion-race flag for ``timeout``, and the faulting IOVA for
-``iommu-fault``.
+The event ``data`` column is per event type: the rejected command for
+``request-fail`` and ``poll-fail``, the staged session epoch for a stale-session
+``submit-fail`` and the request count for a backend ``submit-fail``, the job
+flags for ``select-fail``, the rejected register index for ``translate-fail``
+(``0xffffffff`` when the image was rejected as a whole rather than at one
+register), the RCB descriptor count for ``rcb-fail``, the register-word count
+for ``started``, the queue depth for ``queued``, hardware elapsed nanoseconds
+for ``done``, a hard-CCU completion-race flag for ``timeout``, and the faulting
+IOVA for ``iommu-fault``.  It is zero for ``dispatch``, ``abort`` and
+``spurious-irq``.
+
+A register offset may address exactly one byte past the end of its dma-buf.
+That is an end-exclusive limit pointer rather than an access: libmpp has
+programmed the VEPU580 bitstream-top register (172) as base plus the full
+buffer size since 2021 and only switched to size minus one in April 2026, so
+every release up to and including 1.0.11 depends on it being accepted.  The
+hardware dereferences that address only when the bitstream wraps, and an IOMMU
+fault contains that case.  Anything beyond one past the end is rejected with
+``-ERANGE``, as is an explicit IOVA landing one past an import, where it would
+alias the base of the next mapping.  The first such rejection is reported once
+per job through ``translate-fail`` and a ratelimited ``reject reg`` log line
+carrying the register, offset and mapping size.
 
 Recognized But Unsupported
 --------------------------
