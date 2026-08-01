@@ -2050,34 +2050,60 @@ static int rk_rga_check_dma_sgt(struct sg_table *sgt, const char *source,
 	size_t size = 0;
 	unsigned int i;
 
-	if (!sgt || !sgt->sgl)
+	/*
+	 * Every rejection below is logged under log_errors, because the only
+	 * caller that expects a failure -- the RGA2 multi-SG fallback in
+	 * rk_rga_job_map_import() -- passes false, and a submit that fails
+	 * without saying why costs a full conformance run to notice.  The
+	 * errno matters as much as the message: that fallback re-checks only
+	 * -EOPNOTSUPP and -EOVERFLOW, so an -EINVAL from here skips it and
+	 * fails the job outright.
+	 *
+	 * Rate-limited because this is per-job on the submit path, and a
+	 * userspace loop submitting a permanently invalid mapping would
+	 * otherwise flood the kernel log.
+	 */
+	if (!sgt || !sgt->sgl) {
+		if (log_errors)
+			pr_err_ratelimited("reject %s DMA mapping: no scatter-gather table\n",
+					   source);
 		return -EINVAL;
+	}
 	for_each_sgtable_dma_sg(sgt, sg, i) {
 		dma_addr_t addr = sg_dma_address(sg);
 		size_t len = sg_dma_len(sg);
 
-		if (!len)
+		if (!len) {
+			if (log_errors)
+				pr_err_ratelimited("reject %s DMA mapping: segment %u has zero length, nents=%u, orig_nents=%u\n",
+						   source, i, sgt->nents,
+						   sgt->orig_nents);
 			return -EINVAL;
+		}
 		if (!i)
 			base = addr;
 		else if ((u64)addr != expected) {
 			if (log_errors)
-				pr_err("reject %s DMA mapping: segment %u is not adjacent, expected %#llx, got %pad, nents=%u, orig_nents=%u\n",
-				       source, i, expected, &addr, sgt->nents,
-				       sgt->orig_nents);
+				pr_err_ratelimited("reject %s DMA mapping: segment %u is not adjacent, expected %#llx, got %pad, nents=%u, orig_nents=%u\n",
+						   source, i, expected, &addr,
+						   sgt->nents, sgt->orig_nents);
 			return -EOPNOTSUPP;
 		}
 		if (check_add_overflow(size, len, &size) ||
-		    check_add_overflow((u64)addr, (u64)len, &expected))
+		    check_add_overflow((u64)addr, (u64)len, &expected)) {
+			if (log_errors)
+				pr_err_ratelimited("reject %s DMA mapping: size or address overflow at segment %u, len=%zu, addr=%pad\n",
+						   source, i, len, &addr);
 			return -EOVERFLOW;
+		}
 	}
 
 	if (!required_size)
 		required_size = size;
 	if (size < required_size) {
 		if (log_errors)
-			pr_err("reject %s DMA mapping: mapped view too small, len=%zu required=%zu\n",
-			       source, size, required_size);
+			pr_err_ratelimited("reject %s DMA mapping: mapped view too small, len=%zu required=%zu\n",
+					   source, size, required_size);
 		return -EINVAL;
 	}
 
@@ -2086,6 +2112,14 @@ static int rk_rga_check_dma_sgt(struct sg_table *sgt, const char *source,
 				      log_errors);
 }
 
+/*
+ * Deliberately silent, unlike rk_rga_check_dma_sgt() above: this is a
+ * predicate asking "can RGA2's internal MMU consume this mapping?", and a
+ * negative answer is a normal routing decision rather than a rejection.  When
+ * the job does then fail, the reason is already in the log: it was recorded by
+ * the rk_rga_check_dma_sgt() branch that produced the errno this fallback is
+ * reconsidering.  The caller's unwind path deliberately adds nothing.
+ */
 static int rk_rga_check_dma_sgt_coverage(struct sg_table *sgt,
 					 size_t required_size,
 					 dma_addr_t *first_out)
