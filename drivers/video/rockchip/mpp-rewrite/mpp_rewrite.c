@@ -14143,10 +14143,22 @@ err_deregister_soft_ccu:
 	 * Deregister the armed-but-unstarted core so the coordinator
 	 * returns to BSP-provable idle state (the soft-path error unwind
 	 * deferred from the 2026-07-29 review).
+	 *
+	 * CORE_IDLE is a hiword-masked pair: writing core_mask sets the bit,
+	 * which force-idles the core and disconnects it from the coordinator,
+	 * and writing only the write-enable half clears it again to reconnect.
+	 * Both halves are required here, exactly as the reset path brackets a
+	 * core it stops.  Leaving the core disconnected in a coordinator that
+	 * a sibling job keeps powered would make the next job on this core
+	 * program and start a clock-gated register file -- a silent AXI stall
+	 * or, at best, a watchdog timeout per frame until something resets it.
 	 */
-	if (soft_ccu && rk_mpp_rkvdec2_soft_ccu_regs_ready(soft_ccu))
+	if (soft_ccu && rk_mpp_rkvdec2_soft_ccu_regs_ready(soft_ccu)) {
 		writel(hw->core_mask,
 		       soft_ccu->regs[0] + RK_MPP_RKVDEC_CCU_CORE_IDLE_BASE);
+		writel(hw->core_mask & RK_MPP_RKVDEC_CCU_CORE_RW_MASK,
+		       soft_ccu->regs[0] + RK_MPP_RKVDEC_CCU_CORE_IDLE_BASE);
+	}
 err_unlock_soft_ccu:
 	if (soft_ccu)
 		mutex_unlock(&soft_ccu->run_lock);
