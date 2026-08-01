@@ -15404,20 +15404,23 @@ static int rk_mpp_session_poll_irq(struct rk_mpp_session *session,
 		}
 
 		/*
-		 * Records already popped are gone from the fifo, so failing the
-		 * call now would drop them: the caller cannot distinguish "no
-		 * slices" from "slices delivered, then an error", and a caller
+		 * Records already popped are gone from the fifo, so returning
+		 * an error now would drop them: the caller cannot distinguish
+		 * "no slices" from "slices delivered, then an error", and one
 		 * that retries on error loses them.  Report success with what
 		 * was delivered, exactly as the count_max-reached path above
 		 * does, and let the next poll surface the condition.  The
 		 * overflow flag is one-shot and was consumed by the pop, so put
 		 * it back for that next call.
 		 */
-		if (copy_slices && cfg.count_ret > 0) {
-			if (ret == -EOVERFLOW)
+		if (ret == -EOVERFLOW) {
+			if (copy_slices && cfg.count_ret > 0) {
 				rk_mpp_job_rearm_rkvenc_slice_overflow(job);
+				rk_mpp_job_put(job);
+				return 0;
+			}
 			rk_mpp_job_put(job);
-			return 0;
+			return ret;
 		}
 
 		if (ret != -EAGAIN) {
@@ -15426,8 +15429,14 @@ static int rk_mpp_session_poll_irq(struct rk_mpp_session *session,
 		}
 		rk_mpp_job_put(job);
 
+		/*
+		 * Blocking callers keep waiting with their collected records
+		 * intact -- those were already written to the caller's buffer
+		 * and cfg survives the sleep -- so only the non-blocking return
+		 * has to carry them out.
+		 */
 		if (flags & MPP_FLAGS_POLL_NON_BLOCK)
-			return -EAGAIN;
+			return (copy_slices && cfg.count_ret > 0) ? 0 : -EAGAIN;
 
 		ret = wait_event_interruptible(session->wait,
 					       atomic64_read(&session->poll_seq) !=
