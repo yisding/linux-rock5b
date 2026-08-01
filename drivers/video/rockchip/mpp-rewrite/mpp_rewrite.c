@@ -388,6 +388,13 @@ struct rk_mpp_hw {
 	struct clk_bulk_data *clks;
 	u32 *normal_rates;
 	struct reset_control *resets;
+	/*
+	 * Nonzero while this core's reset line is being pulsed.  Pure
+	 * instrumentation: nothing serializes the pulse against a deassert
+	 * issued for the same core by another context, so this makes that
+	 * interference countable before it is fixed.
+	 */
+	atomic_t reset_pulse_active;
 	struct delayed_work timeout_work;
 	struct work_struct iommu_fault_work;
 	struct mutex run_lock; /* serializes start, abort, timeout, and completion */
@@ -495,6 +502,7 @@ struct rk_mpp_service {
 	atomic_t aborted_job_count;
 	atomic_t reset_count;
 	atomic_t recovery_failure_count;
+	atomic_t reset_deassert_contended_count;
 	atomic_t irq_count;
 	atomic_t spurious_irq_count;
 	atomic_t started_core_count[RK_MPP_DEBUG_CLIENT_COUNT]
@@ -11385,6 +11393,19 @@ static int rk_mpp_hw_power_on(struct rk_mpp_hw *hw)
 
 	rk_mpp_hw_apply_clk_rates(hw);
 
+	/*
+	 * This deassert is unconditional -- it runs even when the core is
+	 * already powered -- and nothing serializes it against a reset pulse
+	 * in progress on the same core.  rk_mpp_rkvdec2_power_on_ccu_cores()
+	 * reaches here for *sibling* cores holding only the submitting core's
+	 * run_lock, while a sibling's own recovery pulses its reset under its
+	 * own run_lock, so the two can overlap.  Count the overlap; the fix is
+	 * a per-reset-domain lock, and this proves the race is reachable on
+	 * real hardware before behaviour changes.
+	 */
+	if (atomic_read(&hw->reset_pulse_active))
+		atomic_inc(&hw->srv->reset_deassert_contended_count);
+
 	ret = reset_control_deassert(hw->resets);
 	if (ret) {
 		rk_mpp_hw_handle_reset_failure(hw, ret);
@@ -11540,6 +11561,14 @@ static int rk_mpp_hw_reset_active(struct rk_mpp_hw *hw)
 		return 0;
 
 	atomic_inc(&hw->srv->reset_count);
+	/*
+	 * Mark the pulse so a deassert issued for this core by another context
+	 * can be counted.  The window that matters is the udelay below: a
+	 * deassert landing inside it ends the pulse early, this core's own
+	 * deassert then no-ops, and the reset is reported as successful
+	 * without having reset anything.
+	 */
+	atomic_inc(&hw->reset_pulse_active);
 	ret = reset_control_assert(hw->resets);
 	if (ret)
 		goto err_reset;
@@ -11548,10 +11577,12 @@ static int rk_mpp_hw_reset_active(struct rk_mpp_hw *hw)
 	ret = reset_control_deassert(hw->resets);
 	if (ret)
 		goto err_reset;
+	atomic_dec(&hw->reset_pulse_active);
 
 	return 0;
 
 err_reset:
+	atomic_dec(&hw->reset_pulse_active);
 	dev_err_ratelimited(hw->dev, "hardware reset failed: %d\n", ret);
 	rk_mpp_hw_handle_reset_failure(hw, ret);
 	return ret;
@@ -16199,12 +16230,13 @@ static int rk_mpp_debug_state_show(struct seq_file *s, void *unused)
 		   atomic_read(&srv->completed_job_count),
 		   atomic_read(&srv->failed_job_count),
 		   atomic_read(&srv->aborted_job_count));
-	seq_printf(s, "errors unsupported=%d rejected=%d timeout=%d reset=%d recovery_failure=%d iommu_fault=%d iommu_refresh=%d iommu_idle_fault=%d irq=%d spurious_irq=%d av1_afbc_irq=%d av1_afbc_prestart_status=%d av1_afbc_stale_status_timeout=%d av1_afbc_before_vcd=%d av1_afbc_after_vcd=%d av1_afbc_observed_at_vcd=%d av1_afbc_not_observed_at_vcd=%d av1_afbc_observed_at_quiesce=%d av1_afbc_not_observed_at_quiesce=%d av1_reset_idle_unproven=%d av1_vcd_to_afbc_observed_max_ns=%lld\n",
+	seq_printf(s, "errors unsupported=%d rejected=%d timeout=%d reset=%d recovery_failure=%d reset_deassert_contended=%d iommu_fault=%d iommu_refresh=%d iommu_idle_fault=%d irq=%d spurious_irq=%d av1_afbc_irq=%d av1_afbc_prestart_status=%d av1_afbc_stale_status_timeout=%d av1_afbc_before_vcd=%d av1_afbc_after_vcd=%d av1_afbc_observed_at_vcd=%d av1_afbc_not_observed_at_vcd=%d av1_afbc_observed_at_quiesce=%d av1_afbc_not_observed_at_quiesce=%d av1_reset_idle_unproven=%d av1_vcd_to_afbc_observed_max_ns=%lld\n",
 		   atomic_read(&srv->unsupported_count),
 		   atomic_read(&srv->rejected_job_count),
 		   atomic_read(&srv->timeout_count),
 		   atomic_read(&srv->reset_count),
 		   atomic_read(&srv->recovery_failure_count),
+		   atomic_read(&srv->reset_deassert_contended_count),
 		   atomic_read(&srv->iommu_fault_count),
 		   atomic_read(&srv->iommu_refresh_count),
 		   atomic_read(&srv->iommu_idle_fault_count),
@@ -17196,6 +17228,9 @@ static int rk_mpp_runtime_register(void)
 	debugfs_create_atomic_t("recovery_failure_count", 0444,
 				rk_mpp_srv.debugfs_root,
 				&rk_mpp_srv.recovery_failure_count);
+	debugfs_create_atomic_t("reset_deassert_contended_count", 0444,
+				rk_mpp_srv.debugfs_root,
+				&rk_mpp_srv.reset_deassert_contended_count);
 	debugfs_create_atomic_t("irq_count", 0444, rk_mpp_srv.debugfs_root,
 				&rk_mpp_srv.irq_count);
 	debugfs_create_atomic_t("spurious_irq_count", 0444,
