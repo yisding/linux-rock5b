@@ -13675,6 +13675,32 @@ static int rk_mpp_rkvenc2_submit(struct rk_mpp_job *job)
 		udelay(5);
 		writel_relaxed(0x0, hw->regs[0] + RK_MPP_RKVENC_CLR_BASE);
 	}
+
+	/*
+	 * This job owns the active slot from here on, but the core is not
+	 * running yet, so any interrupt status still asserted belongs to the
+	 * previous frame and would be serviced against this job -- pushing its
+	 * trailing slice records into this job's fifo and shifting every
+	 * subsequent record, which userspace sees as frame-framing corruption.
+	 * A trailing status can survive its own frame: read_slice_len() merges
+	 * and clears a late status only when it carries INT_DONE, and the
+	 * ONESHOT line stays masked until that frame's threaded handler has
+	 * already completed.  Drop it now, while the core is held clear and
+	 * cannot re-raise; a delivery that still arrives before the start
+	 * write then reads an empty status and is ignored as IRQ_NONE.
+	 */
+	if (rk_mpp_hw_reg_range_valid(hw, 0, RK_MPP_RKVENC_INT_STA_BASE,
+				      sizeof(u32)) &&
+	    rk_mpp_hw_reg_range_valid(hw, 0, RK_MPP_RKVENC_INT_CLR_BASE,
+				      sizeof(u32))) {
+		u32 stale = readl_relaxed(hw->regs[0] +
+					  RK_MPP_RKVENC_INT_STA_BASE);
+
+		if (stale)
+			writel(stale,
+			       hw->regs[0] + RK_MPP_RKVENC_INT_CLR_BASE);
+	}
+
 	if (rk_mpp_hw_reg_range_valid(hw, 0, RK_MPP_RKVENC_COUNTER_CLR_BASE,
 				      sizeof(u32)))
 		writel_relaxed(0x2, hw->regs[0] + RK_MPP_RKVENC_COUNTER_CLR_BASE);
@@ -15186,6 +15212,19 @@ static int rk_mpp_job_pop_rkvenc_slice(struct rk_mpp_job *job, u32 *value)
  * missed the update under session->lock is guaranteed to see the sequence
  * move rather than sleeping across the change.
  */
+/*
+ * Restore a one-shot overflow indication consumed by a pop whose caller then
+ * returned the records it had already collected instead of the error.
+ */
+static void rk_mpp_job_rearm_rkvenc_slice_overflow(struct rk_mpp_job *job)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&job->rkvenc_slice_lock, flags);
+	job->rkvenc_slice_overflow = true;
+	spin_unlock_irqrestore(&job->rkvenc_slice_lock, flags);
+}
+
 static void rk_mpp_session_poll_notify(struct rk_mpp_session *session)
 {
 	atomic64_inc(&session->poll_seq);
@@ -15303,15 +15342,22 @@ static int rk_mpp_session_poll_irq(struct rk_mpp_session *session,
 		}
 
 		/*
-		 * Sample completion before draining the fifo.  Slice records
-		 * are pushed from the hard IRQ strictly before the threaded
-		 * handler completes the job, so once the job is observed done
-		 * the fifo can no longer grow and a subsequent empty pop is
-		 * conclusive.  Sampling after the pop would let the IRQ push
-		 * the remaining slices and complete the job inside the window,
-		 * and the stale empty result would end the stream with
-		 * undelivered slices still queued -- userspace never sees the
-		 * last flag, keeps polling, and consumes the next job's
+		 * Sample completion before draining the fifo.  Every path that
+		 * completes a job the poller can still reach quiesces the hard
+		 * IRQ first -- the line is IRQF_ONESHOT so the handler that
+		 * pushes records cannot run alongside the threaded handler that
+		 * completes, and the timeout, fault and abort paths all
+		 * synchronize_hardirq() before completing -- so once the job is
+		 * observed done the fifo can no longer grow and a subsequent
+		 * empty pop is conclusive.  (rk_mpp_session_abort_jobs() marks
+		 * jobs done before draining the IRQ, but it empties
+		 * session->active_jobs in the same critical section, so a
+		 * poller reaches the -EIO path below rather than reaping a
+		 * truncated stream.)  Sampling after the pop instead would let
+		 * the IRQ push the remaining slices and complete the job inside
+		 * the window, and the stale empty result would end the stream
+		 * with undelivered slices still queued -- userspace never sees
+		 * the last flag, keeps polling, and consumes the next job's
 		 * slices as this frame's.
 		 */
 		done_before_pop = rk_mpp_job_is_done(job);
@@ -15343,6 +15389,23 @@ static int rk_mpp_session_poll_irq(struct rk_mpp_session *session,
 		if (ret == -ENODATA || (ret == -EAGAIN && done_before_pop)) {
 			rk_mpp_job_put(job);
 			return rk_mpp_session_poll_job(session, flags);
+		}
+
+		/*
+		 * Records already popped are gone from the fifo, so failing the
+		 * call now would drop them: the caller cannot distinguish "no
+		 * slices" from "slices delivered, then an error", and a caller
+		 * that retries on error loses them.  Report success with what
+		 * was delivered, exactly as the count_max-reached path above
+		 * does, and let the next poll surface the condition.  The
+		 * overflow flag is one-shot and was consumed by the pop, so put
+		 * it back for that next call.
+		 */
+		if (copy_slices && cfg.count_ret > 0) {
+			if (ret == -EOVERFLOW)
+				rk_mpp_job_rearm_rkvenc_slice_overflow(job);
+			rk_mpp_job_put(job);
+			return 0;
 		}
 
 		if (ret != -EAGAIN) {
@@ -15467,6 +15530,7 @@ static int rk_mpp_job_session_status(struct rk_mpp_job *job)
 static int rk_mpp_execute_jobs(struct rk_mpp_batch_state *batch)
 {
 	struct rk_mpp_job *job;
+	bool submitted = false;
 	int ret;
 
 	list_for_each_entry(job, &batch->jobs, link) {
@@ -15526,6 +15590,8 @@ static int rk_mpp_execute_jobs(struct rk_mpp_batch_state *batch)
 
 	ret = 0;
 	list_for_each_entry(job, &batch->jobs, link) {
+		if (job->set_cnt)
+			submitted = true;
 		if (job->poll_cnt) {
 			int poll_ret;
 
@@ -15552,6 +15618,17 @@ static int rk_mpp_execute_jobs(struct rk_mpp_batch_state *batch)
 				ret = poll_ret;
 		}
 	}
+
+	/*
+	 * -ERESTARTSYS restarts the whole ioctl, which re-materializes and
+	 * re-submits every job this batch already put on the hardware: the
+	 * frame gets encoded twice into the same bitstream buffer and the
+	 * duplicate is never reaped, permanently offsetting the session's
+	 * completion stream.  A batch that only polled can safely restart, so
+	 * narrow the conversion to one that also submitted.
+	 */
+	if (ret == -ERESTARTSYS && submitted)
+		ret = -EINTR;
 
 	return ret;
 
