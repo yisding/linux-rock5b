@@ -82,6 +82,7 @@
 #define RK_MPP_RKVENC_MAX_DCHS_ID	4
 #define RK_MPP_CORE_COUNTER_COUNT	4
 #define RK_MPP_RKVDEC_MAX_CCU_CORES	4
+#define RK_MPP_MAX_RESET_DOMAINS	4
 #define RK_MPP_RKVDEC_PERF_SEL_NUM	64
 #define RK_MPP_RKVDEC_LINK_REGION	1
 #define RK_MPP_RKVDEC_LINK_NODE_ALIGN	256
@@ -389,12 +390,28 @@ struct rk_mpp_hw {
 	u32 *normal_rates;
 	struct reset_control *resets;
 	/*
-	 * Nonzero while this core's reset line is being pulsed.  Pure
-	 * instrumentation: nothing serializes the pulse against a deassert
-	 * issued for the same core by another context, so this makes that
-	 * interference countable before it is fixed.
+	 * Nonzero while this core's reset line is being pulsed.  Set and
+	 * cleared inside reset_domain_lock, and read by rk_mpp_hw_power_on()
+	 * under that same lock, so with the lock doing its job it can never be
+	 * observed set: reset_deassert_contended_count staying at zero is the
+	 * regression signal that the serialization still holds.
 	 */
 	atomic_t reset_pulse_active;
+	/*
+	 * Serializes this core's reset-control operations against every other
+	 * writer of the same line.  Points into the service's domain table when
+	 * the core belongs to a CCU group.
+	 *
+	 * NULL, and the lock helpers then do nothing, when it does not: a core
+	 * outside a group is never reached by
+	 * rk_mpp_rkvdec2_power_on_ccu_cores(), which selects on ccu_node, so
+	 * the only contexts driving its reset line are its own submit and
+	 * recovery paths and those already serialize on its run_lock.  Also
+	 * NULL for a hw a KUnit fixture built without going through probe.
+	 * A pointer rather than an embedded mutex because rk_mpp_hw is built on
+	 * the stack by KUnit tests that already sit near the frame limit.
+	 */
+	struct mutex *reset_domain_lock;
 	struct delayed_work timeout_work;
 	struct work_struct iommu_fault_work;
 	struct mutex run_lock; /* serializes start, abort, timeout, and completion */
@@ -458,11 +475,30 @@ struct rk_mpp_hw {
 	bool genpd_attached;
 };
 
+/*
+ * A core's reset line has two independent writers: its own recovery pulse and
+ * the unconditional deassert every sibling submit issues through
+ * rk_mpp_hw_power_on().  They serialize on this, keyed on the CCU node because
+ * that is exactly the set of cores a submit can reach.
+ *
+ * The lock lives in the service, not in the coordinator's rk_mpp_hw, so that a
+ * coordinator going away under rk_mpp_hw_remove() cannot free a mutex its cores
+ * still point at.  Device nodes outlive the domains, so the table is never torn
+ * down and entries are only ever added.
+ */
+struct rk_mpp_reset_domain {
+	struct device_node *node;
+	struct mutex lock; /* innermost leaf: reset controls only, no nesting */
+};
+
 struct rk_mpp_service {
 	struct miscdevice miscdev;
 	struct dentry *debugfs_root;
 	struct proc_dir_entry *procfs_root;
 	struct mutex hw_lock;
+	/* Reset domains, added under hw_lock at probe and never removed. */
+	struct rk_mpp_reset_domain reset_domains[RK_MPP_MAX_RESET_DOMAINS];
+	u32 reset_domain_count;
 	struct mutex dma_group_lock;
 	struct mutex sched_lock; /* protects queued_jobs */
 	/*
@@ -11383,6 +11419,68 @@ static struct clk *rk_mpp_hw_find_clk(struct rk_mpp_hw *hw, const char *id)
 	return NULL;
 }
 
+/*
+ * Innermost leaf.  Everything under it is reset-control work and a udelay --
+ * no allocation, no further locks, no callbacks -- so it cannot participate in
+ * a cycle whatever else the caller already holds.  In particular
+ * rk_mpp_hw_handle_reset_failure() takes srv->hw_lock and must stay outside.
+ */
+static void rk_mpp_hw_reset_domain_lock(struct rk_mpp_hw *hw)
+{
+	if (hw->reset_domain_lock)
+		mutex_lock(hw->reset_domain_lock);
+}
+
+static void rk_mpp_hw_reset_domain_unlock(struct rk_mpp_hw *hw)
+{
+	if (hw->reset_domain_lock)
+		mutex_unlock(hw->reset_domain_lock);
+}
+
+/*
+ * Bind a core to the reset domain of its CCU group.  Called once from probe,
+ * before the core is reachable through the service list and before
+ * rk_mpp_hw_read_id() first powers it on.  A core outside a group is left
+ * unbound: nothing but its own run_lock-serialized paths drives its reset line.
+ */
+static void rk_mpp_hw_init_reset_domain(struct rk_mpp_hw *hw)
+{
+	struct rk_mpp_service *srv = hw->srv;
+	struct rk_mpp_reset_domain *domain = NULL;
+	u32 i;
+
+	hw->reset_domain_lock = NULL;
+
+	if (!srv || !hw->ccu_node)
+		return;
+
+	mutex_lock(&srv->hw_lock);
+	for (i = 0; i < srv->reset_domain_count; i++) {
+		if (srv->reset_domains[i].node == hw->ccu_node) {
+			domain = &srv->reset_domains[i];
+			break;
+		}
+	}
+	if (!domain && srv->reset_domain_count < ARRAY_SIZE(srv->reset_domains)) {
+		domain = &srv->reset_domains[srv->reset_domain_count++];
+		domain->node = hw->ccu_node;
+		mutex_init(&domain->lock);
+	}
+	if (domain)
+		hw->reset_domain_lock = &domain->lock;
+	mutex_unlock(&srv->hw_lock);
+
+	/*
+	 * Out of domains: leave the core unbound, which is exactly as exposed
+	 * as it was before this fix rather than failing the probe.  Loud,
+	 * because the sibling race is silently back for it.
+	 */
+	if (!domain)
+		dev_warn(hw->dev,
+			 "no free reset domain for %pOF; sibling deasserts stay unserialized for this core\n",
+			 hw->ccu_node);
+}
+
 static int rk_mpp_hw_power_on(struct rk_mpp_hw *hw)
 {
 	int ret;
@@ -11404,28 +11502,37 @@ static int rk_mpp_hw_power_on(struct rk_mpp_hw *hw)
 
 	/*
 	 * This deassert is unconditional -- it runs even when the core is
-	 * already powered -- and nothing serializes it against a reset pulse
-	 * in progress on the same core.  rk_mpp_rkvdec2_power_on_ccu_cores()
-	 * reaches here for *sibling* cores holding only the submitting core's
-	 * run_lock, while a sibling's own recovery pulses its reset under its
-	 * own run_lock, so the two can overlap.  Count the overlap; the fix is
-	 * a per-reset-domain lock, and this proves the race is reachable on
-	 * real hardware before behaviour changes.
+	 * already powered.  rk_mpp_rkvdec2_power_on_ccu_cores() reaches here
+	 * for *sibling* cores holding only the submitting core's run_lock,
+	 * while a sibling's own recovery pulses its reset under its own
+	 * run_lock; no lock was common to the two, so this deassert could land
+	 * inside the pulse's udelay, end it a couple of microseconds in, and
+	 * leave the peer's own deassert to no-op.  Its reset then reported
+	 * success without the core having been reset, and the job completed as
+	 * recovered with the latched error and DMA state still live.
 	 *
-	 * Count the deassert itself as well, per core.  Without it a zero in
-	 * the contended counter cannot be told apart from a workload that
-	 * never issued a deassert while a pulse was running: the expected
-	 * number of overlaps is (pulses on this core) x (deasserts on this
-	 * core per second) x (pulse width), and a harness that has to guess
-	 * the second term from the submit rate guesses high, because a job
+	 * The domain lock closes that.  A pulse now lands either wholly before
+	 * this deassert (and re-asserts afterwards) or wholly after it (a
+	 * redundant deassert of an already-deasserted line); both are correct.
+	 * Holding it across the contended check as well is what keeps that
+	 * counter meaningful as a regression signal -- reset_pulse_active is
+	 * only ever set under this same lock, so any non-zero afterwards means
+	 * the serialization broke, not that the reader raced the pulse.
+	 *
+	 * Count the deassert itself too, per core: the expected number of
+	 * overlaps is (pulses on this core) x (deasserts on this core per
+	 * second) x (pulse width), and without this term a harness has to
+	 * guess it from the submit rate, which guesses high because a job
 	 * inheriting a coordinator power hold issues none.
 	 */
-	if (atomic_read(&hw->reset_pulse_active))
-		atomic_inc(&hw->srv->reset_deassert_contended_count);
 	atomic_inc(&hw->srv->reset_deassert_count);
 	rk_mpp_count_core(hw->srv->reset_deassert_core_count, hw);
 
+	rk_mpp_hw_reset_domain_lock(hw);
+	if (atomic_read(&hw->reset_pulse_active))
+		atomic_inc(&hw->srv->reset_deassert_contended_count);
 	ret = reset_control_deassert(hw->resets);
+	rk_mpp_hw_reset_domain_unlock(hw);
 	if (ret) {
 		rk_mpp_hw_handle_reset_failure(hw, ret);
 		goto err_pm_put;
@@ -11582,12 +11689,14 @@ static int rk_mpp_hw_reset_active(struct rk_mpp_hw *hw)
 	atomic_inc(&hw->srv->reset_count);
 	rk_mpp_count_core(hw->srv->reset_core_count, hw);
 	/*
-	 * Mark the pulse so a deassert issued for this core by another context
-	 * can be counted.  The window that matters is the udelay below: a
-	 * deassert landing inside it ends the pulse early, this core's own
-	 * deassert then no-ops, and the reset is reported as successful
-	 * without having reset anything.
+	 * The whole pulse runs under the domain lock, so a sibling submit
+	 * cannot deassert this core partway through the udelay and end the
+	 * reset early.  The pulse flag is raised and cleared inside the lock
+	 * too: rk_mpp_hw_power_on() reads it while holding the same lock, so it
+	 * can never catch a pulse that is merely queued behind the lock and
+	 * mistake that for interference.
 	 */
+	rk_mpp_hw_reset_domain_lock(hw);
 	atomic_inc(&hw->reset_pulse_active);
 	ret = reset_control_assert(hw->resets);
 	if (ret)
@@ -11598,11 +11707,14 @@ static int rk_mpp_hw_reset_active(struct rk_mpp_hw *hw)
 	if (ret)
 		goto err_reset;
 	atomic_dec(&hw->reset_pulse_active);
+	rk_mpp_hw_reset_domain_unlock(hw);
 
 	return 0;
 
 err_reset:
 	atomic_dec(&hw->reset_pulse_active);
+	/* Before handle_reset_failure(): it takes srv->hw_lock. */
+	rk_mpp_hw_reset_domain_unlock(hw);
 	dev_err_ratelimited(hw->dev, "hardware reset failed: %d\n", ret);
 	rk_mpp_hw_handle_reset_failure(hw, ret);
 	return ret;
@@ -16697,6 +16809,13 @@ static int rk_mpp_hw_probe(struct platform_device *pdev)
 				     "%s references a disabled CCU\n",
 				     match->name);
 	rk_mpp_hw_read_rkvdec_ccu_mode(hw);
+	/*
+	 * The CCU node is settled and validated here, and this still runs
+	 * before rk_mpp_hw_read_id() first powers the core on and before the
+	 * core joins the service list, so no deassert can be issued for it
+	 * without a domain to serialize on.
+	 */
+	rk_mpp_hw_init_reset_domain(hw);
 
 	hw->iommu_node = of_parse_phandle(dev->of_node, "iommus", 0);
 	if (hw->iommu_node) {
