@@ -4579,6 +4579,23 @@ static void rk_rga_job_clear_mappings(struct rk_rga_job *job)
 }
 
 /*
+ * Release a finished job's mappings while the core -- and so the IOMMU sharing
+ * its power domain -- is still powered. rk_iommu_zap_iova() skips the TLB
+ * shootdown for a suspended IOMMU, so unmapping after the power drop leaves
+ * stale entries behind for IOVAs the allocator hands straight back. Callers
+ * must have stopped the engine first.
+ */
+static void rk_rga_job_release_mappings_powered(struct rk_rga_job *job,
+						struct rk_rga_hw *hw)
+{
+	if (job->userptr_device_owned) {
+		rk_rga_job_sync_userptr_for_cpu(job, hw->dev);
+		job->userptr_device_owned = false;
+	}
+	rk_rga_job_clear_mappings(job);
+}
+
+/*
  * Cancel any still-pending acquire callbacks. Returns true when this cancel
  * drove pending_acquire_count to zero, i.e. it (not a racing callback) is the
  * party responsible for queuing the acquire work. Only the caller whose own
@@ -23033,42 +23050,55 @@ static int rk_rga_backend_start(struct rk_rga_hw *hw, struct rk_rga_job *job)
 {
 	int ret;
 
-	ret = rk_rga_job_prepare_hw_mappings(hw, job);
-	if (ret)
-		return ret;
-
-	rk_rga_job_sync_userptr_for_device(job, hw->dev);
-	job->userptr_device_owned = true;
-
+	/*
+	 * Power the core before establishing its IOMMU mappings, and keep it
+	 * powered until they are released again. The RGA IOMMU shares this
+	 * core's power domain, and rk_iommu_zap_iova() skips the TLB shootdown
+	 * entirely when pm_runtime_get_if_in_use() finds the IOMMU suspended.
+	 * Mapping with the domain gated therefore installs page-table entries
+	 * whose stale TLB lines are never invalidated. The vendor driver states
+	 * the same rule: "Memory mapping needs to keep pd enabled."
+	 */
 	ret = rk_rga_hw_power_on(hw);
 	if (ret)
 		return ret;
 
-	ret = rk_rga_job_alloc_cmd(job, hw);
+	ret = rk_rga_job_prepare_hw_mappings(hw, job);
 	if (ret) {
 		rk_rga_hw_power_off(hw);
 		return ret;
 	}
+
+	rk_rga_job_sync_userptr_for_device(job, hw->dev);
+	job->userptr_device_owned = true;
+
+	ret = rk_rga_job_alloc_cmd(job, hw);
+	if (ret)
+		goto err_release;
 
 	ret = rk_rga_job_emit_cmd(hw, job);
 	if (ret) {
 		atomic_inc(&hw->rga->unsupported_count);
-		rk_rga_hw_power_off(hw);
-		return ret;
+		goto err_release;
 	}
 	if (!job->cmd_ready) {
 		atomic_inc(&hw->rga->unsupported_count);
-		rk_rga_hw_power_off(hw);
-		return -EOPNOTSUPP;
+		ret = -EOPNOTSUPP;
+		goto err_release;
 	}
 
 	ret = rk_rga_hw_start(hw, job);
-	if (ret) {
-		rk_rga_hw_power_off(hw);
-		return ret;
-	}
+	if (ret)
+		goto err_release;
 
 	return RK_RGA_BACKEND_QUEUED;
+
+err_release:
+	/* Nothing was started, so unwind the mappings before gating the core. */
+	rk_rga_job_release_mappings_powered(job, hw);
+	rk_rga_hw_power_off(hw);
+
+	return ret;
 }
 
 static irqreturn_t rk_rga_irq_handler(int irq, void *data)
@@ -23135,17 +23165,15 @@ static irqreturn_t rk_rga_irq_thread(int irq, void *data)
 		if (reset_ret)
 			rk_rga_hw_quarantine_irq(hw);
 	}
-	rk_rga_hw_power_off(hw);
-	if (job->userptr_device_owned) {
-		rk_rga_job_sync_userptr_for_cpu(job, hw->dev);
-		job->userptr_device_owned = false;
-	}
 	/*
 	 * Each task gets fresh role-specific DMA-BUF mappings. This makes
 	 * source/destination bounce-buffer copyback ordering match task
 	 * execution even when distinct DMA-BUF objects alias logical memory.
+	 * They are released before the power drop; any recovery reset above
+	 * has already stopped the engine.
 	 */
-	rk_rga_job_clear_mappings(job);
+	rk_rga_job_release_mappings_powered(job, hw);
+	rk_rga_hw_power_off(hw);
 
 	if (rk_rga_job_advance_task(job, result)) {
 		dispatch_session = READ_ONCE(job->session);
@@ -23282,6 +23310,12 @@ static void rk_rga_hw_recover_active(struct rk_rga_hw *hw, bool iommu_fault,
 
 	rk_rga_job_note_hw_done(job);
 	reset_ret = rk_rga_hw_reset_for_recovery(hw);
+	/*
+	 * The reset above stopped the engine, so drop the mappings here rather
+	 * than letting rk_rga_job_complete_queued() unmap with the domain
+	 * already gated.
+	 */
+	rk_rga_job_release_mappings_powered(job, hw);
 	rk_rga_hw_power_off(hw);
 	rk_rga_job_complete_queued(job, result);
 	rk_rga_hw_enable_irq(hw, irq_disabled);
@@ -23613,6 +23647,7 @@ static void rk_rga_hw_abort_jobs(struct rk_rga_hw *hw, int result)
 	if (active) {
 		rk_rga_job_note_hw_done(active);
 		(void)rk_rga_hw_reset_for_recovery(hw);
+		rk_rga_job_release_mappings_powered(active, hw);
 		rk_rga_hw_power_off(hw);
 	}
 	rk_rga_hw_enable_irq(hw, irq_disabled);
@@ -23662,6 +23697,7 @@ static bool rk_rga_hw_abort_session_jobs(struct rk_rga_hw *hw,
 		rk_rga_hw_cancel_timeout(hw);
 		rk_rga_job_note_hw_done(active);
 		(void)rk_rga_hw_reset_for_recovery(hw);
+		rk_rga_job_release_mappings_powered(active, hw);
 		rk_rga_hw_power_off(hw);
 	}
 	rk_rga_hw_enable_irq(hw, irq_disabled);
