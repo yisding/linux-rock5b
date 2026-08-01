@@ -501,8 +501,13 @@ struct rk_mpp_service {
 	atomic_t failed_job_count;
 	atomic_t aborted_job_count;
 	atomic_t reset_count;
+	atomic_t reset_core_count[RK_MPP_DEBUG_CLIENT_COUNT]
+					 [RK_MPP_CORE_COUNTER_COUNT];
 	atomic_t recovery_failure_count;
 	atomic_t reset_deassert_contended_count;
+	atomic_t reset_deassert_count;
+	atomic_t reset_deassert_core_count[RK_MPP_DEBUG_CLIENT_COUNT]
+						  [RK_MPP_CORE_COUNTER_COUNT];
 	atomic_t irq_count;
 	atomic_t spurious_irq_count;
 	atomic_t started_core_count[RK_MPP_DEBUG_CLIENT_COUNT]
@@ -11406,9 +11411,19 @@ static int rk_mpp_hw_power_on(struct rk_mpp_hw *hw)
 	 * own run_lock, so the two can overlap.  Count the overlap; the fix is
 	 * a per-reset-domain lock, and this proves the race is reachable on
 	 * real hardware before behaviour changes.
+	 *
+	 * Count the deassert itself as well, per core.  Without it a zero in
+	 * the contended counter cannot be told apart from a workload that
+	 * never issued a deassert while a pulse was running: the expected
+	 * number of overlaps is (pulses on this core) x (deasserts on this
+	 * core per second) x (pulse width), and a harness that has to guess
+	 * the second term from the submit rate guesses high, because a job
+	 * inheriting a coordinator power hold issues none.
 	 */
 	if (atomic_read(&hw->reset_pulse_active))
 		atomic_inc(&hw->srv->reset_deassert_contended_count);
+	atomic_inc(&hw->srv->reset_deassert_count);
+	rk_mpp_count_core(hw->srv->reset_deassert_core_count, hw);
 
 	ret = reset_control_deassert(hw->resets);
 	if (ret) {
@@ -11565,6 +11580,7 @@ static int rk_mpp_hw_reset_active(struct rk_mpp_hw *hw)
 		return 0;
 
 	atomic_inc(&hw->srv->reset_count);
+	rk_mpp_count_core(hw->srv->reset_core_count, hw);
 	/*
 	 * Mark the pulse so a deassert issued for this core by another context
 	 * can be counted.  The window that matters is the udelay below: a
@@ -16234,13 +16250,14 @@ static int rk_mpp_debug_state_show(struct seq_file *s, void *unused)
 		   atomic_read(&srv->completed_job_count),
 		   atomic_read(&srv->failed_job_count),
 		   atomic_read(&srv->aborted_job_count));
-	seq_printf(s, "errors unsupported=%d rejected=%d timeout=%d reset=%d recovery_failure=%d reset_deassert_contended=%d iommu_fault=%d iommu_refresh=%d iommu_idle_fault=%d irq=%d spurious_irq=%d av1_afbc_irq=%d av1_afbc_prestart_status=%d av1_afbc_stale_status_timeout=%d av1_afbc_before_vcd=%d av1_afbc_after_vcd=%d av1_afbc_observed_at_vcd=%d av1_afbc_not_observed_at_vcd=%d av1_afbc_observed_at_quiesce=%d av1_afbc_not_observed_at_quiesce=%d av1_reset_idle_unproven=%d av1_vcd_to_afbc_observed_max_ns=%lld\n",
+	seq_printf(s, "errors unsupported=%d rejected=%d timeout=%d reset=%d recovery_failure=%d reset_deassert_contended=%d reset_deassert=%d iommu_fault=%d iommu_refresh=%d iommu_idle_fault=%d irq=%d spurious_irq=%d av1_afbc_irq=%d av1_afbc_prestart_status=%d av1_afbc_stale_status_timeout=%d av1_afbc_before_vcd=%d av1_afbc_after_vcd=%d av1_afbc_observed_at_vcd=%d av1_afbc_not_observed_at_vcd=%d av1_afbc_observed_at_quiesce=%d av1_afbc_not_observed_at_quiesce=%d av1_reset_idle_unproven=%d av1_vcd_to_afbc_observed_max_ns=%lld\n",
 		   atomic_read(&srv->unsupported_count),
 		   atomic_read(&srv->rejected_job_count),
 		   atomic_read(&srv->timeout_count),
 		   atomic_read(&srv->reset_count),
 		   atomic_read(&srv->recovery_failure_count),
 		   atomic_read(&srv->reset_deassert_contended_count),
+		   atomic_read(&srv->reset_deassert_count),
 		   atomic_read(&srv->iommu_fault_count),
 		   atomic_read(&srv->iommu_refresh_count),
 		   atomic_read(&srv->iommu_idle_fault_count),
@@ -17229,12 +17246,19 @@ static int rk_mpp_runtime_register(void)
 				&rk_mpp_srv.aborted_job_count);
 	debugfs_create_atomic_t("reset_count", 0444, rk_mpp_srv.debugfs_root,
 				&rk_mpp_srv.reset_count);
+	rk_mpp_debugfs_create_core_counts("reset",
+					  rk_mpp_srv.reset_core_count);
 	debugfs_create_atomic_t("recovery_failure_count", 0444,
 				rk_mpp_srv.debugfs_root,
 				&rk_mpp_srv.recovery_failure_count);
 	debugfs_create_atomic_t("reset_deassert_contended_count", 0444,
 				rk_mpp_srv.debugfs_root,
 				&rk_mpp_srv.reset_deassert_contended_count);
+	debugfs_create_atomic_t("reset_deassert_count", 0444,
+				rk_mpp_srv.debugfs_root,
+				&rk_mpp_srv.reset_deassert_count);
+	rk_mpp_debugfs_create_core_counts("reset_deassert",
+					  rk_mpp_srv.reset_deassert_core_count);
 	debugfs_create_atomic_t("irq_count", 0444, rk_mpp_srv.debugfs_root,
 				&rk_mpp_srv.irq_count);
 	debugfs_create_atomic_t("spurious_irq_count", 0444,
