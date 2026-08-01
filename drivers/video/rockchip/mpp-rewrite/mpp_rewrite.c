@@ -4823,10 +4823,8 @@ static void rk_mpp_av1_afbc_config_kunit(struct kunit *test)
 
 static void rk_mpp_av1_afbc_status_observation_kunit(struct kunit *test)
 {
-	struct rk_mpp_service srv = {};
-	struct rk_mpp_hw hw = {
-		.srv = &srv,
-	};
+	struct rk_mpp_service *srv;
+	struct rk_mpp_hw hw = {};
 	void __iomem *afbc;
 	void __iomem *vcd;
 	void *regs;
@@ -4834,6 +4832,10 @@ static void rk_mpp_av1_afbc_status_observation_kunit(struct kunit *test)
 	unsigned long flags;
 	bool generation_observed = false;
 	bool observed;
+
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
+	hw.srv = srv;
 
 	regs = kunit_kzalloc(test, RK_MPP_AV1_AFBC_MIN_REG_SIZE, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, regs);
@@ -4859,7 +4861,7 @@ static void rk_mpp_av1_afbc_status_observation_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, observed);
 	KUNIT_EXPECT_FALSE(test, generation_observed);
 	KUNIT_EXPECT_EQ(test,
-			atomic_read(&srv.av1_afbc_prestart_status_count), 1);
+			atomic_read(&srv->av1_afbc_prestart_status_count), 1);
 	KUNIT_EXPECT_EQ(test, hw.av1_afbc_status_generation, 0ULL);
 
 	writel(0, afbc + RK_MPP_AV1_AFBC_ACKNOWLEDGE);
@@ -4873,7 +4875,7 @@ static void rk_mpp_av1_afbc_status_observation_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, observed);
 	KUNIT_EXPECT_TRUE(test, generation_observed);
 	KUNIT_EXPECT_EQ(test, hw.av1_afbc_status_generation, 5ULL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&srv.av1_afbc_before_vcd_count), 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&srv->av1_afbc_before_vcd_count), 1);
 
 	writel(0, afbc + RK_MPP_AV1_AFBC_ACKNOWLEDGE);
 	generation_observed = false;
@@ -4901,7 +4903,7 @@ static void rk_mpp_av1_afbc_status_observation_kunit(struct kunit *test)
 			-ETIMEDOUT);
 	KUNIT_EXPECT_EQ(test, readl(vcd + RK_MPP_AV1_IRQ_BASE), 0U);
 	KUNIT_EXPECT_EQ(test,
-			atomic_read(&srv.av1_afbc_stale_status_timeout_count),
+			atomic_read(&srv->av1_afbc_stale_status_timeout_count),
 			1);
 }
 
@@ -8972,7 +8974,7 @@ static void rk_mpp_reset_session_public_cleanup_kunit(struct kunit *test)
 
 static void rk_mpp_reset_session_hw_active_import_kunit(struct kunit *test)
 {
-	struct rk_mpp_service srv = {};
+	struct rk_mpp_service *srv;
 	struct rk_mpp_session *session;
 	struct device *dev;
 	struct rk_mpp_hw hw = {};
@@ -8984,6 +8986,8 @@ static void rk_mpp_reset_session_hw_active_import_kunit(struct kunit *test)
 	struct rk_mpp_job *active;
 	int ret;
 
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
 	session = kunit_kzalloc(test, sizeof(*session), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, session);
 	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
@@ -9003,11 +9007,11 @@ static void rk_mpp_reset_session_hw_active_import_kunit(struct kunit *test)
 	pm_runtime_enable(dev);
 	pm_runtime_get_noresume(dev);
 
-	mutex_init(&srv.sched_lock);
-	spin_lock_init(&srv.rkvenc_dchs_lock);
-	INIT_LIST_HEAD(&srv.queued_jobs);
+	mutex_init(&srv->sched_lock);
+	spin_lock_init(&srv->rkvenc_dchs_lock);
+	INIT_LIST_HEAD(&srv->queued_jobs);
 
-	session->srv = &srv;
+	session->srv = srv;
 	session->initialized = true;
 	session->active_job_count = 1;
 	mutex_init(&session->lock);
@@ -9019,7 +9023,7 @@ static void rk_mpp_reset_session_hw_active_import_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&batch.jobs);
 
 	hw.dev = dev;
-	hw.srv = &srv;
+	hw.srv = srv;
 	hw.terminally_stopped = true;
 	refcount_set(&hw.refs, 1);
 	init_completion(&hw.released);
