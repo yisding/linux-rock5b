@@ -12061,7 +12061,26 @@ static void rk_mpp_hw_abort_job(struct rk_mpp_job *job)
 	if (active_owned && rk_mpp_hw_clear_active_job(hw, job, NULL)) {
 		dchs_lifecycle_locked =
 			rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
-		reset_ret = rk_mpp_hw_stop_active(hw);
+		/*
+		 * Resetting a soft-CCU core behind its coordinator's back
+		 * leaves the coordinator holding this core registered as
+		 * work-pending, with whatever CORE_ERR the reset latched: the
+		 * link-table release does no coordinator MMIO, so if a sibling
+		 * job keeps the coordinator powered that state outlives the
+		 * session and the next job on this core stalls until its
+		 * watchdog reconnects the core.  Take the same disconnect /
+		 * reset / clear-error / reconnect bracket the timeout path
+		 * uses, which the vendor applies to every soft-CCU core reset.
+		 * The job still owns its coordinator power reference here --
+		 * rk_mpp_rkvdec2_release_link_table() drops it below -- and the
+		 * lock order matches rk_mpp_hw_recover_active(), which reaches
+		 * the same helper holding this same ccu_recovery_lock and
+		 * run_lock pair.
+		 */
+		if (rk_mpp_rkvdec2_soft_ccu_enabled(hw))
+			reset_ret = rk_mpp_rkvdec2_reset_soft_ccu_job(job);
+		else
+			reset_ret = rk_mpp_hw_stop_active(hw);
 		if (reset_ret) {
 			rk_mpp_job_get(job);
 			if (WARN_ON_ONCE(!rk_mpp_hw_restore_active_job(hw, job)))
