@@ -2368,7 +2368,7 @@ static void rk_rga_userptr_view_release(struct rk_rga_userptr_view *view)
 		atomic_dec(&view->rga->shadow_head_active_count);
 	if (view->shadow_tail)
 		atomic_dec(&view->rga->shadow_tail_active_count);
-	kfree(view->pages);
+	kvfree(view->pages);
 	kfree(view);
 }
 
@@ -2402,7 +2402,7 @@ static int rk_rga_userptr_view_create(struct rk_rga_import *import,
 		ret = -EOVERFLOW;
 		goto err_release;
 	}
-	view->pages = kmemdup(import->pages, pages_size, GFP_KERNEL);
+	view->pages = kvmemdup(import->pages, pages_size, GFP_KERNEL);
 	if (!view->pages) {
 		ret = -ENOMEM;
 		goto err_release;
@@ -2446,7 +2446,7 @@ static int rk_rga_userptr_view_create(struct rk_rga_import *import,
 err_release:
 	for (u32 i = 0; i < view->shadow_count; i++)
 		__free_page(view->shadows[i].shadow);
-	kfree(view->pages);
+	kvfree(view->pages);
 	kfree(view);
 err_count:
 	atomic_inc(&import->rga->shadow_setup_failure_count);
@@ -2614,7 +2614,7 @@ static void rk_rga_import_destroy(struct rk_rga_import *import)
 			unpin_user_pages_dirty_lock(import->pages,
 						    import->pinned_pages,
 						    true);
-			kfree(import->pages);
+			kvfree(import->pages);
 		}
 		kfree(import->userptr_extents);
 	}
@@ -5834,13 +5834,21 @@ static int rk_rga_job_acquire_status(struct rk_rga_job *job, bool *pending)
 	return 0;
 }
 
+/*
+ * The acquire fences come from userspace and carry no completion guarantee:
+ * a fence nobody ever signals (a stalled peer device, or a sw_sync fence the
+ * submitter simply never advances) would otherwise park this thread in
+ * TASK_UNINTERRUPTIBLE forever, immune even to SIGKILL, and wedge the
+ * session's uninterruptible release wait behind it.  Wait interruptibly, as
+ * the vendor driver does, so a signal can always break the submitter out.
+ */
 static int rk_rga_job_wait_acquire_fences(struct rk_rga_job *job)
 {
 	for (u32 i = 0; i < job->acquire_fence_count; i++) {
 		struct dma_fence *fence = job->acquire_fences[i];
 		int ret;
 
-		ret = dma_fence_wait(fence, false);
+		ret = dma_fence_wait(fence, true);
 		if (ret)
 			return ret;
 
@@ -8746,7 +8754,8 @@ static int rk_rga_request_config(struct rk_rga_session *session,
 static int rk_rga_import_buffer_size(const struct rga_external_buffer *buffer,
 				     size_t *size);
 static int rk_rga_import_one(struct rk_rga_session *session,
-			     struct rga_external_buffer *buffer);
+			     struct rga_external_buffer *buffer,
+			     struct rk_rga_import **import_out);
 static struct rk_rga_hw *
 rk_rga_find_best_hw_for_job(struct list_head *hw_list, struct rk_rga_job *job,
 			    u32 type_mask, u32 rr_start);
@@ -12786,7 +12795,8 @@ static void rk_rga_import_buffer_size_kunit(struct kunit *test)
 
 	buffer.type = RGA_PHYSICAL_ADDRESS;
 	buffer.memory_parm.size = 4096;
-	KUNIT_EXPECT_EQ(test, rk_rga_import_one(NULL, &buffer), -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, rk_rga_import_one(NULL, &buffer, NULL),
+			-EOPNOTSUPP);
 }
 
 static void rk_rga2_mmu_sgt_kunit(struct kunit *test);
@@ -23968,6 +23978,16 @@ static int rk_rga_import_buffer_size(const struct rga_external_buffer *buffer,
 		return 0;
 	}
 
+	/*
+	 * The geometry fields are u32 in the import ABI but u16 everywhere the
+	 * image is described, so anything wider cannot be represented.  Reject
+	 * it: truncating instead would silently size the import from the low
+	 * 16 bits and pin a fraction of the buffer the caller asked for.
+	 */
+	if (buffer->memory_parm.width > U16_MAX ||
+	    buffer->memory_parm.height > U16_MAX)
+		return -EINVAL;
+
 	img.vir_w = buffer->memory_parm.width;
 	img.vir_h = buffer->memory_parm.height;
 	img.format = buffer->memory_parm.format;
@@ -24255,7 +24275,14 @@ static int rk_rga_import_userptr(struct rk_rga_service *rga,
 		return -EOVERFLOW;
 	page_count = nr_pages;
 
-	pages = kcalloc(page_count, sizeof(*pages), GFP_KERNEL);
+	/*
+	 * The page count comes from an unbounded u32 buffer size and is sized
+	 * before anything is pinned, so a bogus size costs the caller nothing
+	 * and must not turn into a huge contiguous kernel allocation: a 4 GiB
+	 * request alone asks for an 8 MiB array, past MAX_PAGE_ORDER, which
+	 * would warn rather than fail cleanly.  Let it fall back to vmalloc.
+	 */
+	pages = kvcalloc(page_count, sizeof(*pages), GFP_KERNEL);
 	if (!pages)
 		return -ENOMEM;
 
@@ -24264,14 +24291,14 @@ static int rk_rga_import_userptr(struct rk_rga_service *rga,
 	if (pinned != page_count) {
 		if (pinned > 0)
 			unpin_user_pages(pages, pinned);
-		kfree(pages);
+		kvfree(pages);
 		return pinned < 0 ? pinned : -EFAULT;
 	}
 
 	import = kzalloc(sizeof(*import), GFP_KERNEL);
 	if (!import) {
 		unpin_user_pages(pages, page_count);
-		kfree(pages);
+		kvfree(pages);
 		return -ENOMEM;
 	}
 
@@ -24319,7 +24346,8 @@ static int rk_rga_import_userptr(struct rk_rga_service *rga,
 }
 
 static int rk_rga_import_one(struct rk_rga_session *session,
-			     struct rga_external_buffer *buffer)
+			     struct rga_external_buffer *buffer,
+			     struct rk_rga_import **import_out)
 {
 	struct rk_rga_import *import;
 	int handle;
@@ -24351,6 +24379,7 @@ static int rk_rga_import_one(struct rk_rga_session *session,
 	}
 
 	buffer->handle = handle;
+	*import_out = import;
 
 	return handle;
 }
@@ -24358,6 +24387,7 @@ static int rk_rga_import_one(struct rk_rga_session *session,
 static long rk_rga_ioctl_import_buffer(unsigned long arg,
 				       struct rk_rga_session *session)
 {
+	struct rk_rga_import *imported_obj[RGA_BUFFER_POOL_SIZE_MAX];
 	struct rga_buffer_pool pool;
 	struct rga_external_buffer *buffers;
 	int imported[RGA_BUFFER_POOL_SIZE_MAX];
@@ -24378,9 +24408,12 @@ static long rk_rga_ioctl_import_buffer(unsigned long arg,
 		return PTR_ERR(buffers);
 
 	for (u32 i = 0; i < pool.size; i++) {
-		ret = rk_rga_import_one(session, &buffers[i]);
+		struct rk_rga_import *import = NULL;
+
+		ret = rk_rga_import_one(session, &buffers[i], &import);
 		if (ret < 0)
 			goto rollback;
+		imported_obj[imported_count] = import;
 		imported[imported_count++] = ret;
 	}
 
@@ -24395,11 +24428,23 @@ out:
 
 rollback:
 	while (imported_count) {
-		void *ptr;
+		void *ptr = NULL;
+		int handle;
 
 		imported_count--;
+		handle = imported[imported_count];
+		/*
+		 * Another thread sharing this fd may have released one of these
+		 * handles and imported its own buffer in the window since we
+		 * allocated it, and idr_alloc() hands out the lowest free id,
+		 * so the same id can already belong to somebody else.  Undo the
+		 * slot only while it still holds the import this call put
+		 * there, or the rollback frees an unrelated live buffer.
+		 */
 		mutex_lock(&session->lock);
-		ptr = idr_remove(&session->imports, imported[imported_count]);
+		if (idr_find(&session->imports, handle) ==
+		    imported_obj[imported_count])
+			ptr = idr_remove(&session->imports, handle);
 		mutex_unlock(&session->lock);
 		if (ptr)
 			rk_rga_import_put(ptr);
