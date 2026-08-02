@@ -12699,6 +12699,16 @@ static u32 rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu)
 			if (WARN_ON_ONCE(!rk_mpp_hw_restore_active_job(hw, job))) {
 				mutex_unlock(&hw->run_lock);
 				rk_mpp_hw_put(hw);
+				/*
+				 * The slot refused the reference, so this
+				 * iteration still owns both of them: the one
+				 * the done list handed over and the one
+				 * detached from the active slot. The path
+				 * below drops only one because a successful
+				 * restore takes the other back.
+				 */
+				rk_mpp_job_put(job);
+				rk_mpp_job_put(job);
 				break;
 			}
 			mutex_unlock(&hw->run_lock);
@@ -12974,11 +12984,22 @@ static int rk_mpp_hw_abort_active(struct rk_mpp_hw *hw, int result)
 	dchs_lifecycle_locked = rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
 	stop_ret = rk_mpp_hw_stop_active(hw);
 	if (stop_ret) {
-		WARN_ON_ONCE(!rk_mpp_hw_restore_active_job(hw, job));
+		bool restored = rk_mpp_hw_restore_active_job(hw, job);
+
+		WARN_ON_ONCE(!restored);
 		rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
 						     dchs_lifecycle_locked);
 		rk_mpp_hw_enable_irq(hw, irq_disabled);
 		mutex_unlock(&hw->run_lock);
+		/*
+		 * The slot takes the reference back on a successful restore.
+		 * When it refuses, this function still owns it, and a leaked
+		 * job pins its session, its hardware reference and every one
+		 * of its dma-buf attachments -- which then blocks remove()'s
+		 * wait_for_completion(&hw->released) forever.
+		 */
+		if (!restored)
+			rk_mpp_job_put(job);
 		return stop_ret;
 	}
 	rk_mpp_hw_power_off(hw);
@@ -13001,6 +13022,12 @@ static int
 rk_mpp_hw_abort_active_recovery_locked(struct rk_mpp_hw *hw, int result)
 {
 	struct rk_mpp_job *job;
+	/*
+	 * Held separately because job is cleared once the active slot takes
+	 * its reference back, and the unlock still needs the job it locked.
+	 */
+	struct rk_mpp_job *dchs_job = NULL;
+	bool dchs_lifecycle_locked = false;
 	bool irq_disabled;
 	int stop_ret = 0;
 
@@ -13019,16 +13046,34 @@ rk_mpp_hw_abort_active_recovery_locked(struct rk_mpp_hw *hw, int result)
 	mutex_lock(&hw->run_lock);
 	job = rk_mpp_hw_take_active_job(hw, NULL);
 	if (job) {
+		/*
+		 * Reset, power-off and completion are exactly the three
+		 * operations the DCHS lifecycle lock serializes against a
+		 * consumer's patch-through-START window on the sibling core.
+		 * This path runs for every dependent of the coordinator, so on
+		 * RK3588 unbinding one encoder core reaches the other one too.
+		 */
+		dchs_lifecycle_locked = rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
+		dchs_job = job;
 		stop_ret = rk_mpp_hw_stop_active(hw);
 		if (stop_ret) {
-			WARN_ON_ONCE(!rk_mpp_hw_restore_active_job(hw, job));
-			job = NULL;
+			bool restored = rk_mpp_hw_restore_active_job(hw, job);
+
+			/*
+			 * A successful restore hands the reference back to the
+			 * slot; a failed one leaves us owning it, so it must
+			 * not be dropped on the floor.
+			 */
+			WARN_ON_ONCE(!restored);
+			if (restored)
+				job = NULL;
 			goto out_unlock;
 		}
 		rk_mpp_hw_power_off(hw);
 		rk_mpp_job_complete(job, result);
 	}
 out_unlock:
+	rk_mpp_rkvenc2_dchs_lifecycle_unlock(dchs_job, dchs_lifecycle_locked);
 	rk_mpp_hw_enable_irq(hw, irq_disabled);
 	mutex_unlock(&hw->run_lock);
 	rk_mpp_job_put(job);
