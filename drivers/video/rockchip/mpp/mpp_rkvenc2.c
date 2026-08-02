@@ -929,6 +929,18 @@ static u32 *rkvenc_get_class_reg(struct rkvenc_task *task, u32 addr)
 		base_s = hw->reg_msg[i].base_s;
 		base_e = hw->reg_msg[i].base_e;
 		if (addr >= base_s && addr < base_e) {
+			/*
+			 * Class buffers are allocated lazily, only for classes a
+			 * register write actually overlapped, so data may be NULL
+			 * here. Returning NULL + (addr - base_s) produced a small
+			 * non-NULL pointer that passed every caller's "if (reg)"
+			 * guard -- rkvenc_finish() then stored the irq status
+			 * through address int_sta_base (0x2c) for any task that
+			 * never wrote CLASS_BASE.
+			 */
+			if (!task->reg[i].data)
+				break;
+
 			reg = (u8 *)task->reg[i].data + (addr - base_s);
 			break;
 		}
@@ -2222,7 +2234,19 @@ static int rkvenc_dump_session(struct mpp_session *session, struct seq_file *seq
 
 			seq_printf(seq, "%8d|", data);
 		} else if (flag == CODEC_INFO_FLAG_STRING) {
-			const char *name = (const char *)&priv->codec_info[i].val;
+			/*
+			 * val is a u64 holding 8 user-supplied bytes, not a
+			 * string. "%8s" is a minimum field width, not a
+			 * precision, so vsnprintf() ran strlen() off the end of
+			 * the field and printed the rest of the session's
+			 * private data -- and past it -- into a 0444 procfs
+			 * file. Bound the read to the field and terminate it.
+			 */
+			char name[sizeof(priv->codec_info[i].val) + 1];
+
+			memcpy(name, &priv->codec_info[i].val,
+			       sizeof(priv->codec_info[i].val));
+			name[sizeof(name) - 1] = '\0';
 
 			seq_printf(seq, "%8s|", name);
 		} else {
