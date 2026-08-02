@@ -2650,7 +2650,7 @@ static void rk_rga_import_destroy(struct rk_rga_import *import)
 						    true);
 			kvfree(import->pages);
 		}
-		kfree(import->userptr_extents);
+		kvfree(import->userptr_extents);
 	}
 	if (import->counted)
 		atomic_dec(&rga->import_count);
@@ -3661,7 +3661,14 @@ static int rk_rga_userptr_build_extents(struct rk_rga_import *import)
 	    import->userptr_extent_count)
 		return -EINVAL;
 
-	extents = kcalloc(import->page_count, sizeof(*extents), GFP_KERNEL);
+	/*
+	 * One extent per pinned page, from a page count the caller's u32
+	 * buffer size chose. At 16 bytes per extent this passes MAX_PAGE_ORDER
+	 * sooner than the pages[] array in rk_rga_import_userptr() does, and
+	 * that one already documents why a contiguous allocation here would
+	 * WARN rather than fail cleanly. Same reasoning, same fallback.
+	 */
+	extents = kvcalloc(import->page_count, sizeof(*extents), GFP_KERNEL);
 	if (!extents)
 		return -ENOMEM;
 
@@ -3689,7 +3696,7 @@ static int rk_rga_userptr_build_extents(struct rk_rga_import *import)
 	     rk_rga_userptr_extent_cmp, NULL);
 	if (rk_rga_physical_extents_self_overlap(extents,
 						 import->page_count)) {
-		kfree(extents);
+		kvfree(extents);
 		return -EOPNOTSUPP;
 	}
 	import->userptr_extents = extents;
@@ -3698,7 +3705,7 @@ static int rk_rga_userptr_build_extents(struct rk_rga_import *import)
 	return 0;
 
 invalid:
-	kfree(extents);
+	kvfree(extents);
 	return -EINVAL;
 }
 
