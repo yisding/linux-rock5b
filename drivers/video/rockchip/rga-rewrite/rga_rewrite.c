@@ -12850,10 +12850,6 @@ static void rk_rga_import_buffer_size_kunit(struct kunit *test)
 			-EOPNOTSUPP);
 }
 
-static void rk_rga2_mmu_sgt_kunit(struct kunit *test);
-static void rk_rga2_mmu_plane_layout_kunit(struct kunit *test);
-static void rk_rga2_mmu_emit_kunit(struct kunit *test);
-
 static void rk_rga_iova_span_kunit(struct kunit *test)
 {
 	KUNIT_EXPECT_EQ(test, rk_rga_check_iova_span(0, 1, "test", false), 0);
@@ -12869,10 +12865,6 @@ static void rk_rga_iova_span_kunit(struct kunit *test)
 					       "test", false),
 			-EOVERFLOW);
 
-	/* Keep the established 148-case boot manifest while extending coverage. */
-	rk_rga2_mmu_sgt_kunit(test);
-	rk_rga2_mmu_plane_layout_kunit(test);
-	rk_rga2_mmu_emit_kunit(test);
 }
 
 static void rk_rga2_mmu_sgt_kunit(struct kunit *test)
@@ -20023,6 +20015,9 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_request_remove_free_kunit),
 	KUNIT_CASE(rk_rga_import_buffer_size_kunit),
 	KUNIT_CASE(rk_rga_iova_span_kunit),
+	KUNIT_CASE(rk_rga2_mmu_sgt_kunit),
+	KUNIT_CASE(rk_rga2_mmu_plane_layout_kunit),
+	KUNIT_CASE(rk_rga2_mmu_emit_kunit),
 	KUNIT_CASE(rk_rga_clock_count_kunit),
 	KUNIT_CASE(rk_rga_mmio_size_kunit),
 	KUNIT_CASE(rk_rga_irq_flags_kunit),
