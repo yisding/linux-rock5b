@@ -1284,7 +1284,17 @@ rga_mm_lookup_external(struct rga_mm *mm_session,
 		break;
 	case RGA_DMA_BUFFER_PTR:
 		idr_for_each_entry(&mm_session->memory_idr, temp_buffer, id) {
-			if (temp_buffer->type != RGA_DMA_BUFFER_PTR)
+			/*
+			 * Both dma-buf types resolve to the same struct dma_buf
+			 * and are compared pointer-to-pointer below, so an fd
+			 * import and a PTR import of one buffer must still
+			 * de-dup onto each other -- otherwise every MPI frame
+			 * re-attaches and re-maps a buffer userspace already
+			 * holds by fd. Only the address-keyed arms need a
+			 * strict type match.
+			 */
+			if (temp_buffer->type != RGA_DMA_BUFFER_PTR &&
+			    temp_buffer->type != RGA_DMA_BUFFER)
 				continue;
 
 			if (temp_buffer->dma_buffer == NULL)
@@ -3184,7 +3194,6 @@ int rga_mm_import_buffer(struct rga_external_buffer *external_buffer,
 	internal_buffer = rga_mm_lookup_external(mm, external_buffer, current->mm);
 	if (!IS_ERR_OR_NULL(internal_buffer)) {
 		kref_get(&internal_buffer->refcount);
-		internal_buffer->import_cnt++;
 		/*
 		 * Adopt an orphaned buffer. rga_mm_release_buffer() clears the
 		 * owner when the last import reference goes away, so a buffer
@@ -3193,6 +3202,17 @@ int rga_mm_import_buffer(struct rga_external_buffer *external_buffer,
 		 */
 		if (!internal_buffer->session)
 			internal_buffer->session = session;
+
+		/*
+		 * import_cnt is what the *owner* took, and is spent as such at
+		 * session teardown. Lookup is global -- another session, or a
+		 * second fd in this one, can de-dup onto this buffer -- so
+		 * counting a foreign import here would make the owner's close
+		 * hand back references it never held, freeing the buffer under
+		 * the other session's handle or its running job.
+		 */
+		if (internal_buffer->session == session)
+			internal_buffer->import_cnt++;
 
 		mutex_unlock(&mm->lock);
 

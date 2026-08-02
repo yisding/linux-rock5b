@@ -258,6 +258,12 @@ static void task_msgs_reset(struct mpp_task_msgs *msgs)
 	msgs->req_cnt = 0;
 	msgs->set_cnt = 0;
 	msgs->poll_cnt = 0;
+	/*
+	 * Must be cleared too: a recycled msgs whose poll_req still points at
+	 * the previous batch's request keeps that stale pointer, because the
+	 * collector only assigns poll_req when it is NULL.
+	 */
+	msgs->poll_req = NULL;
 }
 
 static void task_msgs_init(struct mpp_task_msgs *msgs, struct mpp_session *session)
@@ -311,22 +317,34 @@ static void put_task_msgs(struct mpp_task_msgs *msgs)
 {
 	struct mpp_session *session = msgs->session;
 	unsigned long flags;
+	struct fd f;
+	bool put_fd;
 
 	if (!session) {
 		pr_err("invalid msgs without session\n");
 		return;
 	}
 
-	if (msgs->ext_fd >= 0) {
-		fdput(msgs->f);
-		msgs->ext_fd = -1;
-	}
+	/*
+	 * Drop the fd reference last. It may be the final one on the session's
+	 * file, and a sibling thread closing that fd runs __fput() -- and so
+	 * mpp_session_deinit(), which kfree()s every msgs and then the session
+	 * -- synchronously. Releasing it first left this function writing
+	 * msgs->ext_fd, splicing msgs->list_session and taking
+	 * session->lock_msgs in freed memory.
+	 */
+	put_fd = msgs->ext_fd >= 0;
+	f = msgs->f;
+	msgs->ext_fd = -1;
 
 	task_msgs_reset(msgs);
 
 	spin_lock_irqsave(&session->lock_msgs, flags);
 	list_move_tail(&msgs->list_session, &session->list_msgs_idle);
 	spin_unlock_irqrestore(&session->lock_msgs, flags);
+
+	if (put_fd)
+		fdput(f);
 }
 
 static void clear_task_msgs(struct mpp_session *session)
@@ -1628,13 +1646,24 @@ static int mpp_process_request(struct mpp_session *session,
 			return -EINVAL;
 		}
 		count = req->size / sizeof(u32);
+		ret = 0;
 		for (i = 0; i < count; i++) {
-			ret = mpp_dma_release_fd(session->dma, data[i]);
-			if (ret) {
+			int fd_ret = mpp_dma_release_fd(session->dma, data[i]);
+
+			/*
+			 * Keep going and report the first failure. Aborting
+			 * mid-array would silently leave the remaining fds
+			 * holding their references with no way for the caller
+			 * to learn how far it got.
+			 */
+			if (fd_ret) {
 				mpp_err("release fd %d failed.\n", data[i]);
-				return ret;
+				if (!ret)
+					ret = fd_ret;
 			}
 		}
+		if (ret)
+			return ret;
 	} break;
 	default: {
 		mpp = session->mpp;
@@ -1774,13 +1803,23 @@ next:
 		 * the batch a session another thread may already have freed.
 		 */
 		if (fd_file(f)->f_op != &rockchip_mpp_fops) {
-			int ret = -EBADF;
+			int uret = -EBADF;
 
 			mpp_err("fd %d is not an mpp session\n", bat_msg.fd);
 			fdput(f);
-			if (copy_to_user(&usr_cmd->ret, &ret, sizeof(usr_cmd->ret)))
+			if (copy_to_user(&usr_cmd->ret, &uret, sizeof(usr_cmd->ret)))
 				mpp_err("copy_to_user failed.\n");
-			goto session_switch_done;
+			/*
+			 * Abort rather than continue against the previous
+			 * session. Continuing would append the rest of the
+			 * batch to the retained msgs, merging two sub-batches
+			 * into one task: past MPP_MAX_MSG_NUM that discards the
+			 * requests already collected, and it bleeds the first
+			 * sub-batch's msg_flags into the second's register
+			 * translation.
+			 */
+			ret = -EBADF;
+			goto err_put_msgs;
 		}
 
 		/* NOTE: add previous ready task to queue and drop empty task */

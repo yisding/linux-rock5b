@@ -2131,6 +2131,7 @@ int rkvdec2_soft_ccu_iommu_fault_handle(struct iommu_domain *iommu,
 	struct mpp_dev *mpp = (struct mpp_dev *)arg;
 	struct mpp_taskqueue *queue = mpp->queue;
 	struct mpp_task *mpp_task;
+	unsigned long flags;
 
 	mpp_debug_enter();
 
@@ -2144,9 +2145,17 @@ int rkvdec2_soft_ccu_iommu_fault_handle(struct iommu_domain *iommu,
 	 * Until the pagefault task finish by hw timeout.
 	 */
 	rockchip_iommu_mask_irq(mpp->dev);
+	/*
+	 * Read cur_task and walk its mem_region_list under running_lock, the
+	 * lock the dequeue path clears it beneath. Reading it bare from this
+	 * hard-IRQ handler raced the kref_put() that frees the task, so the
+	 * walk could follow list heads that live inside freed memory.
+	 */
+	spin_lock_irqsave(&mpp->queue->running_lock, flags);
 	mpp_task = mpp->cur_task;
 	if (mpp_task)
 		mpp_task_dump_mem_region(mpp, mpp_task);
+	spin_unlock_irqrestore(&mpp->queue->running_lock, flags);
 
 	atomic_inc(&mpp->queue->reset_request);
 	kthread_queue_work(&mpp->queue->worker, &mpp->work);
@@ -2237,6 +2246,7 @@ static int rkvdec2_soft_ccu_enqueue(struct mpp_dev *mpp, struct mpp_task *mpp_ta
 	struct rkvdec2_task *task = to_rkvdec2_task(mpp_task);
 	struct rkvdec_link_dev *link_dec = dec->link_dec;
 	u32 timing_en = mpp->srv->timing_en;
+	unsigned long flags;
 
 	mpp_debug_enter();
 
@@ -2277,8 +2287,14 @@ static int rkvdec2_soft_ccu_enqueue(struct mpp_dev *mpp, struct mpp_task *mpp_ta
 		e = s + req->size / sizeof(u32);
 		mpp_write_req(mpp, task->reg, s, e, reg_en);
 	}
-	/* init current task */
+	/*
+	 * Publish the current task under the same lock the dequeue clears it
+	 * beneath and the IOMMU fault handler reads it under, so a fault
+	 * arriving mid-dispatch cannot observe a torn or stale pointer.
+	 */
+	spin_lock_irqsave(&mpp->queue->running_lock, flags);
 	mpp->cur_task = mpp_task;
+	spin_unlock_irqrestore(&mpp->queue->running_lock, flags);
 
 	mpp_task_run_begin(mpp_task, timing_en, MPP_WORK_TIMEOUT_DELAY);
 
@@ -2613,7 +2629,8 @@ static int rkvdec2_hard_ccu_dequeue(struct mpp_taskqueue *queue,
 			struct rkvdec2_dev *dec = to_rkvdec2_dev(queue->cores[0]);
 
 			set_bit(TASK_STATE_HANDLE, &mpp_task->state);
-			cancel_delayed_work(&mpp_task->timeout_work);
+			/* sync: this path frees the task below, see soft CCU */
+			cancel_delayed_work_sync(&mpp_task->timeout_work);
 			mpp_task->hw_cycles = tb_reg[hw->tb_reg_cycle];
 			mpp_task->hw_time = mpp_task->hw_cycles /
 					    (dec->cycle_clk->real_rate_hz / 1000000);
@@ -2968,7 +2985,7 @@ static void rkvdec2_hard_ccu_resend_tasks(struct mpp_dev *mpp, struct mpp_taskqu
 				tb_reg[dec->link_dec->info->tb_reg_next], irq_status);
 
 		if (!irq_status) {
-			cancel_delayed_work(&loop->timeout_work);
+			cancel_delayed_work_sync(&loop->timeout_work);
 			clear_bit(TASK_STATE_START, &loop->state);
 			rkvdec2_hard_ccu_enqueue(dec->ccu, loop, queue, mpp);
 		}
@@ -2998,7 +3015,7 @@ void rkvdec2_hard_ccu_worker(struct kthread_work *work_s)
 		struct mpp_task *loop = NULL, *n;
 
 		list_for_each_entry_safe(loop, n, &queue->running_list, queue_link) {
-			cancel_delayed_work(&loop->timeout_work);
+			cancel_delayed_work_sync(&loop->timeout_work);
 		}
 		/* reset process */
 		ret = rkvdec2_hard_ccu_reset(queue, dec->ccu);

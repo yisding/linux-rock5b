@@ -33,6 +33,45 @@
 #include "mpp_iommu.h"
 #include "mpp_common.h"
 
+/*
+ * Caller must hold dma->list_mutex, and must keep holding it for as long as it
+ * uses the returned pointer: no reference is taken, so dropping the lock lets
+ * the slot be released and recycled for a different dma_buf underneath it.
+ */
+static struct mpp_dma_buffer *
+mpp_dma_find_buffer_locked(struct mpp_dma_session *dma, struct dma_buf *dmabuf)
+{
+	struct mpp_dma_buffer *out = NULL;
+	struct mpp_dma_buffer *buffer = NULL, *n;
+	int find = 0;
+
+	list_for_each_entry_safe(buffer, n,
+				 &dma->used_list, link) {
+		/*
+		 * fd may dup several and point the same dambuf.
+		 * thus, here should be distinguish with the dmabuf.
+		 */
+		if (buffer->dmabuf == dmabuf) {
+			out = buffer;
+			find = 1;
+			list_move_tail(&buffer->link, &buffer->dma->used_list);
+			break;
+		}
+	}
+	if (!find) {
+		list_for_each_entry_safe(buffer, n,
+					&dma->static_list, link) {
+			if (buffer->dmabuf == dmabuf) {
+				out = buffer;
+				list_move_tail(&buffer->link, &buffer->dma->static_list);
+				break;
+			}
+		}
+	}
+
+	return out;
+}
+
 struct mpp_dma_buffer *
 mpp_dma_find_buffer_fd(struct mpp_dma_session *dma, int fd)
 {
@@ -195,6 +234,7 @@ int mpp_dma_release(struct mpp_dma_session *dma,
 int mpp_dma_release_fd(struct mpp_dma_session *dma, int fd)
 {
 	struct device *dev;
+	struct dma_buf *dmabuf;
 	struct mpp_dma_buffer *buffer = NULL;
 
 	/*
@@ -207,14 +247,29 @@ int mpp_dma_release_fd(struct mpp_dma_session *dma, int fd)
 
 	dev = dma->dev;
 
-	buffer = mpp_dma_find_buffer_fd(dma, fd);
-	if (IS_ERR_OR_NULL(buffer)) {
-		dev_err(dev, "can not find %d buffer in list\n", fd);
+	dmabuf = dma_buf_get(fd);
+	if (IS_ERR(dmabuf)) {
+		dev_err_ratelimited(dev, "can not get dma_buf for fd %d\n", fd);
 
 		return -EINVAL;
 	}
 
+	/*
+	 * Look up, check and put under one hold of list_mutex. Splitting them
+	 * around mpp_dma_find_buffer_fd()'s own lock would leave a window in
+	 * which the slot is released and recycled for a different dma_buf,
+	 * and this would then spend the new owner's count.
+	 */
 	mutex_lock(&dma->list_mutex);
+	buffer = mpp_dma_find_buffer_locked(dma, dmabuf);
+	if (!buffer) {
+		mutex_unlock(&dma->list_mutex);
+		dma_buf_put(dmabuf);
+		dev_err_ratelimited(dev, "can not find %d buffer in list\n", fd);
+
+		return -EINVAL;
+	}
+
 	/*
 	 * Only give back a reference this ioctl handed out. Without the count
 	 * this is an unauthenticated kref_put: MPP_CMD_RELEASE_FD takes an
@@ -225,13 +280,16 @@ int mpp_dma_release_fd(struct mpp_dma_session *dma, int fd)
 	 */
 	if (!buffer->static_cnt) {
 		mutex_unlock(&dma->list_mutex);
-		dev_err(dev, "fd %d was not imported by this session\n", fd);
+		dma_buf_put(dmabuf);
+		dev_err_ratelimited(dev, "fd %d was not imported by this session\n",
+				    fd);
 
 		return -EINVAL;
 	}
 	buffer->static_cnt--;
 	kref_put(&buffer->ref, mpp_dma_release_buffer);
 	mutex_unlock(&dma->list_mutex);
+	dma_buf_put(dmabuf);
 
 	return 0;
 }

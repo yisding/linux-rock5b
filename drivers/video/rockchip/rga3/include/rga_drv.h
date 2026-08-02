@@ -240,7 +240,12 @@ struct rga_internal_buffer {
 	struct kref refcount;
 	struct rga_session *session;
 	/*
-	 * Outstanding RGA_IOC_IMPORT_BUFFER references, guarded by mm->lock.
+	 * Outstanding RGA_IOC_IMPORT_BUFFER references held by `session`, the
+	 * owner -- not by any other session that de-dupped onto this buffer,
+	 * since teardown spends this count on the owner's behalf. Guarded by
+	 * mm->lock once the buffer is published in memory_idr; the initial
+	 * store happens before publication, alongside kref_init().
+	 *
 	 * Imports are de-duplicated, so one buffer can be imported several
 	 * times; ownership must survive until the last of those is released,
 	 * otherwise the buffer is orphaned (session == NULL) and the owning
