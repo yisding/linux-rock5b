@@ -1467,7 +1467,12 @@ static int mpp_process_request(struct mpp_session *session,
 			return -EINVAL;
 		if (get_user(val, (u32 __user *)req->data))
 			return -EFAULT;
-		if (mpp->grf_info->grf)
+		/*
+		 * Only rkvdec2/rkvenc2 attach a grf_info. mpp_av1dec never does
+		 * and its mpp_dev is zeroed, so an AV1-bound session reaches
+		 * here with a NULL pointer.
+		 */
+		if (mpp->grf_info && mpp->grf_info->grf)
 			regmap_write(mpp->grf_info->grf, 0x5d8, val);
 	} break;
 	case MPP_CMD_INIT_TRANS_TABLE: {
@@ -1715,14 +1720,15 @@ next:
 	/* first, parse to fixed struct */
 	ret = mpp_copy_msg_v1(&msg_v1, &msg, compat_ioctl);
 	if (ret)
-		return ret;
+		goto err_put_msgs;
 
 	mpp_debug(DEBUG_IOCTL, "cmd %x collect flags %08x, size %d, offset %x\n",
 		  msg_v1.cmd, msg_v1.flags, msg_v1.size, msg_v1.offset);
 
 	if (mpp_check_cmd_v1(msg_v1.cmd)) {
 		mpp_err("mpp cmd %x is not supported.\n", msg_v1.cmd);
-		return -EFAULT;
+		ret = -EFAULT;
+		goto err_put_msgs;
 	}
 
 	if (msg_v1.flags & MPP_FLAGS_MULTI_MSG)
@@ -1739,8 +1745,10 @@ next:
 		/* try session switch here */
 		usr_cmd = (struct mpp_bat_msg __user *)(unsigned long)msg_v1.data_ptr;
 
-		if (copy_from_user(&bat_msg, usr_cmd, sizeof(bat_msg)))
-			return -EFAULT;
+		if (copy_from_user(&bat_msg, usr_cmd, sizeof(bat_msg))) {
+			ret = -EFAULT;
+			goto err_put_msgs;
+		}
 
 		/* skip finished message */
 		if (bat_msg.flag & MPP_BAT_MSG_DONE)
@@ -1757,17 +1765,14 @@ next:
 			goto session_switch_done;
 		}
 
-		/* NOTE: add previous ready task to queue and drop empty task */
-		if (msgs) {
-			if (msgs->req_cnt)
-				task_msgs_add(msgs, head);
-			else
-				put_task_msgs(msgs);
-
-			msgs = NULL;
-		}
-
-		/* validate the fd actually refers to an mpp device file */
+		/*
+		 * Validate the fd actually refers to an mpp device file before
+		 * flushing the previous messages. put_task_msgs() below drops
+		 * the fdget() reference that keeps the *current* session alive,
+		 * and this error path leaves `session` pointing at it -- so
+		 * rejecting after the flush would hand every later message in
+		 * the batch a session another thread may already have freed.
+		 */
 		if (fd_file(f)->f_op != &rockchip_mpp_fops) {
 			int ret = -EBADF;
 
@@ -1778,13 +1783,24 @@ next:
 			goto session_switch_done;
 		}
 
+		/* NOTE: add previous ready task to queue and drop empty task */
+		if (msgs) {
+			if (msgs->req_cnt)
+				task_msgs_add(msgs, head);
+			else
+				put_task_msgs(msgs);
+
+			msgs = NULL;
+		}
+
 		/* switch session */
 		session = fd_file(f)->private_data;
 		msgs = get_task_msgs(session);
 		if (!msgs) {
 			/* alloc failed: release the held fd, don't deref NULL */
 			fdput(f);
-			return -ENOMEM;
+			ret = -ENOMEM;
+			goto err_put_msgs;
 		}
 		msgs->ext_fd = bat_msg.fd;
 		msgs->f = f;
@@ -1793,9 +1809,23 @@ next:
 				bat_msg.fd, session->index, session->msgs_cnt);
 
 session_switch_done:
-		/* session id should NOT be the last message */
-		if (last)
+		/*
+		 * A session id should NOT be the last message, but userspace
+		 * decides that. Retire whatever is held rather than stranding
+		 * it: queue it if it carries requests, otherwise return it to
+		 * the session's idle pool along with its fd reference.
+		 */
+		if (last) {
+			if (msgs) {
+				if (msgs->req_cnt)
+					task_msgs_add(msgs, head);
+				else
+					put_task_msgs(msgs);
+
+				msgs = NULL;
+			}
 			return 0;
+		}
 
 		goto next;
 	}
@@ -1812,7 +1842,8 @@ session_switch_done:
 	if (msgs->req_cnt >= MPP_MAX_MSG_NUM) {
 		mpp_err("session %d message count %d more than %d.\n",
 			session->index, msgs->req_cnt, MPP_MAX_MSG_NUM);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto err_put_msgs;
 	}
 
 	req = &msgs->reqs[msgs->req_cnt++];
@@ -1826,7 +1857,7 @@ session_switch_done:
 	if (ret) {
 		mpp_err("session %d process cmd %x ret %d\n",
 			session->index, req->cmd, ret);
-		return ret;
+		goto err_put_msgs;
 	}
 
 	if (!last)
@@ -1836,6 +1867,19 @@ session_switch_done:
 	msgs = NULL;
 
 	return 0;
+
+err_put_msgs:
+	/*
+	 * get_task_msgs() moves the object onto session->list_msgs and only
+	 * put_task_msgs() returns it to the idle list, so bailing out with one
+	 * still held stranded it there for the life of the fd -- along with any
+	 * session fd reference it carries -- and the next call simply allocated
+	 * another.
+	 */
+	if (msgs)
+		put_task_msgs(msgs);
+
+	return ret;
 }
 
 static void mpp_msgs_trigger(struct list_head *msgs_list)
@@ -2136,23 +2180,31 @@ int mpp_translate_reg_address(struct mpp_session *session,
 		struct mpp_mem_region *mem_region = NULL;
 
 		/*
-		 * With a session translation table these indexes are raw
-		 * user input (MPP_CMD_INIT_TRANS_TABLE validates only the byte
+		 * With a session translation table these indexes are raw user
+		 * input (MPP_CMD_INIT_TRANS_TABLE validates only the byte
 		 * count), so they must be bounded against the register buffer
 		 * before being used to read and write through it.
+		 *
+		 * Snapshot the index once. session->trans_table is rewritten by
+		 * MPP_CMD_INIT_TRANS_TABLE with no lock, and mpp_task_attach_fd()
+		 * below sleeps in a dma-buf import -- re-reading tbl[i] after it
+		 * would let a concurrent writer move the index past the bound
+		 * that was just checked.
 		 */
-		if (tbl[i] >= reg_cnt) {
+		u32 idx = READ_ONCE(tbl[i]);
+
+		if (idx >= reg_cnt) {
 			mpp_err("reg index %u out of range %u\n",
-				tbl[i], reg_cnt);
+				idx, reg_cnt);
 			return -EINVAL;
 		}
 
 		if (session->msg_flags & MPP_FLAGS_REG_NO_OFFSET) {
-			usr_fd = reg[tbl[i]];
+			usr_fd = reg[idx];
 			offset = 0;
 		} else {
-			usr_fd = reg[tbl[i]] & 0x3ff;
-			offset = reg[tbl[i]] >> 10;
+			usr_fd = reg[idx] & 0x3ff;
+			offset = reg[idx] >> 10;
 		}
 
 		if (usr_fd == 0)
@@ -2161,15 +2213,15 @@ int mpp_translate_reg_address(struct mpp_session *session,
 		mem_region = mpp_task_attach_fd(task, usr_fd);
 		if (IS_ERR(mem_region)) {
 			mpp_err("reg[%3d]: 0x%08x fd %d failed\n",
-				tbl[i], reg[tbl[i]], usr_fd);
+				idx, reg[idx], usr_fd);
 			return PTR_ERR(mem_region);
 		}
 		mpp_debug(DEBUG_IOMMU,
 			  "reg[%3d]: %d => %pad, offset %10d, size %lx\n",
-			  tbl[i], usr_fd, &mem_region->iova,
+			  idx, usr_fd, &mem_region->iova,
 			  offset, mem_region->len);
-		mem_region->reg_idx = tbl[i];
-		reg[tbl[i]] = mem_region->iova + offset;
+		mem_region->reg_idx = idx;
+		reg[idx] = mem_region->iova + offset;
 	}
 
 	mpp_debug_leave();
