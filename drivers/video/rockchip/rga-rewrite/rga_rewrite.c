@@ -23353,14 +23353,65 @@ static irqreturn_t rk_rga_irq_handler(int irq, void *data)
 	return ret;
 }
 
+/*
+ * Retire a job whose current task has just ended, and drop hw->run_lock.
+ *
+ * A multi-task request whose task succeeded goes back on the queue for its
+ * next task; anything else completes. Both the completion IRQ and the watchdog
+ * recovery path end this way. The recovery path used to complete
+ * unconditionally, so a salvaged completion reported a request whose remaining
+ * tasks never ran as a success.
+ */
+static void rk_rga_hw_finish_job_locked(struct rk_rga_hw *hw,
+					struct rk_rga_job *job, int result,
+					int reset_ret)
+{
+	struct rk_rga_session *dispatch_session = NULL;
+	bool pending_tasks = job->current_task + 1 < job->task_count;
+	bool requeued = false;
+
+	/*
+	 * A failed recovery reset quarantines the core, so the remaining tasks
+	 * cannot run on it and the request cannot be called successful. This
+	 * is unreachable from the IRQ thread, which only resets when the task
+	 * already failed, but the watchdog path resets on a salvaged
+	 * completion too.
+	 */
+	if (reset_ret && pending_tasks && !result)
+		result = -EIO;
+
+	if (!reset_ret && rk_rga_job_advance_task(job, result)) {
+		dispatch_session = READ_ONCE(job->session);
+		if (dispatch_session &&
+		    rk_rga_session_begin_job_dispatch(dispatch_session)) {
+			rk_rga_job_release_hw(job);
+			requeued = true;
+		} else {
+			result = -EFAULT;
+		}
+	}
+
+	mutex_unlock(&hw->run_lock);
+
+	if (requeued) {
+		rk_rga_job_queue_ref(job, false);
+		rk_rga_session_end_job_dispatch(dispatch_session);
+		rk_rga_hw_dispatch(hw);
+		return;
+	}
+
+	rk_rga_job_complete_queued(job, result);
+	rk_rga_hw_dispatch(hw);
+	if (reset_ret)
+		rk_rga_abort_incompatible_pending_acquire_jobs(hw->rga, -EIO);
+}
+
 static irqreturn_t rk_rga_irq_thread(int irq, void *data)
 {
 	struct rk_rga_hw *hw = data;
 	struct rk_rga_job *job;
-	struct rk_rga_session *dispatch_session = NULL;
 	int reset_ret = 0;
 	int result;
-	bool requeued = false;
 
 	atomic_inc(&hw->rga->irq_thread_count);
 	mutex_lock(&hw->run_lock);
@@ -23391,31 +23442,7 @@ static irqreturn_t rk_rga_irq_thread(int irq, void *data)
 	 */
 	rk_rga_job_release_mappings_powered(job, hw);
 	rk_rga_hw_power_off(hw);
-
-	if (rk_rga_job_advance_task(job, result)) {
-		dispatch_session = READ_ONCE(job->session);
-		if (dispatch_session &&
-		    rk_rga_session_begin_job_dispatch(dispatch_session)) {
-			rk_rga_job_release_hw(job);
-			requeued = true;
-		} else {
-			result = -EFAULT;
-		}
-	}
-
-	mutex_unlock(&hw->run_lock);
-
-	if (requeued) {
-		rk_rga_job_queue_ref(job, false);
-		rk_rga_session_end_job_dispatch(dispatch_session);
-		rk_rga_hw_dispatch(hw);
-		return IRQ_HANDLED;
-	}
-
-	rk_rga_job_complete_queued(job, result);
-	rk_rga_hw_dispatch(hw);
-	if (reset_ret)
-		rk_rga_abort_incompatible_pending_acquire_jobs(hw->rga, -EIO);
+	rk_rga_hw_finish_job_locked(hw, job, result, reset_ret);
 
 	return IRQ_HANDLED;
 }
@@ -23534,12 +23561,14 @@ static void rk_rga_hw_recover_active(struct rk_rga_hw *hw, bool iommu_fault,
 	 */
 	rk_rga_job_release_mappings_powered(job, hw);
 	rk_rga_hw_power_off(hw);
-	rk_rga_job_complete_queued(job, result);
 	rk_rga_hw_enable_irq(hw, irq_disabled);
-	mutex_unlock(&hw->run_lock);
-	rk_rga_hw_dispatch(hw);
-	if (reset_ret)
-		rk_rga_abort_incompatible_pending_acquire_jobs(hw->rga, -EIO);
+	/*
+	 * Completion moves after the unlock, matching the IRQ thread. The
+	 * shared tail has to advance a multi-task request rather than complete
+	 * it, and it must do that before dropping run_lock so the requeued job
+	 * cannot be dispatched underneath this function.
+	 */
+	rk_rga_hw_finish_job_locked(hw, job, result, reset_ret);
 }
 
 static void rk_rga_hw_timeout_work(struct work_struct *work)
