@@ -1131,7 +1131,6 @@ struct rk_rga_import {
 	unsigned int userptr_extent_count;
 	unsigned int page_offset;
 	bool iommu_mapped;
-	bool mapping_invalidated;
 	bool counted;
 	bool service_linked;
 };
@@ -2588,23 +2587,17 @@ static void rk_rga_import_detach_map_locked(struct rk_rga_import *import)
 	if (!map_hw)
 		return;
 
-	if (import->type == RK_RGA_IMPORT_DMABUF) {
-		if (import->sgt)
-			dma_buf_unmap_attachment_unlocked(import->attach,
-							  import->sgt,
-							  DMA_TO_DEVICE);
-		if (import->attach)
-			dma_buf_detach(import->dmabuf, import->attach);
-		import->sgt = NULL;
-		import->attach = NULL;
-		/*
-		 * An exporter may move the backing store once its attachment is
-		 * unmapped. Permanently reject this import so a prepared job
-		 * cannot execute after the mapping that pinned its backing was
-		 * destroyed.
-		 */
-		WRITE_ONCE(import->mapping_invalidated, true);
-	} else if (import->type == RK_RGA_IMPORT_USERPTR) {
+	/*
+	 * Only rk_rga_import_userptr() ever sets map_hw, so a DMA-BUF import
+	 * cannot reach here. Since the 2026-07-31 multi-SG rework those carry
+	 * no persistent attachment at all -- they are mapped and unmapped per
+	 * job -- so there is nothing to detach and nothing to invalidate.
+	 */
+	if (WARN_ON_ONCE(import->type != RK_RGA_IMPORT_USERPTR)) {
+		import->map_hw = NULL;
+		return;
+	}
+	if (import->type == RK_RGA_IMPORT_USERPTR) {
 		rk_rga_unmap_userptr_sgt(import->rga, import->dev, import->sgt,
 					 import->userptr_view,
 					 import->domain, import->iova,
@@ -3255,12 +3248,6 @@ static int rk_rga_resolve_handle_locked(struct rk_rga_session *session,
 	import = idr_find(&session->imports, (int)handle);
 	if (!import)
 		return -EINVAL;
-	mutex_lock(&import->map_lock);
-	if (import->mapping_invalidated) {
-		mutex_unlock(&import->map_lock);
-		return -ENODEV;
-	}
-	mutex_unlock(&import->map_lock);
 	if (required_size && import->size < required_size)
 		return -EINVAL;
 
@@ -3864,10 +3851,6 @@ rk_rga_materialize_existing_import(struct rga_img_info_t *img,
 	int ret;
 
 	mutex_lock(&import->map_lock);
-	if (import->mapping_invalidated) {
-		mutex_unlock(&import->map_lock);
-		return -ENODEV;
-	}
 	refcount_inc(&import->refs);
 	mutex_unlock(&import->map_lock);
 	ret = rk_rga_materialize_img_import(img, import, imports,
@@ -4756,10 +4739,6 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 	int ret;
 
 	mutex_lock(&import->map_lock);
-	if (import->mapping_invalidated) {
-		mutex_unlock(&import->map_lock);
-		return -ENODEV;
-	}
 	if (import->type == RK_RGA_IMPORT_USERPTR && import->map_hw == hw) {
 		*iova = import->iova;
 		mutex_unlock(&import->map_lock);
@@ -4848,11 +4827,6 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 	 * was covered by alias validation until the job releases it.
 	 */
 	mutex_lock(&import->map_lock);
-	if (import->mapping_invalidated) {
-		mutex_unlock(&import->map_lock);
-		rk_rga_hw_put(hw);
-		return -ENODEV;
-	}
 	attach = dma_buf_attach(import->dmabuf, dev);
 	if (IS_ERR(attach)) {
 		mutex_unlock(&import->map_lock);
@@ -6186,85 +6160,6 @@ rk_rga_abort_incompatible_pending_acquire_jobs(struct rk_rga_service *rga,
 	list_for_each_entry(session, &rga->sessions, service_node)
 		rk_rga_session_abort_incompatible_pending_acquire_jobs(
 			session, available_core_mask, result);
-	mutex_unlock(&rga->session_lock);
-}
-
-static bool
-rk_rga_pending_job_has_invalidated_import(const struct rk_rga_job *job)
-{
-	/*
-	 * Pending-acquire jobs keep their import array and every referenced
-	 * import immutable and pinned. Detachment publishes invalidation before
-	 * this scan, so the flag is safe to test while holding job_lock.
-	 */
-	for (u32 i = 0; i < job->import_count; i++) {
-		if (READ_ONCE(job->imports[i]->mapping_invalidated))
-			return true;
-	}
-
-	return false;
-}
-
-static void
-rk_rga_job_abort_invalidated_pending_acquire(struct rk_rga_job *job,
-					      int result)
-{
-	if (READ_ONCE(job->waiting_acquire) &&
-	    rk_rga_pending_job_has_invalidated_import(job))
-		rk_rga_job_abort_pending_acquire(job, result);
-}
-
-static struct rk_rga_job *
-rk_rga_session_take_invalidated_pending_acquire_job(
-	struct rk_rga_session *session, int result)
-{
-	struct rk_rga_job *job;
-	unsigned long flags;
-
-	spin_lock_irqsave(&session->job_lock, flags);
-	list_for_each_entry(job, &session->jobs, session_node) {
-		if (!rk_rga_job_is_pending_acquire(job) ||
-		    !rk_rga_pending_job_has_invalidated_import(job))
-			continue;
-
-		rk_rga_job_set_acquire_result(job, result);
-		job->waiting_acquire = false;
-		rk_rga_job_get(job);
-		spin_unlock_irqrestore(&session->job_lock, flags);
-		return job;
-	}
-	spin_unlock_irqrestore(&session->job_lock, flags);
-
-	return NULL;
-}
-
-static void
-rk_rga_session_abort_invalidated_pending_acquire_jobs(
-	struct rk_rga_session *session, int result)
-{
-	struct rk_rga_job *job;
-
-	for (;;) {
-		job = rk_rga_session_take_invalidated_pending_acquire_job(
-			session, result);
-		if (!job)
-			return;
-
-		rk_rga_job_abort_pending_acquire(job, result);
-		rk_rga_job_put(job);
-	}
-}
-
-static void
-rk_rga_abort_invalidated_pending_acquire_jobs(struct rk_rga_service *rga,
-					       int result)
-{
-	struct rk_rga_session *session;
-
-	mutex_lock(&rga->session_lock);
-	list_for_each_entry(session, &rga->sessions, service_node)
-		rk_rga_session_abort_invalidated_pending_acquire_jobs(
-			session, result);
 	mutex_unlock(&rga->session_lock);
 }
 
@@ -12003,112 +11898,6 @@ rk_rga_incompatible_pending_acquire_oom_fallback_kunit(struct kunit *test)
 	idr_destroy(&session->requests);
 }
 
-static void
-rk_rga_pending_import_invalidation_kunit(struct kunit *test,
-					 bool invalidate_before_arm)
-{
-	struct rk_rga_hw remaining = {
-		.type = RK_RGA_HW_RGA3,
-		.core_mask = BIT(1),
-	};
-	struct rk_rga_session *session;
-	struct rk_rga_import *import;
-	struct dma_fence *acquire_fence;
-	struct dma_fence *release_fence;
-	struct rk_rga_job *job;
-
-	INIT_LIST_HEAD(&remaining.node);
-
-	session = kzalloc_obj(*session, GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, session);
-	KUNIT_ASSERT_NOT_NULL(test,
-			      rk_rga_kunit_session_init(test, session));
-	remaining.rga = session->rga;
-	list_add_tail(&remaining.node, &session->rga->hw_list);
-	rk_rga_session_link(session);
-
-	job = kzalloc_obj(*job, GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, job);
-	rk_rga_job_init(job);
-	job->tasks = kcalloc(1, sizeof(*job->tasks), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, job->tasks);
-	job->tasks[0] = rk_rga_fill_task(BIT(1));
-	job->task_count = 1;
-	job->sync_mode = RGA_BLIT_ASYNC;
-
-	import = rk_rga_kunit_import(test);
-	KUNIT_ASSERT_NOT_NULL(test, import);
-	job->imports = kcalloc(1, sizeof(*job->imports), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, job->imports);
-	job->imports[0] = import;
-	job->import_count = 1;
-
-	acquire_fence = rk_rga_kunit_alloc_fence(test);
-	KUNIT_ASSERT_NOT_NULL(test, acquire_fence);
-	dma_fence_get(acquire_fence);
-	job->acquire_fences = kcalloc(1, sizeof(*job->acquire_fences),
-				      GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, job->acquire_fences);
-	job->acquire_fences[0] = acquire_fence;
-	job->acquire_fence_count = 1;
-
-	release_fence = rk_rga_kunit_alloc_fence(test);
-	KUNIT_ASSERT_NOT_NULL(test, release_fence);
-	dma_fence_get(release_fence);
-	job->release_fence = release_fence;
-
-	KUNIT_ASSERT_EQ(test, rk_rga_session_track_job(session, job), 0);
-	rk_rga_job_get(job);
-	if (invalidate_before_arm)
-		WRITE_ONCE(import->mapping_invalidated, true);
-	KUNIT_ASSERT_EQ(test, rk_rga_job_arm_acquire_callbacks(job), 0);
-	KUNIT_ASSERT_TRUE(test, job->waiting_acquire);
-
-	/*
-	 * Topology alone still permits the job on the remaining RGA3 core,
-	 * but detaching the removed core invalidated one of its DMA-BUF
-	 * imports. It must finish without waiting for the acquire fence.
-	 */
-	if (invalidate_before_arm) {
-		rk_rga_job_abort_invalidated_pending_acquire(job, -ENODEV);
-	} else {
-		WRITE_ONCE(import->mapping_invalidated, true);
-		rk_rga_abort_invalidated_pending_acquire_jobs(session->rga,
-							      -ENODEV);
-	}
-	flush_work(&job->acquire_work);
-
-	KUNIT_EXPECT_TRUE(test, job->done);
-	KUNIT_EXPECT_EQ(test, job->result, -ENODEV);
-	KUNIT_EXPECT_EQ(test, dma_fence_get_status(release_fence), -ENODEV);
-	KUNIT_EXPECT_TRUE(test, list_empty(&session->jobs));
-	KUNIT_EXPECT_EQ(test, refcount_read(&job->refs), 1);
-
-	rk_rga_fence_signal(acquire_fence, 0);
-	KUNIT_EXPECT_EQ(test, dma_fence_get_status(release_fence), -ENODEV);
-
-	list_del_init(&remaining.node);
-	rk_rga_session_unlink(session);
-	rk_rga_job_put(job);
-	kunit_release_action(test, rk_rga_kunit_fence_put, acquire_fence);
-	kunit_release_action(test, rk_rga_kunit_fence_put, release_fence);
-	idr_destroy(&session->imports);
-	idr_destroy(&session->requests);
-	kfree(session);
-}
-
-static void
-rk_rga_partial_hw_remove_pending_import_kunit(struct kunit *test)
-{
-	rk_rga_pending_import_invalidation_kunit(test, false);
-}
-
-static void
-rk_rga_submit_post_arm_invalidated_import_kunit(struct kunit *test)
-{
-	rk_rga_pending_import_invalidation_kunit(test, true);
-}
-
 static void rk_rga_release_queued_job_kunit(struct kunit *test)
 {
 	struct rk_rga_session *session;
@@ -14806,12 +14595,7 @@ static void rk_rga_dma_mapping_hw_lifetime_kunit(struct kunit *test)
 	struct rk_rga_service *rga;
 	struct rk_rga_hw hw = {};
 	struct rk_rga_import *import;
-	struct rk_rga_import *imports[1] = {};
-	struct rga_img_info_t img =
-		rk_rga_kunit_img(0, RK_RGA_FORMAT_RGBA_8888, 16, 16);
 	struct rk_rga_job job = {};
-	dma_addr_t iova;
-	u32 import_count = 0;
 
 	rga = rk_rga_kunit_alloc_service(test);
 	KUNIT_ASSERT_NOT_NULL(test, rga);
@@ -14831,14 +14615,6 @@ static void rk_rga_dma_mapping_hw_lifetime_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&hw.refs), 1);
 	KUNIT_EXPECT_PTR_EQ(test, import->map_hw, NULL);
 	KUNIT_EXPECT_TRUE(test, import->service_linked);
-	KUNIT_EXPECT_TRUE(test, import->mapping_invalidated);
-	KUNIT_EXPECT_EQ(test,
-			rk_rga_materialize_existing_import(&img, import, imports,
-							   &import_count),
-			-ENODEV);
-	KUNIT_EXPECT_EQ(test,
-			rk_rga_job_map_import(&job, import, &hw, &iova),
-			-ENODEV);
 	rk_rga_import_put(import);
 
 	job.mappings = kcalloc(1, sizeof(*job.mappings), GFP_KERNEL);
@@ -20078,8 +19854,6 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_last_hw_remove_pending_acquire_kunit),
 	KUNIT_CASE(rk_rga_incompatible_hw_pending_acquire_kunit),
 	KUNIT_CASE(rk_rga_incompatible_pending_acquire_oom_fallback_kunit),
-	KUNIT_CASE(rk_rga_partial_hw_remove_pending_import_kunit),
-	KUNIT_CASE(rk_rga_submit_post_arm_invalidated_import_kunit),
 	KUNIT_CASE(rk_rga_release_queued_job_kunit),
 	KUNIT_CASE(rk_rga_request_reconfig_gauss_kunit),
 	KUNIT_CASE(rk_rga_legacy_blit_sync_wait_kunit),
@@ -24077,9 +23851,6 @@ static int rk_rga_job_submit(struct rk_rga_session *session,
 		if (!rk_rga_pending_job_can_run_on_core_mask(
 			    job, rk_rga_available_core_mask(session->rga)))
 			rk_rga_job_abort_pending_acquire(job, -ENODEV);
-		else
-			rk_rga_job_abort_invalidated_pending_acquire(
-				job, -ENODEV);
 
 		*release_sync_file = sync_file;
 
@@ -25361,7 +25132,6 @@ static void rk_rga_hw_remove(struct platform_device *pdev)
 	cancel_work_sync(&hw->iommu_fault_work);
 	rk_rga_hw_abort_jobs(hw, -ENODEV);
 	rk_rga_detach_hw_imports(hw);
-	rk_rga_abort_invalidated_pending_acquire_jobs(hw->rga, -ENODEV);
 	wait_event(hw->idle, rk_rga_hw_unreferenced(hw));
 	/* The fail-fast handler makes balancing safe before devres frees the IRQ. */
 	rk_rga_hw_restore_irq_depth(hw);
