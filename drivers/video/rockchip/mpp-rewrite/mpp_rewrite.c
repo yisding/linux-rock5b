@@ -657,6 +657,11 @@ struct rk_mpp_reg_binding {
 	struct rk_mpp_import *import;
 };
 
+struct rk_mpp_kernel_reg_binding {
+	u32 index;
+	dma_addr_t iova;
+};
+
 struct rk_mpp_reg_region {
 	u32 *regs;
 	u32 reg_words;
@@ -684,6 +689,9 @@ struct rk_mpp_reg_image {
 	struct rk_mpp_reg_binding *bindings;
 	u32 binding_count;
 	u32 binding_capacity;
+	struct rk_mpp_kernel_reg_binding
+		kernel_bindings[RK_MPP_MAX_RCB_ELEMS];
+	u32 kernel_binding_count;
 	struct rk_mpp_rcb_desc rcb_descs[RK_MPP_MAX_RCB_ELEMS];
 	u32 rcb_count;
 	u32 rkvdec_perf_sel[RK_MPP_RKVDEC_PERF_SEL_NUM];
@@ -862,6 +870,8 @@ static struct rk_mpp_hw *
 rk_mpp_hard_fault_owner(struct list_head *fault_hws,
 			struct rk_mpp_hw *source, u32 descriptor_iova,
 			bool descriptor_valid);
+static bool rk_mpp_hard_fault_descriptor_iova(struct rk_mpp_hw *hw,
+					      u32 *descriptor_iova);
 static struct rk_mpp_service rk_mpp_srv;
 static struct rk_mpp_debug_event
 	rk_mpp_debug_events[RK_MPP_DEBUG_EVENT_COUNT];
@@ -1378,6 +1388,7 @@ MODULE_DEVICE_TABLE(of, rk_mpp_hw_of_match);
 #define RK_MPP_RKVENC_RESOLUTION_BASE		0x0310
 #define RK_MPP_RKVENC_COUNTER_CLR_BASE		0x5300
 #define RK_MPP_RKVENC_BS_TOP_BASE		0x02b0
+#define RK_MPP_RKVENC_BS_TOP_WORD		(RK_MPP_RKVENC_BS_TOP_BASE / sizeof(u32))
 #define RK_MPP_RKVENC_BS_BOTTOM_BASE		0x02b4
 #define RK_MPP_RKVENC_BS_READ_BASE		0x02b8
 #define RK_MPP_RKVENC_BS_WRITE_BASE		0x02bc
@@ -2072,6 +2083,28 @@ static int rk_mpp_check_msg_flags(__u32 cmd, __u32 flags)
 	return flags & ~allowed ? -EINVAL : 0;
 }
 
+static bool rk_mpp_cmd_is_poll(__u32 cmd)
+{
+	return cmd == MPP_CMD_POLL_HW_FINISH || cmd == MPP_CMD_POLL_HW_IRQ;
+}
+
+static int rk_mpp_job_check_poll_request(const struct rk_mpp_job *job,
+					 __u32 cmd)
+{
+	if (rk_mpp_cmd_is_poll(cmd) && job->poll_cnt)
+		return -EINVAL;
+
+	return 0;
+}
+
+static int rk_mpp_poll_interrupt_result(int ret, bool progressed)
+{
+	if (ret == -ERESTARTSYS && progressed)
+		return -EINTR;
+
+	return ret;
+}
+
 static __u32 rk_mpp_get_cmd_butt(__u32 cmd)
 {
 	switch (cmd) {
@@ -2391,24 +2424,37 @@ static int rk_mpp_import_iova_at_offset(const struct rk_mpp_import *import,
 {
 	if (!import || !import->dmabuf || !iova)
 		return -EINVAL;
-	/*
-	 * One past the end is a legal end-exclusive limit pointer, not an
-	 * access.  The VEPU580 bitstream-top register (172) has been programmed
-	 * as base + full buffer size since 2021; libmpp only switched to
-	 * size - 1 in April 2026, so rejecting it here would break encode for
-	 * every release up to and including 1.0.11.  The hardware dereferences
-	 * that address only when the bitstream wraps, and an IOMMU fault
-	 * contains that case.  Anything genuinely past the end is still
-	 * refused, as is the reverse IOVA lookup, where one past the end of one
-	 * import aliases the base of the next.
-	 */
-	if (offset > import->dmabuf->size)
+	if (offset >= import->dmabuf->size)
 		return -ERANGE;
 	if (check_add_overflow(import->iova, (dma_addr_t)offset, iova) ||
 	    upper_32_bits(*iova))
 		return -EOVERFLOW;
 
 	return 0;
+}
+
+static int rk_mpp_job_iova_at_offset(const struct rk_mpp_job *job, u32 index,
+				     const struct rk_mpp_import *import,
+				     u32 offset, dma_addr_t *iova)
+{
+	/*
+	 * Only VEPU580's bitstream-top register is an end-exclusive limit.
+	 * libmpp through 1.0.11 programmed base + size there; broadening this
+	 * compatibility exception to ordinary address registers admitted a
+	 * one-past pointer that those engines can dereference directly.
+	 */
+	if (job && job->client_type == RK_MPP_DEVICE_RKVENC &&
+	    index == RK_MPP_RKVENC_BS_TOP_WORD && import && import->dmabuf &&
+	    offset == import->dmabuf->size) {
+		if (!iova)
+			return -EINVAL;
+		if (check_add_overflow(import->iova, (dma_addr_t)offset, iova) ||
+		    upper_32_bits(*iova))
+			return -EOVERFLOW;
+		return 0;
+	}
+
+	return rk_mpp_import_iova_at_offset(import, offset, iova);
 }
 
 static struct rk_mpp_import *
@@ -3874,6 +3920,7 @@ static struct rk_mpp_reg_binding *
 rk_mpp_job_find_reg_binding(struct rk_mpp_job *job, u32 index);
 static struct rk_mpp_reg_binding *
 rk_mpp_job_append_reg_binding(struct rk_mpp_job *job);
+static int rk_mpp_job_hold_explicit_iova(struct rk_mpp_job *job, u32 index);
 static int rk_mpp_job_store_reg_offsets(struct rk_mpp_job *job,
 					const struct rk_mpp_job_req *job_req);
 static int rk_mpp_job_apply_reg_offsets(struct rk_mpp_job *job);
@@ -4450,10 +4497,33 @@ static void rk_mpp_dma_contiguous_span_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test,
 			rk_mpp_import_iova_at_offset(&import, 0x1fff, &iova), 0);
 	KUNIT_EXPECT_EQ(test, iova, (dma_addr_t)0x2fff);
-	/* Exactly one past the end is the legal end-exclusive limit pointer. */
+	/* The generic helper describes dereferenceable addresses, not limits. */
 	KUNIT_EXPECT_EQ(test,
-			rk_mpp_import_iova_at_offset(&import, 0x2000, &iova), 0);
-	KUNIT_EXPECT_EQ(test, iova, (dma_addr_t)0x3000);
+			rk_mpp_import_iova_at_offset(&import, 0x2000, &iova),
+			-ERANGE);
+	{
+		struct rk_mpp_job job = {
+			.client_type = RK_MPP_DEVICE_RKVENC,
+		};
+
+		KUNIT_EXPECT_EQ(test,
+				rk_mpp_job_iova_at_offset(
+					&job, RK_MPP_RKVENC_BS_TOP_WORD,
+					&import, 0x2000, &iova),
+				0);
+		KUNIT_EXPECT_EQ(test, iova, (dma_addr_t)0x3000);
+		KUNIT_EXPECT_EQ(test,
+				rk_mpp_job_iova_at_offset(
+					&job, RK_MPP_RKVENC_BS_TOP_WORD + 1,
+					&import, 0x2000, &iova),
+				-ERANGE);
+		job.client_type = RK_MPP_DEVICE_RKVDEC;
+		KUNIT_EXPECT_EQ(test,
+				rk_mpp_job_iova_at_offset(
+					&job, RK_MPP_RKVENC_BS_TOP_WORD,
+					&import, 0x2000, &iova),
+				-ERANGE);
+	}
 	KUNIT_EXPECT_EQ(test,
 			rk_mpp_import_iova_at_offset(&import, 0x2001, &iova),
 			-ERANGE);
@@ -4770,13 +4840,13 @@ static void rk_mpp_av1_post_offset_provenance_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, binding.offset, 0x40U);
 	KUNIT_EXPECT_EQ(test, regs[65], 0x80000040U);
 
-	/* The end-exclusive limit pointer survives the post-offset recheck. */
+	/* AV1 address registers are dereferenceable and reject exact-end. */
 	job->reg_image.translated = false;
 	binding.offset = 0;
 	regs[65] = lower_32_bits(import.iova);
 	job->reg_image.offsets[0].offset = (u32)dmabuf.size;
-	KUNIT_EXPECT_EQ(test, rk_mpp_job_translate_reg_image(job), 0);
-	KUNIT_EXPECT_EQ(test, binding.offset, (u32)dmabuf.size);
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_translate_reg_image(job), -ERANGE);
+	KUNIT_EXPECT_EQ(test, binding.offset, 0U);
 
 	/* One byte further is a genuine out-of-bounds address. */
 	job->reg_image.translated = false;
@@ -5250,11 +5320,14 @@ static void rk_mpp_reg_offset_dma_bounds_kunit(struct kunit *test)
 
 	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, job);
+	job->client_type = RK_MPP_DEVICE_RKVENC;
 	job->reg_image.regs =
-		kunit_kcalloc(test, 2, sizeof(*job->reg_image.regs), GFP_KERNEL);
+		kunit_kcalloc(test, RK_MPP_RKVENC_BS_TOP_WORD + 2,
+			      sizeof(*job->reg_image.regs), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, job->reg_image.regs);
-	job->reg_image.reg_words = 2;
-	job->reg_image.reg_bytes = 2 * sizeof(*job->reg_image.regs);
+	job->reg_image.reg_words = RK_MPP_RKVENC_BS_TOP_WORD + 2;
+	job->reg_image.reg_bytes = job->reg_image.reg_words *
+				    sizeof(*job->reg_image.regs);
 	job->reg_image.bindings =
 		kunit_kcalloc(test, RK_MPP_MAX_REG_TRANS_NUM,
 			      sizeof(*job->reg_image.bindings), GFP_KERNEL);
@@ -5265,16 +5338,18 @@ static void rk_mpp_reg_offset_dma_bounds_kunit(struct kunit *test)
 	dmabuf->size = 0x1000;
 	import.dmabuf = dmabuf;
 	import.iova = 0xffffe000;
-	job->reg_image.bindings[0].index = 1;
+	job->reg_image.bindings[0].index = RK_MPP_RKVENC_BS_TOP_WORD;
 	job->reg_image.bindings[0].offset = 0x100;
 	job->reg_image.bindings[0].import = &import;
 	job->reg_image.binding_count = 1;
-	job->reg_image.offsets[0].index = 1;
+	job->reg_image.offsets[0].index = RK_MPP_RKVENC_BS_TOP_WORD;
 	job->reg_image.offsets[0].offset = 0xef0;
 	job->reg_image.offset_count = 1;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_reg_offsets(job), 0);
 	KUNIT_EXPECT_EQ(test, job->reg_image.bindings[0].offset, 0xff0U);
-	KUNIT_EXPECT_EQ(test, job->reg_image.regs[1], 0xffffeff0U);
+	KUNIT_EXPECT_EQ(test,
+			job->reg_image.regs[RK_MPP_RKVENC_BS_TOP_WORD],
+			0xffffeff0U);
 
 	/*
 	 * 0xff0 + 0x10 is exactly the end of the mapping: the end-exclusive
@@ -5283,17 +5358,35 @@ static void rk_mpp_reg_offset_dma_bounds_kunit(struct kunit *test)
 	job->reg_image.offsets[0].offset = 0x10;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_reg_offsets(job), 0);
 	KUNIT_EXPECT_EQ(test, job->reg_image.bindings[0].offset, 0x1000U);
-	KUNIT_EXPECT_EQ(test, job->reg_image.regs[1], 0xfffff000U);
+	KUNIT_EXPECT_EQ(test,
+			job->reg_image.regs[RK_MPP_RKVENC_BS_TOP_WORD],
+			0xfffff000U);
+
+	/* The adjacent bitstream-bottom register is an ordinary address. */
+	job->reg_image.fail_index = -1;
+	job->reg_image.bindings[0].index = RK_MPP_RKVENC_BS_TOP_WORD + 1;
+	job->reg_image.bindings[0].offset = 0xff0;
+	job->reg_image.offsets[0].index = RK_MPP_RKVENC_BS_TOP_WORD + 1;
+	job->reg_image.offsets[0].offset = 0x10;
+	job->reg_image.regs[RK_MPP_RKVENC_BS_TOP_WORD + 1] = 0xffffeff0U;
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_reg_offsets(job), -ERANGE);
+	KUNIT_EXPECT_EQ(test, job->reg_image.fail_index,
+			RK_MPP_RKVENC_BS_TOP_WORD + 1);
 
 	/* One byte past it is rejected, and names the register. */
 	job->reg_image.fail_index = -1;
+	job->reg_image.bindings[0].index = RK_MPP_RKVENC_BS_TOP_WORD;
 	job->reg_image.bindings[0].offset = 0xff0;
-	job->reg_image.regs[1] = 0xffffeff0U;
+	job->reg_image.offsets[0].index = RK_MPP_RKVENC_BS_TOP_WORD;
+	job->reg_image.regs[RK_MPP_RKVENC_BS_TOP_WORD] = 0xffffeff0U;
 	job->reg_image.offsets[0].offset = 0x11;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_reg_offsets(job), -ERANGE);
 	KUNIT_EXPECT_EQ(test, job->reg_image.bindings[0].offset, 0xff0U);
-	KUNIT_EXPECT_EQ(test, job->reg_image.regs[1], 0xffffeff0U);
-	KUNIT_EXPECT_EQ(test, job->reg_image.fail_index, 1);
+	KUNIT_EXPECT_EQ(test,
+			job->reg_image.regs[RK_MPP_RKVENC_BS_TOP_WORD],
+			0xffffeff0U);
+	KUNIT_EXPECT_EQ(test, job->reg_image.fail_index,
+			RK_MPP_RKVENC_BS_TOP_WORD);
 
 	/* The first rejected index wins over any later one. */
 	job->reg_image.fail_index = 7;
@@ -5307,7 +5400,8 @@ static void rk_mpp_reg_offset_dma_bounds_kunit(struct kunit *test)
 	job->reg_image.offsets[0].offset = 1;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_reg_offsets(job), -EOVERFLOW);
 	KUNIT_EXPECT_EQ(test, job->reg_image.bindings[0].offset, 0U);
-	KUNIT_EXPECT_EQ(test, job->reg_image.fail_index, 1);
+	KUNIT_EXPECT_EQ(test, job->reg_image.fail_index,
+			RK_MPP_RKVENC_BS_TOP_WORD);
 }
 
 static void rk_mpp_request_check_reg_span_kunit(struct kunit *test)
@@ -7332,13 +7426,25 @@ static void rk_mpp_explicit_iova_affinity_kunit(struct kunit *test)
 
 static void rk_mpp_explicit_iova_validation_kunit(struct kunit *test)
 {
+	static const u32 initial_iovas[] = {
+		0x1000,
+		0xfffffff0,
+		0x10f0,
+	};
+	static const int expected[] = {
+		0,
+		-EOVERFLOW,
+		-ERANGE,
+	};
 	struct rk_mpp_session *session;
 	struct rk_mpp_import *import;
 	struct rk_mpp_job *job;
+	struct rk_mpp_job *offset_jobs[ARRAY_SIZE(expected)];
 	struct rk_mpp_hw *hw;
 	struct dma_buf *dmabuf;
 	struct device *dev;
 	u32 *regs;
+	u32 i;
 
 	session = kunit_kzalloc(test, sizeof(*session), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, session);
@@ -7397,11 +7503,69 @@ static void rk_mpp_explicit_iova_validation_kunit(struct kunit *test)
 			-ERANGE);
 	KUNIT_EXPECT_EQ(test, refcount_read(&import->refs), 2);
 
+	/* NO_TRANS still applies SET_REG_ADDR_OFFSET before final validation. */
+	regs[128] = 0x1080;
+	regs[17] = 0x1000;
+	job->flags = MPP_FLAGS_REG_FD_NO_TRANS;
+	job->reg_image.offsets[0] = (struct rk_mpp_reg_offset) {
+		.index = 17,
+		.offset = 0x20,
+	};
+	job->reg_image.offset_count = 1;
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_translate_reg_image(job), 0);
+	KUNIT_EXPECT_EQ(test, regs[17], 0x1020U);
+	KUNIT_EXPECT_TRUE(test, job->reg_image.translated);
+
 	job->import_count = 0;
 	refcount_dec(&import->refs);
-	list_del_init(&import->link);
 	kfree(job->reg_image.bindings);
 	kfree(job->imports);
+
+	/* Repeat NO_TRANS offset validation with no preexisting bindings. */
+	for (i = 0; i < ARRAY_SIZE(offset_jobs); i++) {
+		u32 *regs;
+
+		offset_jobs[i] = kunit_kzalloc(test, sizeof(*offset_jobs[i]),
+					       GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, offset_jobs[i]);
+		regs = kunit_kcalloc(test, 200, sizeof(*regs), GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, regs);
+		offset_jobs[i]->session = session;
+		offset_jobs[i]->client_type = RK_MPP_DEVICE_RKVDEC;
+		offset_jobs[i]->hw = hw;
+		offset_jobs[i]->flags = MPP_FLAGS_REG_FD_NO_TRANS;
+		offset_jobs[i]->reg_image.regs = regs;
+		offset_jobs[i]->reg_image.reg_words = 200;
+		offset_jobs[i]->reg_image.reg_bytes = 200 * sizeof(*regs);
+		offset_jobs[i]->reg_image.offsets[0] = (struct rk_mpp_reg_offset) {
+			.index = 128,
+			.offset = 0x20,
+		};
+		offset_jobs[i]->reg_image.offset_count = 1;
+		regs[RK_MPP_RKVDEC_REG_FMT] = RK_MPP_RKVDEC_FMT_H264D;
+		regs[128] = initial_iovas[i];
+
+		KUNIT_EXPECT_EQ(test,
+				rk_mpp_job_translate_reg_image(offset_jobs[i]),
+				expected[i]);
+	}
+
+	/* The successful case began without a binding and retained the final IOVA. */
+	KUNIT_EXPECT_EQ(test, offset_jobs[0]->reg_image.regs[128], 0x1020U);
+	KUNIT_EXPECT_EQ(test, offset_jobs[0]->reg_image.binding_count, 1U);
+	KUNIT_EXPECT_EQ(test, offset_jobs[0]->reg_image.bindings[0].index, 128U);
+	KUNIT_EXPECT_EQ(test, offset_jobs[0]->reg_image.bindings[0].offset, 0x20U);
+	KUNIT_EXPECT_EQ(test, offset_jobs[0]->import_count, 1U);
+	KUNIT_EXPECT_EQ(test, refcount_read(&import->refs), 2);
+	KUNIT_EXPECT_EQ(test, offset_jobs[1]->reg_image.regs[128], 0xfffffff0U);
+	KUNIT_EXPECT_EQ(test, offset_jobs[2]->reg_image.regs[128], 0x1110U);
+
+	refcount_dec(&import->refs);
+	list_del_init(&import->link);
+	for (i = 0; i < ARRAY_SIZE(offset_jobs); i++) {
+		kfree(offset_jobs[i]->reg_image.bindings);
+		kfree(offset_jobs[i]->imports);
+	}
 }
 
 static void rk_mpp_iommu_fault_match_kunit(struct kunit *test)
@@ -7509,6 +7673,8 @@ static void rk_mpp_iommu_hard_ccu_fault_target_kunit(struct kunit *test)
 	struct rk_mpp_hw *peer;
 	struct rk_mpp_hw *other;
 	struct rk_mpp_hw *target;
+	u32 descriptor_iova;
+	u32 *link;
 	LIST_HEAD(fault_hws);
 
 	fixture = kunit_kzalloc(test, sizeof(*fixture), GFP_KERNEL);
@@ -7532,6 +7698,7 @@ static void rk_mpp_iommu_hard_ccu_fault_target_kunit(struct kunit *test)
 	other->rkvdec_ccu_mode = RK_MPP_RKVDEC_CCU_MODE_HARD;
 
 	spin_lock_init(&source->lock);
+	raw_spin_lock_init(&source->regs_lock);
 	spin_lock_init(&owner->lock);
 	spin_lock_init(&peer->lock);
 	spin_lock_init(&other->lock);
@@ -7543,6 +7710,22 @@ static void rk_mpp_iommu_hard_ccu_fault_target_kunit(struct kunit *test)
 	list_add_tail(&owner->fault_link, &fault_hws);
 	list_add_tail(&peer->fault_link, &fault_hws);
 	list_add_tail(&other->fault_link, &fault_hws);
+
+	link = kunit_kcalloc(test, 2, sizeof(*link), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, link);
+	source->regs[RK_MPP_RKVDEC_LINK_REGION] = (void __iomem *)link;
+	source->reg_size[RK_MPP_RKVDEC_LINK_REGION] = 2 * sizeof(*link);
+	link[RK_MPP_RKVDEC_LINK_CFG_ADDR_BASE / sizeof(*link)] = 0x12345678;
+	descriptor_iova = 0xa5a5a5a5;
+	KUNIT_EXPECT_FALSE(test,
+			   rk_mpp_hard_fault_descriptor_iova(source,
+							     &descriptor_iova));
+	KUNIT_EXPECT_EQ(test, descriptor_iova, 0xa5a5a5a5U);
+	source->regs_live_count = 1;
+	KUNIT_EXPECT_TRUE(test,
+			  rk_mpp_hard_fault_descriptor_iova(source,
+							    &descriptor_iova));
+	KUNIT_EXPECT_EQ(test, descriptor_iova, 0x12345678U);
 
 	fixture->owner_job.rkvdec_ccu_started = true;
 	fixture->owner_job.rkvdec_link_iova = 0x2000;
@@ -7568,6 +7751,9 @@ static void rk_mpp_iommu_hard_ccu_fault_target_kunit(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, target, source);
 
 	source->rkvdec_ccu_mode = RK_MPP_RKVDEC_CCU_MODE_SOFT;
+	KUNIT_EXPECT_FALSE(test,
+			   rk_mpp_hard_fault_descriptor_iova(source,
+							     &descriptor_iova));
 	target = rk_mpp_hard_fault_owner(&fault_hws, source, 0x3000, true);
 	KUNIT_EXPECT_PTR_EQ(test, target, source);
 }
@@ -7586,6 +7772,39 @@ static void rk_mpp_poll_irq_check_size_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_mpp_poll_irq_check_size(1, base), -EINVAL);
 	KUNIT_EXPECT_EQ(test, rk_mpp_poll_irq_check_size(S32_MAX, base),
 			-EINVAL);
+}
+
+static void rk_mpp_poll_request_limit_kunit(struct kunit *test)
+{
+	struct rk_mpp_job job = {};
+
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_job_check_poll_request(&job,
+						      MPP_CMD_POLL_HW_FINISH), 0);
+	job.poll_cnt = 1;
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_job_check_poll_request(&job,
+						      MPP_CMD_POLL_HW_FINISH),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_job_check_poll_request(&job,
+						      MPP_CMD_POLL_HW_IRQ),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_job_check_poll_request(&job,
+						      MPP_CMD_SET_REG_READ), 0);
+}
+
+static void rk_mpp_poll_interrupt_result_kunit(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_poll_interrupt_result(-ERESTARTSYS, false),
+			-ERESTARTSYS);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_poll_interrupt_result(-ERESTARTSYS, true),
+			-EINTR);
+	KUNIT_EXPECT_EQ(test, rk_mpp_poll_interrupt_result(-EIO, true), -EIO);
+	KUNIT_EXPECT_EQ(test, rk_mpp_poll_interrupt_result(0, true), 0);
 }
 
 static void rk_mpp_rkvenc_slice_mode_kunit(struct kunit *test)
@@ -8009,6 +8228,7 @@ static void rk_mpp_rcb_invalid_index_kunit(struct kunit *test)
 	struct rk_mpp_hw hw = {
 		.rcb_iova = 0x80000000,
 		.rcb_size = 0x300,
+		.rcb_count = 2,
 	};
 	u32 max_words = RK_MPP_MAX_REG_IMAGE_BYTES / sizeof(u32);
 	struct rk_mpp_job *job;
@@ -8021,6 +8241,10 @@ static void rk_mpp_rcb_invalid_index_kunit(struct kunit *test)
 	job->session = &session;
 	job->client_type = RK_MPP_DEVICE_RKVENC;
 	job->hw = &hw;
+	hw.rcb_descs[0].index = 2;
+	hw.rcb_descs[0].size = 0x100;
+	hw.rcb_descs[1].index = 4;
+	hw.rcb_descs[1].size = 0x100;
 	job->reg_image.rcb_count = 3;
 	job->reg_image.rcb_descs[0].index = 2;
 	job->reg_image.rcb_descs[0].size = 0x100;
@@ -8034,6 +8258,11 @@ static void rk_mpp_rcb_invalid_index_kunit(struct kunit *test)
 	KUNIT_ASSERT_GT(test, job->reg_image.reg_words, 4U);
 	KUNIT_EXPECT_EQ(test, job->reg_image.regs[2], 0x80000000U);
 	KUNIT_EXPECT_EQ(test, job->reg_image.regs[4], 0x80000100U);
+	KUNIT_EXPECT_EQ(test, job->reg_image.kernel_binding_count, 2U);
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_hold_explicit_iova(job, 4), 0);
+	job->reg_image.regs[4]++;
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_hold_explicit_iova(job, 4), -ERANGE);
+	job->reg_image.regs[4] = 0x80000100U;
 
 	hw.rcb_iova = 0;
 	job->reg_image.rcb_count = 1;
@@ -8042,6 +8271,7 @@ static void rk_mpp_rcb_invalid_index_kunit(struct kunit *test)
 	job->reg_image.regs[4] = 0xdeadbeef;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_rcb_info(job), 0);
 	KUNIT_EXPECT_EQ(test, job->reg_image.regs[4], 0U);
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_hold_explicit_iova(job, 4), 0);
 
 	/*
 	 * An index past the client's own register region must be skipped like
@@ -8059,7 +8289,85 @@ static void rk_mpp_rcb_invalid_index_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_rcb_info(job), 0);
 	KUNIT_EXPECT_EQ(test, job->reg_image.regs[4], 0x80000000U);
 
+	/* A valid register number that is absent from trusted DT RCB data is not patched. */
+	job->reg_image.rcb_count = 2;
+	job->reg_image.rcb_descs[0].index = 3;
+	job->reg_image.rcb_descs[0].size = 0x80;
+	job->reg_image.rcb_descs[1].index = 4;
+	job->reg_image.rcb_descs[1].size = 0x100;
+	job->reg_image.regs[3] = 0xdeadbeef;
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_rcb_info(job), 0);
+	KUNIT_EXPECT_EQ(test, job->reg_image.regs[3], 0xdeadbeefU);
+	KUNIT_EXPECT_EQ(test, job->reg_image.regs[4], 0x80000000U);
+
+	/* A request cannot reserve more than the trusted descriptor permits. */
+	job->reg_image.rcb_count = 1;
+	job->reg_image.rcb_descs[0].index = 4;
+	job->reg_image.rcb_descs[0].size = 0x101;
+	job->reg_image.regs[4] = 0xa5a5a5a5;
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_rcb_info(job), 0);
+	KUNIT_EXPECT_EQ(test, job->reg_image.regs[4], 0xa5a5a5a5U);
+
 	kfree(job->reg_image.regs);
+}
+
+static void rk_mpp_rcb_trusted_extent_kunit(struct kunit *test)
+{
+	struct rk_mpp_hw *hw;
+	struct rk_mpp_job *job;
+	u32 *regs;
+
+	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
+	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+	regs = kunit_kcalloc(test, 8, sizeof(*regs), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, regs);
+
+	hw->rcb_iova = 0x80000000;
+	hw->rcb_size = 0x200;
+	hw->rcb_count = 2;
+	job->client_type = RK_MPP_DEVICE_RKVENC;
+	job->hw = hw;
+	job->reg_image.regs = regs;
+	job->reg_image.reg_words = 8;
+	job->reg_image.reg_bytes = 8 * sizeof(*regs);
+	job->reg_image.rcb_count = 3;
+
+	hw->rcb_descs[0] = (struct rk_mpp_rcb_desc) {
+		.index = 2,
+		.size = 0x180,
+	};
+	hw->rcb_descs[1] = (struct rk_mpp_rcb_desc) {
+		.index = 4,
+		.size = 0x100,
+	};
+	job->reg_image.rcb_descs[0] = (struct rk_mpp_rcb_desc) {
+		.index = 2,
+		.size = 1,
+	};
+	job->reg_image.rcb_descs[1] = job->reg_image.rcb_descs[0];
+	job->reg_image.rcb_descs[2] = (struct rk_mpp_rcb_desc) {
+		.index = 4,
+		.size = 1,
+	};
+	regs[4] = 0xa5a5a5a5;
+
+	/* A short request still reserves the complete trusted hardware extent. */
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_rcb_info(job), 0);
+	KUNIT_EXPECT_EQ(test, regs[2], 0x80000000U);
+	KUNIT_EXPECT_EQ(test, regs[4], 0xa5a5a5a5U);
+	KUNIT_EXPECT_EQ(test, job->reg_image.kernel_binding_count, 1U);
+
+	/* With enough room, the duplicate is ignored and consumes no extent. */
+	hw->rcb_size = 0x300;
+	job->reg_image.kernel_binding_count = 0;
+	regs[2] = 0;
+	regs[4] = 0;
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_rcb_info(job), 0);
+	KUNIT_EXPECT_EQ(test, regs[2], 0x80000000U);
+	KUNIT_EXPECT_EQ(test, regs[4], 0x80000180U);
+	KUNIT_EXPECT_EQ(test, job->reg_image.kernel_binding_count, 2U);
 }
 
 static void rk_mpp_rkvdec_rcb_width_gate_kunit(struct kunit *test)
@@ -8776,7 +9084,11 @@ static void rk_mpp_session_poll_nonblock_pending_kunit(struct kunit *test)
 	struct rk_mpp_session session = {
 		.active_job_count = 1,
 	};
+	struct mpp_request req = {
+		.cmd = MPP_CMD_POLL_HW_IRQ,
+	};
 	struct rk_mpp_job *job;
+	u32 value;
 
 	mutex_init(&session.lock);
 	INIT_LIST_HEAD(&session.active_jobs);
@@ -8801,6 +9113,19 @@ static void rk_mpp_session_poll_nonblock_pending_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, job->state,
 			(enum rk_mpp_job_state)RK_MPP_JOB_ACTIVE);
 	KUNIT_EXPECT_EQ(test, job->result, -EINPROGRESS);
+	KUNIT_EXPECT_EQ(test, refcount_read(&job->refs), 1);
+
+	/* Empty-buffer nonblocking slice poll deliberately drains and discards. */
+	job->rkvenc_slice_mode = true;
+	spin_lock_init(&job->rkvenc_slice_lock);
+	INIT_KFIFO(job->rkvenc_slice_fifo);
+	rk_mpp_job_push_rkvenc_slice(job, 0x1234);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_session_poll_irq(&session, &req,
+						MPP_FLAGS_POLL_NON_BLOCK),
+			-EAGAIN);
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_pop_rkvenc_slice(job, &value),
+			-EAGAIN);
 	KUNIT_EXPECT_EQ(test, refcount_read(&job->refs), 1);
 
 	list_del_init(&job->session_link);
@@ -9270,6 +9595,8 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_iommu_fault_match_kunit),
 	KUNIT_CASE(rk_mpp_iommu_hard_ccu_fault_target_kunit),
 	KUNIT_CASE(rk_mpp_poll_irq_check_size_kunit),
+	KUNIT_CASE(rk_mpp_poll_request_limit_kunit),
+	KUNIT_CASE(rk_mpp_poll_interrupt_result_kunit),
 	KUNIT_CASE(rk_mpp_rkvenc_slice_mode_kunit),
 	KUNIT_CASE(rk_mpp_rkvenc_slice_fifo_kunit),
 	KUNIT_CASE(rk_mpp_rkvenc_bs_overflow_kunit),
@@ -9277,6 +9604,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_rkvenc2_dchs_remap_kunit),
 	KUNIT_CASE(rk_mpp_rkvenc2_dchs_independent_cores_kunit),
 	KUNIT_CASE(rk_mpp_rcb_invalid_index_kunit),
+	KUNIT_CASE(rk_mpp_rcb_trusted_extent_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec_rcb_width_gate_kunit),
 	KUNIT_CASE(rk_mpp_switch_session_status_kunit),
 	KUNIT_CASE(rk_mpp_batch_server_wait_detect_kunit),
@@ -9556,6 +9884,39 @@ rk_mpp_job_find_reg_binding(struct rk_mpp_job *job, u32 index)
 	return NULL;
 }
 
+static struct rk_mpp_kernel_reg_binding *
+rk_mpp_job_find_kernel_binding(struct rk_mpp_job *job, u32 index)
+{
+	struct rk_mpp_reg_image *image = &job->reg_image;
+	u32 i;
+
+	for (i = 0; i < image->kernel_binding_count; i++) {
+		if (image->kernel_bindings[i].index == index)
+			return &image->kernel_bindings[i];
+	}
+
+	return NULL;
+}
+
+static int rk_mpp_job_record_kernel_binding(struct rk_mpp_job *job, u32 index,
+					    dma_addr_t iova)
+{
+	struct rk_mpp_reg_image *image = &job->reg_image;
+	struct rk_mpp_kernel_reg_binding *binding;
+
+	binding = rk_mpp_job_find_kernel_binding(job, index);
+	if (!binding) {
+		if (image->kernel_binding_count >=
+		    ARRAY_SIZE(image->kernel_bindings))
+			return -EOVERFLOW;
+		binding = &image->kernel_bindings[image->kernel_binding_count++];
+		binding->index = index;
+	}
+	binding->iova = iova;
+
+	return 0;
+}
+
 static int rk_mpp_job_hold_import(struct rk_mpp_job *job,
 				  struct rk_mpp_import *import)
 {
@@ -9637,6 +9998,7 @@ static void rk_mpp_job_reject_reg(struct rk_mpp_job *job, u32 index, u32 offset,
 static int rk_mpp_job_hold_explicit_iova(struct rk_mpp_job *job, u32 index)
 {
 	struct rk_mpp_reg_binding *binding;
+	struct rk_mpp_kernel_reg_binding *kernel_binding;
 	struct rk_mpp_import *import;
 	dma_addr_t iova;
 	u32 *word;
@@ -9648,10 +10010,18 @@ static int rk_mpp_job_hold_explicit_iova(struct rk_mpp_job *job, u32 index)
 		return ret;
 	if (!word)
 		return 0;
+	kernel_binding = rk_mpp_job_find_kernel_binding(job, index);
+	if (kernel_binding) {
+		if (*word != lower_32_bits(kernel_binding->iova)) {
+			rk_mpp_job_reject_reg(job, index, 0, NULL, -ERANGE);
+			return -ERANGE;
+		}
+		return 0;
+	}
 	binding = rk_mpp_job_find_reg_binding(job, index);
 	if (binding) {
-		ret = rk_mpp_import_iova_at_offset(binding->import,
-						   binding->offset, &iova);
+		ret = rk_mpp_job_iova_at_offset(job, index, binding->import,
+						binding->offset, &iova);
 		if (ret) {
 			rk_mpp_job_reject_reg(job, index, binding->offset,
 					      binding->import, ret);
@@ -9773,7 +10143,8 @@ static int rk_mpp_job_translate_reg(struct rk_mpp_job *job, u32 index)
 	if (IS_ERR(import))
 		return PTR_ERR(import);
 
-	ret = rk_mpp_import_iova_at_offset(import, embedded_offset, &iova);
+	ret = rk_mpp_job_iova_at_offset(job, index, import, embedded_offset,
+					&iova);
 	if (ret) {
 		rk_mpp_job_reject_reg(job, index, embedded_offset, import, ret);
 		rk_mpp_import_put(import);
@@ -9855,8 +10226,8 @@ static int rk_mpp_job_apply_reg_offsets(struct rk_mpp_job *job)
 					      binding->import, -EOVERFLOW);
 			return -EOVERFLOW;
 		}
-		ret = rk_mpp_import_iova_at_offset(binding->import, offset,
-						   &iova);
+		ret = rk_mpp_job_iova_at_offset(job, index, binding->import,
+						offset, &iova);
 		if (ret) {
 			rk_mpp_job_reject_reg(job, index, offset,
 					      binding->import, ret);
@@ -9903,9 +10274,23 @@ static bool rk_mpp_job_rkvdec_rcb_enabled(struct rk_mpp_job *job)
 	return width >= job->hw->rcb_min_width;
 }
 
+static const struct rk_mpp_rcb_desc *
+rk_mpp_hw_find_rcb_desc(const struct rk_mpp_hw *hw, u32 index)
+{
+	u32 i;
+
+	for (i = 0; i < hw->rcb_count; i++) {
+		if (hw->rcb_descs[i].index == index)
+			return &hw->rcb_descs[i];
+	}
+
+	return NULL;
+}
+
 static int rk_mpp_job_apply_rcb_info(struct rk_mpp_job *job)
 {
 	struct rk_mpp_reg_image *image = &job->reg_image;
+	DECLARE_BITMAP(used, RK_MPP_MAX_RCB_ELEMS) = {};
 	dma_addr_t rcb_iova;
 	u32 rcb_offset = 0;
 	u32 i;
@@ -9921,7 +10306,9 @@ static int rk_mpp_job_apply_rcb_info(struct rk_mpp_job *job)
 
 	for (i = 0; i < image->rcb_count; i++) {
 		const struct rk_mpp_rcb_desc *desc = &image->rcb_descs[i];
+		const struct rk_mpp_rcb_desc *trusted;
 		u32 max_words = rk_mpp_client_reg_words(job->client_type);
+		u32 trusted_index;
 		u32 next_offset;
 
 		/*
@@ -9932,9 +10319,21 @@ static int rk_mpp_job_apply_rcb_info(struct rk_mpp_job *job)
 		 * out-of-range descriptor otherwise killed every later job on
 		 * that session. The BSP skips these (mpp_rkvdec2.c).
 		 */
-		if (desc->index >= max_words)
+		trusted = rk_mpp_hw_find_rcb_desc(job->hw, desc->index);
+		if (desc->index >= max_words || !trusted || !desc->size ||
+		    desc->size > trusted->size)
 			continue;
-		if (check_add_overflow(rcb_offset, desc->size, &next_offset) ||
+		trusted_index = trusted - job->hw->rcb_descs;
+		if (test_bit(trusted_index, used))
+			continue;
+		/*
+		 * The size supplied by userspace describes its expected workload, not
+		 * a hardware access limit. Reserve the DT-trusted maximum so a short
+		 * request cannot place the register at the end of the allocation and
+		 * leave the engine free to run beyond it. Duplicate register entries
+		 * are ignored rather than consuming another trusted extent.
+		 */
+		if (check_add_overflow(rcb_offset, trusted->size, &next_offset) ||
 		    next_offset > job->hw->rcb_size)
 			continue;
 		if (check_add_overflow(job->hw->rcb_iova,
@@ -9953,7 +10352,12 @@ static int rk_mpp_job_apply_rcb_info(struct rk_mpp_job *job)
 			return ret;
 		}
 
+		ret = rk_mpp_job_record_kernel_binding(job, desc->index,
+						       rcb_iova);
+		if (ret)
+			return ret;
 		image->regs[desc->index] = lower_32_bits(rcb_iova);
+		__set_bit(trusted_index, used);
 		rcb_offset = next_offset;
 	}
 
@@ -10397,6 +10801,15 @@ static int rk_mpp_job_translate_reg_image(struct rk_mpp_job *job)
 	image->fail_index = -1;
 
 	if (job->flags & MPP_FLAGS_REG_FD_NO_TRANS) {
+		/*
+		 * SET_REG_ADDR_OFFSET is part of the register-image contract, not
+		 * an fd-translation side effect. Apply it to caller-supplied IOVAs
+		 * too, then validate the final addresses against retained imports.
+		 * The forward port silently skipped these offsets in NO_TRANS mode.
+		 */
+		ret = rk_mpp_job_apply_reg_offsets(job);
+		if (ret)
+			return ret;
 		ret = rk_mpp_job_apply_rcb_info(job);
 		if (ret)
 			return ret;
@@ -11623,7 +12036,10 @@ static void rk_mpp_hw_power_off(struct rk_mpp_hw *hw)
 	 * acquiring it here means no handler is mid-MMIO when they go down.
 	 */
 	raw_spin_lock_irqsave(&hw->regs_lock, flags);
-	hw->regs_live_count--;
+	if (WARN_ON_ONCE(!hw->regs_live_count))
+		hw->regs_live_count = 0;
+	else
+		hw->regs_live_count--;
 	raw_spin_unlock_irqrestore(&hw->regs_lock, flags);
 
 	clk_bulk_disable_unprepare(hw->num_clks, hw->clks);
@@ -11653,10 +12069,18 @@ static bool rk_mpp_hw_genpd_is_off(struct rk_mpp_hw *hw)
  */
 static bool rk_mpp_hw_terminal_drain_power(struct rk_mpp_hw *hw)
 {
+	unsigned long flags;
 	int ret = 0;
 
 	rk_mpp_hw_deactivate_aux_irqs(hw);
 	while (atomic_dec_if_positive(&hw->power_count) >= 0) {
+		/* Match normal power-off: retract MMIO before gating clocks. */
+		raw_spin_lock_irqsave(&hw->regs_lock, flags);
+		if (WARN_ON_ONCE(!hw->regs_live_count))
+			hw->regs_live_count = 0;
+		else
+			hw->regs_live_count--;
+		raw_spin_unlock_irqrestore(&hw->regs_lock, flags);
 		clk_bulk_disable_unprepare(hw->num_clks, hw->clks);
 		ret = pm_runtime_put_sync_suspend(hw->dev);
 		if (ret < 0)
@@ -13472,6 +13896,35 @@ rk_mpp_hard_fault_owner(struct list_head *fault_hws,
 	return fallback ?: source;
 }
 
+static bool rk_mpp_hard_fault_descriptor_iova(struct rk_mpp_hw *hw,
+					      u32 *descriptor_iova)
+{
+	unsigned long flags;
+	bool valid = false;
+
+	if (!descriptor_iova || !rk_mpp_rkvdec2_hard_ccu_enabled(hw) ||
+	    !rk_mpp_hw_reg_range_valid(hw, RK_MPP_RKVDEC_LINK_REGION,
+				       RK_MPP_RKVDEC_LINK_CFG_ADDR_BASE,
+				       sizeof(u32)))
+		return false;
+
+	/*
+	 * The IOMMU callback races completion and timeout power-off.  Reading a
+	 * gated RK3588 register file can stall the interconnect, so hold the same
+	 * live-MMIO gate as the normal hard-IRQ dispatcher.
+	 */
+	raw_spin_lock_irqsave(&hw->regs_lock, flags);
+	if (hw->regs_live_count) {
+		*descriptor_iova = readl_relaxed(
+			hw->regs[RK_MPP_RKVDEC_LINK_REGION] +
+			RK_MPP_RKVDEC_LINK_CFG_ADDR_BASE);
+		valid = true;
+	}
+	raw_spin_unlock_irqrestore(&hw->regs_lock, flags);
+
+	return valid;
+}
+
 static int rk_mpp_iommu_fault_handler(struct iommu_domain *domain,
 				      struct device *iommu_dev,
 				      unsigned long iova, int status,
@@ -13491,16 +13944,8 @@ static int rk_mpp_iommu_fault_handler(struct iommu_domain *domain,
 					    iommu_dev);
 	if (source) {
 		target = source;
-		if (rk_mpp_rkvdec2_hard_ccu_enabled(source) &&
-		    rk_mpp_hw_reg_range_valid(source,
-					      RK_MPP_RKVDEC_LINK_REGION,
-					      RK_MPP_RKVDEC_LINK_CFG_ADDR_BASE,
-					      sizeof(u32))) {
-			descriptor_iova =
-				readl_relaxed(source->regs[RK_MPP_RKVDEC_LINK_REGION] +
-					      RK_MPP_RKVDEC_LINK_CFG_ADDR_BASE);
-			descriptor_valid = true;
-		}
+		descriptor_valid = rk_mpp_hard_fault_descriptor_iova(
+			source, &descriptor_iova);
 		target = rk_mpp_hard_fault_owner(&srv->fault_hws, source,
 						 descriptor_iova, descriptor_valid);
 		rk_mpp_hw_get(target);
@@ -15728,6 +16173,7 @@ static int rk_mpp_session_poll_irq(struct rk_mpp_session *session,
 {
 	struct rk_mpp_rkvenc_poll_slice_cfg cfg = {};
 	bool copy_slices = false;
+	bool progressed = false;
 	bool req_validated = false;
 	int ret;
 
@@ -15781,6 +16227,8 @@ static int rk_mpp_session_poll_irq(struct rk_mpp_session *session,
 		if (!ret) {
 			bool last = slice_info & RK_MPP_RKVENC_SLICE_LAST;
 
+			progressed = true;
+
 			if (copy_slices && cfg.count_ret < cfg.count_max) {
 				ret = rk_mpp_poll_irq_put_slice(req,
 							       cfg.count_ret,
@@ -15794,8 +16242,10 @@ static int rk_mpp_session_poll_irq(struct rk_mpp_session *session,
 
 			rk_mpp_job_put(job);
 
-			if (last)
-				return rk_mpp_session_poll_job(session, flags);
+			if (last) {
+				ret = rk_mpp_session_poll_job(session, flags);
+				return rk_mpp_poll_interrupt_result(ret, progressed);
+			}
 			if (copy_slices && cfg.count_ret >= cfg.count_max)
 				return 0;
 			continue;
@@ -15803,7 +16253,8 @@ static int rk_mpp_session_poll_irq(struct rk_mpp_session *session,
 
 		if (ret == -ENODATA || (ret == -EAGAIN && done_before_pop)) {
 			rk_mpp_job_put(job);
-			return rk_mpp_session_poll_job(session, flags);
+			ret = rk_mpp_session_poll_job(session, flags);
+			return rk_mpp_poll_interrupt_result(ret, progressed);
 		}
 
 		/*
@@ -15845,7 +16296,7 @@ static int rk_mpp_session_poll_irq(struct rk_mpp_session *session,
 					       atomic64_read(&session->poll_seq) !=
 					       seq);
 		if (ret)
-			return ret;
+			return rk_mpp_poll_interrupt_result(ret, progressed);
 	}
 }
 
@@ -15868,6 +16319,8 @@ static int rk_mpp_job_add_request(struct rk_mpp_session *session,
 	 * failing silently.
 	 */
 	if (job->req_cnt >= RK_MPP_MAX_MSG_NUM)
+		ret = -EINVAL;
+	else if (rk_mpp_job_check_poll_request(job, req->cmd))
 		ret = -EINVAL;
 	else if (req->size > RK_MPP_MAX_JOB_PAYLOAD)
 		ret = -ENOMEM;
@@ -15954,6 +16407,7 @@ static int rk_mpp_job_session_status(struct rk_mpp_job *job)
 static int rk_mpp_execute_jobs(struct rk_mpp_batch_state *batch)
 {
 	struct rk_mpp_job *job;
+	bool poll_progress = false;
 	bool submitted = false;
 	int ret;
 
@@ -16003,13 +16457,12 @@ static int rk_mpp_execute_jobs(struct rk_mpp_batch_state *batch)
 							ret, 0, job->req_cnt);
 				goto rejected;
 			}
+			submitted = true;
 		}
 	}
 
 	ret = 0;
 	list_for_each_entry(job, &batch->jobs, link) {
-		if (job->set_cnt)
-			submitted = true;
 		if (job->poll_cnt) {
 			int poll_ret;
 
@@ -16034,6 +16487,10 @@ static int rk_mpp_execute_jobs(struct rk_mpp_batch_state *batch)
 							job->poll_req.cmd);
 			if (poll_ret && !ret)
 				ret = poll_ret;
+			if (!poll_ret)
+				poll_progress = true;
+			if (poll_ret == -ERESTARTSYS || poll_ret == -EINTR)
+				break;
 		}
 	}
 
@@ -16042,11 +16499,13 @@ static int rk_mpp_execute_jobs(struct rk_mpp_batch_state *batch)
 	 * re-submits every job this batch already put on the hardware: the
 	 * frame gets encoded twice into the same bitstream buffer and the
 	 * duplicate is never reaped, permanently offsetting the session's
-	 * completion stream.  A batch that only polled can safely restart, so
-	 * narrow the conversion to one that also submitted.
+	 * completion stream. Poll success is destructive too: it consumes a
+	 * completion or slice record, so restarting after an earlier successful
+	 * poll loses that result. Preserve restart semantics only while the whole
+	 * ioctl is still side-effect free.
 	 */
-	if (ret == -ERESTARTSYS && submitted)
-		ret = -EINTR;
+	ret = rk_mpp_poll_interrupt_result(ret,
+					   submitted || poll_progress);
 
 	return ret;
 
