@@ -284,11 +284,11 @@ int rga_mpi_commit(struct rga_mpi_job_t *mpi_job)
 
 err_put_request:
 	if ((mpi_job->dma_buf_src0 != NULL) && (mpi_cmd.src.yrgb_addr > 0))
-		rga_mm_release_buffer(mpi_cmd.src.yrgb_addr);
+		rga_mm_release_buffer(mpi_cmd.src.yrgb_addr, NULL);
 	if ((mpi_job->dma_buf_src1 != NULL) && (mpi_cmd.pat.yrgb_addr > 0))
-		rga_mm_release_buffer(mpi_cmd.pat.yrgb_addr);
+		rga_mm_release_buffer(mpi_cmd.pat.yrgb_addr, NULL);
 	if ((mpi_job->dma_buf_dst != NULL) && (mpi_cmd.dst.yrgb_addr > 0))
-		rga_mm_release_buffer(mpi_cmd.dst.yrgb_addr);
+		rga_mm_release_buffer(mpi_cmd.dst.yrgb_addr, NULL);
 
 err_release_rwsem:
 	up_read(&request->session->release_rwsem);
@@ -752,7 +752,8 @@ err_free_external_buffer:
 	return ret;
 }
 
-static long rga_ioctl_release_buffer(unsigned long arg)
+static long rga_ioctl_release_buffer(unsigned long arg,
+				     struct rga_session *session)
 {
 	int i;
 	int ret = 0;
@@ -797,7 +798,7 @@ static long rga_ioctl_release_buffer(unsigned long arg)
 		if (DEBUGGER_EN(MSG))
 			rga_log("release buffer handle[%d]\n", external_buffer[i].handle);
 
-		ret = rga_mm_release_buffer(external_buffer[i].handle);
+		ret = rga_mm_release_buffer(external_buffer[i].handle, session);
 		if (ret < 0) {
 			rga_err("buffer[%d] mm release buffer failed! handle = %d\n",
 			       i, external_buffer[i].handle);
@@ -1153,7 +1154,7 @@ static long rga_ioctl(struct file *file, uint32_t cmd, unsigned long arg)
 	case RGA_IOC_RELEASE_BUFFER:
 		rga_power_enable_all();
 
-		ret = rga_ioctl_release_buffer(arg);
+		ret = rga_ioctl_release_buffer(arg, session);
 
 		rga_power_disable_all();
 

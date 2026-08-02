@@ -3259,7 +3259,7 @@ FREE_INTERNAL_BUFFER:
 	return ret;
 }
 
-int rga_mm_release_buffer(uint32_t handle)
+int rga_mm_release_buffer(uint32_t handle, struct rga_session *session)
 {
 	struct rga_mm *mm;
 	struct rga_internal_buffer *internal_buffer;
@@ -3280,6 +3280,20 @@ int rga_mm_release_buffer(uint32_t handle)
 
 		mutex_unlock(&mm->lock);
 		return -ENOENT;
+	}
+
+	/*
+	 * Handles are a single global idr, so without this any /dev/rga opener
+	 * could release a handle another session imported -- the same
+	 * unauthenticated-put shape as MPP_CMD_RELEASE_FD. In-kernel callers
+	 * pass NULL and keep the old unchecked behaviour.
+	 */
+	if (session && internal_buffer->session != session) {
+		rga_err("handle[%d] does not belong to this session\n",
+			(int)handle);
+
+		mutex_unlock(&mm->lock);
+		return -EPERM;
 	}
 
 	if (DEBUGGER_EN(MM)) {
