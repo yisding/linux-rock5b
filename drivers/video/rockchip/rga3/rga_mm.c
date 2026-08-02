@@ -1265,6 +1265,16 @@ rga_mm_lookup_external(struct rga_mm *mm_session,
 		break;
 	case RGA_PHYSICAL_ADDRESS:
 		idr_for_each_entry(&mm_session->memory_idr, temp_buffer, id) {
+			/*
+			 * Match only against buffers of the same kind. Every
+			 * non-contiguous import leaves phys_addr at 0, so
+			 * without this a lookup for physical address 0 returned
+			 * the first unrelated buffer in the global idr -- and
+			 * the caller took a reference on someone else's memory.
+			 */
+			if (temp_buffer->type != RGA_PHYSICAL_ADDRESS)
+				continue;
+
 			if (temp_buffer->phys_addr == external_buffer->memory) {
 				output_buffer = temp_buffer;
 				break;
@@ -1274,6 +1284,9 @@ rga_mm_lookup_external(struct rga_mm *mm_session,
 		break;
 	case RGA_DMA_BUFFER_PTR:
 		idr_for_each_entry(&mm_session->memory_idr, temp_buffer, id) {
+			if (temp_buffer->type != RGA_DMA_BUFFER_PTR)
+				continue;
+
 			if (temp_buffer->dma_buffer == NULL)
 				continue;
 
@@ -3171,6 +3184,15 @@ int rga_mm_import_buffer(struct rga_external_buffer *external_buffer,
 	internal_buffer = rga_mm_lookup_external(mm, external_buffer, current->mm);
 	if (!IS_ERR_OR_NULL(internal_buffer)) {
 		kref_get(&internal_buffer->refcount);
+		internal_buffer->import_cnt++;
+		/*
+		 * Adopt an orphaned buffer. rga_mm_release_buffer() clears the
+		 * owner when the last import reference goes away, so a buffer
+		 * that a job still referenced could otherwise sit unowned and be
+		 * skipped by every session-teardown walk.
+		 */
+		if (!internal_buffer->session)
+			internal_buffer->session = session;
 
 		mutex_unlock(&mm->lock);
 
@@ -3197,6 +3219,7 @@ int rga_mm_import_buffer(struct rga_external_buffer *external_buffer,
 
 	kref_init(&internal_buffer->refcount);
 	internal_buffer->session = session;
+	internal_buffer->import_cnt = 1;
 
 	mutex_lock(&mm->lock);
 	/*
@@ -3265,15 +3288,26 @@ int rga_mm_release_buffer(uint32_t handle)
 	}
 
 	/*
-	 * The import reference is being surrendered here, so the buffer is no
-	 * longer owned by any session. Clearing this matters because
-	 * rga_mm_session_release_buffer() treats a refcount of 1 on a buffer
-	 * it still owns as "the last reference is mine" and frees it in place.
-	 * Handles are global, so without this a session could import, hand the
-	 * handle to a job in another session, release it, and then free the
-	 * buffer out from under that still-running job on close.
+	 * Surrender one import reference. Ownership is dropped only when the
+	 * last one goes, which matters in both directions:
+	 *
+	 * Clearing it at all is what stops rga_mm_session_release_buffer()
+	 * treating a refcount of 1 on a buffer it still owns as "the last
+	 * reference is mine" and freeing it in place -- handles are global, so
+	 * a session could import, hand the handle to a job in another session,
+	 * release its own, and free the buffer under that running job on close.
+	 *
+	 * Clearing it only on the *last* import is what stops the opposite
+	 * failure: imports are de-duplicated, so releasing one of several left
+	 * the buffer unowned while an import reference was still outstanding,
+	 * and every session-teardown walk then skipped it -- leaking the
+	 * buffer, its pinned pages, its mapping and its mm reference for the
+	 * lifetime of the driver.
 	 */
-	internal_buffer->session = NULL;
+	if (internal_buffer->import_cnt)
+		internal_buffer->import_cnt--;
+	if (!internal_buffer->import_cnt)
+		internal_buffer->session = NULL;
 
 	kref_put(&internal_buffer->refcount, rga_mm_kref_release_buffer);
 
@@ -3314,10 +3348,17 @@ int rga_mm_session_release_buffer(struct rga_session *session)
 		 * and freeing, so a surviving reference is never left pointing
 		 * at freed memory.
 		 */
-		if (kref_read(&buffer->refcount) > 1) {
-			rga_err("[tgid:%d] handle[%d] still referenced at exit (refcount=%u), dropping session reference only\n",
+		/*
+		 * The session may hold more than one import reference on the
+		 * same buffer, because imports are de-duplicated. Give back
+		 * exactly what it took.
+		 */
+		if (kref_read(&buffer->refcount) > buffer->import_cnt) {
+			uint32_t n = buffer->import_cnt;
+
+			rga_err("[tgid:%d] handle[%d] still referenced at exit (refcount=%u, imports=%u), dropping session references only\n",
 			       session->tgid, buffer->handle,
-			       kref_read(&buffer->refcount));
+			       kref_read(&buffer->refcount), n);
 			/*
 			 * The session is going away; detach it so the surviving
 			 * reference does not dereference the freed session and a
@@ -3325,12 +3366,15 @@ int rga_mm_session_release_buffer(struct rga_session *session)
 			 * for the owner here.
 			 */
 			buffer->session = NULL;
+			buffer->import_cnt = 0;
 			/*
-			 * refcount > 1, so this only decrements: it never runs
-			 * rga_mm_kref_release_buffer() and therefore never drops
+			 * refcount > n, so these only decrement: they never run
+			 * rga_mm_kref_release_buffer() and therefore never drop
 			 * mm->lock -- safe to call inside idr_for_each_entry().
 			 */
-			kref_put(&buffer->refcount, rga_mm_kref_release_buffer);
+			while (n--)
+				kref_put(&buffer->refcount,
+					 rga_mm_kref_release_buffer);
 		} else {
 			rga_err("[tgid:%d] Destroy handle[%d] when the user exits\n",
 			       session->tgid, buffer->handle);

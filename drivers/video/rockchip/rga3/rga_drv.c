@@ -702,6 +702,29 @@ static long rga_ioctl_import_buffer(unsigned long arg, struct rga_session *sessi
 			rga_dump_external_buffer(&external_buffer[i]);
 		}
 
+		/*
+		 * Userspace may only name memory it can already reach: a
+		 * dma-buf fd or one of its own virtual addresses.
+		 *
+		 * RGA_DMA_BUFFER_PTR takes `memory` as a kernel `struct dma_buf *`
+		 * and dereferences it (get_dma_buf(), then an indirect call
+		 * through dmabuf->ops->attach), and RGA_PHYSICAL_ADDRESS takes it
+		 * as a physical address whose only check is that it is linear-
+		 * mapped RAM -- which every kernel text, data and page-table page
+		 * satisfies. Both types exist for the in-kernel rga_mpi_commit()
+		 * and rga_kernel_commit() callers, which pass trusted values;
+		 * neither is meaningful from an ioctl.
+		 */
+		if (external_buffer[i].type != RGA_DMA_BUFFER &&
+		    external_buffer[i].type != RGA_VIRTUAL_ADDRESS) {
+			rga_err("buffer[%d] unsupported import type %s(0x%x)\n",
+				i, rga_get_memory_type_str(external_buffer[i].type),
+				external_buffer[i].type);
+			ret = -EOPNOTSUPP;
+
+			goto err_free_external_buffer;
+		}
+
 		ret = rga_mm_import_buffer(&external_buffer[i], session);
 		if (ret <= 0) {
 			rga_err("buffer[%d] mm import buffer failed! memory = 0x%lx, type = %s(0x%x)\n",
@@ -808,7 +831,8 @@ static long rga_ioctl_request_create(unsigned long arg, struct rga_session *sess
 	return 0;
 }
 
-static long rga_ioctl_request_submit(unsigned long arg, bool run_enbale)
+static long rga_ioctl_request_submit(unsigned long arg, bool run_enbale,
+				     struct rga_session *session)
 {
 	int ret = 0;
 	struct rga_pending_request_manager *request_manager = NULL;
@@ -833,7 +857,7 @@ static long rga_ioctl_request_submit(unsigned long arg, bool run_enbale)
 	if (DEBUGGER_EN(MSG))
 		rga_log("config request id = %d", user_request.id);
 
-	request = rga_request_config(&user_request);
+	request = rga_request_config(&user_request, session);
 	if (IS_ERR_OR_NULL(request)) {
 		rga_err("request[%d] config failed!\n", user_request.id);
 		return -EFAULT;
@@ -860,7 +884,8 @@ static long rga_ioctl_request_submit(unsigned long arg, bool run_enbale)
 	return ret;
 }
 
-static long rga_ioctl_request_cancel(unsigned long arg)
+static long rga_ioctl_request_cancel(unsigned long arg,
+				     struct rga_session *session)
 {
 	uint32_t id;
 	struct rga_pending_request_manager *request_manager;
@@ -887,6 +912,18 @@ static long rga_ioctl_request_cancel(unsigned long arg)
 		rga_err("can not find request from id[%d]", id);
 		mutex_unlock(&request_manager->lock);
 		return -EINVAL;
+	}
+
+	/*
+	 * Ids are global and guessable, and this handler previously took no
+	 * session at all, so any /dev/rga opener could retire another
+	 * process's in-flight request -- freeing the task_list its running job
+	 * still borrows.
+	 */
+	if (session && request->session != session) {
+		rga_err("id[%d] does not belong to this session\n", id);
+		mutex_unlock(&request_manager->lock);
+		return -EPERM;
 	}
 
 	/* Retire the request's initial reference (idempotent). */
@@ -925,7 +962,7 @@ static long rga_ioctl_blit(unsigned long arg, uint32_t cmd, struct rga_session *
 		goto err_free_request_by_id;
 	}
 
-	request = rga_request_config(&user_request);
+	request = rga_request_config(&user_request, session);
 	if (IS_ERR(request)) {
 		rga_err("ID[%d]: config failed!\n", user_request.id);
 		ret = -EFAULT;
@@ -968,7 +1005,15 @@ err_free_request_by_id:
 		return -EINVAL;
 	}
 
-	rga_request_free(request);
+	/*
+	 * Retire through the refcount, never rga_request_free(). That is the
+	 * raw destructor -- it idr_removes, kfrees task_list and kfrees the
+	 * request without consulting the kref -- while rga_request_config()
+	 * holds a reference across a sleeping copy_from_user(). A concurrent
+	 * config on this id would then walk, write and kfree through freed
+	 * memory. Every other retire path in the driver uses this helper.
+	 */
+	rga_request_release_ref(request);
 
 	mutex_unlock(&request_manager->lock);
 
@@ -1120,17 +1165,17 @@ static long rga_ioctl(struct file *file, uint32_t cmd, unsigned long arg)
 		break;
 
 	case RGA_IOC_REQUEST_SUBMIT:
-		ret = rga_ioctl_request_submit(arg, true);
+		ret = rga_ioctl_request_submit(arg, true, session);
 
 		break;
 
 	case RGA_IOC_REQUEST_CONFIG:
-		ret = rga_ioctl_request_submit(arg, false);
+		ret = rga_ioctl_request_submit(arg, false, session);
 
 		break;
 
 	case RGA_IOC_REQUEST_CANCEL:
-		ret = rga_ioctl_request_cancel(arg);
+		ret = rga_ioctl_request_cancel(arg, session);
 
 		break;
 
