@@ -1376,6 +1376,54 @@ struct rk_rga_session {
 	bool service_linked;
 };
 
+/*
+ * Rejection diagnostics.
+ *
+ * RGA has 121 -EINVAL and 221 -EOPNOTSUPP return sites, and
+ * rk_rga_request_ioctl_ret() normalizes every preparation failure to -EFAULT
+ * for BSP ioctl-wrapper compatibility (ABI.rst). That normalization is
+ * deliberate and stays, but it left an operator with an incremented counter
+ * and nothing else for ~340 distinct causes -- no dev_dbg anywhere in the
+ * driver, no event ring, while the sibling MPP driver has both and the vendor
+ * driver at least dumps the failing request.
+ *
+ * This ring records the real errno before it is flattened, plus the task index
+ * and, for the case that matters most, each backend's individual verdict:
+ * "no core matched" is otherwise indistinguishable from any other -EFAULT
+ * even though it means the two validators disagreed for different reasons.
+ */
+enum rk_rga_debug_event_type {
+	RK_RGA_DEBUG_REJECT_VALIDATE,
+	RK_RGA_DEBUG_REJECT_CONFIG,
+	RK_RGA_DEBUG_REJECT_SUBMIT,
+	RK_RGA_DEBUG_REJECT_EMIT,
+	RK_RGA_DEBUG_JOB_FAIL,
+};
+
+#define RK_RGA_DEBUG_EVENT_COUNT	256
+#define RK_RGA_DEBUG_TRACE_REJECT	BIT(0)
+#define RK_RGA_DEBUG_TRACE_JOB		BIT(1)
+#define RK_RGA_DEBUG_TRACE_DEFAULT	RK_RGA_DEBUG_TRACE_REJECT
+
+struct rk_rga_debug_event {
+	u64 seq;
+	u64 timestamp_ns;
+	s32 result;
+	s32 rga3_result;
+	s32 rga2_result;
+	/*
+	 * Correlation handles only. Printed with %p, which the kernel hashes,
+	 * so a reader can group events by job without the ring leaking kernel
+	 * addresses; RGA jobs and sessions carry no id of their own.
+	 */
+	const void *job;
+	const void *session;
+	u32 task_index;
+	u32 render_mode;
+	u8 type;
+	char hw_name[20];
+};
+
 struct rk_rga_service {
 	struct miscdevice miscdev;
 	struct dentry *debugfs_root;
@@ -1388,6 +1436,12 @@ struct rk_rga_service {
 	struct list_head sessions;
 	struct list_head fault_hws;
 	struct rga_hw_versions_t hw_versions;
+	struct rk_rga_debug_event *debug_events;
+	raw_spinlock_t debug_lock; /* debug_events ring, taken in IRQ context */
+	u64 debug_event_next_seq;
+	u32 debug_event_head;
+	u32 debug_event_count;
+	u32 debug_trace_mask;
 	u32 hw_count;
 	u32 core_select_seq;
 	spinlock_t fence_lock;
@@ -1448,6 +1502,72 @@ static void rk_rga_service_state_init(struct rk_rga_service *rga)
 	INIT_LIST_HEAD(&rga->sessions);
 	INIT_LIST_HEAD(&rga->fault_hws);
 	spin_lock_init(&rga->fence_lock);
+	raw_spin_lock_init(&rga->debug_lock);
+	rga->debug_trace_mask = RK_RGA_DEBUG_TRACE_DEFAULT;
+}
+
+static const char *rk_rga_debug_event_name(enum rk_rga_debug_event_type type)
+{
+	switch (type) {
+	case RK_RGA_DEBUG_REJECT_VALIDATE:
+		return "reject-validate";
+	case RK_RGA_DEBUG_REJECT_CONFIG:
+		return "reject-config";
+	case RK_RGA_DEBUG_REJECT_SUBMIT:
+		return "reject-submit";
+	case RK_RGA_DEBUG_REJECT_EMIT:
+		return "reject-emit";
+	case RK_RGA_DEBUG_JOB_FAIL:
+		return "job-fail";
+	default:
+		return "unknown";
+	}
+}
+
+static u32 rk_rga_debug_event_trace_bit(enum rk_rga_debug_event_type type)
+{
+	return type == RK_RGA_DEBUG_JOB_FAIL ? RK_RGA_DEBUG_TRACE_JOB :
+					       RK_RGA_DEBUG_TRACE_REJECT;
+}
+
+static void rk_rga_debug_record(struct rk_rga_service *rga,
+				enum rk_rga_debug_event_type type,
+				struct rk_rga_job *job, u32 task_index,
+				int result, int rga3_result, int rga2_result)
+{
+	struct rk_rga_debug_event event = {};
+	unsigned long flags;
+
+	if (!rga || !rga->debug_events)
+		return;
+	if (!(READ_ONCE(rga->debug_trace_mask) &
+	      rk_rga_debug_event_trace_bit(type)))
+		return;
+
+	event.timestamp_ns = ktime_get_ns();
+	event.type = type;
+	event.result = result;
+	event.rga3_result = rga3_result;
+	event.rga2_result = rga2_result;
+	event.task_index = task_index;
+	if (job) {
+		event.job = job;
+		event.session = READ_ONCE(job->session);
+		if (task_index < job->task_count && job->tasks)
+			event.render_mode = job->tasks[task_index].render_mode;
+		if (job->hw)
+			strscpy(event.hw_name, dev_name(job->hw->dev),
+				sizeof(event.hw_name));
+	}
+
+	raw_spin_lock_irqsave(&rga->debug_lock, flags);
+	event.seq = ++rga->debug_event_next_seq;
+	rga->debug_events[rga->debug_event_head] = event;
+	rga->debug_event_head = (rga->debug_event_head + 1) %
+				RK_RGA_DEBUG_EVENT_COUNT;
+	if (rga->debug_event_count < RK_RGA_DEBUG_EVENT_COUNT)
+		rga->debug_event_count++;
+	raw_spin_unlock_irqrestore(&rga->debug_lock, flags);
 }
 
 static int rk_rga_release(struct inode *inode, struct file *file);
@@ -10612,6 +10732,50 @@ static void rk_rga_request_check_kunit(struct kunit *test)
 
 	user.task_num = RGA_TASK_NUM_MAX;
 	KUNIT_EXPECT_EQ(test, rk_rga_request_check(&user), 0);
+}
+
+static void rk_rga_debug_event_ring_kunit(struct kunit *test)
+{
+	struct rk_rga_service *rga;
+	u32 i;
+
+	rga = rk_rga_kunit_alloc_service(test);
+	KUNIT_ASSERT_NOT_NULL(test, rga);
+	rga->debug_events = kunit_kcalloc(test, RK_RGA_DEBUG_EVENT_COUNT,
+					  sizeof(*rga->debug_events),
+					  GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, rga->debug_events);
+
+	/* The default mask records rejections and not job completions. */
+	rk_rga_debug_record(rga, RK_RGA_DEBUG_REJECT_VALIDATE, NULL, 3,
+			    -EOPNOTSUPP, -EINVAL, -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, rga->debug_event_count, 1U);
+	KUNIT_EXPECT_EQ(test, rga->debug_events[0].result, -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, rga->debug_events[0].rga3_result, -EINVAL);
+	KUNIT_EXPECT_EQ(test, rga->debug_events[0].rga2_result, -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, rga->debug_events[0].task_index, 3U);
+	KUNIT_EXPECT_EQ(test, rga->debug_events[0].seq, 1ULL);
+
+	rk_rga_debug_record(rga, RK_RGA_DEBUG_JOB_FAIL, NULL, 0, -EIO, 0, 0);
+	KUNIT_EXPECT_EQ(test, rga->debug_event_count, 1U);
+
+	rga->debug_trace_mask |= RK_RGA_DEBUG_TRACE_JOB;
+	rk_rga_debug_record(rga, RK_RGA_DEBUG_JOB_FAIL, NULL, 0, -EIO, 0, 0);
+	KUNIT_EXPECT_EQ(test, rga->debug_event_count, 2U);
+
+	/* A full ring wraps and keeps the newest entries. */
+	for (i = 0; i < RK_RGA_DEBUG_EVENT_COUNT; i++)
+		rk_rga_debug_record(rga, RK_RGA_DEBUG_REJECT_CONFIG, NULL, i,
+				    -EINVAL, 0, 0);
+	KUNIT_EXPECT_EQ(test, rga->debug_event_count,
+			(u32)RK_RGA_DEBUG_EVENT_COUNT);
+	KUNIT_EXPECT_EQ(test, rga->debug_event_next_seq,
+			(u64)RK_RGA_DEBUG_EVENT_COUNT + 2);
+
+	/* A NULL ring is tolerated rather than dereferenced. */
+	rga->debug_events = NULL;
+	rk_rga_debug_record(rga, RK_RGA_DEBUG_REJECT_CONFIG, NULL, 0, -EINVAL,
+			    0, 0);
 }
 
 static void rk_rga_request_ioctl_ret_kunit(struct kunit *test)
@@ -19847,6 +20011,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga2_palette_emit_kunit),
 	KUNIT_CASE(rk_rga2_update_palette_emit_kunit),
 	KUNIT_CASE(rk_rga_request_check_kunit),
+	KUNIT_CASE(rk_rga_debug_event_ring_kunit),
 	KUNIT_CASE(rk_rga_request_ioctl_ret_kunit),
 	KUNIT_CASE(rk_rga_request_create_cancel_ioctl_kunit),
 	KUNIT_CASE(rk_rga_request_config_handles_kunit),
@@ -22904,10 +23069,22 @@ static int rk_rga_task_hw_type_mask(struct rk_rga_job *job, u32 task_index,
 			return 0;
 
 		if (rga3_ret != -EOPNOTSUPP)
-			return rga3_ret;
-		if (rga2_ret != -EOPNOTSUPP)
-			return rga2_ret;
-		return -EOPNOTSUPP;
+			ret = rga3_ret;
+		else if (rga2_ret != -EOPNOTSUPP)
+			ret = rga2_ret;
+		else
+			ret = -EOPNOTSUPP;
+		/*
+		 * Both backends refused, usually for two different reasons.
+		 * The caller keeps one errno and the ioctl wrapper then
+		 * flattens that to -EFAULT, so record both verdicts here while
+		 * they still exist -- "no core matched" is the single most
+		 * common thing an operator needs to explain and the hardest to
+		 * distinguish from every other -EFAULT.
+		 */
+		rk_rga_debug_record(job->rga, RK_RGA_DEBUG_REJECT_VALIDATE,
+				    job, task_index, ret, rga3_ret, rga2_ret);
+		return ret;
 	}
 	case RK_RGA_RENDER_COLOR_FILL:
 		if (!job->import_count)
@@ -23077,6 +23254,8 @@ static int rk_rga_backend_start(struct rk_rga_hw *hw, struct rk_rga_job *job)
 	ret = rk_rga_job_emit_cmd(hw, job);
 	if (ret) {
 		atomic_inc(&hw->rga->unsupported_count);
+		rk_rga_debug_record(hw->rga, RK_RGA_DEBUG_REJECT_EMIT, job,
+				    job->current_task, ret, 0, 0);
 		goto err_release;
 	}
 	if (!job->cmd_ready) {
@@ -24619,14 +24798,27 @@ static long rk_rga_ioctl_request_submit(unsigned long arg,
 		return ret;
 
 	ret = rk_rga_request_config(session, &user, run ? &job : NULL);
-	if (ret)
+	if (ret) {
+		/*
+		 * ABI.rst normalizes preparation failures to the BSP wrapper's
+		 * -EFAULT, which is deliberate and stays. Record the real
+		 * errno first: after the wrapper it is the only thing that
+		 * could have distinguished ~340 rejection causes, and it is
+		 * gone.
+		 */
+		rk_rga_debug_record(session->rga, RK_RGA_DEBUG_REJECT_CONFIG,
+				    NULL, 0, ret, 0, 0);
 		return rk_rga_request_ioctl_ret(ret);
+	}
 
 	if (run) {
 		ret = rk_rga_job_submit(session, job, &release_fence_fd,
 					user.sync_mode == RGA_BLIT_ASYNC ?
 					&release_sync_file : NULL);
 		if (ret) {
+			rk_rga_debug_record(session->rga,
+					    RK_RGA_DEBUG_REJECT_SUBMIT, NULL,
+					    0, ret, 0, 0);
 			ret = rk_rga_request_ioctl_ret(ret);
 		} else if (user.sync_mode == RGA_BLIT_ASYNC) {
 			if (release_fence_fd < 0 || !release_sync_file) {
@@ -25264,6 +25456,56 @@ rk_rga_debugfs_create_core_times(const char *prefix,
 	}
 }
 
+static int rk_rga_debug_events_show(struct seq_file *sf, void *unused)
+{
+	struct rk_rga_service *rga = sf->private;
+	struct rk_rga_debug_event *snapshot;
+	unsigned long flags;
+	u32 count;
+	u32 head;
+	u32 i;
+
+	if (!rga->debug_events)
+		return 0;
+
+	/*
+	 * Copy under the lock and format outside it: the ring is written from
+	 * hard-IRQ context, and seq_printf() into a userspace-sized buffer is
+	 * not something to do with a raw spinlock held.
+	 */
+	snapshot = kcalloc(RK_RGA_DEBUG_EVENT_COUNT, sizeof(*snapshot),
+			   GFP_KERNEL);
+	if (!snapshot)
+		return -ENOMEM;
+
+	raw_spin_lock_irqsave(&rga->debug_lock, flags);
+	count = rga->debug_event_count;
+	head = rga->debug_event_head;
+	memcpy(snapshot, rga->debug_events,
+	       RK_RGA_DEBUG_EVENT_COUNT * sizeof(*snapshot));
+	raw_spin_unlock_irqrestore(&rga->debug_lock, flags);
+
+	seq_puts(sf,
+		 "seq\ttime_ns\tevent\tresult\trga3\trga2\ttask\trender\tjob\tsession\thw\n");
+	for (i = 0; i < count; i++) {
+		u32 idx = (head + RK_RGA_DEBUG_EVENT_COUNT - count + i) %
+			  RK_RGA_DEBUG_EVENT_COUNT;
+		struct rk_rga_debug_event *e = &snapshot[idx];
+
+		seq_printf(sf,
+			   "%llu\t%llu\t%s\t%d\t%d\t%d\t%u\t%u\t%p\t%p\t%s\n",
+			   e->seq, e->timestamp_ns,
+			   rk_rga_debug_event_name(e->type), e->result,
+			   e->rga3_result, e->rga2_result, e->task_index,
+			   e->render_mode, e->job, e->session,
+			   e->hw_name[0] ? e->hw_name : "-");
+	}
+	kfree(snapshot);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(rk_rga_debug_events);
+
 static void rk_rga_debugfs_create_route_b(void)
 {
 	struct dentry *dir;
@@ -25283,9 +25525,21 @@ static int rk_rga_runtime_register(void)
 
 	rk_rga_service_state_init(&rk_rga);
 
+	/*
+	 * Allocated before the platform driver so a core probing immediately
+	 * can already record. A failure here is not fatal: rk_rga_debug_record()
+	 * tolerates a NULL ring and the driver simply runs without rejection
+	 * diagnostics.
+	 */
+	rk_rga.debug_events = kcalloc(RK_RGA_DEBUG_EVENT_COUNT,
+				      sizeof(*rk_rga.debug_events), GFP_KERNEL);
+
 	ret = platform_driver_register(&rk_rga_platform_driver);
-	if (ret)
+	if (ret) {
+		kfree(rk_rga.debug_events);
+		rk_rga.debug_events = NULL;
 		return ret;
+	}
 
 	rk_rga.miscdev.minor = MISC_DYNAMIC_MINOR;
 	rk_rga.miscdev.name = "rga";
@@ -25296,6 +25550,10 @@ static int rk_rga_runtime_register(void)
 		goto err_unregister_platform;
 
 	rk_rga.debugfs_root = debugfs_create_dir("rk_rga_rewrite", NULL);
+	debugfs_create_file("events", 0444, rk_rga.debugfs_root, &rk_rga,
+			    &rk_rga_debug_events_fops);
+	debugfs_create_u32("trace_mask", 0644, rk_rga.debugfs_root,
+			   &rk_rga.debug_trace_mask);
 	debugfs_create_u32("hw_count", 0444, rk_rga.debugfs_root,
 			   &rk_rga.hw_count);
 	debugfs_create_atomic_t("ioctl_count", 0444, rk_rga.debugfs_root,
@@ -25391,6 +25649,8 @@ static int rk_rga_runtime_register(void)
 
 err_unregister_platform:
 	platform_driver_unregister(&rk_rga_platform_driver);
+	kfree(rk_rga.debug_events);
+	rk_rga.debug_events = NULL;
 	return ret;
 }
 
@@ -25403,6 +25663,9 @@ static void rk_rga_runtime_unregister(void)
 	debugfs_remove_recursive(rk_rga.debugfs_root);
 	misc_deregister(&rk_rga.miscdev);
 	platform_driver_unregister(&rk_rga_platform_driver);
+	/* After the driver is gone nothing can reach the ring. */
+	kfree(rk_rga.debug_events);
+	rk_rga.debug_events = NULL;
 }
 
 static int __init rk_rga_init(void)
