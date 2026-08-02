@@ -301,7 +301,28 @@ Implemented
   userspace maps it to ``RK_FORMAT_RGBA_8888``.  The path requires MMU-mapped
   source/destination images: modern handle requests use the session import
   table, while legacy direct-buffer requests create job-owned temporary imports
-  from dma-buf fds or user virtual addresses.  It rejects color-key and
+  from dma-buf fds or user virtual addresses.
+
+  **Deviation from the BSP: a single request cannot mix the two buffer
+  provenances.**  All imports reaching one request must be dma-buf backed or
+  all must be userspace-virtual; a mismatch is rejected by
+  ``rk_rga_check_alias_provenance()``.  The restriction exists because alias
+  detection resolves userptr imports through their pinned ``struct page`` set
+  and dma-buf imports through ``iommu_iova_to_phys()``, and the DMA-BUF
+  contract hides the backing pages from importers, so overlap between the two
+  families cannot be proved and the driver fails closed rather than programming
+  an engine over buffers it cannot prove disjoint.  The vendor driver has no
+  such restriction (``rga_mm_get_buffer()`` treats each buffer independently),
+  so ``importbuffer_fd()`` for one image and ``importbuffer_virtualaddr()`` for
+  another in the same task -- for example a V4L2 dma-buf source into a
+  ``malloc``'d destination -- works there and does not here.  The check spans
+  the whole request, not one task, because the import array is shared across
+  its tasks.  Note this failure is normalized to ``-EFAULT`` by the ioctl
+  wrapper like every other preparation failure, so the errno does not
+  distinguish it; ``librga`` callers that need both families must issue them as
+  separate requests.
+
+  It rejects color-key and
   unsupported pattern operations, and supports the 8-bit RGB/YUV plus
   semiplanar 10-bit YUV formats exposed by common ``librga`` and
   ``ffmpeg-rockchip`` blit/scale/convert users.
