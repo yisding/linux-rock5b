@@ -4,7 +4,7 @@ config ROCKCHIP_RGA_REWRITE
 	depends on ARCH_ROCKCHIP
 	depends on !ROCKCHIP_MULTI_RGA
 	depends on !VIDEO_ROCKCHIP_RGA
-	select DMA_SHARED_BUFFER
+	select SYNC_FILE
 	help
 	  ABI-compatible /dev/rga rewrite for RK3588 bring-up. This driver
 	  preserves version/query, import/release, request lifetime, legacy
