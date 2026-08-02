@@ -5,6 +5,13 @@
  * The driver owns /dev/rga and preserves the userspace ioctl surface used by
  * librga.  Buffer import/release, request lifetime, prepared job resource
  * ownership, and the first RK3588 RGA2/RGA3 execution paths are implemented.
+ *
+ * Provenance: an independent implementation written against the Rockchip BSP
+ * driver as a behavioural reference. No BSP source is compiled, adapted, or
+ * copied here; register offsets, bit positions and table contents are
+ * functional facts about the silicon, and the comments that depend on a BSP
+ * contract name the file and function they were derived from. This is not a
+ * Chinese-wall reimplementation and does not claim to be.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -25413,6 +25420,6 @@ module_exit(rk_rga_exit);
 
 MODULE_IMPORT_NS("DMA_BUF");
 MODULE_DESCRIPTION("Minimal Rockchip RGA compatibility rewrite");
-MODULE_AUTHOR("OpenAI");
+MODULE_AUTHOR("Yi Ding <yi.s.ding@gmail.com>");
 MODULE_LICENSE("GPL");
 MODULE_VERSION(RK_RGA_REWRITE_VERSION);
