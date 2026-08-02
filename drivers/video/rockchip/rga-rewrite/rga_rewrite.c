@@ -10239,13 +10239,27 @@ static void rk_rga2_validator_chain_exclusions_kunit(struct kunit *test)
 			-EOPNOTSUPP);
 	KUNIT_EXPECT_FALSE(test, profile.color_key);
 
-	/* Alpha-bitmap carrying OSD must be rejected: both consume task->pat
-	 * and only the alpha-bitmap validator would run.
+	/* An alpha-bitmap task the validator accepts on its own, so the
+	 * rejection below is attributable to the OSD exclusion rather than
+	 * to an earlier field check such as the missing pat address.
 	 */
 	task.color_key_min = 0;
 	task.src_trans_mode = 0;
-	task.alpha_rop_flag = 0;
+	task.pat = rk_rga_kunit_img(0x30000000, RK_RGA_FORMAT_ARGB_5551,
+				    1280, 720);
+	task.bsfilter_flag = 1;
+	task.alpha_rop_flag = RK_RGA2_ALPHA_FLAG_ENABLE |
+			      RK_RGA2_ALPHA_FLAG_PD_ENABLE |
+			      RK_RGA2_ALPHA_FLAG_CAL_MODE |
+			      RK_RGA2_ALPHA_FLAG_REAL_COLOR;
+	task.alpha_rop_mode = 0x1;
+	task.PD_mode = RK_RGA_ALPHA_BLEND_DST_OVER;
 	task.rgba5551_alpha.flags = BIT(0);
+	KUNIT_EXPECT_EQ(test, rk_rga2_validate_bitblt(&task, &profile), 0);
+
+	/* Alpha-bitmap carrying OSD must be rejected: both consume task->pat
+	 * and only the alpha-bitmap validator would run.
+	 */
 	task.osd_info.enable = 1;
 	KUNIT_EXPECT_EQ(test, rk_rga2_validate_bitblt(&task, &profile),
 			-EOPNOTSUPP);
@@ -14776,7 +14790,13 @@ static void rk_rga_dma_mapping_hw_lifetime_kunit(struct kunit *test)
 	init_waitqueue_head(&hw.idle);
 	import = kzalloc_obj(*import, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, import);
-	rk_rga_import_init(import, rga, RK_RGA_IMPORT_DMABUF);
+	/*
+	 * Since the multi-SG rework only userptr imports hold a persistent
+	 * map_hw; a DMA-BUF import with one is WARN territory. The sgt is
+	 * left NULL so detach skips the DMA unmap and the test observes only
+	 * the hw reference drop.
+	 */
+	rk_rga_import_init(import, rga, RK_RGA_IMPORT_USERPTR);
 	import->map_hw = &hw;
 	import->size = 16 * 16 * 4;
 	mutex_lock(&rga->import_lock);
