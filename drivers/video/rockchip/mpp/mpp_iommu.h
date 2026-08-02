@@ -36,6 +36,13 @@ struct mpp_dma_buffer {
 	void *vaddr;
 
 	struct kref ref;
+	/*
+	 * References handed to userspace by MPP_CMD_TRANS_FD_TO_IOVA, guarded
+	 * by dma->list_mutex. MPP_CMD_RELEASE_FD may only give back what it
+	 * took: without this it is an unauthenticated kref_put, and repeating
+	 * one fd in its array drops references belonging to in-flight tasks.
+	 */
+	u32 static_cnt;
 	ktime_t last_used;
 	/* alloc by device */
 	struct device *dev;
