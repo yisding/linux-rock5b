@@ -17106,6 +17106,84 @@ static void rk_rga3_librga_center_rotate_emit_kunit(struct kunit *test)
 			lower_32_bits(task.dst.yrgb_addr + 437ULL * 4ULL));
 }
 
+/*
+ * The overlap_copy path (FBC destination with a non-zero offset) reads the
+ * destination through WIN0 at 1:1 with no rotate flags of its own, so it must
+ * be handed the canvas-oriented window even though the legacy 90/270 wire form
+ * arrives pre-swapped.  Emitting the wire form here walks act_h rows down a
+ * vir_h-row surface.  Both orientations carry ROT_BIT_ROT_90; 270 adds the
+ * mirror bits, which must not change WIN0's geometry.
+ */
+static void rk_rga3_overlap_copy_rotate_emit_kunit(struct kunit *test)
+{
+	static const struct {
+		const char *name;
+		__s32 sina;
+	} orientations[] = {
+		{ "rot90", 65536 },
+		{ "rot270", -65536 },
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(orientations); i++) {
+		u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
+		enum rk_rga_hw_type type = 0;
+		struct rga_req task =
+			rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+						  RK_RGA_FORMAT_RGBA_8888);
+		struct rk_rga_job job = {
+			.tasks = &task,
+			.task_count = 1,
+			.import_count = 2,
+			.cmd_vaddr = cmd,
+			.cmd_size = sizeof(cmd),
+		};
+
+		/* Source is the rotated rectangle: 600 wide, 1000 tall. */
+		task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
+					    600, 1000);
+		/* Destination canvas is 1280x720; the visible rectangle is
+		 * 1000x600 at x=64, submitted pre-swapped as act_w=600,
+		 * act_h=1000.
+		 */
+		task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_RGBA_8888,
+					    1280, 720);
+		task.dst.rd_mode = RK_RGA_FBC_MODE;
+		task.dst.x_offset = 64;
+		task.dst.y_offset = 0;
+		task.dst.act_w = 600;
+		task.dst.act_h = 1000;
+		task.rotate_mode = 1;
+		task.sina = orientations[i].sina;
+		task.cosa = 0;
+		task.yuv2rgb_mode = 0;
+
+		KUNIT_EXPECT_EQ_MSG(test, rk_rga_job_hw_type(&job, &type), 0,
+				    "%s", orientations[i].name);
+		KUNIT_EXPECT_EQ_MSG(test, type, RK_RGA_HW_RGA3, "%s",
+				    orientations[i].name);
+		KUNIT_EXPECT_EQ_MSG(test, rk_rga3_emit_simple_bitblt(&job), 0,
+				    "%s", orientations[i].name);
+		KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+
+		/*
+		 * Canvas orientation: 1000 wide by 600 tall.  The pre-fix
+		 * emitter produced the transposed 600 | (1000 << 16) here.
+		 */
+		KUNIT_EXPECT_EQ_MSG(test,
+				    cmd[RK_RGA3_WIN0_ACT_SIZE_OFFSET / 4],
+				    1000U | (600U << 16), "%s",
+				    orientations[i].name);
+		KUNIT_EXPECT_EQ_MSG(test,
+				    cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
+				    1000U | (600U << 16), "%s",
+				    orientations[i].name);
+		KUNIT_EXPECT_EQ_MSG(test,
+				    cmd[RK_RGA3_WIN0_ACT_OFF_OFFSET / 4], 64U,
+				    "%s", orientations[i].name);
+	}
+}
+
 static void rk_rga3_librga_flip_emit_kunit(struct kunit *test)
 {
 	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
@@ -20012,6 +20090,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga3_librga_rotate_emit_kunit),
 	KUNIT_CASE(rk_rga3_librga_rotate_flip_emit_kunit),
 	KUNIT_CASE(rk_rga3_librga_center_rotate_emit_kunit),
+	KUNIT_CASE(rk_rga3_overlap_copy_rotate_emit_kunit),
 	KUNIT_CASE(rk_rga3_librga_flip_emit_kunit),
 	KUNIT_CASE(rk_rga3_yuv422_rotate_policy_kunit),
 	KUNIT_CASE(rk_rga3_librga_side_border_kunit),
@@ -22565,11 +22644,32 @@ static int rk_rga3_emit_overlap_bitblt(struct rk_rga_job *job,
 				       const struct rga_req *task,
 				       const struct rk_rga3_bitblt_profile *profile)
 {
+	const struct rga_img_info_t *bg = &task->dst;
+	struct rga_img_info_t rotated_bg;
+	u32 bg_dst_w = task->dst.act_w;
+	u32 bg_dst_h = task->dst.act_h;
 	int ret;
 
-	ret = rk_rga3_emit_read_window(job, &task->dst, &profile->dst_fmt,
+	/*
+	 * Legacy 90/270 requests arrive with the destination window
+	 * pre-swapped (dstActW = rect.height), and the validators check it in
+	 * canvas orientation.  WIN0 reads that window at 1:1 with no rotate
+	 * flags of its own, so it has to be handed canvas geometry too --
+	 * otherwise it walks act_h rows down a vir_h-row surface.  WIN1 keeps
+	 * the wire form because it carries rotate_flags and swaps internally.
+	 */
+	if (profile->rotate_flags & RK_RGA3_ROT_BIT_ROT_90) {
+		rotated_bg = task->dst;
+		rotated_bg.act_w = task->dst.act_h;
+		rotated_bg.act_h = task->dst.act_w;
+		bg = &rotated_bg;
+		bg_dst_w = task->dst.act_h;
+		bg_dst_h = task->dst.act_w;
+	}
+
+	ret = rk_rga3_emit_read_window(job, bg, &profile->dst_fmt,
 				       &profile->dst_fmt, profile->dst_mode, 0,
-				       task->dst.act_w, task->dst.act_h,
+				       bg_dst_w, bg_dst_h,
 				       RK_RGA3_WIN0_RD_CTRL_OFFSET, true,
 				       task->yuv2rgb_mode, true);
 	if (ret)
