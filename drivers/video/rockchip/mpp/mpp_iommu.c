@@ -150,6 +150,7 @@ static void mpp_dma_release_buffer(struct kref *ref)
 	buffer->iova = 0;
 	buffer->size = 0;
 	buffer->vaddr = NULL;
+	buffer->static_cnt = 0;
 	buffer->last_used = 0;
 }
 
@@ -214,6 +215,21 @@ int mpp_dma_release_fd(struct mpp_dma_session *dma, int fd)
 	}
 
 	mutex_lock(&dma->list_mutex);
+	/*
+	 * Only give back a reference this ioctl handed out. Without the count
+	 * this is an unauthenticated kref_put: MPP_CMD_RELEASE_FD takes an
+	 * array of up to MPP_MAX_REG_TRANS_NUM fds and never checked that the
+	 * caller owned any of them, so repeating one fd drove a buffer that an
+	 * in-flight task still referenced to zero -- unmapping its IOVA under
+	 * live DMA and then recycling the slot under the task's stale pointer.
+	 */
+	if (!buffer->static_cnt) {
+		mutex_unlock(&dma->list_mutex);
+		dev_err(dev, "fd %d was not imported by this session\n", fd);
+
+		return -EINVAL;
+	}
+	buffer->static_cnt--;
 	kref_put(&buffer->ref, mpp_dma_release_buffer);
 	mutex_unlock(&dma->list_mutex);
 
@@ -281,8 +297,14 @@ struct mpp_dma_buffer *mpp_dma_import_fd(struct mpp_iommu_info *iommu_info,
 	/* Check whether in dma session */
 	buffer = mpp_dma_find_buffer_fd(dma, fd);
 	if (!IS_ERR_OR_NULL(buffer)) {
-		if (kref_get_unless_zero(&buffer->ref))
+		if (kref_get_unless_zero(&buffer->ref)) {
+			if (static_use) {
+				mutex_lock(&dma->list_mutex);
+				buffer->static_cnt++;
+				mutex_unlock(&dma->list_mutex);
+			}
 			return buffer;
+		}
 		dev_dbg(dma->dev, "missing the fd %d\n", fd);
 	}
 
@@ -340,10 +362,13 @@ struct mpp_dma_buffer *mpp_dma_import_fd(struct mpp_iommu_info *iommu_info,
 
 	mutex_lock(&dma->list_mutex);
 	dma->buffer_count++;
-	if (static_use)
+	if (static_use) {
+		buffer->static_cnt = 1;
 		list_add_tail(&buffer->link, &dma->static_list);
-	else
+	} else {
+		buffer->static_cnt = 0;
 		list_add_tail(&buffer->link, &dma->used_list);
+	}
 	mutex_unlock(&dma->list_mutex);
 
 	return buffer;
