@@ -422,6 +422,15 @@ struct rk_mpp_hw {
 	struct rk_mpp_job *timeout_job;
 	u64 active_generation;
 	u64 timeout_generation;
+	/*
+	 * Absolute expiry of the current activation's watchdog, and the
+	 * activation it belongs to. Keyed to the generation rather than to
+	 * timeout_job because the watchdog is legitimately cancelled and
+	 * restored while the same job runs, and a restore must not extend the
+	 * deadline.
+	 */
+	u64 timeout_deadline_generation;
+	unsigned long timeout_deadline;
 	u64 iommu_fault_generation;
 	u64 av1_afbc_armed_generation;
 	u64 av1_afbc_status_generation;
@@ -6710,6 +6719,7 @@ static void rk_mpp_timeout_target_replacement_kunit(struct kunit *test)
 	struct rk_mpp_hw *hw;
 	struct rk_mpp_job *target;
 	struct rk_mpp_job *replacement;
+	unsigned long deadline;
 	int ret;
 
 	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
@@ -6758,6 +6768,28 @@ static void rk_mpp_timeout_target_replacement_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, hw->timeout_generation, 2ULL);
 	KUNIT_EXPECT_EQ(test, refcount_read(&replacement->refs), 2);
 	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&hw->timeout_work));
+
+	/*
+	 * Cancel and restore the watchdog for the same activation, as
+	 * rk_mpp_hw_abort_job() does for a job it does not own. The deadline
+	 * must stay where the activation put it: a restore that re-armed a
+	 * fresh window would let an unrelated session postpone this job's
+	 * watchdog forever.
+	 */
+	deadline = hw->timeout_deadline;
+	KUNIT_EXPECT_EQ(test, hw->timeout_deadline_generation, 2ULL);
+	rk_mpp_hw_cancel_timeout_sync(hw);
+	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_job, NULL);
+	rk_mpp_hw_schedule_timeout(hw);
+	KUNIT_EXPECT_EQ(test, hw->timeout_deadline, deadline);
+	KUNIT_EXPECT_EQ(test, hw->timeout_deadline_generation, 2ULL);
+
+	/* A new activation does start a new window. */
+	hw->active_generation = 3;
+	rk_mpp_hw_cancel_timeout_sync(hw);
+	rk_mpp_hw_schedule_timeout(hw);
+	KUNIT_EXPECT_EQ(test, hw->timeout_deadline_generation, 3ULL);
+
 	rk_mpp_hw_cancel_timeout_sync(hw);
 	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_job, NULL);
 	KUNIT_EXPECT_EQ(test, refcount_read(&replacement->refs), 1);
@@ -12298,7 +12330,9 @@ static void rk_mpp_hw_schedule_timeout(struct rk_mpp_hw *hw)
 {
 	struct rk_mpp_job *job;
 	struct rk_mpp_job *old = NULL;
+	unsigned long deadline;
 	unsigned long flags;
+	unsigned long now;
 
 	spin_lock_irqsave(&hw->lock, flags);
 	job = hw->active_job;
@@ -12309,12 +12343,34 @@ static void rk_mpp_hw_schedule_timeout(struct rk_mpp_hw *hw)
 		hw->timeout_job = job;
 	}
 	hw->timeout_generation = job ? hw->active_generation : 0;
+	/*
+	 * Only a new activation starts a new window. rk_mpp_hw_abort_job()
+	 * must drain the watchdog before it can take run_lock, so it clears
+	 * the slot for whatever job owns the core and restores it here -- and
+	 * an unrelated session can drive that path as fast as it likes via
+	 * RESET_SESSION or close(). Handing out a fresh full window each time
+	 * let it postpone another session's watchdog indefinitely, which on a
+	 * wedged core is the only recovery there is.
+	 */
+	if (job && hw->timeout_deadline_generation != hw->active_generation) {
+		hw->timeout_deadline = jiffies +
+			msecs_to_jiffies(RK_MPP_WORK_TIMEOUT_MS);
+		hw->timeout_deadline_generation = hw->active_generation;
+	}
+	deadline = hw->timeout_deadline;
 	spin_unlock_irqrestore(&hw->lock, flags);
 	rk_mpp_job_put(old);
 
-	if (job)
+	if (job) {
+		/*
+		 * time_after() is load-bearing, not defensive: deadline - now
+		 * on an already-expired deadline underflows to a delay of
+		 * roughly forever. Clamp it to the next tick instead.
+		 */
+		now = jiffies;
 		mod_delayed_work(system_wq, &hw->timeout_work,
-				 msecs_to_jiffies(RK_MPP_WORK_TIMEOUT_MS));
+				 time_after(deadline, now) ? deadline - now : 1);
+	}
 }
 
 static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
