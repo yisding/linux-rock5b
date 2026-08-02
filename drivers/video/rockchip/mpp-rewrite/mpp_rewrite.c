@@ -8002,6 +8002,22 @@ static void rk_mpp_rcb_invalid_index_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_rcb_info(job), 0);
 	KUNIT_EXPECT_EQ(test, job->reg_image.regs[4], 0U);
 
+	/*
+	 * An index past the client's own register region must be skipped like
+	 * any other out-of-range descriptor, not fail the job: session-level
+	 * rcb_descs are sticky, so returning an error here killed every later
+	 * job on the session rather than just ignoring one bad entry.
+	 */
+	hw.rcb_iova = 0x80000000;
+	job->reg_image.rcb_count = 2;
+	job->reg_image.rcb_descs[0].index =
+		RK_MPP_RKVENC2_MIN_REG_SIZE / sizeof(u32);
+	job->reg_image.rcb_descs[0].size = 0x100;
+	job->reg_image.rcb_descs[1].index = 4;
+	job->reg_image.rcb_descs[1].size = 0x100;
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_rcb_info(job), 0);
+	KUNIT_EXPECT_EQ(test, job->reg_image.regs[4], 0x80000000U);
+
 	kfree(job->reg_image.regs);
 }
 
@@ -9901,6 +9917,21 @@ static int rk_mpp_job_apply_reg_offsets(struct rk_mpp_job *job)
 	return 0;
 }
 
+/*
+ * Words addressable in a client's primary register region, or the generic
+ * image ceiling when the client has no declared layout.
+ */
+static u32 rk_mpp_client_reg_words(u32 client_type)
+{
+	const struct rk_mpp_reg_layout *layout =
+		rk_mpp_reg_layout_for_type(client_type);
+
+	if (!layout || !layout->region_count)
+		return RK_MPP_MAX_REG_IMAGE_BYTES / sizeof(u32);
+
+	return layout->regions[0].size / sizeof(u32);
+}
+
 static bool rk_mpp_job_rkvdec_rcb_enabled(struct rk_mpp_job *job)
 {
 	u64 width;
@@ -9932,9 +9963,17 @@ static int rk_mpp_job_apply_rcb_info(struct rk_mpp_job *job)
 
 	for (i = 0; i < image->rcb_count; i++) {
 		const struct rk_mpp_rcb_desc *desc = &image->rcb_descs[i];
-		u32 max_words = RK_MPP_MAX_REG_IMAGE_BYTES / sizeof(*image->regs);
+		u32 max_words = rk_mpp_client_reg_words(job->client_type);
 		u32 next_offset;
 
+		/*
+		 * Bound against the client's own register region, not the
+		 * generic image ceiling. The deeper check in
+		 * rk_mpp_job_ensure_reg_word() uses the region size and returns
+		 * -ENOMEM, and session->rcb_descs is sticky, so a single
+		 * out-of-range descriptor otherwise killed every later job on
+		 * that session. The BSP skips these (mpp_rkvdec2.c).
+		 */
 		if (desc->index >= max_words)
 			continue;
 		if (check_add_overflow(rcb_offset, desc->size, &next_offset) ||
@@ -9945,8 +9984,16 @@ static int rk_mpp_job_apply_rcb_info(struct rk_mpp_job *job)
 			return -EOVERFLOW;
 
 		ret = rk_mpp_job_ensure_reg_word(job, desc->index);
-		if (ret)
+		if (ret) {
+			/*
+			 * Recorded here rather than at the call site: this now
+			 * runs inside rk_mpp_job_translate_reg_image(), whose
+			 * own failure event would otherwise absorb it.
+			 */
+			rk_mpp_debug_record_job(job, RK_MPP_DEBUG_RCB_FAIL, ret,
+						0, image->rcb_count);
 			return ret;
+		}
 
 		image->regs[desc->index] = lower_32_bits(rcb_iova);
 		rcb_offset = next_offset;
@@ -10385,12 +10432,16 @@ static int rk_mpp_job_translate_reg_image(struct rk_mpp_job *job)
 
 	if (image->translated)
 		return 0;
-	if (!rk_mpp_job_has_reg_image(job) && !image->offset_count)
+	if (!rk_mpp_job_has_reg_image(job) && !image->offset_count &&
+	    !image->rcb_count)
 		return 0;
 
 	image->fail_index = -1;
 
 	if (job->flags & MPP_FLAGS_REG_FD_NO_TRANS) {
+		ret = rk_mpp_job_apply_rcb_info(job);
+		if (ret)
+			return ret;
 		ret = rk_mpp_job_validate_explicit_iovas(job);
 		if (!ret)
 			image->translated = true;
@@ -10421,6 +10472,17 @@ static int rk_mpp_job_translate_reg_image(struct rk_mpp_job *job)
 	}
 
 	ret = rk_mpp_job_apply_reg_offsets(job);
+	if (ret)
+		return ret;
+
+	/*
+	 * RCB has to land before the revalidation below, not after this whole
+	 * function. It is the only writer of image->regs[] whose index comes
+	 * from userspace, so running it afterwards left it able to rewrite any
+	 * word the revalidation had just approved -- including the format
+	 * selector that chooses which address table gets validated.
+	 */
+	ret = rk_mpp_job_apply_rcb_info(job);
 	if (ret)
 		return ret;
 
@@ -15828,12 +15890,6 @@ static int rk_mpp_execute_jobs(struct rk_mpp_batch_state *batch)
 							RK_MPP_DEBUG_TRANSLATE_FAIL,
 							ret, 0,
 							(u32)job->reg_image.fail_index);
-				goto rejected;
-			}
-			ret = rk_mpp_job_apply_rcb_info(job);
-			if (ret) {
-				rk_mpp_debug_record_job(job, RK_MPP_DEBUG_RCB_FAIL,
-							ret, 0, job->reg_image.rcb_count);
 				goto rejected;
 			}
 			ret = rk_mpp_job_submit(job);
