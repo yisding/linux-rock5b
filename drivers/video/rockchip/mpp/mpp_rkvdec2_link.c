@@ -1944,7 +1944,19 @@ static int rkvdec2_soft_ccu_dequeue(struct mpp_taskqueue *queue)
 			}
 
 			set_bit(TASK_STATE_HANDLE, &mpp_task->state);
-			cancel_delayed_work(&mpp_task->timeout_work);
+			/*
+			 * Sync cancel: this path frees the task a few lines
+			 * below, and the plain cancel_delayed_work() does not
+			 * wait for an already-running rkvdec2_ccu_timeout_work().
+			 * That callback touches task->state and task->session
+			 * even on its early-return arm, so without the wait it
+			 * could run on freed memory. The non-CCU link paths in
+			 * this file already use the sync variant.
+			 *
+			 * Safe to sleep here: this runs in the taskqueue kthread
+			 * with no lock held, and the callback only queues work.
+			 */
+			cancel_delayed_work_sync(&mpp_task->timeout_work);
 			mpp_task->hw_cycles = mpp_read(mpp, RKVDEC_PERF_WORKING_CNT);
 			mpp_task->hw_time = mpp_task->hw_cycles /
 					    (dec->cycle_clk->real_rate_hz / 1000000);
@@ -1967,6 +1979,18 @@ static int rkvdec2_soft_ccu_dequeue(struct mpp_taskqueue *queue)
 			/* free task */
 			spin_lock_irqsave(&queue->running_lock, flags);
 			list_del_init(&mpp_task->queue_link);
+			/*
+			 * The CCU dispatch path publishes mpp->cur_task
+			 * (rkvdec2_ccu_enqueue) but retires tasks through
+			 * ->finish rather than ->isr, so nothing ever cleared
+			 * it. The IOMMU fault handler reads cur_task from hard
+			 * IRQ and walks task->mem_region_list, whose list head
+			 * lives inside the task -- leaving it set here made that
+			 * pointer stale by construction for the whole idle
+			 * period of the core.
+			 */
+			if (mpp->cur_task == mpp_task)
+				mpp->cur_task = NULL;
 			spin_unlock_irqrestore(&queue->running_lock, flags);
 			mpp_dev_load(mpp, mpp_task);
 			kref_put(&mpp_task->ref, mpp_free_task);
