@@ -14790,6 +14790,7 @@ rk_mpp_av1_afbc_required_span(u32 width, u32 height, u32 bits_per_pixel,
 			      u64 header_size, u64 *required_span)
 {
 	u64 payload_block_size;
+	u64 grid_header_size;
 	u64 payload_size;
 	u64 block_count;
 	u64 pixels;
@@ -14802,6 +14803,33 @@ rk_mpp_av1_afbc_required_span(u32 width, u32 height, u32 bits_per_pixel,
 	if (check_mul_overflow((u64)width, (u64)height, &pixels))
 		return -EOVERFLOW;
 	block_count = div_u64(pixels, RK_MPP_AV1_AFBC_BLOCK_PIXELS);
+
+	/*
+	 * The caller's header_size follows the BSP formula, which uses the
+	 * unaligned width and (height + 28) where the payload model below uses
+	 * the 16-aligned block grid. The two disagree whenever
+	 * vir_top + vir_bottom exceeds 28 or the padded width is not
+	 * 16-aligned, and they disagree in the unsafe direction: 3840x2160
+	 * with vir_left 1 and vir_top = vir_bottom = 15 gives 525,248 against
+	 * a grid header of 528,352, so the payload would be placed 3 KB inside
+	 * a region the extent check believed it had covered.
+	 *
+	 * Which model the silicon follows is a hardware question that source
+	 * reading cannot settle -- two reviewers reached opposite conclusions.
+	 * Size the check by whichever is larger, which can only reject buffers
+	 * a smaller estimate would have accepted, and warn once when they
+	 * differ so a board run says which one is right. The value programmed
+	 * to hardware is unaffected: this only widens the extent demanded of
+	 * the imported buffer.
+	 */
+	grid_header_size = ALIGN(div_u64(pixels, 16),
+				 RK_MPP_AV1_AFBC_HEADER_ALIGN);
+	if (grid_header_size > header_size) {
+		WARN_ONCE(1,
+			  KBUILD_MODNAME ": AV1 AFBC header models disagree (bsp=%llu grid=%llu for %ux%u); using the larger\n",
+			  header_size, grid_header_size, width, height);
+		header_size = grid_header_size;
+	}
 	payload_block_size =
 		ALIGN((u64)bits_per_pixel * RK_MPP_AV1_AFBC_BLOCK_PIXELS / 8,
 		      RK_MPP_AV1_AFBC_PAYLOAD_ALIGN);
