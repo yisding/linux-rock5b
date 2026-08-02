@@ -5,6 +5,13 @@
  * This is an ABI-first char device for /dev/mpp_service.  It deliberately
  * keeps the BSP userspace ABI while rebuilding the RK3588 execution paths on
  * top of public DMA/IOMMU APIs.
+ *
+ * Provenance: an independent implementation written against the Rockchip BSP
+ * driver as a behavioural reference. No BSP source is compiled, adapted, or
+ * copied here; register offsets, bit positions and table contents are
+ * functional facts about the silicon, and the comments that depend on a BSP
+ * contract name the file and function they were derived from. This is not a
+ * Chinese-wall reimplementation and does not claim to be.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -1490,6 +1497,14 @@ enum rk_mpp_rkvenc_fmt {
 	RK_MPP_RKVENC_FMT_H265E	= 1,
 };
 
+/*
+ * Per-codec register indices that carry a buffer address and therefore need fd
+ * to IOVA translation. These are a property of the VDPU381 register file, not
+ * a design choice: the sets match the vendor driver's trans_tbl_* tables in
+ * mpp_rkvdec2.c element for element, because any driver that translated a
+ * different set would program the hardware wrongly. The format selector that
+ * chooses between them is RK_MPP_RKVDEC_REG_FMT.
+ */
 static const u16 rk_mpp_rkvdec_h264d_regs[] = {
 	128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140,
 	141, 142, 161, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172,
@@ -17766,6 +17781,6 @@ module_exit(rk_mpp_exit);
 
 MODULE_IMPORT_NS("DMA_BUF");
 MODULE_DESCRIPTION("Minimal Rockchip MPP service compatibility rewrite");
-MODULE_AUTHOR("OpenAI");
+MODULE_AUTHOR("Yi Ding <yi.s.ding@gmail.com>");
 MODULE_LICENSE("GPL");
 MODULE_VERSION(RK_MPP_REWRITE_VERSION);
