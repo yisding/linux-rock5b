@@ -696,25 +696,22 @@ static long rga_ioctl_import_buffer(unsigned long arg, struct rga_session *sessi
 		goto err_free_external_buffer;
 	}
 
+	/*
+	 * Check every type before importing any of them. The unwind below only
+	 * frees the array, so rejecting mid-pool would strand the handles
+	 * already imported until session close.
+	 *
+	 * Userspace may only name memory it can already reach: a dma-buf fd or
+	 * one of its own virtual addresses. RGA_DMA_BUFFER_PTR takes `memory`
+	 * as a kernel `struct dma_buf *` and dereferences it (get_dma_buf(),
+	 * then an indirect call through dmabuf->ops->attach), and
+	 * RGA_PHYSICAL_ADDRESS takes it as a physical address whose only check
+	 * is that it is linear-mapped RAM -- which every kernel text, data and
+	 * page-table page satisfies. Both types exist for the in-kernel
+	 * rga_mpi_commit() and rga_kernel_commit() callers, which pass trusted
+	 * values; neither is meaningful from an ioctl.
+	 */
 	for (i = 0; i < buffer_pool.size; i++) {
-		if (DEBUGGER_EN(MSG)) {
-			rga_log("import buffer info:\n");
-			rga_dump_external_buffer(&external_buffer[i]);
-		}
-
-		/*
-		 * Userspace may only name memory it can already reach: a
-		 * dma-buf fd or one of its own virtual addresses.
-		 *
-		 * RGA_DMA_BUFFER_PTR takes `memory` as a kernel `struct dma_buf *`
-		 * and dereferences it (get_dma_buf(), then an indirect call
-		 * through dmabuf->ops->attach), and RGA_PHYSICAL_ADDRESS takes it
-		 * as a physical address whose only check is that it is linear-
-		 * mapped RAM -- which every kernel text, data and page-table page
-		 * satisfies. Both types exist for the in-kernel rga_mpi_commit()
-		 * and rga_kernel_commit() callers, which pass trusted values;
-		 * neither is meaningful from an ioctl.
-		 */
 		if (external_buffer[i].type != RGA_DMA_BUFFER &&
 		    external_buffer[i].type != RGA_VIRTUAL_ADDRESS) {
 			rga_err("buffer[%d] unsupported import type %s(0x%x)\n",
@@ -723,6 +720,13 @@ static long rga_ioctl_import_buffer(unsigned long arg, struct rga_session *sessi
 			ret = -EOPNOTSUPP;
 
 			goto err_free_external_buffer;
+		}
+	}
+
+	for (i = 0; i < buffer_pool.size; i++) {
+		if (DEBUGGER_EN(MSG)) {
+			rga_log("import buffer info:\n");
+			rga_dump_external_buffer(&external_buffer[i]);
 		}
 
 		ret = rga_mm_import_buffer(&external_buffer[i], session);
