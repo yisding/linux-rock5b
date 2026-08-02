@@ -59,7 +59,7 @@ void rga_mm_unmap_job_info(struct rga_job *job);
 
 int rga_mm_import_buffer(struct rga_external_buffer *external_buffer,
 			 struct rga_session *session);
-int rga_mm_release_buffer(uint32_t handle);
+int rga_mm_release_buffer(uint32_t handle, struct rga_session *session);
 int rga_mm_session_release_buffer(struct rga_session *session);
 
 int rga_mm_init(struct rga_mm **session);
