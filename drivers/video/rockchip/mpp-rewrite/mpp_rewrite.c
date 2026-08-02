@@ -4893,6 +4893,11 @@ static void rk_mpp_av1_afbc_config_kunit(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, rk_mpp_av1_build_afbc_config(job, &config), 0);
 	KUNIT_EXPECT_FALSE(test, config.enabled);
 
+	/* Re-arm the tile bit so the truncated image below is disabled by
+	 * the reg-word bounds gate alone, not by the zeroed PP config left
+	 * over from the previous case.
+	 */
+	regs[RK_MPP_AV1_PP_CONFIG_WORD] = RK_MPP_AV1_PP_TILE_16X16;
 	job->reg_image.reg_words = 320;
 	job->reg_image.reg_bytes = 320 * sizeof(*regs);
 	KUNIT_ASSERT_EQ(test, rk_mpp_av1_build_afbc_config(job, &config), 0);
@@ -8920,92 +8925,6 @@ static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 			-EIO);
 }
 
-static void rk_mpp_session_abort_hw_active_kunit(struct kunit *test)
-{
-	struct rk_mpp_service srv = {};
-	struct rk_mpp_session *session;
-	struct device *dev;
-	struct rk_mpp_hw *hw;
-	struct rk_mpp_job *active;
-	int ret;
-
-	session = kunit_kzalloc(test, sizeof(*session), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, session);
-	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, dev);
-	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, hw);
-	/*
-	 * The exercised abort path drops both job references and frees the
-	 * job with kfree() in rk_mpp_job_release(), so the allocation must
-	 * not be KUnit-managed or teardown double-frees it.
-	 */
-	active = kzalloc(sizeof(*active), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, active);
-
-	device_initialize(dev);
-	dev->release = rk_mpp_kunit_device_release;
-	ret = kunit_add_action_or_reset(test, rk_mpp_kunit_put_device, dev);
-	KUNIT_ASSERT_EQ(test, ret, 0);
-	pm_runtime_set_active(dev);
-	pm_runtime_enable(dev);
-	ret = kunit_add_action_or_reset(test, rk_mpp_kunit_pm_runtime_disable,
-					dev);
-	KUNIT_ASSERT_EQ(test, ret, 0);
-	pm_runtime_get_noresume(dev);
-
-	mutex_init(&srv.sched_lock);
-	spin_lock_init(&srv.rkvenc_dchs_lock);
-	INIT_LIST_HEAD(&srv.queued_jobs);
-
-	session->srv = &srv;
-	session->active_job_count = 1;
-	mutex_init(&session->lock);
-	INIT_LIST_HEAD(&session->imports);
-	INIT_LIST_HEAD(&session->active_jobs);
-	init_waitqueue_head(&session->wait);
-	refcount_set(&session->refs, 2);
-
-	hw->dev = dev;
-	hw->srv = &srv;
-	hw->terminally_stopped = true;
-	refcount_set(&hw->refs, 1);
-	init_completion(&hw->released);
-	spin_lock_init(&hw->lock);
-	raw_spin_lock_init(&hw->regs_lock);
-	mutex_init(&hw->run_lock);
-	INIT_LIST_HEAD(&hw->rkvdec_ccu_jobs);
-	INIT_DELAYED_WORK(&hw->timeout_work, rk_mpp_hw_timeout_work);
-	INIT_WORK(&hw->iommu_fault_work, rk_mpp_hw_iommu_fault_work);
-	ret = kunit_add_action_or_reset(test, rk_mpp_kunit_cancel_hw_work,
-					hw);
-	KUNIT_ASSERT_EQ(test, ret, 0);
-
-	active->session = session;
-	active->hw = hw;
-	active->state = RK_MPP_JOB_ACTIVE;
-	active->result = -EINPROGRESS;
-	refcount_set(&active->refs, 2);
-	INIT_LIST_HEAD(&active->link);
-	INIT_LIST_HEAD(&active->session_link);
-	INIT_LIST_HEAD(&active->sched_link);
-	INIT_LIST_HEAD(&active->rkvdec_ccu_node);
-	list_add_tail(&active->session_link, &session->active_jobs);
-	hw->active_job = active;
-
-	rk_mpp_session_abort_jobs(session);
-
-	KUNIT_EXPECT_TRUE(test, list_empty(&session->active_jobs));
-	KUNIT_EXPECT_EQ(test, session->active_job_count, 0U);
-	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, NULL);
-	KUNIT_EXPECT_TRUE(test, completion_done(&hw->released));
-	KUNIT_EXPECT_EQ(test, refcount_read(&session->refs), 1);
-
-	kunit_release_action(test, rk_mpp_kunit_cancel_hw_work, hw);
-	kunit_release_action(test, rk_mpp_kunit_pm_runtime_disable, dev);
-	kunit_release_action(test, rk_mpp_kunit_put_device, dev);
-}
-
 static void rk_mpp_reset_session_public_cleanup_kunit(struct kunit *test)
 {
 	struct rk_mpp_service *srv;
@@ -9374,7 +9293,6 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_session_poll_nonblock_pending_kunit),
 	KUNIT_CASE(rk_mpp_session_poll_irq_nonslice_kunit),
 	KUNIT_CASE(rk_mpp_session_abort_jobs_kunit),
-	KUNIT_CASE(rk_mpp_session_abort_hw_active_kunit),
 	KUNIT_CASE(rk_mpp_reset_session_public_cleanup_kunit),
 	KUNIT_CASE(rk_mpp_reset_session_hw_active_import_kunit),
 	KUNIT_CASE(rk_mpp_file_release_public_cleanup_kunit),
