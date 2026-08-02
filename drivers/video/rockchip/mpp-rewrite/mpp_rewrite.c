@@ -420,6 +420,19 @@ struct rk_mpp_hw {
 	raw_spinlock_t aux_lock; /* hard/thread IRQ auxiliary MMIO and state */
 	struct rk_mpp_job *active_job;
 	struct rk_mpp_job *timeout_job;
+	/*
+	 * Nonzero exactly while this core's clocks are running. The hard IRQ
+	 * dispatcher holds regs_lock across the whole backend handler, and
+	 * rk_mpp_hw_power_off() takes it before gating the clocks, so a
+	 * handler can never be mid-MMIO when they go down.
+	 *
+	 * This needs its own lock rather than hw->lock, which the backend
+	 * handlers take themselves, and it cannot be atomic power_count: that
+	 * answers whether the core is powered but gives the handler no way to
+	 * hold the answer still for the duration of a register read.
+	 */
+	raw_spinlock_t regs_lock; /* regs_live_count vs. hard-IRQ MMIO */
+	unsigned int regs_live_count;
 	u64 active_generation;
 	u64 timeout_generation;
 	/*
@@ -5521,6 +5534,7 @@ static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
 	hw->online = true;
 	ccu->online = true;
 	spin_lock_init(&hw->lock);
+	raw_spin_lock_init(&hw->regs_lock);
 	KUNIT_EXPECT_EQ(test,
 			rk_mpp_rkvdec2_start_soft_ccu_job(job, 0x100), 0);
 	KUNIT_EXPECT_EQ(test,
@@ -5904,6 +5918,7 @@ static void rk_mpp_rkvdec2_link_table_ownership_kunit(struct kunit *test)
 	job2->hw = hw;
 	job2->reg_image = *image;
 	spin_lock_init(&hw->lock);
+	raw_spin_lock_init(&hw->regs_lock);
 
 	for (i = 0; i < image->reg_words; i++)
 		regs[i] = 0xa5000000 | i;
@@ -6547,6 +6562,7 @@ static void rk_mpp_hw_take_active_if_kunit(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, job1);
 
 	spin_lock_init(&hw.lock);
+	raw_spin_lock_init(&hw.regs_lock);
 	hw.active_job = job0;
 	hw.irq_status = 0x1234;
 
@@ -6569,6 +6585,7 @@ static void rk_mpp_hw_take_spurious_irq_kunit(struct kunit *test)
 	u32 irq_status = 0;
 
 	spin_lock_init(&hw.lock);
+	raw_spin_lock_init(&hw.regs_lock);
 	hw.irq_status = 0x1234;
 
 	KUNIT_EXPECT_PTR_EQ(test,
@@ -6598,6 +6615,7 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, job1);
 
 	spin_lock_init(&hw.lock);
+	raw_spin_lock_init(&hw.regs_lock);
 	hw.iommu_domain = &domain;
 	job0->session = &session;
 	job1->session = &session;
@@ -6650,6 +6668,7 @@ static void rk_mpp_iommu_fault_generation_kunit(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, replacement);
 
 	spin_lock_init(&hw->lock);
+	raw_spin_lock_init(&hw->regs_lock);
 	mutex_init(&hw->run_lock);
 	INIT_DELAYED_WORK(&hw->timeout_work, rk_mpp_hw_timeout_work);
 	INIT_WORK(&hw->iommu_fault_work, rk_mpp_hw_iommu_fault_work);
@@ -6730,6 +6749,7 @@ static void rk_mpp_timeout_target_replacement_kunit(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, replacement);
 
 	spin_lock_init(&hw->lock);
+	raw_spin_lock_init(&hw->regs_lock);
 	mutex_init(&hw->run_lock);
 	INIT_DELAYED_WORK(&hw->timeout_work, rk_mpp_hw_timeout_work);
 	INIT_WORK(&hw->iommu_fault_work, rk_mpp_hw_iommu_fault_work);
@@ -7184,6 +7204,7 @@ static void rk_mpp_scheduler_skips_recovery_failed_kunit(struct kunit *test)
 	mutex_init(&srv->sched_lock);
 	INIT_LIST_HEAD(&srv->queued_jobs);
 	spin_lock_init(&hw->lock);
+	raw_spin_lock_init(&hw->regs_lock);
 	INIT_LIST_HEAD(&job->sched_link);
 	INIT_LIST_HEAD(&job->abort_link);
 	list_add_tail(&job->sched_link, &srv->queued_jobs);
@@ -8823,6 +8844,7 @@ static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 	init_waitqueue_head(&session.wait);
 	hw->srv = &srv;
 	spin_lock_init(&hw->lock);
+	raw_spin_lock_init(&hw->regs_lock);
 	mutex_init(&hw->run_lock);
 	INIT_DELAYED_WORK(&hw->timeout_work, rk_mpp_hw_timeout_work);
 	refcount_set(&hw->refs, 1);
@@ -8935,6 +8957,7 @@ static void rk_mpp_session_abort_hw_active_kunit(struct kunit *test)
 	refcount_set(&hw->refs, 1);
 	init_completion(&hw->released);
 	spin_lock_init(&hw->lock);
+	raw_spin_lock_init(&hw->regs_lock);
 	mutex_init(&hw->run_lock);
 	INIT_LIST_HEAD(&hw->rkvdec_ccu_jobs);
 	INIT_DELAYED_WORK(&hw->timeout_work, rk_mpp_hw_timeout_work);
@@ -8997,6 +9020,7 @@ static void rk_mpp_reset_session_public_cleanup_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&batch.jobs);
 	hw.srv = srv;
 	spin_lock_init(&hw.lock);
+	raw_spin_lock_init(&hw.regs_lock);
 	mutex_init(&hw.run_lock);
 	INIT_DELAYED_WORK_ONSTACK(&hw.timeout_work, rk_mpp_hw_timeout_work);
 	refcount_set(&hw.refs, 1);
@@ -9117,6 +9141,7 @@ static void rk_mpp_reset_session_hw_active_import_kunit(struct kunit *test)
 	refcount_set(&hw.refs, 1);
 	init_completion(&hw.released);
 	spin_lock_init(&hw.lock);
+	raw_spin_lock_init(&hw.regs_lock);
 	mutex_init(&hw.run_lock);
 	INIT_LIST_HEAD(&hw.rkvdec_ccu_jobs);
 	INIT_DELAYED_WORK_ONSTACK(&hw.timeout_work, rk_mpp_hw_timeout_work);
@@ -11577,6 +11602,7 @@ static void rk_mpp_hw_init_reset_domain(struct rk_mpp_hw *hw)
 
 static int rk_mpp_hw_power_on(struct rk_mpp_hw *hw)
 {
+	unsigned long flags;
 	int ret;
 
 	if (READ_ONCE(hw->terminally_stopped) ||
@@ -11635,6 +11661,9 @@ static int rk_mpp_hw_power_on(struct rk_mpp_hw *hw)
 	ret = clk_bulk_prepare_enable(hw->num_clks, hw->clks);
 	if (ret)
 		goto err_pm_put;
+	raw_spin_lock_irqsave(&hw->regs_lock, flags);
+	hw->regs_live_count++;
+	raw_spin_unlock_irqrestore(&hw->regs_lock, flags);
 	atomic_inc(&hw->power_count);
 
 	return 0;
@@ -11646,12 +11675,23 @@ err_pm_put:
 
 static void rk_mpp_hw_power_off(struct rk_mpp_hw *hw)
 {
+	unsigned long flags;
+
 	if (atomic_read(&hw->power_count) <= 0)
 		return;
 
 	rk_mpp_hw_deactivate_aux_irqs(hw);
 	if (atomic_dec_if_positive(&hw->power_count) < 0)
 		return;
+
+	/*
+	 * Retract the regs-live publication before gating the clocks. The hard
+	 * IRQ dispatcher runs the backend handler entirely under regs_lock, so
+	 * acquiring it here means no handler is mid-MMIO when they go down.
+	 */
+	raw_spin_lock_irqsave(&hw->regs_lock, flags);
+	hw->regs_live_count--;
+	raw_spin_unlock_irqrestore(&hw->regs_lock, flags);
 
 	clk_bulk_disable_unprepare(hw->num_clks, hw->clks);
 	pm_runtime_mark_last_busy(hw->dev);
@@ -14288,6 +14328,38 @@ static irqreturn_t rk_mpp_rkvenc2_irq(struct rk_mpp_hw *hw)
 	return IRQ_HANDLED;
 }
 
+/*
+ * Drain any interrupt status the encoder latched after the top half sampled
+ * it, while the clocks are still running.
+ *
+ * INT_CLR is write-1-to-clear (BSP mpp_rkvenc2.c writes 0xffffffff to it on
+ * reset), so the top half's writel(status, INT_CLR) clears exactly the bits it
+ * read and nothing else. A bit the hardware raises between that read and that
+ * write therefore survives, and holds the level line asserted. With
+ * IRQF_ONESHOT the redelivery lands after this thread has returned -- i.e.
+ * after rk_mpp_hw_power_off() -- so the line is asserted against a core whose
+ * clocks are gated. The regs-live gate in rk_mpp_hw_irq() keeps that from
+ * becoming MMIO, but an asserted level line nobody handles still ends in
+ * "irq NN: nobody cared" and a dead encoder IRQ for the rest of the boot.
+ *
+ * Clearing what is actually latched, here, is the only place both facts hold:
+ * the clocks are on, and the top half cannot run again until we return.
+ */
+static void rk_mpp_rkvenc2_drain_int_status(struct rk_mpp_hw *hw)
+{
+	u32 status;
+
+	if (!rk_mpp_hw_reg_range_valid(hw, 0, RK_MPP_RKVENC_INT_STA_BASE,
+				       sizeof(u32)) ||
+	    !rk_mpp_hw_reg_range_valid(hw, 0, RK_MPP_RKVENC_INT_CLR_BASE,
+				       sizeof(u32)))
+		return;
+
+	status = readl_relaxed(hw->regs[0] + RK_MPP_RKVENC_INT_STA_BASE);
+	if (status)
+		writel(status, hw->regs[0] + RK_MPP_RKVENC_INT_CLR_BASE);
+}
+
 static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 {
 	struct rk_mpp_job *job;
@@ -14333,6 +14405,7 @@ static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 		if (!ret)
 			ret = reset_ret;
 	}
+	rk_mpp_rkvenc2_drain_int_status(hw);
 	rk_mpp_hw_power_off(hw);
 	rk_mpp_job_complete(job, ret);
 	rk_mpp_rkvenc2_dchs_lifecycle_unlock(job, dchs_lifecycle_locked);
@@ -15432,6 +15505,8 @@ static irqreturn_t rk_mpp_hw_aux_irq(int irq, void *data)
 static irqreturn_t rk_mpp_hw_irq(int irq, void *data)
 {
 	struct rk_mpp_hw *hw = data;
+	unsigned long flags;
+	irqreturn_t ret;
 
 	/* Teardown may briefly balance a quarantined IRQ before freeing it. */
 	if (unlikely(READ_ONCE(hw->recovery_failed)))
@@ -15439,7 +15514,29 @@ static irqreturn_t rk_mpp_hw_irq(int irq, void *data)
 	if (!hw->match->ops || !hw->match->ops->irq)
 		return IRQ_NONE;
 
-	return hw->match->ops->irq(hw);
+	/*
+	 * An unpowered core cannot own the interrupt, and reading its
+	 * registers with the clocks gated stalls the bus. Two paths deliver
+	 * one here anyway: the threaded handler calls rk_mpp_hw_power_off()
+	 * before it returns, so IRQF_ONESHOT unmasks a still-asserted line
+	 * afterwards; and every recovery path disables, resets, powers off and
+	 * only then re-enables, where __enable_irq()'s IRQ_RESEND replays
+	 * whatever was latched while the line was lazily disabled.
+	 *
+	 * One gate at the dispatcher covers all three backends. Doing it per
+	 * enable site would mean repeating it at each of the seven, which is
+	 * how the sibling RGA driver's version of this fix came to exist in
+	 * only one of the two drivers.
+	 */
+	raw_spin_lock_irqsave(&hw->regs_lock, flags);
+	if (unlikely(!hw->regs_live_count)) {
+		raw_spin_unlock_irqrestore(&hw->regs_lock, flags);
+		return IRQ_NONE;
+	}
+	ret = hw->match->ops->irq(hw);
+	raw_spin_unlock_irqrestore(&hw->regs_lock, flags);
+
+	return ret;
 }
 
 static irqreturn_t rk_mpp_hw_irq_thread(int irq, void *data)
@@ -16923,6 +17020,7 @@ static int rk_mpp_hw_probe(struct platform_device *pdev)
 	mutex_init(&hw->ccu_recovery_lock);
 	spin_lock_init(&hw->lock);
 	raw_spin_lock_init(&hw->aux_lock);
+	raw_spin_lock_init(&hw->regs_lock);
 	if (match->type == RK_MPP_DEVICE_BUTT) {
 		lockdep_set_class(&hw->run_lock, &rk_mpp_ccu_run_lock_key);
 		lockdep_set_class(&hw->lock, &rk_mpp_ccu_hw_lock_key);
