@@ -1220,7 +1220,8 @@ int rga_request_release_signal(struct rga_scheduler_t *scheduler, struct rga_job
 	return 0;
 }
 
-struct rga_request *rga_request_config(struct rga_user_request *user_request)
+struct rga_request *rga_request_config(struct rga_user_request *user_request,
+				       struct rga_session *session)
 {
 	int ret;
 	unsigned long flags;
@@ -1242,6 +1243,20 @@ struct rga_request *rga_request_config(struct rga_user_request *user_request)
 		rga_err("can not find request from id[%d]", user_request->id);
 		mutex_unlock(&request_manager->lock);
 		return ERR_PTR(-EINVAL);
+	}
+
+	/*
+	 * Request ids are a single global idr allocated cyclically from 1 and
+	 * rga_request_lookup() is a bare idr_find, so without this check any
+	 * process holding /dev/rga can reconfigure another process's in-flight
+	 * request -- which is what turns the task_list lifetime races into a
+	 * cross-process primitive rather than a self-inflicted one.
+	 */
+	if (session && request->session != session) {
+		rga_err("id[%d] does not belong to this session\n",
+			user_request->id);
+		mutex_unlock(&request_manager->lock);
+		return ERR_PTR(-EPERM);
 	}
 
 	rga_request_get(request);

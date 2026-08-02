@@ -239,6 +239,14 @@ struct rga_internal_buffer {
 
 	struct kref refcount;
 	struct rga_session *session;
+	/*
+	 * Outstanding RGA_IOC_IMPORT_BUFFER references, guarded by mm->lock.
+	 * Imports are de-duplicated, so one buffer can be imported several
+	 * times; ownership must survive until the last of those is released,
+	 * otherwise the buffer is orphaned (session == NULL) and the owning
+	 * session's teardown walk skips it, leaking its pages and mm ref.
+	 */
+	uint32_t import_cnt;
 
 	/* The scheduler of the mapping */
 	struct rga_scheduler_t *scheduler;
