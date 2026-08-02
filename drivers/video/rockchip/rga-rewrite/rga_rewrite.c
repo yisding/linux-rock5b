@@ -8546,6 +8546,14 @@ static int rk_rga2_validate_quantize(const struct rga_req *task)
 	if (task->PD_mode || task->feature.global_alpha_en ||
 	    task->rop_code || task->alpha_rop_mode)
 		return -EOPNOTSUPP;
+	/*
+	 * Quantize precedes color-key in rk_rga2_validate_bitblt()'s validator
+	 * chain, so without this the color-key registers would be emitted from
+	 * a src_trans_mode no validator ever looked at. The sibling validators
+	 * carry the same exclusion.
+	 */
+	if (task->color_key_min || task->color_key_max)
+		return -EOPNOTSUPP;
 	if (task->src.format != task->dst.format)
 		return -EOPNOTSUPP;
 	if ((task->src.rd_mode && task->src.rd_mode != RK_RGA_RASTER_MODE) ||
@@ -8600,6 +8608,14 @@ static int rk_rga2_validate_alpha_bitmap(const struct rga_req *task)
 	    (task->fg_global_alpha != 0xff || task->bg_global_alpha != 0xff))
 		return -EOPNOTSUPP;
 	if (task->rop_code || task->color_key_min || task->color_key_max)
+		return -EOPNOTSUPP;
+	/*
+	 * Alpha-bitmap precedes OSD in the validator chain and both consume
+	 * task->pat, so accepting the pair would emit the OSD registers with
+	 * rk_rga2_validate_osd() skipped. Reject it the way the gauss and
+	 * color-key validators already reject OSD.
+	 */
+	if (task->osd_info.enable)
 		return -EOPNOTSUPP;
 	if (task->src.yrgb_addr == task->dst.yrgb_addr)
 		return -EOPNOTSUPP;
@@ -8802,6 +8818,8 @@ static u32 rk_rga2_pack_nn_quantize(__s16 r, __s16 g, __s16 b);
 static int rk_rga3_emit_simple_bitblt(struct rk_rga_job *job);
 static int rk_rga3_alpha_factors(u8 pd_mode, u32 *top_factor,
 				 u32 *bottom_factor);
+static int rk_rga2_validate_bitblt(const struct rga_req *task,
+				   struct rk_rga2_bitblt_profile *profile);
 static int rk_rga3_validate_bitblt(const struct rga_req *task,
 				   struct rk_rga3_bitblt_profile *profile);
 static int rk_rga_request_check(const struct rga_user_request *user);
@@ -10161,6 +10179,55 @@ static void rk_rga2_gauss_emit_kunit(struct kunit *test)
 	task.gauss_config.size = 5;
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), -EINVAL);
+}
+
+/*
+ * rk_rga2_validate_bitblt() runs exactly one validator, so a task that sets
+ * two features reaches only the first one in the chain. Every such pair must
+ * be rejected by the validator that does run -- otherwise the second feature's
+ * registers are emitted from fields nothing checked. These are the two pairs
+ * that were not covered: quantize precedes color-key, and alpha-bitmap
+ * precedes OSD.
+ */
+static void rk_rga2_validator_chain_exclusions_kunit(struct kunit *test)
+{
+	struct rk_rga2_bitblt_profile profile = { };
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_RGBA_8888);
+
+	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
+				    1280, 720);
+	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_RGBA_8888,
+				    1280, 720);
+	task.yuv2rgb_mode = 0;
+
+	/* Quantize alone is accepted, and leaves color_key clear. */
+	task.alpha_rop_flag = BIT(8);
+	KUNIT_EXPECT_EQ(test, rk_rga2_validate_bitblt(&task, &profile), 0);
+	KUNIT_EXPECT_FALSE(test, profile.color_key);
+
+	/* Quantize carrying a color key must be rejected, not silently
+	 * promoted to a color-key emission with an unvalidated
+	 * src_trans_mode.
+	 */
+	task.color_key_min = 1;
+	task.src_trans_mode = 0x07;	/* neither 0x1e nor 0x1f */
+	KUNIT_EXPECT_EQ(test, rk_rga2_validate_bitblt(&task, &profile),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_FALSE(test, profile.color_key);
+
+	/* Alpha-bitmap carrying OSD must be rejected: both consume task->pat
+	 * and only the alpha-bitmap validator would run.
+	 */
+	task.color_key_min = 0;
+	task.src_trans_mode = 0;
+	task.alpha_rop_flag = 0;
+	task.rgba5551_alpha.flags = BIT(0);
+	task.osd_info.enable = 1;
+	KUNIT_EXPECT_EQ(test, rk_rga2_validate_bitblt(&task, &profile),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_FALSE(test, profile.osd);
 }
 
 static void rk_rga2_quantize_emit_kunit(struct kunit *test)
@@ -19990,6 +20057,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga2_rop_emit_kunit),
 	KUNIT_CASE(rk_rga2_colorkey_emit_kunit),
 	KUNIT_CASE(rk_rga2_gauss_emit_kunit),
+	KUNIT_CASE(rk_rga2_validator_chain_exclusions_kunit),
 	KUNIT_CASE(rk_rga2_quantize_emit_kunit),
 	KUNIT_CASE(rk_rga2_alpha_bitmap_emit_kunit),
 	KUNIT_CASE(rk_rga2_osd_emit_kunit),
@@ -20477,6 +20545,9 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 	bool uses_rop = !uses_alpha_bitmap && !uses_color_key &&
 			!uses_quantize && !uses_gauss && !uses_osd &&
 			rk_rga2_task_uses_rop(task);
+	bool validated_alpha_bitmap = false;
+	bool validated_color_key = false;
+	bool validated_osd = false;
 	int ret;
 
 	profile->alpha_bitmap = false;
@@ -20510,10 +20581,18 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 	} else if (!rk_rga_in_place_bitblt_allowed(task)) {
 		return -EOPNOTSUPP;
 	}
+	/*
+	 * Only one arm of this chain runs, so a profile bit must record which
+	 * validator approved the task rather than which flag the request set.
+	 * Deriving profile->color_key from the request is what let a quantize
+	 * task carry a color key past rk_rga2_validate_color_key() and still
+	 * reach the color-key emitter.
+	 */
 	if (uses_alpha_bitmap) {
 		ret = rk_rga2_validate_alpha_bitmap(task);
 		if (ret)
 			return ret;
+		validated_alpha_bitmap = true;
 	} else if (uses_quantize) {
 		ret = rk_rga2_validate_quantize(task);
 		if (ret)
@@ -20522,6 +20601,7 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 		ret = rk_rga2_validate_color_key(task);
 		if (ret)
 			return ret;
+		validated_color_key = true;
 	} else if (uses_rop) {
 		ret = rk_rga2_validate_rop(task);
 		if (ret)
@@ -20534,6 +20614,7 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 		ret = rk_rga2_validate_osd(task);
 		if (ret)
 			return ret;
+		validated_osd = true;
 	} else {
 		if (!rk_rga2_dither_flags_allowed(task) || task->PD_mode ||
 		    task->feature.global_alpha_en)
@@ -20561,15 +20642,15 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 				  &profile->dst_fmt);
 	if (ret)
 		return ret;
-	if (uses_alpha_bitmap || uses_osd) {
+	if (validated_alpha_bitmap || validated_osd) {
 		ret = rk_rga2_format_info(task->pat.format, false,
 					  &profile->pat_fmt);
 		if (ret)
 			return ret;
-		profile->alpha_bitmap = uses_alpha_bitmap;
-		profile->osd = uses_osd;
+		profile->alpha_bitmap = validated_alpha_bitmap;
+		profile->osd = validated_osd;
 	}
-	profile->color_key = uses_color_key;
+	profile->color_key = validated_color_key;
 	if (profile->src_fmt.yuv10 &&
 	    !rk_rga_img_yuv10_compact(&task->src))
 		return -EOPNOTSUPP;
