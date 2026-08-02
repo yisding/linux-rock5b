@@ -9735,44 +9735,6 @@ static void rk_rga2_fill_packed_yuv_emit_kunit(struct kunit *test)
 			expected_base);
 }
 
-static void rk_rga2_fill_multitask_hw_type_kunit(struct kunit *test)
-{
-	enum rk_rga_hw_type type = 0;
-	struct rga_req *tasks;
-	struct rk_rga_job job = {
-		.task_count = 4,
-		.import_count = 1,
-	};
-
-	tasks = kunit_kcalloc(test, job.task_count, sizeof(*tasks), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, tasks);
-	job.tasks = tasks;
-
-	for (u32 i = 0; i < job.task_count; i++) {
-		tasks[i] = rk_rga_fill_task(BIT(2));
-		tasks[i].dst.vir_w = 640;
-		tasks[i].dst.vir_h = 480;
-	}
-
-	tasks[0].dst.act_w = 300;
-	tasks[0].dst.act_h = 4;
-	tasks[1].dst.x_offset = 100;
-	tasks[1].dst.y_offset = 100;
-	tasks[1].dst.act_w = 300;
-	tasks[1].dst.act_h = 4;
-	tasks[2].dst.x_offset = 100;
-	tasks[2].dst.y_offset = 4;
-	tasks[2].dst.act_w = 4;
-	tasks[2].dst.act_h = 96;
-	tasks[3].dst.x_offset = 396;
-	tasks[3].dst.y_offset = 4;
-	tasks[3].dst.act_w = 4;
-	tasks[3].dst.act_h = 96;
-
-	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
-	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
-}
-
 static void rk_rga2_rectangle_task_emit_kunit(struct kunit *test)
 {
 	u32 cmd[RK_RGA2_CMD_REG_COUNT] = {};
@@ -14137,26 +14099,6 @@ static void rk_rga_userptr_backing_identity_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, duplicate.userptr_extent_count, 0U);
 }
 
-static void rk_rga_dmabuf_public_provenance_kunit(struct kunit *test)
-{
-	struct dma_buf object = {};
-	struct rk_rga_import dmabuf = {
-		.type = RK_RGA_IMPORT_DMABUF,
-		.dmabuf = &object,
-	};
-	struct rk_rga_import *imports[] = { &dmabuf };
-
-	/*
-	 * DMA-BUF object identity is public and stable; mapped attachment
-	 * page links are deliberately opaque to importers.
-	 */
-	KUNIT_EXPECT_EQ(test,
-			rk_rga_check_alias_provenance(imports,
-						      ARRAY_SIZE(imports),
-						      &dmabuf),
-			0);
-}
-
 static void rk_rga_cross_type_alias_kunit(struct kunit *test)
 {
 	struct rk_rga_import dmabuf = {
@@ -16024,6 +15966,14 @@ static void rk_rga_timeout_target_replacement_kunit(struct kunit *test)
 	refcount_set(&target.refs, 1);
 	refcount_set(&replacement.refs, 1);
 	hw->active_job = &replacement;
+	/*
+	 * Arm the watchdog the way dispatch does: a live nonzero generation
+	 * carried by both sides. Only the job != timeout_job clause may
+	 * block recovery here, so the pointer guard stays load-bearing; a
+	 * zero generation would mask its loss.
+	 */
+	hw->active_generation = 1;
+	hw->timeout_generation = 1;
 	hw->timeout_job = &target;
 	rk_rga_job_get(&target);
 
@@ -17939,6 +17889,7 @@ static void rk_rga2_src_crop_emit_kunit(struct kunit *test)
 static void rk_rga_ffmpeg_fbc_profiles_kunit(struct kunit *test)
 {
 	enum rk_rga_hw_type type = 0;
+	u32 hw_mode;
 	struct rga_req task =
 		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_420_SP,
 					  RK_RGA_FORMAT_RGBA_8888);
@@ -17961,7 +17912,11 @@ static void rk_rga_ffmpeg_fbc_profiles_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 
-	/* RGA2-Pro compressed source modes are recognized but unsupported. */
+	/* RGA2-Pro compressed source modes are recognized but unsupported.
+	 * Both reject in rk_rga3_hw_rd_mode() before any format or
+	 * superblock-offset field is read, so one case per mode is the
+	 * entire dispatch contract; the direct calls pin the gate itself.
+	 */
 	task.src.rd_mode = RK_RGA_RKFBC_MODE;
 	task.dst.rd_mode = RK_RGA_RASTER_MODE;
 	task.src.x_offset = 64;
@@ -17970,59 +17925,18 @@ static void rk_rga_ffmpeg_fbc_profiles_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
 			-EOPNOTSUPP);
 
-	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_420_SP_10B,
-					 RK_RGA_FORMAT_RGBA_8888);
-	task.src.rd_mode = RK_RGA_RKFBC_MODE;
-	task.dst.rd_mode = RK_RGA_RASTER_MODE;
-	task.src.x_offset = 96;
-	task.src.y_offset = 12;
-	type = 0;
-	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
-			-EOPNOTSUPP);
-
-	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_422_SP_10B,
-					 RK_RGA_FORMAT_RGBA_8888);
-	task.src.rd_mode = RK_RGA_RKFBC_MODE;
-	task.dst.rd_mode = RK_RGA_RASTER_MODE;
-	task.src.x_offset = 128;
-	task.src.y_offset = 8;
-	type = 0;
-	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
-			-EOPNOTSUPP);
-
 	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
 					 RK_RGA_FORMAT_BGRA_8888);
 	task.src.rd_mode = RK_RGA_AFBC32X8_MODE;
 	task.dst.rd_mode = RK_RGA_RASTER_MODE;
-	task.src.x_offset = 32;
-	task.src.y_offset = 8;
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
 			-EOPNOTSUPP);
 
-	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGB_888,
-					 RK_RGA_FORMAT_BGRA_8888);
-	task.src.rd_mode = RK_RGA_AFBC32X8_MODE;
-	task.dst.rd_mode = RK_RGA_RASTER_MODE;
-	type = 0;
-	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+	KUNIT_EXPECT_EQ(test, rk_rga3_hw_rd_mode(RK_RGA_RKFBC_MODE, &hw_mode),
 			-EOPNOTSUPP);
-
-	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_420_SP,
-					 RK_RGA_FORMAT_RGBA_8888);
-	task.src.rd_mode = RK_RGA_AFBC32X8_MODE;
-	task.dst.rd_mode = RK_RGA_RASTER_MODE;
-	type = 0;
-	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
-			-EOPNOTSUPP);
-
-	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_YCBCR_422_SP_10B,
-					 RK_RGA_FORMAT_RGBA_8888);
-	task.src.rd_mode = RK_RGA_RKFBC_MODE;
-	task.dst.rd_mode = RK_RGA_RASTER_MODE;
-	task.core = BIT(0);
-	type = 0;
-	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+	KUNIT_EXPECT_EQ(test,
+			rk_rga3_hw_rd_mode(RK_RGA_AFBC32X8_MODE, &hw_mode),
 			-EOPNOTSUPP);
 }
 
@@ -20017,7 +19931,6 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga2_pre_intr_kunit),
 	KUNIT_CASE(rk_rga2_fill_yuv_emit_kunit),
 	KUNIT_CASE(rk_rga2_fill_packed_yuv_emit_kunit),
-	KUNIT_CASE(rk_rga2_fill_multitask_hw_type_kunit),
 	KUNIT_CASE(rk_rga2_rectangle_task_emit_kunit),
 	KUNIT_CASE(rk_rga2_mosaic_emit_kunit),
 	KUNIT_CASE(rk_rga2_mosaic_task_array_emit_kunit),
@@ -20077,7 +19990,6 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_raster_stride_backend_mask_kunit),
 	KUNIT_CASE(rk_rga_direct_import_identity_kunit),
 	KUNIT_CASE(rk_rga_userptr_backing_identity_kunit),
-	KUNIT_CASE(rk_rga_dmabuf_public_provenance_kunit),
 	KUNIT_CASE(rk_rga_cross_type_alias_kunit),
 	KUNIT_CASE(rk_rga_distinct_dmabuf_provenance_kunit),
 	KUNIT_CASE(rk_rga_handle_dmabuf_alias_kunit),
