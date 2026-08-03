@@ -1056,6 +1056,20 @@ static void mpp_iommu_clear_fault_handler(struct mpp_iommu_info *info)
 	}
 }
 
+void mpp_iommu_quiesce_fault_handler(struct mpp_iommu_info *info)
+{
+	if (!info)
+		return;
+
+	mpp_iommu_clear_fault_handler(info);
+	/*
+	 * Provider callbacks run outside their registration locks.  Wait before
+	 * a codec exit callback destroys workqueues or frees the handler token.
+	 */
+	rockchip_iommu_sync_fault_handler(info->dev);
+	vsi_iommu_sync_fault_handler(info->dev);
+}
+
 int mpp_iommu_remove(struct mpp_iommu_info *info)
 {
 	if (!info)
@@ -1065,7 +1079,7 @@ int mpp_iommu_remove(struct mpp_iommu_info *info)
 	if (info->shared)
 		mpp_iommu_attach(info);
 
-	mpp_iommu_clear_fault_handler(info);
+	mpp_iommu_quiesce_fault_handler(info);
 	iommu_group_put(info->group);
 	platform_device_put(info->pdev);
 
@@ -1215,8 +1229,8 @@ int mpp_iommu_reserve_iova(struct mpp_iommu_info *info, dma_addr_t iova, size_t 
 	/* iova will be freed automatically by put_iova_domain() */
 	pfn_lo = iova_pfn(iovad, iova);
 	pfn_hi = iova_pfn(iovad, end);
-	if (!reserve_iova(iovad, pfn_lo, pfn_hi))
-		return -EINVAL;
+	if (!reserve_iova_exclusive(iovad, pfn_lo, pfn_hi))
+		return -EBUSY;
 
 	return 0;
 

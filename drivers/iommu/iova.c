@@ -549,6 +549,43 @@ finish:
 }
 EXPORT_SYMBOL_GPL(reserve_iova);
 
+/**
+ * reserve_iova_exclusive - reserve an IOVA range only when wholly unused
+ * @iovad: IOVA domain
+ * @pfn_lo: first page frame
+ * @pfn_hi: last page frame
+ *
+ * Unlike reserve_iova(), this helper never treats an existing overlapping
+ * node as success. Callers that later free the returned reservation therefore
+ * own the allocator node they remove.
+ */
+struct iova *reserve_iova_exclusive(struct iova_domain *iovad,
+				    unsigned long pfn_lo,
+				    unsigned long pfn_hi)
+{
+	struct rb_node *node;
+	struct iova *iova = NULL;
+	unsigned long flags;
+
+	if (WARN_ON((pfn_hi | pfn_lo) >
+		    (ULLONG_MAX >> iova_shift(iovad))))
+		return NULL;
+
+	spin_lock_irqsave(&iovad->iova_rbtree_lock, flags);
+	for (node = rb_first(&iovad->rbroot); node; node = rb_next(node)) {
+		if (__is_range_overlap(node, pfn_lo, pfn_hi))
+			goto out_unlock;
+	}
+
+	iova = __insert_new_range(iovad, pfn_lo, pfn_hi);
+
+out_unlock:
+	spin_unlock_irqrestore(&iovad->iova_rbtree_lock, flags);
+
+	return iova;
+}
+EXPORT_SYMBOL_GPL(reserve_iova_exclusive);
+
 /*
  * Magazine caches for IOVA ranges.  For an introduction to magazines,
  * see the USENIX 2001 paper "Magazines and Vmem: Extending the Slab

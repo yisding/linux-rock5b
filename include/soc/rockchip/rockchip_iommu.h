@@ -23,6 +23,8 @@ void rockchip_iommu_unmask_irq(struct device *dev);
 int rockchip_pagefault_done(struct device *dev);
 int rockchip_iommu_set_fault_handler(struct device *dev,
 				     iommu_fault_handler_t handler, void *token);
+/* Waits (sleeps) until no provider IRQ callback is using the old token. */
+int rockchip_iommu_sync_fault_handler(struct device *dev);
 #else
 static inline int rockchip_iommu_enable(struct device *dev)
 {
@@ -60,6 +62,11 @@ static inline int rockchip_pagefault_done(struct device *dev)
 static inline int rockchip_iommu_set_fault_handler(struct device *dev,
 					  iommu_fault_handler_t handler,
 					  void *token)
+{
+	return -ENODEV;
+}
+
+static inline int rockchip_iommu_sync_fault_handler(struct device *dev)
 {
 	return -ENODEV;
 }
