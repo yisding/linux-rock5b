@@ -767,7 +767,7 @@ static int rkisp2_params_g_fmt_meta_out(struct file *file, void *fh,
 
 	static const struct v4l2_meta_format mfmt = {
 		.dataformat = V4L2_META_FMT_RKISP2_PARAMS,
-		.buffersize = v4l2_isp_params_buffer_size(RKISP2_PARAMS_MAX_SIZE),
+		.buffersize = v4l2_isp_buffer_size(RKISP2_PARAMS_MAX_SIZE),
 	};
 
 	f->fmt.meta = mfmt;
@@ -815,7 +815,7 @@ static int rkisp2_params_vb2_queue_setup(struct vb2_queue *vq,
 
 	*num_planes = 1;
 
-	sizes[0] = v4l2_isp_params_buffer_size(RKISP2_PARAMS_MAX_SIZE);
+	sizes[0] = v4l2_isp_buffer_size(RKISP2_PARAMS_MAX_SIZE);
 
 	return 0;
 }
@@ -825,7 +825,7 @@ static int rkisp2_params_vb2_buf_init(struct vb2_buffer *vb)
 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
 	struct rkisp2_params_buffer *params_buf = to_rkisp2_params_buffer(vbuf);
 
-	params_buf->cfg = kvmalloc(v4l2_isp_params_buffer_size(RKISP2_PARAMS_MAX_SIZE),
+	params_buf->cfg = kvmalloc(v4l2_isp_buffer_size(RKISP2_PARAMS_MAX_SIZE),
 				   GFP_KERNEL);
 	if (!params_buf->cfg)
 		return -ENOMEM;
@@ -864,7 +864,7 @@ static int rkisp2_params_vb2_buf_prepare(struct vb2_buffer *vb)
 	int ret;
 
 	ret = v4l2_isp_params_validate_buffer_size(params->rkisp2->dev, vb,
-						   v4l2_isp_params_buffer_size(RKISP2_PARAMS_MAX_SIZE));
+						   v4l2_isp_buffer_size(RKISP2_PARAMS_MAX_SIZE));
 	if (ret)
 		return ret;
 
