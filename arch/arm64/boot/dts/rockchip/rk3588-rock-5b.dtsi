@@ -99,6 +99,14 @@
 	status = "okay";
 };
 
+&iep {
+	status = "okay";
+};
+
+&iep_mmu {
+	status = "okay";
+};
+
 &av1d {
 	compatible = "rockchip,av1-decoder";
 	reg = <0x0 0xfdc70000 0x0 0x800>,

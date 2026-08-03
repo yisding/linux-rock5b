@@ -51,6 +51,15 @@ config ROCKCHIP_MPP_RKVDEC2_DEVFREQ
 	  When off, the donor's private ../drivers/devfreq/governor.h include is
 	  elided (it is absent from out-of-tree build trees).
 
+config ROCKCHIP_MPP_IEP2
+	bool "IEP2 image enhancement and deinterlacing"
+	depends on ARM64
+	default y
+	help
+	  Hardware IEP2 image enhancement and deinterlacing block found on
+	  RK3588. The driver registers MPP client type 28 through the shared
+	  /dev/mpp_service interface used by Rockchip libmpp.
+
 config ROCKCHIP_MPP_AV1DEC
 	bool "AV1 decoder"
 	depends on ARM64 && IOMMU_SUPPORT

@@ -1,0 +1,140 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/rockchip,iep2.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Rockchip RK3588 IEP2 image enhancement processor
+
+maintainers:
+  - RKMPP forward-port maintainers <rkmpp-forward-port@example.invalid>
+
+description:
+  The RK3588 IEP2 is a fixed-function image enhancement and deinterlacing
+  engine exposed to Rockchip userspace as client 28 of /dev/mpp_service.
+
+properties:
+  compatible:
+    const: rockchip,iep-v2
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  interrupt-names:
+    const: irq_iep
+
+  clocks:
+    minItems: 3
+    maxItems: 3
+
+  clock-names:
+    items:
+      - const: aclk
+      - const: hclk
+      - const: sclk
+
+  assigned-clocks: true
+  assigned-clock-rates: true
+
+  rockchip,normal-rates:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 2
+    maxItems: 2
+    description: Normal operating rates for the AXI and AHB clocks.
+
+  resets:
+    minItems: 3
+    maxItems: 3
+
+  reset-names:
+    items:
+      - const: rst_a
+      - const: rst_h
+      - const: rst_s
+
+  iommus:
+    maxItems: 1
+
+  power-domains:
+    maxItems: 1
+
+  rockchip,srv:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Phandle to the vendor MPP service coordinator.
+
+  rockchip,taskqueue-node:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: MPP service taskqueue index used by IEP2.
+
+  rockchip,skip-pmu-idle-request:
+    type: boolean
+
+  rockchip,disable-auto-freq:
+    type: boolean
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - interrupt-names
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+  - iommus
+  - power-domains
+  - rockchip,srv
+  - rockchip,taskqueue-node
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/rockchip,rk3588-cru.h>
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+    #include <dt-bindings/power/rk3588-power.h>
+    #include <dt-bindings/reset/rockchip,rk3588-cru.h>
+
+    bus {
+      #address-cells = <2>;
+      #size-cells = <2>;
+
+      cru: clock-controller {
+        #clock-cells = <1>;
+        #reset-cells = <1>;
+      };
+
+      power: power-controller {
+        #power-domain-cells = <1>;
+      };
+
+      mpp_srv: mpp-srv {
+        compatible = "rockchip,mpp-service";
+      };
+
+      iep_mmu: iommu@fdbb0800 {
+        reg = <0x0 0xfdbb0800 0x0 0x100>;
+        #iommu-cells = <0>;
+      };
+
+      iep@fdbb0000 {
+        compatible = "rockchip,iep-v2";
+        reg = <0x0 0xfdbb0000 0x0 0x500>;
+        interrupts = <GIC_SPI 117 IRQ_TYPE_LEVEL_HIGH 0>;
+        interrupt-names = "irq_iep";
+        clocks = <&cru ACLK_IEP2P0>, <&cru HCLK_IEP2P0>,
+                 <&cru CLK_IEP2P0_CORE>;
+        clock-names = "aclk", "hclk", "sclk";
+        resets = <&cru SRST_A_IEP2P0>, <&cru SRST_H_IEP2P0>,
+                 <&cru SRST_IEP2P0_CORE>;
+        reset-names = "rst_a", "rst_h", "rst_s";
+        iommus = <&iep_mmu>;
+        power-domains = <&power RK3588_PD_VDPU>;
+        rockchip,srv = <&mpp_srv>;
+        rockchip,taskqueue-node = <6>;
+      };
+    };
+...
