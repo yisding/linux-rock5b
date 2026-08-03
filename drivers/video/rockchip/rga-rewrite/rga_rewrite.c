@@ -23871,15 +23871,16 @@ static int rk_rga_iommu_unregister_fault_handler(struct rk_rga_hw *hw)
 		return 0;
 
 	/* Provider callbacks are per IOMMU, even when the DMA domain is shared. */
+	/*
+	 * The clear fails only as -ENODEV, when the device has no Rockchip
+	 * IOMMU: there is then no provider IRQ to mask and no stored token to
+	 * invoke, so this path cannot leave a stale callback behind. MPP's
+	 * equivalent teardown reports the same failure and returns.
+	 */
 	ret = rockchip_iommu_set_fault_handler(hw->dev, NULL, NULL);
 	if (ret) {
 		dev_warn(hw->dev, "failed to clear IOMMU fault handler: %pe\n",
 			 ERR_PTR(ret));
-		/*
-		 * If the provider still exists but refused the clear, prevent a
-		 * newly delivered IRQ from invoking the stale token after teardown.
-		 */
-		rockchip_iommu_mask_irq(hw->dev);
 		return ret;
 	}
 	/* rga may be freed after unbind; wait out every in-flight callback. */
