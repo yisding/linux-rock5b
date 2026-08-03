@@ -33,7 +33,6 @@
 #define MVL			28
 #define MVR			27
 
-#define IOMMU_GET_BUS_ID(x)	(((x) >> 6) & 0x1f)
 #define AUX_PAGE_SIZE		SZ_4K
 
 enum rockchip_iep2_fmt {
@@ -230,6 +229,7 @@ struct iep2_dev {
 	struct page *aux_page;
 	unsigned long aux_iova;
 	unsigned long fault_iova;
+	bool aux_reserved;
 };
 
 static int iep2_addr_rnum[] = {
@@ -242,8 +242,7 @@ static int iep2_addr_rnum[] = {
 	33, /* md */
 };
 
-static int iep2_process_reg_fd(struct mpp_session *session,
-			       struct iep_task *task,
+static int iep2_process_reg_fd(struct iep_task *task,
 			       struct mpp_task_msgs *msgs)
 {
 	int i;
@@ -259,7 +258,7 @@ static int iep2_process_reg_fd(struct mpp_session *session,
 		u32 offset;
 		struct mpp_mem_region *mem_region = NULL;
 
-		if (session->msg_flags & MPP_FLAGS_REG_NO_OFFSET) {
+		if (msgs->flags & MPP_FLAGS_REG_NO_OFFSET) {
 			usr_fd = paddr[i];
 			offset = 0;
 		} else {
@@ -267,8 +266,26 @@ static int iep2_process_reg_fd(struct mpp_session *session,
 			offset = paddr[i] >> 10;
 		}
 
-		if (usr_fd == 0 || iep2_addr_rnum[i] == -1)
+		if (iep2_addr_rnum[i] == -1) {
+			paddr[i] = 0;
 			continue;
+		}
+
+		/* Separate V addresses are ignored for semiplanar input. */
+		if ((iep2_addr_rnum[i] == 28 || iep2_addr_rnum[i] == 30 ||
+		     iep2_addr_rnum[i] == 32) &&
+		    task->params.src_yuv_swap < ROCKCHIP_IEP2_YUV_SWAP_P0) {
+			paddr[i] = 0;
+			continue;
+		}
+
+		if (!paddr[i])
+			continue;
+		if (!usr_fd) {
+			mpp_err("reg[%03d]: nonzero packed address has fd 0\n",
+				iep2_addr_rnum[i]);
+			return -EINVAL;
+		}
 
 		mem_region = mpp_task_attach_fd(&task->mpp_task, usr_fd);
 		if (IS_ERR(mem_region)) {
@@ -279,7 +296,7 @@ static int iep2_process_reg_fd(struct mpp_session *session,
 
 		mem_region->reg_idx = iep2_addr_rnum[i];
 
-		if (session->msg_flags & MPP_FLAGS_REG_NO_OFFSET)
+		if (msgs->flags & MPP_FLAGS_REG_NO_OFFSET)
 			offset = mpp_query_reg_offset_info(&task->off_inf, mem_region->reg_idx);
 
 		mpp_debug(DEBUG_IOMMU, "reg[%3d]: %3d => %pad + offset %u\n",
@@ -290,6 +307,67 @@ static int iep2_process_reg_fd(struct mpp_session *session,
 				iep2_addr_rnum[i], &mem_region->iova,
 				offset, mem_region->len);
 			return -ERANGE;
+		}
+		{
+			u64 span;
+			u32 width = task->params.tile_cols * TILE_WIDTH;
+			u32 height = task->params.tile_rows * TILE_HEIGHT;
+			u32 rows = height;
+			u32 row_bytes = width;
+			u32 stride = 0;
+
+			switch (iep2_addr_rnum[i]) {
+			case 24:
+			case 25:
+			case 26:
+				stride = task->params.src_y_stride * 4;
+				break;
+			case 27:
+			case 28:
+			case 29:
+			case 30:
+			case 31:
+			case 32:
+				stride = task->params.src_uv_stride * 4;
+				if (task->params.src_yuv_swap >=
+				    ROCKCHIP_IEP2_YUV_SWAP_P0)
+					row_bytes /= 2;
+				if (task->params.src_fmt == ROCKCHIP_IEP2_FMT_YUV420)
+					rows /= 2;
+				break;
+			case 44:
+			case 45:
+				stride = task->params.dst_y_stride * 4;
+				break;
+			case 46:
+			case 47:
+				stride = task->params.dst_y_stride * 4;
+				if (task->params.dst_fmt == ROCKCHIP_IEP2_FMT_YUV420)
+					rows /= 2;
+				break;
+			case 34:
+				span = task->params.tile_cols * task->params.tile_rows;
+				goto check_span;
+			case 33:
+				span = (u64)width * height;
+				goto check_span;
+			default:
+				return -EINVAL;
+			}
+
+			if (stride < row_bytes)
+				return -EINVAL;
+			/* Include the final row's padding and hardware burst window. */
+			span = (u64)rows * stride;
+
+check_span:
+			if (span > mem_region->len - offset) {
+				mpp_err("reg[%03d]: offset %u span %llu exceeds len %lu\n",
+					iep2_addr_rnum[i], offset,
+					(unsigned long long)span,
+					mem_region->len);
+				return -ERANGE;
+			}
 		}
 		paddr[i] = (u32)mem_region->iova + offset;
 
@@ -308,6 +386,8 @@ static int iep2_process_reg_fd(struct mpp_session *session,
 
 static int iep2_validate_params(const struct iep2_params *params)
 {
+	int i;
+
 	if (params->src_fmt < ROCKCHIP_IEP2_FMT_YUV422 ||
 	    params->src_fmt > ROCKCHIP_IEP2_FMT_YUV420 ||
 	    params->dst_fmt < ROCKCHIP_IEP2_FMT_YUV422 ||
@@ -327,11 +407,33 @@ static int iep2_validate_params(const struct iep2_params *params)
 	    !params->dst_y_stride || params->dst_y_stride > U16_MAX)
 		return -EINVAL;
 
+	if (params->src_y_stride * 4 < params->tile_cols * TILE_WIDTH ||
+	    params->src_uv_stride * 4 <
+		(params->src_yuv_swap >= ROCKCHIP_IEP2_YUV_SWAP_P0 ?
+		 params->tile_cols * TILE_WIDTH / 2 :
+		 params->tile_cols * TILE_WIDTH) ||
+	    params->dst_y_stride * 4 < params->tile_cols * TILE_WIDTH)
+		return -EINVAL;
+
 	if (params->dil_mode > ROCKCHIP_IEP2_DIL_MODE_DECT ||
 	    params->dil_out_mode > 1 ||
 	    params->dil_field_order > ROCKCHIP_IEP2_DIL_FF_ORDER_BT ||
 	    params->osd_area_num > ARRAY_SIZE(params->osd_x_sta) ||
 	    params->roi_layer_num > ARRAY_SIZE(params->roi_mode))
+		return -EINVAL;
+
+	for (i = 0; i < ARRAY_SIZE(params->src); i++) {
+		if (!params->src[i].y || !params->src[i].cbcr)
+			return -EINVAL;
+		if (params->src_yuv_swap >= ROCKCHIP_IEP2_YUV_SWAP_P0 &&
+		    !params->src[i].cr)
+			return -EINVAL;
+	}
+	for (i = 0; i < ARRAY_SIZE(params->dst); i++) {
+		if (!params->dst[i].y || !params->dst[i].cbcr)
+			return -EINVAL;
+	}
+	if (!params->mv_addr || !params->md_addr)
 		return -EINVAL;
 
 	return 0;
@@ -412,16 +514,18 @@ static void *iep2_alloc_task(struct mpp_session *session,
 		return NULL;
 
 	mpp_task_init(session, &task->mpp_task);
+	if (msgs->flags & MPP_FLAGS_REG_FD_NO_TRANS) {
+		mpp_err("IEP2 does not accept untranslated DMA addresses\n");
+		goto fail;
+	}
 	/* extract reqs for current task */
 	ret = iep2_extract_task_msg(task, msgs);
 	if (ret)
 		goto fail;
 	/* process fd in register */
-	if (!(msgs->flags & MPP_FLAGS_REG_FD_NO_TRANS)) {
-		ret = iep2_process_reg_fd(session, task, msgs);
-		if (ret)
-			goto fail;
-	}
+	ret = iep2_process_reg_fd(task, msgs);
+	if (ret)
+		goto fail;
 	task->clk_mode = CLK_MODE_NORMAL;
 
 	mpp_debug_leave();
@@ -667,6 +771,7 @@ static int iep2_run(struct mpp_dev *mpp,
 		    struct mpp_task *mpp_task)
 {
 	struct iep_task *task = NULL;
+	unsigned long flags;
 	u32 timing_en = mpp->srv->timing_en;
 
 	mpp_debug_enter();
@@ -674,7 +779,9 @@ static int iep2_run(struct mpp_dev *mpp,
 	task = to_iep_task(mpp_task);
 
 	/* init current task */
+	spin_lock_irqsave(&mpp->queue->running_lock, flags);
 	mpp->cur_task = mpp_task;
+	spin_unlock_irqrestore(&mpp->queue->running_lock, flags);
 
 	iep2_config(mpp, task);
 	iep2_osd_cfg(mpp, task);
@@ -728,18 +835,22 @@ static int iep2_isr(struct mpp_dev *mpp)
 	struct mpp_task *mpp_task = NULL;
 	struct iep_task *task = NULL;
 	struct iep2_dev *iep = to_iep2_dev(mpp);
+	unsigned long flags;
 
 	mpp_debug_enter();
 
+	spin_lock_irqsave(&mpp->queue->running_lock, flags);
 	mpp_task = mpp->cur_task;
 	if (!mpp_task) {
+		spin_unlock_irqrestore(&mpp->queue->running_lock, flags);
 		dev_err(iep->mpp.dev, "no current task\n");
 		return IRQ_HANDLED;
 	}
-	task = to_iep_task(mpp_task);
-
-	mpp_time_diff(mpp_task);
 	mpp->cur_task = NULL;
+	spin_unlock_irqrestore(&mpp->queue->running_lock, flags);
+
+	task = to_iep_task(mpp_task);
+	mpp_time_diff(mpp_task);
 	task->irq_status = mpp->irq_status;
 	mpp_debug(DEBUG_IRQ_STATUS, "irq_status: %08x\n",
 		  task->irq_status);
@@ -815,6 +926,22 @@ static int iep2_finish(struct mpp_dev *mpp,
 		output->mv_hist[i] = IEP2_REG_RO_MV_HIST_EVEN(reg);
 		output->mv_hist[i + 1] = IEP2_REG_RO_MV_HIST_ODD(reg);
 	}
+
+	/* No fault recovery may outlive the task whose IOVA it extends. */
+	cancel_work_sync(&to_iep2_dev(mpp)->iommu_work);
+	mpp_iommu_down_write(mpp->iommu_info);
+	if (to_iep2_dev(mpp)->aux_iova != -1) {
+		struct iep2_dev *iep = to_iep2_dev(mpp);
+
+		iommu_unmap(mpp->iommu_info->domain, iep->aux_iova,
+			    AUX_PAGE_SIZE);
+		if (iep->aux_reserved)
+			mpp_iommu_unreserve_iova(mpp->iommu_info, iep->aux_iova,
+						 AUX_PAGE_SIZE);
+		iep->aux_iova = -1;
+		iep->aux_reserved = false;
+	}
+	mpp_iommu_up_write(mpp->iommu_info);
 
 	mpp_debug_leave();
 
@@ -908,21 +1035,37 @@ static void iep2_iommu_handle_work(struct work_struct *work_s)
 
 	if (iep->aux_iova != -1) {
 		iommu_unmap(mpp->iommu_info->domain, iep->aux_iova, AUX_PAGE_SIZE);
+		if (iep->aux_reserved)
+			mpp_iommu_unreserve_iova(mpp->iommu_info, iep->aux_iova,
+						 AUX_PAGE_SIZE);
 		iep->aux_iova = -1;
+		iep->aux_reserved = false;
 	}
 
 	page_iova = round_down(iep->fault_iova, AUX_PAGE_SIZE);
+	ret = mpp_iommu_reserve_iova(mpp->iommu_info, page_iova,
+				     AUX_PAGE_SIZE);
+	if (ret) {
+		mpp_err("reserve auxiliary iova %lx error %d\n", page_iova, ret);
+		atomic_inc(&mpp->reset_request);
+		goto out_unlock;
+	}
+	iep->aux_reserved = true;
 	ret = iommu_map(mpp->iommu_info->domain, page_iova,
 			page_to_phys(iep->aux_page), AUX_PAGE_SIZE,
 			IOMMU_READ, GFP_KERNEL);
 	if (ret) {
 		mpp_err("iommu_map iova %lx error.\n", page_iova);
+		mpp_iommu_unreserve_iova(mpp->iommu_info, page_iova,
+					 AUX_PAGE_SIZE);
+		iep->aux_reserved = false;
 		atomic_inc(&mpp->reset_request);
 	} else {
 		iep->aux_iova = page_iova;
 		rockchip_iommu_unmask_irq(mpp->dev);
 	}
 
+out_unlock:
 	mpp_iommu_up_write(mpp->iommu_info);
 
 	mpp_debug_leave();
@@ -934,22 +1077,29 @@ static int iep2_iommu_fault_handle(struct iommu_domain *iommu,
 {
 	struct mpp_dev *mpp = (struct mpp_dev *)arg;
 	struct iep2_dev *iep = to_iep2_dev(mpp);
-	struct mpp_task *mpp_task = mpp->cur_task;
+	struct mpp_task *mpp_task;
 	struct iep_task *task;
+	unsigned long flags;
+	bool expected_fault;
 
 	mpp_debug_enter();
-	mpp_debug(DEBUG_IOMMU, "IOMMU_GET_BUS_ID(status)=%d\n", IOMMU_GET_BUS_ID(status));
-	rockchip_iommu_mask_irq(mpp->dev);
+	spin_lock_irqsave(&mpp->queue->running_lock, flags);
+	mpp_task = mpp->cur_task;
 	if (!mpp_task) {
+		spin_unlock_irqrestore(&mpp->queue->running_lock, flags);
 		dev_err(iommu_dev, "IEP2 IOMMU fault without a current task: iova %#lx status %#x\n",
 			iova, status);
-		atomic_inc(&mpp->reset_request);
-		return 0;
+		mpp_debug_leave();
+		return -ENODEV;
 	}
 	task = to_iep_task(mpp_task);
-	if (IOMMU_GET_BUS_ID(status) &&
-	    task->params.dil_mode == ROCKCHIP_IEP2_DIL_MODE_I1O1T &&
-	    task->src_iova_end == iova) {
+	expected_fault = !(status & (IOMMU_FAULT_WRITE |
+				      ROCKCHIP_IOMMU_FAULT_BUS_ERROR)) &&
+			 task->params.dil_mode == ROCKCHIP_IEP2_DIL_MODE_I1O1T &&
+			 task->src_iova_end == iova;
+
+	rockchip_iommu_mask_irq(mpp->dev);
+	if (expected_fault) {
 		iep->fault_iova = iova;
 		queue_work(iep->iommu_wq, &iep->iommu_work);
 	} else {
@@ -958,6 +1108,7 @@ static int iep2_iommu_fault_handle(struct iommu_domain *iommu,
 		mpp_task_dump_mem_region(mpp, mpp_task);
 		atomic_inc(&mpp->reset_request);
 	}
+	spin_unlock_irqrestore(&mpp->queue->running_lock, flags);
 
 	mpp_debug_leave();
 
@@ -974,25 +1125,37 @@ static int iep2_init(struct mpp_dev *mpp)
 	/* Get clock info from dtsi */
 	ret = mpp_get_clk_info(mpp, &iep->aclk_info, "aclk");
 	if (ret)
-		mpp_err("failed on clk_get aclk\n");
+		return ret;
 	ret = mpp_get_clk_info(mpp, &iep->hclk_info, "hclk");
 	if (ret)
-		mpp_err("failed on clk_get hclk\n");
+		return ret;
 	ret = mpp_get_clk_info(mpp, &iep->sclk_info, "sclk");
 	if (ret)
-		mpp_err("failed on clk_get sclk\n");
+		return ret;
 	/* Set default rates */
 	mpp_set_clk_info_rate_hz(&iep->aclk_info, CLK_MODE_DEFAULT, 300 * MHZ);
 
 	iep->rst_a = mpp_reset_control_get(mpp, RST_TYPE_A, "rst_a");
+	if (IS_ERR(iep->rst_a))
+		return dev_err_probe(mpp->dev, PTR_ERR(iep->rst_a),
+				     "failed to get aclk reset\n");
 	if (!iep->rst_a)
-		mpp_err("No aclk reset resource define\n");
+		return dev_err_probe(mpp->dev, -ENODEV,
+				     "missing aclk reset\n");
 	iep->rst_h = mpp_reset_control_get(mpp, RST_TYPE_H, "rst_h");
+	if (IS_ERR(iep->rst_h))
+		return dev_err_probe(mpp->dev, PTR_ERR(iep->rst_h),
+				     "failed to get hclk reset\n");
 	if (!iep->rst_h)
-		mpp_err("No hclk reset resource define\n");
+		return dev_err_probe(mpp->dev, -ENODEV,
+				     "missing hclk reset\n");
 	iep->rst_s = mpp_reset_control_get(mpp, RST_TYPE_CORE, "rst_s");
+	if (IS_ERR(iep->rst_s))
+		return dev_err_probe(mpp->dev, PTR_ERR(iep->rst_s),
+				     "failed to get sclk reset\n");
 	if (!iep->rst_s)
-		mpp_err("No sclk reset resource define\n");
+		return dev_err_probe(mpp->dev, -ENODEV,
+				     "missing sclk reset\n");
 
 	iep->roi.size = IEP2_TILE_W_MAX * IEP2_TILE_H_MAX;
 	iep->roi.vaddr = dma_alloc_coherent(mpp->dev, iep->roi.size,
@@ -1019,6 +1182,7 @@ static int iep2_init(struct mpp_dev *mpp)
 	}
 	clear_highpage(iep->aux_page);
 	iep->aux_iova = -1;
+	iep->aux_reserved = false;
 
 	iep->iommu_wq = alloc_ordered_workqueue("iep2-iommu", WQ_MEM_RECLAIM);
 	if (!iep->iommu_wq) {
@@ -1054,8 +1218,14 @@ static int iep2_exit(struct mpp_dev *mpp)
 	}
 
 	if (iep->aux_iova != -1) {
+		mpp_iommu_down_write(mpp->iommu_info);
 		iommu_unmap(mpp->iommu_info->domain, iep->aux_iova, AUX_PAGE_SIZE);
+		if (iep->aux_reserved)
+			mpp_iommu_unreserve_iova(mpp->iommu_info, iep->aux_iova,
+						 AUX_PAGE_SIZE);
 		iep->aux_iova = -1;
+		iep->aux_reserved = false;
+		mpp_iommu_up_write(mpp->iommu_info);
 	}
 
 	if (iep->aux_page) {
@@ -1075,21 +1245,34 @@ static int iep2_exit(struct mpp_dev *mpp)
 static int iep2_clk_on(struct mpp_dev *mpp)
 {
 	struct iep2_dev *iep = to_iep2_dev(mpp);
+	int ret;
 
-	mpp_clk_safe_enable(iep->aclk_info.clk);
-	mpp_clk_safe_enable(iep->hclk_info.clk);
-	mpp_clk_safe_enable(iep->sclk_info.clk);
+	ret = mpp_clk_safe_enable(iep->aclk_info.clk);
+	if (ret)
+		return ret;
+	ret = mpp_clk_safe_enable(iep->hclk_info.clk);
+	if (ret)
+		goto err_disable_aclk;
+	ret = mpp_clk_safe_enable(iep->sclk_info.clk);
+	if (ret)
+		goto err_disable_hclk;
 
 	return 0;
+
+err_disable_hclk:
+	mpp_clk_safe_disable(iep->hclk_info.clk);
+err_disable_aclk:
+	mpp_clk_safe_disable(iep->aclk_info.clk);
+	return ret;
 }
 
 static int iep2_clk_off(struct mpp_dev *mpp)
 {
 	struct iep2_dev *iep = to_iep2_dev(mpp);
 
-	mpp_clk_safe_disable(iep->aclk_info.clk);
-	mpp_clk_safe_disable(iep->hclk_info.clk);
 	mpp_clk_safe_disable(iep->sclk_info.clk);
+	mpp_clk_safe_disable(iep->hclk_info.clk);
+	mpp_clk_safe_disable(iep->aclk_info.clk);
 
 	return 0;
 }
@@ -1231,8 +1414,10 @@ static void iep2_remove(struct platform_device *pdev)
 	struct mpp_dev *mpp = dev_get_drvdata(dev);
 
 	dev_info(dev, "remove device\n");
-	mpp_dev_remove(mpp);
 	iep2_procfs_remove(mpp);
+	/* No main IRQ callback may reach the device after queue teardown. */
+	devm_free_irq(dev, mpp->irq, mpp);
+	mpp_dev_remove(mpp);
 }
 
 struct platform_driver rockchip_iep2_driver = {
@@ -1243,6 +1428,8 @@ struct platform_driver rockchip_iep2_driver = {
 		.name = IEP2_DRIVER_NAME,
 		.of_match_table = of_match_ptr(mpp_iep2_match),
 		.pm = &mpp_common_pm_ops,
+		/* Common MPP lacks a safe per-subdevice hot-unbind contract. */
+		.suppress_bind_attrs = true,
 	},
 };
 EXPORT_SYMBOL(rockchip_iep2_driver);

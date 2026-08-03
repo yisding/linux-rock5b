@@ -900,6 +900,22 @@ int vsi_iommu_set_fault_handler(struct device *dev,
 }
 EXPORT_SYMBOL_GPL(vsi_iommu_set_fault_handler);
 
+/* Clearing the callback does not wait for the IRQ path that copied it. */
+int vsi_iommu_sync_fault_handler(struct device *dev)
+{
+	struct vsi_iommu *iommu = vsi_iommu_from_dev_checked(dev);
+
+	might_sleep();
+
+	if (!iommu)
+		return -ENODEV;
+
+	synchronize_irq(iommu->irq);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(vsi_iommu_sync_fault_handler);
+
 static const struct of_device_id vsi_iommu_dt_ids[] = {
 	{
 		.compatible = "verisilicon,iommu-1.2",

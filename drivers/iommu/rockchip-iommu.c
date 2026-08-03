@@ -1489,6 +1489,34 @@ int rockchip_iommu_set_fault_handler(struct device *dev,
 }
 EXPORT_SYMBOL_GPL(rockchip_iommu_set_fault_handler);
 
+/*
+ * The provider invokes the callback after dropping fault_lock.  Clearing the
+ * pointer therefore prevents new callbacks but does not wait for one that
+ * already copied the old token.
+ */
+int rockchip_iommu_sync_fault_handler(struct device *dev)
+{
+	struct rk_iommu *iommu = rk_iommu_from_dev_checked(dev);
+	struct platform_device *pdev;
+	int i;
+
+	might_sleep();
+
+	if (!iommu)
+		return -ENODEV;
+
+	pdev = to_platform_device(iommu->dev);
+	for (i = 0; i < iommu->num_irq; i++) {
+		int irq = platform_get_irq(pdev, i);
+
+		if (irq >= 0)
+			synchronize_irq(irq);
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(rockchip_iommu_sync_fault_handler);
+
 static int rk_iommu_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;

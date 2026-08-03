@@ -765,23 +765,23 @@ static inline u32 mpp_read_relaxed(struct mpp_dev *mpp, u32 reg)
 
 static inline int mpp_safe_reset(struct reset_control *rst)
 {
-	if (rst)
-		reset_control_assert(rst);
+	if (!IS_ERR_OR_NULL(rst))
+		return reset_control_assert(rst);
 
 	return 0;
 }
 
 static inline int mpp_safe_unreset(struct reset_control *rst)
 {
-	if (rst)
-		reset_control_deassert(rst);
+	if (!IS_ERR_OR_NULL(rst))
+		return reset_control_deassert(rst);
 
 	return 0;
 }
 
 static inline int mpp_clk_safe_enable(struct clk *clk)
 {
-	if (clk)
+	if (!IS_ERR_OR_NULL(clk))
 		return clk_prepare_enable(clk);
 
 	return 0;
@@ -789,7 +789,7 @@ static inline int mpp_clk_safe_enable(struct clk *clk)
 
 static inline int mpp_clk_safe_disable(struct clk *clk)
 {
-	if (clk)
+	if (!IS_ERR_OR_NULL(clk))
 		clk_disable_unprepare(clk);
 
 	return 0;

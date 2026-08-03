@@ -181,6 +181,7 @@ void mpp_dma_buf_sync(struct mpp_dma_buffer *buffer, u32 offset, u32 length,
 
 struct mpp_iommu_info *
 mpp_iommu_probe(struct device *dev);
+void mpp_iommu_quiesce_fault_handler(struct mpp_iommu_info *info);
 int mpp_iommu_remove(struct mpp_iommu_info *info);
 
 int mpp_iommu_attach(struct mpp_iommu_info *info);

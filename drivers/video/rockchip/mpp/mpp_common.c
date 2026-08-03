@@ -196,6 +196,10 @@ mpp_taskqueue_pop_running(struct mpp_taskqueue *queue,
 static void mpp_taskqueue_fail_running(struct mpp_taskqueue *queue,
 				       struct mpp_task *task)
 {
+	/* Claim the task and wait out any callback before dropping its ref. */
+	set_bit(TASK_STATE_HANDLE, &task->state);
+	cancel_delayed_work_sync(&task->timeout_work);
+
 	set_bit(TASK_STATE_ABORT, &task->state);
 	set_bit(TASK_STATE_FINISH, &task->state);
 	set_bit(TASK_STATE_DONE, &task->state);
@@ -718,6 +722,7 @@ struct reset_control *
 mpp_reset_control_get(struct mpp_dev *mpp, enum MPP_RESET_TYPE type, const char *name)
 {
 	int index;
+	int ret;
 	struct reset_control *rst = NULL;
 	char shared_name[32] = "shared_";
 	struct mpp_reset_group *group;
@@ -726,7 +731,11 @@ mpp_reset_control_get(struct mpp_dev *mpp, enum MPP_RESET_TYPE type, const char 
 	index = of_property_match_string(mpp->dev->of_node, "reset-names", name);
 	if (index >= 0) {
 		rst = devm_reset_control_get(mpp->dev, name);
-		mpp_safe_unreset(rst);
+		if (IS_ERR(rst))
+			return rst;
+		ret = mpp_safe_unreset(rst);
+		if (ret)
+			return ERR_PTR(ret);
 
 		return rst;
 	}
@@ -751,11 +760,18 @@ mpp_reset_control_get(struct mpp_dev *mpp, enum MPP_RESET_TYPE type, const char 
 	rst = group->resets[type];
 	if (!rst) {
 		rst = devm_reset_control_get(mpp->dev, shared_name);
-		mpp_safe_unreset(rst);
+		if (IS_ERR(rst))
+			goto out_unlock;
+		ret = mpp_safe_unreset(rst);
+		if (ret) {
+			rst = ERR_PTR(ret);
+			goto out_unlock;
+		}
 		group->resets[type] = rst;
 		group->queue = mpp->queue;
 	}
 	dev_info(mpp->dev, "reset_group->rw_sem_on=%d\n", group->rw_sem_on);
+out_unlock:
 	up_write(&group->rw_sem);
 
 	return rst;
@@ -996,6 +1012,14 @@ static void try_process_running_task(struct mpp_dev *mpp)
 			enable_irq(mpp->irq);
 			continue;
 		}
+		/*
+		 * The hard IRQ can only cancel asynchronously.  Once IRQ disablement
+		 * makes HANDLE ownership stable, wait out a callback that already
+		 * started before the ISR can drop the running task reference.  A
+		 * callback's nested disable_irq()/enable_irq() pair is depth-balanced
+		 * inside this outer disable.
+		 */
+		cancel_delayed_work_sync(&mpp_task->timeout_work);
 
 		/* process timeout task */
 		if (test_bit(TASK_STATE_TIMEOUT, &mpp_task->state)) {
@@ -2691,6 +2715,9 @@ failed:
 
 int mpp_dev_remove(struct mpp_dev *mpp)
 {
+	/* The hardware exit path may free resources used by the fault callback. */
+	mpp_iommu_quiesce_fault_handler(mpp->iommu_info);
+
 	if (mpp->hw_ops->exit)
 		mpp->hw_ops->exit(mpp);
 
@@ -2937,6 +2964,13 @@ int mpp_get_clk_info(struct mpp_dev *mpp,
 		return -EINVAL;
 
 	clk_info->clk = devm_clk_get(mpp->dev, name);
+	if (IS_ERR(clk_info->clk)) {
+		int ret = PTR_ERR(clk_info->clk);
+
+		clk_info->clk = NULL;
+		return dev_err_probe(mpp->dev, ret,
+				     "failed to get %s clock\n", name);
+	}
 	of_property_read_u32_index(mpp->dev->of_node,
 				   "rockchip,normal-rates",
 				   index,

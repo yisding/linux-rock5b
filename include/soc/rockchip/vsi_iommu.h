@@ -12,6 +12,7 @@ int vsi_iommu_refresh(struct device *dev);
 void vsi_iommu_mask_irq(struct device *dev);
 int vsi_iommu_set_fault_handler(struct device *dev,
 					iommu_fault_handler_t handler, void *token);
+int vsi_iommu_sync_fault_handler(struct device *dev);
 #else
 static inline int vsi_iommu_refresh(struct device *dev)
 {
@@ -24,6 +25,11 @@ static inline void vsi_iommu_mask_irq(struct device *dev)
 
 static inline int vsi_iommu_set_fault_handler(struct device *dev,
 				     iommu_fault_handler_t handler, void *token)
+{
+	return -ENODEV;
+}
+
+static inline int vsi_iommu_sync_fault_handler(struct device *dev)
 {
 	return -ENODEV;
 }

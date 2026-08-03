@@ -538,6 +538,8 @@ static struct platform_driver mpp_service_driver = {
 	.driver = {
 		.name = "mpp_service",
 		.of_match_table = of_match_ptr(mpp_dt_ids),
+		/* Open sessions have no safe hot-unplug lifetime contract. */
+		.suppress_bind_attrs = true,
 	},
 };
 
