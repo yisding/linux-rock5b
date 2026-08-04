@@ -3494,6 +3494,7 @@ static int rkvenc2_iommu_fault_handle(struct iommu_domain *iommu,
 	struct rkvenc_ccu *ccu = enc->ccu;
 	struct rkvenc_dev *fault_enc = enc;
 	struct mpp_task *mpp_task;
+	unsigned long flags;
 
 	if (ccu) {
 		struct rkvenc_dev *core;
@@ -3522,6 +3523,7 @@ static int rkvenc2_iommu_fault_handle(struct iommu_domain *iommu,
 		 */
 		rockchip_iommu_mask_irq(mpp->dev);
 
+		spin_lock_irqsave(&mpp->queue->running_lock, flags);
 		mpp_task = mpp->cur_task;
 		dev_info(mpp->dev, "core %d page fault found dchs %08x\n",
 			 mpp->core_id,
@@ -3529,6 +3531,7 @@ static int rkvenc2_iommu_fault_handle(struct iommu_domain *iommu,
 
 		if (mpp_task)
 			mpp_task_dump_mem_region(mpp, mpp_task);
+		spin_unlock_irqrestore(&mpp->queue->running_lock, flags);
 		rcu_read_unlock();
 
 		return 0;
@@ -3540,12 +3543,14 @@ static int rkvenc2_iommu_fault_handle(struct iommu_domain *iommu,
 	 */
 	rockchip_iommu_mask_irq(mpp->dev);
 
+	spin_lock_irqsave(&mpp->queue->running_lock, flags);
 	mpp_task = mpp->cur_task;
 	dev_info(mpp->dev, "core %d page fault found dchs %08x\n",
 		 mpp->core_id, mpp_read_relaxed(&fault_enc->mpp, DCHS_REG_OFFSET));
 
 	if (mpp_task)
 		mpp_task_dump_mem_region(mpp, mpp_task);
+	spin_unlock_irqrestore(&mpp->queue->running_lock, flags);
 
 	return 0;
 }
