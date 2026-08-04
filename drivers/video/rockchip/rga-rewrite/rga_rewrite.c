@@ -18820,8 +18820,8 @@ static void rk_rga_ffmpeg_alpha_overlay_kunit(struct kunit *test)
 	task.rotate_mode = 1;
 	task.sina = 65536;
 	type = 0;
-	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
-	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
 }
 
 static void rk_rga3_librga_alpha_yuv_emit_kunit(struct kunit *test)
@@ -18968,8 +18968,6 @@ static void rk_rga3_librga_slt_alpha_emit_kunit(struct kunit *test)
 		.feature.global_alpha_en = true,
 		.fg_global_alpha = 0xff,
 		.bg_global_alpha = 0xff,
-		.rotate_mode = 1 | (4 << 4),
-		.cosa = -65536,
 		.yuv2rgb_mode = 2 << 2,
 	};
 	struct rk_rga_job job = {
@@ -19037,6 +19035,13 @@ static void rk_rga3_librga_slt_alpha_emit_kunit(struct kunit *test)
 			lower_32_bits(task.dst.yrgb_addr));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_U_BASE_OFFSET / 4],
 			lower_32_bits(task.dst.uv_addr));
+
+	/* Pattern-blend rotation has no established BSP wire/canvas contract. */
+	task.rotate_mode = 1 | (4 << 4);
+	task.cosa = -65536;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
+			-EOPNOTSUPP);
 }
 
 static void rk_rga3_librga_global_alpha_emit_kunit(struct kunit *test)
@@ -19885,16 +19890,9 @@ static void rk_rga3_alpha_rotate_emit_kunit(struct kunit *test)
 	task.rotate_mode = 1;
 	task.sina = 65536;
 
-	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
-	KUNIT_EXPECT_FALSE(test, cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
-			   RK_RGA3_WIN0_ROT);
-	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4] &
-			  RK_RGA3_WIN0_ROT);
-	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
-			1280 | (720 << 16));
-	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN1_DST_SIZE_OFFSET / 4],
-			1280 | (720 << 16));
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
 
 	memset(cmd, 0, sizeof(cmd));
 	memset(&task.pat, 0, sizeof(task.pat));
@@ -24501,7 +24499,8 @@ static int rk_rga_request_config(struct rk_rga_session *session,
 
 out_unlock:
 	mutex_unlock(&session->lock);
-	rk_rga_request_free(consumed);
+	if (consumed)
+		rk_rga_request_free(consumed);
 	if (close_acquire_fds)
 		rk_rga_close_kernel_acquire_fds(acquire_fds,
 						acquire_fd_count);
