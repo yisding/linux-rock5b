@@ -984,19 +984,18 @@ static struct rk_iommu *rk_iommu_from_dev(struct device *dev)
 static int rk_iommu_call_fault_handler(struct rk_iommu *iommu,
 				       dma_addr_t iova, int flags)
 {
-	iommu_fault_handler_t handler;
 	unsigned long irq_flags;
-	void *token;
+	int ret;
 
 	spin_lock_irqsave(&iommu->fault_lock, irq_flags);
-	handler = iommu->fault_handler;
-	token = iommu->fault_handler_token;
+	if (!iommu->fault_handler || iommu->domain == &rk_identity_domain)
+		ret = -EOPNOTSUPP;
+	else
+		ret = iommu->fault_handler(iommu->domain, iommu->dev, iova,
+					   flags, iommu->fault_handler_token);
 	spin_unlock_irqrestore(&iommu->fault_lock, irq_flags);
 
-	if (!handler || iommu->domain == &rk_identity_domain)
-		return -EOPNOTSUPP;
-
-	return handler(iommu->domain, iommu->dev, iova, flags, token);
+	return ret;
 }
 
 /* Must be called with iommu powered on and attached */
@@ -1489,11 +1488,7 @@ int rockchip_iommu_set_fault_handler(struct device *dev,
 }
 EXPORT_SYMBOL_GPL(rockchip_iommu_set_fault_handler);
 
-/*
- * The provider invokes the callback after dropping fault_lock.  Clearing the
- * pointer therefore prevents new callbacks but does not wait for one that
- * already copied the old token.
- */
+/* Wait for the complete provider IRQ path after clearing the callback. */
 int rockchip_iommu_sync_fault_handler(struct device *dev)
 {
 	struct rk_iommu *iommu = rk_iommu_from_dev_checked(dev);

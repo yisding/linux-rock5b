@@ -912,6 +912,7 @@ static int mpp_iommu_handle(struct iommu_domain *iommu,
 			    int status, void *arg)
 {
 	struct mpp_dev *mpp = (struct mpp_dev *)arg;
+	unsigned long flags;
 
 	/*
 	 * Mask iommu irq, in order for iommu not repeatedly trigger pagefault.
@@ -930,8 +931,10 @@ static int mpp_iommu_handle(struct iommu_domain *iommu,
 		return 0;
 	}
 
+	spin_lock_irqsave(&mpp->queue->running_lock, flags);
 	if (mpp->cur_task)
 		mpp_task_dump_mem_region(mpp, mpp->cur_task);
+	spin_unlock_irqrestore(&mpp->queue->running_lock, flags);
 
 	if (mpp->dev_ops && mpp->dev_ops->dump_dev)
 		mpp->dev_ops->dump_dev(mpp);
@@ -1063,8 +1066,9 @@ void mpp_iommu_quiesce_fault_handler(struct mpp_iommu_info *info)
 
 	mpp_iommu_clear_fault_handler(info);
 	/*
-	 * Provider callbacks run outside their registration locks.  Wait before
-	 * a codec exit callback destroys workqueues or frees the handler token.
+	 * Callback removal waits on the provider registration lock.  Also wait
+	 * for the rest of a provider IRQ before codec teardown releases state
+	 * that the IRQ path itself can still access.
 	 */
 	rockchip_iommu_sync_fault_handler(info->dev);
 	vsi_iommu_sync_fault_handler(info->dev);

@@ -200,19 +200,18 @@ static int vsi_iommu_call_fault_handler(struct vsi_iommu *iommu,
 					struct iommu_domain *domain,
 					dma_addr_t iova, int flags)
 {
-	iommu_fault_handler_t handler;
 	unsigned long irq_flags;
-	void *token;
+	int ret;
 
 	spin_lock_irqsave(&iommu->fault_lock, irq_flags);
-	handler = iommu->fault_handler;
-	token = iommu->fault_handler_token;
+	if (!iommu->fault_handler || !domain || domain == &vsi_identity_domain)
+		ret = -EOPNOTSUPP;
+	else
+		ret = iommu->fault_handler(domain, iommu->dev, iova, flags,
+					   iommu->fault_handler_token);
 	spin_unlock_irqrestore(&iommu->fault_lock, irq_flags);
 
-	if (!handler || !domain || domain == &vsi_identity_domain)
-		return -EOPNOTSUPP;
-
-	return handler(domain, iommu->dev, iova, flags, token);
+	return ret;
 }
 
 static void vsi_iommu_mask_irq_locked(struct vsi_iommu *iommu)
@@ -900,7 +899,7 @@ int vsi_iommu_set_fault_handler(struct device *dev,
 }
 EXPORT_SYMBOL_GPL(vsi_iommu_set_fault_handler);
 
-/* Clearing the callback does not wait for the IRQ path that copied it. */
+/* Wait for the complete provider IRQ path after clearing the callback. */
 int vsi_iommu_sync_fault_handler(struct device *dev)
 {
 	struct vsi_iommu *iommu = vsi_iommu_from_dev_checked(dev);
