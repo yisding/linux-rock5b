@@ -347,6 +347,7 @@ struct rga_job {
 	struct rga_dma_buffer *cmd_buf;
 	struct rga_req *task_list;
 	struct rga_job_task_buffers *task_buffers;
+	size_t task_start;
 	size_t task_count;
 	size_t finished_count;
 
