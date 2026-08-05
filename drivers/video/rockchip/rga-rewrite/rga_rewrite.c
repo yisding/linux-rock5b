@@ -2245,8 +2245,8 @@ static int rk_rga_check_dma_sgt(struct sg_table *sgt, const char *source,
  * predicate asking "can RGA2's internal MMU consume this mapping?", and a
  * negative answer is a normal routing decision rather than a rejection.  When
  * the job does then fail, the reason is already in the log: it was recorded by
- * the rk_rga_check_dma_sgt() branch that produced the errno this fallback is
- * reconsidering.  The caller's unwind path deliberately adds nothing.
+ * the caller emits it only if this fallback also fails, so successful RGA2
+ * internal-MMU routing remains quiet.
  */
 static int rk_rga_check_dma_sgt_coverage(struct sg_table *sgt,
 					 size_t required_size,
@@ -2296,6 +2296,21 @@ static void rk_rga_reset_sgt_dma_state(struct sg_table *sgt)
 	}
 
 	sgt->nents = sgt->orig_nents;
+}
+
+static unsigned int rk_rga_dma_max_segment_size(struct device *dev)
+{
+	size_t max_segment = dma_max_mapping_size(dev);
+
+	/*
+	 * A zero limit means the DMA backend did not publish one.  Keep the
+	 * scatterlist helper's historical unlimited behavior in that case, and
+	 * clamp the size_t API to the unsigned-int segment limit it accepts.
+	 */
+	if (!max_segment || max_segment > UINT_MAX)
+		return UINT_MAX;
+
+	return max_segment;
 }
 
 static int rk_rga_iommu_prot(struct device *dev, enum dma_data_direction dir)
@@ -5042,8 +5057,14 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 		return PTR_ERR(sgt);
 	}
 
+	/*
+	 * A discontinuous selected-device mapping is a normal RGA2 input: its
+	 * internal MMU consumes the mapped DMA pages below.  Delay the rejection
+	 * diagnostic until that fallback has also failed so a successful job does
+	 * not leave a misleading "reject dma-buf remap" line in dmesg.
+	 */
 	ret = rk_rga_check_dma_sgt(sgt, "dma-buf remap", import->size, iova,
-				   true);
+				   hw->type != RK_RGA_HW_RGA2);
 	if (ret && hw->type == RK_RGA_HW_RGA2 &&
 	    (ret == -EOPNOTSUPP || ret == -EOVERFLOW) &&
 	    !rk_rga_check_dma_sgt_coverage(sgt, import->size, iova)) {
@@ -5057,6 +5078,9 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 		ret = 0;
 	}
 	if (ret) {
+		if (hw->type == RK_RGA_HW_RGA2)
+			rk_rga_check_dma_sgt(sgt, "dma-buf remap",
+					     import->size, iova, true);
 		dma_buf_unmap_attachment_unlocked(attach, sgt,
 						  dma_dir);
 		dma_buf_detach(import->dmabuf, attach);
@@ -12354,6 +12378,8 @@ static void rk_rga_legacy_blit_sync_wait_kunit(struct kunit *test)
 	task.dst.yrgb_addr = 12;
 	task.dst.uv_addr = 0;
 	task.dst.v_addr = 0;
+	/* Legacy librga leaves an absent acquire fence at zero. */
+	task.in_fence_fd = 0;
 	task.out_fence_fd = -1;
 
 	uncopied = copy_to_user(task_user, &task, sizeof(task));
@@ -12467,6 +12493,7 @@ static void rk_rga_legacy_blit_sync_wait_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, user_task.handle_flag & 1, 1U);
 	KUNIT_EXPECT_EQ(test, user_task.src.yrgb_addr, 11ULL);
 	KUNIT_EXPECT_EQ(test, user_task.dst.yrgb_addr, 12ULL);
+	KUNIT_EXPECT_EQ(test, user_task.in_fence_fd, 0);
 	KUNIT_EXPECT_EQ(test, user_task.out_fence_fd, -1);
 
 	hw->active_job = NULL;
@@ -24651,10 +24678,20 @@ static int rk_rga_map_userptr_sgt(struct rk_rga_import *import,
 		goto err_release_view;
 	}
 
-	ret = sg_alloc_table_from_pages(sgt, view->pages,
-					import->page_count,
-					import->page_offset,
-					import->size, GFP_KERNEL);
+	/*
+	 * RGA2 is limited to 32-bit DMA on a system with memory above 4 GiB, so
+	 * dma_map_sgtable() may bounce USERPTR pages through SWIOTLB.  SWIOTLB has
+	 * a strict per-mapping limit even when its pool is otherwise empty.  Do
+	 * not coalesce physically adjacent pages into an entry larger than the
+	 * selected DMA backend can map; RGA2's internal MMU already consumes the
+	 * resulting multi-entry view.
+	 */
+	ret = sg_alloc_table_from_pages_segment(sgt, view->pages,
+						import->page_count,
+						import->page_offset,
+						import->size,
+						rk_rga_dma_max_segment_size(dev),
+						GFP_KERNEL);
 	if (ret)
 		goto err_free_sgt;
 
@@ -25291,6 +25328,18 @@ static long rk_rga_ioctl_blit(unsigned long arg, struct rk_rga_session *session,
 			return -ENOMEM;
 		}
 	}
+
+	/*
+	 * Legacy librga leaves in_fence_fd at zero in ordinary zero-initialized
+	 * rga_info requests.  The Rockchip driver considers only positive legacy
+	 * fds to be acquire fences; treating zero as a sync-file tries to import
+	 * stdin and rejects an otherwise valid synchronous blit with -EINVAL.
+	 * Normalize only the kernel-owned task copy, after preserving the async
+	 * reply, so modern REQUEST_* fd semantics and caller-visible fields stay
+	 * unchanged.
+	 */
+	if (!task->in_fence_fd)
+		task->in_fence_fd = -1;
 
 	ret = rk_rga_copy_gauss_coeffs(task, 1, &gauss_coeffs);
 	if (ret) {
