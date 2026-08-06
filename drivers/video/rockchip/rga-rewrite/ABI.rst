@@ -91,9 +91,12 @@ Legacy direct buffers
   interpreted as a DMA-BUF fd, so fd-shaped low virtual addresses are not
   supported.  Direct physical-address channels are rejected.
 
-A single request must use one provenance family: all DMA-BUF or all USERPTR.
-Mixing the two is rejected because overlap cannot be proved across the
-exporter boundary.
+A request may mix DMA-BUF and USERPTR channels only when every page pinned
+for each USERPTR channel is anonymous.  Anonymous pages come from no DMA-BUF
+exporter reachable on this platform, so overlap is excluded without having to
+prove it across the exporter boundary.  A USERPTR channel backed by anything
+else -- a file mapping, shmem, or a mapped DMA-BUF -- keeps the whole request
+rejected, because overlap then cannot be proved either way.
 
 Import and release pools contain at most 40 entries; larger pools return
 ``-EFBIG``.  Import is transactional, including copyout rollback.  Release is
@@ -280,7 +283,7 @@ Not supported or guaranteed
 
 - Direct physical-address execution.
 - Secure/protected-buffer semantics are not guaranteed.
-- Mixed DMA-BUF/USERPTR requests.
+- Mixed DMA-BUF/USERPTR requests whose USERPTR side is not wholly anonymous.
 - Genuinely gapped RGA3 DMA-BUF attachments.
 - RFBC64x4 and AFBC32x8 execution on RK3588; AFBC32x8/RFBC destination modes;
   packed-YUV FBC; compressed in-place writeback.
@@ -297,8 +300,8 @@ Legacy blit ioctls preserve the internal validation errno, commonly
 
 After structural request validation succeeds, CONFIG preparation and SUBMIT
 preparation/profile failures are normalized to the BSP wrapper's ``-EFAULT``.
-Mixed-provenance modern preparation is therefore observed as ``-EFAULT``.  The
-underlying cause remains in rewrite debug events.
+A rejected mixed-provenance modern preparation is therefore observed as
+``-EFAULT``.  The underlying cause remains in rewrite debug events.
 
 Hardware/lifecycle results include ``-ENODEV`` for lost hardware, ``-EIO`` for
 IOMMU fault or work rejected by a quarantined core, ``-EBUSY`` for a watchdog
