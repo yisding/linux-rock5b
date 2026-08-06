@@ -1275,6 +1275,7 @@ struct rk_rga_job {
 	u32 current_task;
 	u32 import_count;
 	u32 mapping_count;
+	u32 dmabuf_incompatible_hw_type_mask;
 	u32 acquire_fence_count;
 	u32 intr_status;
 	u32 hw_status;
@@ -1400,12 +1401,14 @@ enum rk_rga_debug_event_type {
 	RK_RGA_DEBUG_REJECT_SUBMIT,
 	RK_RGA_DEBUG_REJECT_EMIT,
 	RK_RGA_DEBUG_JOB_FAIL,
+	RK_RGA_DEBUG_JOB_REROUTE,
 };
 
 #define RK_RGA_DEBUG_EVENT_COUNT	256
 #define RK_RGA_DEBUG_TRACE_REJECT	BIT(0)
 #define RK_RGA_DEBUG_TRACE_JOB		BIT(1)
-#define RK_RGA_DEBUG_TRACE_DEFAULT	RK_RGA_DEBUG_TRACE_REJECT
+#define RK_RGA_DEBUG_TRACE_DEFAULT	(RK_RGA_DEBUG_TRACE_REJECT | \
+					 RK_RGA_DEBUG_TRACE_JOB)
 
 struct rk_rga_debug_event {
 	u64 seq;
@@ -1479,6 +1482,12 @@ struct rk_rga_service {
 	atomic_t route_b_attempt_count;
 	atomic_t route_b_ok_count;
 	atomic_t route_b_active_count;
+	atomic_t dmabuf_rga2_map_failure_count;
+	atomic_t dmabuf_rga2_reroute_count;
+	atomic_t userptr_rga2_map_attempt_count;
+	atomic_t userptr_rga2_map_failure_count;
+	atomic_t userptr_rga2_mmu_mapping_count;
+	atomic_t userptr_rga2_mmu_prepare_failure_count;
 	atomic_t shadow_head_active_count;
 	atomic_t shadow_tail_active_count;
 	atomic_t shadow_setup_failure_count;
@@ -1521,6 +1530,8 @@ static const char *rk_rga_debug_event_name(enum rk_rga_debug_event_type type)
 		return "reject-emit";
 	case RK_RGA_DEBUG_JOB_FAIL:
 		return "job-fail";
+	case RK_RGA_DEBUG_JOB_REROUTE:
+		return "job-reroute";
 	default:
 		return "unknown";
 	}
@@ -1528,8 +1539,9 @@ static const char *rk_rga_debug_event_name(enum rk_rga_debug_event_type type)
 
 static u32 rk_rga_debug_event_trace_bit(enum rk_rga_debug_event_type type)
 {
-	return type == RK_RGA_DEBUG_JOB_FAIL ? RK_RGA_DEBUG_TRACE_JOB :
-					       RK_RGA_DEBUG_TRACE_REJECT;
+	return type == RK_RGA_DEBUG_JOB_FAIL ||
+	       type == RK_RGA_DEBUG_JOB_REROUTE ? RK_RGA_DEBUG_TRACE_JOB :
+						  RK_RGA_DEBUG_TRACE_REJECT;
 }
 
 static void rk_rga_debug_record(struct rk_rga_service *rga,
@@ -2055,6 +2067,12 @@ static void rk_rga_set_iommu_dma_limit(struct device *dev)
 {
 	if (!dev->bus_dma_limit || dev->bus_dma_limit > RK_RGA_IOMMU_DMA_LIMIT)
 		dev->bus_dma_limit = RK_RGA_IOMMU_DMA_LIMIT;
+}
+
+static unsigned int
+rk_rga_hw_min_dma_align_mask(enum rk_rga_hw_type type)
+{
+	return type == RK_RGA_HW_RGA2 ? PAGE_SIZE - 1 : 0;
 }
 
 static bool rk_rga_hw_accepting_jobs(const struct rk_rga_hw *hw)
@@ -4990,6 +5008,8 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 		bool iommu_mapped;
 		bool rga2_mmu;
 
+		if (hw->type == RK_RGA_HW_RGA2)
+			atomic_inc(&job->rga->userptr_rga2_map_attempt_count);
 		ret = rk_rga_map_userptr_sgt(import, dev, &sgt,
 					     &view,
 					     &mapped_iova, &domain,
@@ -4997,9 +5017,13 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 					     hw->type == RK_RGA_HW_RGA2,
 					     &rga2_mmu);
 		if (ret) {
+			if (hw->type == RK_RGA_HW_RGA2)
+				atomic_inc(&job->rga->userptr_rga2_map_failure_count);
 			rk_rga_hw_put(hw);
 			return ret;
 		}
+		if (hw->type == RK_RGA_HW_RGA2 && rga2_mmu)
+			atomic_inc(&job->rga->userptr_rga2_mmu_mapping_count);
 
 		job->mappings[job->mapping_count] = (struct rk_rga_job_mapping) {
 			.import = import,
@@ -5051,10 +5075,16 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 
 	sgt = dma_buf_map_attachment_unlocked(attach, dma_dir);
 	if (IS_ERR(sgt)) {
+		ret = PTR_ERR(sgt);
+		if (hw->type == RK_RGA_HW_RGA2 && ret == -EIO) {
+			job->dmabuf_incompatible_hw_type_mask |=
+				RK_RGA_HW_TYPE_MASK_RGA2;
+			atomic_inc(&job->rga->dmabuf_rga2_map_failure_count);
+		}
 		dma_buf_detach(import->dmabuf, attach);
 		mutex_unlock(&import->map_lock);
 		rk_rga_hw_put(hw);
-		return PTR_ERR(sgt);
+		return ret;
 	}
 
 	/*
@@ -5173,6 +5203,26 @@ static bool rk_rga2_import_requires_mmu(struct rk_rga_job *job,
 	mapping = rk_rga_job_find_mapping(job, import, hw);
 
 	return mapping && mapping->rga2_mmu_required;
+}
+
+static bool
+rk_rga2_img_uses_userptr_mmu(struct rk_rga_job *job,
+			     const struct rk_rga_img_imports *imports,
+			     struct rk_rga_hw *hw)
+{
+	struct rk_rga_import *plane_imports[] = {
+		imports->yrgb, imports->uv, imports->v,
+	};
+
+	for (u32 i = 0; i < ARRAY_SIZE(plane_imports); i++) {
+		struct rk_rga_import *import = plane_imports[i];
+
+		if (import && import->type == RK_RGA_IMPORT_USERPTR &&
+		    rk_rga2_import_requires_mmu(job, import, hw))
+			return true;
+	}
+
+	return false;
 }
 
 static int rk_rga2_get_mmu_view(struct rk_rga_job *job,
@@ -5578,8 +5628,12 @@ prepare_mmu:
 	if (hw->type != RK_RGA_HW_RGA2)
 		return 0;
 
-	return rk_rga2_prepare_img_mmu(job, img, img_imports, &layout, hw,
-				       channel);
+	ret = rk_rga2_prepare_img_mmu(job, img, img_imports, &layout, hw,
+				      channel);
+	if (ret && rk_rga2_img_uses_userptr_mmu(job, img_imports, hw))
+		atomic_inc(&job->rga->userptr_rga2_mmu_prepare_failure_count);
+
+	return ret;
 }
 
 static void rk_rga_job_free(struct rk_rga_job *job)
@@ -6532,6 +6586,7 @@ static bool rk_rga_job_advance_task(struct rk_rga_job *job, int result)
 		return false;
 
 	job->current_task++;
+	job->dmabuf_incompatible_hw_type_mask = 0;
 	return true;
 }
 
@@ -8934,6 +8989,8 @@ static int rk_rga2_select_dst_addresses(const struct rga_img_info_t *dst,
 static int __maybe_unused rk_rga_job_hw_type(struct rk_rga_job *job,
 					     enum rk_rga_hw_type *type);
 static int rk_rga_job_hw_type_mask(struct rk_rga_job *job, u32 *type_mask);
+static int rk_rga_job_sched_hw_type_mask(struct rk_rga_job *job,
+					 u32 *type_mask);
 static int rk_rga_job_emit_cmd(struct rk_rga_hw *hw, struct rk_rga_job *job);
 static void rk_rga2_emit_mmu(struct rk_rga_job *job);
 static int rk_rga2_emit_simple_bitblt(struct rk_rga_job *job);
@@ -10849,7 +10906,7 @@ static void rk_rga_debug_event_ring_kunit(struct kunit *test)
 					  GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, rga->debug_events);
 
-	/* The default mask records rejections and not job completions. */
+	/* The default mask records rejections and terminal/rerouted jobs. */
 	rk_rga_debug_record(rga, RK_RGA_DEBUG_REJECT_VALIDATE, NULL, 3,
 			    -EOPNOTSUPP, -EINVAL, -EOPNOTSUPP);
 	KUNIT_EXPECT_EQ(test, rga->debug_event_count, 1U);
@@ -10860,11 +10917,11 @@ static void rk_rga_debug_event_ring_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rga->debug_events[0].seq, 1ULL);
 
 	rk_rga_debug_record(rga, RK_RGA_DEBUG_JOB_FAIL, NULL, 0, -EIO, 0, 0);
-	KUNIT_EXPECT_EQ(test, rga->debug_event_count, 1U);
+	KUNIT_EXPECT_EQ(test, rga->debug_event_count, 2U);
 
 	rga->debug_trace_mask |= RK_RGA_DEBUG_TRACE_JOB;
 	rk_rga_debug_record(rga, RK_RGA_DEBUG_JOB_FAIL, NULL, 0, -EIO, 0, 0);
-	KUNIT_EXPECT_EQ(test, rga->debug_event_count, 2U);
+	KUNIT_EXPECT_EQ(test, rga->debug_event_count, 3U);
 
 	/* A full ring wraps and keeps the newest entries. */
 	for (i = 0; i < RK_RGA_DEBUG_EVENT_COUNT; i++)
@@ -10873,7 +10930,7 @@ static void rk_rga_debug_event_ring_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rga->debug_event_count,
 			(u32)RK_RGA_DEBUG_EVENT_COUNT);
 	KUNIT_EXPECT_EQ(test, rga->debug_event_next_seq,
-			(u64)RK_RGA_DEBUG_EVENT_COUNT + 2);
+			(u64)RK_RGA_DEBUG_EVENT_COUNT + 3);
 
 	/* A NULL ring is tolerated rather than dereferenced. */
 	rga->debug_events = NULL;
@@ -13034,6 +13091,12 @@ static void rk_rga2_mmu_sgt_kunit(struct kunit *test)
 	u32 page_table[3] = {};
 	u32 page_count = 0;
 	u32 head_offset = 0;
+
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_hw_min_dma_align_mask(RK_RGA_HW_RGA2),
+			(unsigned int)PAGE_SIZE - 1);
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_hw_min_dma_align_mask(RK_RGA_HW_RGA3), 0U);
 
 	sg_init_table(sgl, ARRAY_SIZE(sgl));
 	sg_dma_address(&sgl[0]) = 0x1003;
@@ -15637,11 +15700,13 @@ static void rk_rga_mixed_task_core_handoff_kunit(struct kunit *test)
 	KUNIT_ASSERT_PTR_EQ(test, selected, rga3);
 
 	job.hw = selected;
+	job.dmabuf_incompatible_hw_type_mask = RK_RGA_HW_TYPE_MASK_RGA2;
 	KUNIT_EXPECT_TRUE(test, rk_rga_job_advance_task(&job, 0));
 	rk_rga_job_release_hw(&job);
 	KUNIT_EXPECT_PTR_EQ(test, job.hw, NULL);
 	KUNIT_EXPECT_EQ(test, refcount_read(&rga3->refs), 1);
 	KUNIT_EXPECT_EQ(test, job.current_task, 1U);
+	KUNIT_EXPECT_EQ(test, job.dmabuf_incompatible_hw_type_mask, 0U);
 
 	tasks[1].core = BIT(2);
 	type_mask = 0;
@@ -15667,6 +15732,12 @@ static void rk_rga_bitblt_hw_type_mask_kunit(struct kunit *test)
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask), 0);
 	KUNIT_EXPECT_EQ(test, type_mask, RK_RGA_HW_TYPE_MASK_ALL);
+	job.dmabuf_incompatible_hw_type_mask = RK_RGA_HW_TYPE_MASK_RGA2;
+	type_mask = 0;
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_job_sched_hw_type_mask(&job, &type_mask), 0);
+	KUNIT_EXPECT_EQ(test, type_mask, RK_RGA_HW_TYPE_MASK_RGA3);
+	job.dmabuf_incompatible_hw_type_mask = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 
@@ -15675,6 +15746,13 @@ static void rk_rga_bitblt_hw_type_mask_kunit(struct kunit *test)
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask), 0);
 	KUNIT_EXPECT_EQ(test, type_mask, RK_RGA_HW_TYPE_MASK_RGA2);
+	job.dmabuf_incompatible_hw_type_mask = RK_RGA_HW_TYPE_MASK_RGA2;
+	type_mask = U32_MAX;
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_job_sched_hw_type_mask(&job, &type_mask),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, type_mask, 0U);
+	job.dmabuf_incompatible_hw_type_mask = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 
@@ -23391,6 +23469,20 @@ static int rk_rga_job_hw_type_mask(struct rk_rga_job *job, u32 *type_mask)
 	return rk_rga_task_hw_type_mask(job, job->current_task, type_mask);
 }
 
+static int rk_rga_job_sched_hw_type_mask(struct rk_rga_job *job,
+					 u32 *type_mask)
+{
+	int ret;
+
+	ret = rk_rga_job_hw_type_mask(job, type_mask);
+	if (ret)
+		return ret;
+
+	*type_mask &= ~job->dmabuf_incompatible_hw_type_mask;
+
+	return *type_mask ? 0 : -EOPNOTSUPP;
+}
+
 static int __maybe_unused rk_rga_job_hw_type(struct rk_rga_job *job,
 					     enum rk_rga_hw_type *type)
 {
@@ -23413,7 +23505,7 @@ static struct rk_rga_hw *rk_rga_hw_get_for_job(struct rk_rga_job *job,
 	struct rk_rga_hw *hw;
 	int ret;
 
-	ret = rk_rga_job_hw_type_mask(job, &type_mask);
+	ret = rk_rga_job_sched_hw_type_mask(job, &type_mask);
 	if (ret) {
 		*error = ret;
 		return NULL;
@@ -23953,10 +24045,15 @@ static int rk_rga_iommu_unregister_fault_handler(struct rk_rga_hw *hw)
 
 static void rk_rga_hw_dispatch(struct rk_rga_hw *hw)
 {
+	struct rk_rga_service *rga = hw->rga;
+
 	for (;;) {
 		struct rk_rga_job *job;
+		struct rk_rga_hw *fallback_hw;
+		struct rk_rga_session *dispatch_session;
 		unsigned long flags;
 		bool recovery_failed;
+		int fallback_error;
 		int ret;
 
 		mutex_lock(&hw->run_lock);
@@ -23988,8 +24085,8 @@ static void rk_rga_hw_dispatch(struct rk_rga_hw *hw)
 			continue;
 		}
 
-		atomic_inc(&hw->rga->dispatched_job_count);
-		rk_rga_count_core(hw->rga->dispatched_core_count, hw);
+		atomic_inc(&rga->dispatched_job_count);
+		rk_rga_count_core(rga->dispatched_core_count, hw);
 		ret = rk_rga_backend_start(hw, job);
 		if (ret == RK_RGA_BACKEND_QUEUED) {
 			mutex_unlock(&hw->run_lock);
@@ -24000,6 +24097,35 @@ static void rk_rga_hw_dispatch(struct rk_rga_hw *hw)
 		if (hw->active_job == job)
 			hw->active_job = NULL;
 		spin_unlock_irqrestore(&hw->job_lock, flags);
+
+		if (ret == -EIO && hw->type == RK_RGA_HW_RGA2 &&
+		    (job->dmabuf_incompatible_hw_type_mask &
+		     RK_RGA_HW_TYPE_MASK_RGA2)) {
+			dispatch_session = READ_ONCE(job->session);
+			if (dispatch_session &&
+			    rk_rga_session_begin_job_dispatch(dispatch_session)) {
+				fallback_hw =
+					rk_rga_hw_get_for_job(job, &fallback_error);
+				if (fallback_hw) {
+					rk_rga_debug_record(rga,
+							    RK_RGA_DEBUG_JOB_REROUTE,
+							    job, job->current_task,
+							    ret, 0, ret);
+					atomic_inc(&rga->dmabuf_rga2_reroute_count);
+					rk_rga_job_release_hw(job);
+					mutex_unlock(&hw->run_lock);
+					rk_rga_job_queue_on_hw(job, fallback_hw, false);
+					rk_rga_session_end_job_dispatch(dispatch_session);
+					rk_rga_hw_dispatch(hw);
+					return;
+				}
+				rk_rga_session_end_job_dispatch(dispatch_session);
+			}
+		}
+
+		if (ret)
+			rk_rga_debug_record(rga, RK_RGA_DEBUG_JOB_FAIL, job,
+					    job->current_task, ret, 0, 0);
 
 		rk_rga_job_complete_queued(job, ret);
 		mutex_unlock(&hw->run_lock);
@@ -25617,6 +25743,15 @@ static int rk_rga_hw_probe(struct platform_device *pdev)
 		return ret;
 
 	/*
+	 * RGA2's internal MMU consumes page-granular entries. Preserve a
+	 * USERPTR segment's page offset when SWIOTLB bounces it, so adjacent
+	 * source pages still end and begin on RGA2 page-table boundaries.
+	 */
+	if (hw->type == RK_RGA_HW_RGA2)
+		dma_set_min_align_mask(dev,
+				       rk_rga_hw_min_dma_align_mask(hw->type));
+
+	/*
 	 * Contiguous dma-buf imports routinely exceed the 64 KiB default
 	 * segment size; leaving it in place makes dma_map_sgtable() refuse to
 	 * merge a multi-entry table into the single IOVA span the import path
@@ -26077,6 +26212,24 @@ static int rk_rga_runtime_register(void)
 				rk_rga.debugfs_root,
 				&rk_rga.recovery_failure_count);
 	rk_rga_debugfs_create_route_b();
+	debugfs_create_atomic_t("dmabuf_rga2_map_failure_count", 0444,
+				rk_rga.debugfs_root,
+				&rk_rga.dmabuf_rga2_map_failure_count);
+	debugfs_create_atomic_t("dmabuf_rga2_reroute_count", 0444,
+				rk_rga.debugfs_root,
+				&rk_rga.dmabuf_rga2_reroute_count);
+	debugfs_create_atomic_t("userptr_rga2_map_attempt_count", 0444,
+				rk_rga.debugfs_root,
+				&rk_rga.userptr_rga2_map_attempt_count);
+	debugfs_create_atomic_t("userptr_rga2_map_failure_count", 0444,
+				rk_rga.debugfs_root,
+				&rk_rga.userptr_rga2_map_failure_count);
+	debugfs_create_atomic_t("userptr_rga2_mmu_mapping_count", 0444,
+				rk_rga.debugfs_root,
+				&rk_rga.userptr_rga2_mmu_mapping_count);
+	debugfs_create_atomic_t("userptr_rga2_mmu_prepare_failure_count", 0444,
+				rk_rga.debugfs_root,
+				&rk_rga.userptr_rga2_mmu_prepare_failure_count);
 	debugfs_create_atomic_t("shadow_head_active_count", 0444,
 				rk_rga.debugfs_root,
 				&rk_rga.shadow_head_active_count);
