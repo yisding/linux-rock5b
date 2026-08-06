@@ -10945,7 +10945,8 @@ static void rk_rga_request_config_handles_kunit(struct kunit *test)
 		.id = 7,
 		.sync_mode = RGA_BLIT_ASYNC,
 		.mpi_config_flags = 0x5a,
-		.acquire_fence_fd = -1,
+		/* This is imendJob()'s public absent-fence default. */
+		.acquire_fence_fd = 0,
 	};
 	struct rk_rga_session session = {};
 	struct rk_rga_request *request;
@@ -11006,6 +11007,8 @@ static void rk_rga_request_config_handles_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, request->task_count, 1U);
 	KUNIT_EXPECT_EQ(test, request->sync_mode, (u32)RGA_BLIT_ASYNC);
 	KUNIT_EXPECT_EQ(test, request->mpi_config_flags, 0x5aU);
+	KUNIT_EXPECT_EQ(test, request->acquire_fence_fd, 0);
+	KUNIT_EXPECT_EQ(test, request->acquire_fence_count, 0U);
 	KUNIT_EXPECT_EQ(test, request->release_fence_fd, -1);
 	KUNIT_EXPECT_EQ(test, request->import_count, 2U);
 	KUNIT_EXPECT_EQ(test, refcount_read(&src_import->refs), 2);
@@ -24463,6 +24466,7 @@ static int rk_rga_request_config(struct rk_rga_session *session,
 	u32 fence_count = 0;
 	u32 import_count = 0;
 	bool close_acquire_fds = false;
+	__s32 acquire_fence_fd;
 	int ret;
 
 	ret = rk_rga_copy_user_tasks(user, &tasks);
@@ -24490,8 +24494,18 @@ static int rk_rga_request_config(struct rk_rga_session *session,
 		goto out_unlock;
 	}
 
+	/*
+	 * librga's public imendJob() default leaves acquire_fence_fd at zero,
+	 * and the BSP request path imports only positive descriptors. Preserve
+	 * the caller's field for an asynchronous reply, but apply that sentinel
+	 * rule to the kernel-owned fence lookup.
+	 */
+	acquire_fence_fd = (__s32)user->acquire_fence_fd;
+	if (!acquire_fence_fd)
+		acquire_fence_fd = -1;
+
 	ret = rk_rga_prepare_tasks_locked(session, tasks, user->task_num,
-					  user->acquire_fence_fd,
+					  acquire_fence_fd,
 					  &imports, &import_count,
 					  &task_imports,
 					  &fences, &fence_count,
