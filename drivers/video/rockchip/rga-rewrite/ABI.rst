@@ -79,10 +79,12 @@ DMA-BUF
 Userspace virtual address
   Pages are long-term pinned and synchronized around hardware access.  When
   the ordinary DMA mapping is gapped, an RGA3 core with an IOMMU may receive a
-  driver-owned contiguous IOVA.  RGA2 uses its page-table path when the mapped
-  pages are representable.  CPU writes made between jobs remain visible;
-  final release does not overwrite CPU-owned data; and cache maintenance or
-  shadow copyback does not alter bytes outside an unaligned imported range.
+  driver-owned contiguous IOVA.  Mapping is deferred until a job has selected
+  and powered its core, and is retired before that core is powered off.  RGA2
+  uses its page-table path when the mapped pages are representable.  CPU writes
+  made between jobs remain visible; final release does not overwrite CPU-owned
+  data; and cache maintenance or shadow copyback does not alter bytes outside
+  an unaligned imported range.
 
 Legacy direct buffers
   MMU-backed DMA-BUF fd and userspace-virtual channels are supported through
