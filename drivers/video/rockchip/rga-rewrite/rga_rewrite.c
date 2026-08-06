@@ -1141,6 +1141,7 @@ struct rk_rga_import {
 	bool iommu_mapped;
 	bool counted;
 	bool service_linked;
+	bool userptr_anon_backed;
 };
 
 struct rk_rga_job_mapping {
@@ -2750,6 +2751,12 @@ static void rk_rga_import_init(struct rk_rga_import *import,
 	import->rga = rga;
 	import->type = type;
 	import->fd = -1;
+	/*
+	 * Every caller zeroes the import first, but this field gates the
+	 * mixed-provenance alias check, so make the conservative default
+	 * structural rather than conventional.
+	 */
+	import->userptr_anon_backed = false;
 }
 
 static void rk_rga_import_register_locked(struct rk_rga_import *import)
@@ -3947,6 +3954,34 @@ rk_rga_userptr_backing_overlaps(const struct rk_rga_import *a,
 					       b->userptr_extent_count);
 }
 
+/*
+ * A USERPTR and a DMA-BUF in one job can only be the same memory if the
+ * USERPTR pin landed on pages some exporter also owns.
+ * rk_rga_userptr_pages_are_anon() recorded whether every pinned page is
+ * anonymous; no DMA-BUF exporter reachable on this platform hands out
+ * anonymous pages, so such a pair cannot alias here and the job may proceed.
+ * See that function for the exact scope of that claim.  Everything else --
+ * any non-anonymous USERPTR, or a pairing this does not model -- keeps
+ * failing closed.
+ */
+static bool
+rk_rga_cross_type_alias_possible(const struct rk_rga_import *a,
+				 const struct rk_rga_import *b)
+{
+	const struct rk_rga_import *userptr;
+
+	if (a->type == RK_RGA_IMPORT_USERPTR &&
+	    b->type == RK_RGA_IMPORT_DMABUF)
+		userptr = a;
+	else if (a->type == RK_RGA_IMPORT_DMABUF &&
+		 b->type == RK_RGA_IMPORT_USERPTR)
+		userptr = b;
+	else
+		return true;
+
+	return !userptr->userptr_anon_backed;
+}
+
 static int
 rk_rga_check_alias_provenance(struct rk_rga_import **imports,
 			      u32 import_count,
@@ -3978,10 +4013,13 @@ rk_rga_check_alias_provenance(struct rk_rga_import **imports,
 		 * DMA-BUF deliberately hides the attachment's struct pages from
 		 * importers, so mixed DMA-BUF/USERPTR physical aliasing cannot be
 		 * established through the public API. Fail closed for mixed
-		 * provenance. Same-type aliases are handled by exact per-job
-		 * DMA targets or the explicitly pinned USERPTR page lists.
+		 * provenance unless the USERPTR side is provably anonymous, which
+		 * no DMA-BUF mapping can be. Same-type aliases are handled by
+		 * exact per-job DMA targets or the explicitly pinned USERPTR
+		 * page lists.
 		 */
-		return -EOPNOTSUPP;
+		if (rk_rga_cross_type_alias_possible(import, candidate))
+			return -EOPNOTSUPP;
 	}
 
 	return 0;
@@ -14317,7 +14355,50 @@ static void rk_rga_cross_type_alias_kunit(struct kunit *test)
 	};
 	struct rk_rga_import *imports[] = { &dmabuf };
 
-	/* Public APIs cannot prove mixed DMA-BUF/USERPTR disjointness. */
+	/*
+	 * A file-backed USERPTR may be a view of the DMA-BUF, and public APIs
+	 * cannot prove otherwise, so the pair still fails closed in both
+	 * resolution orders.
+	 */
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_check_alias_provenance(imports,
+						      ARRAY_SIZE(imports),
+						      &userptr),
+			-EOPNOTSUPP);
+	imports[0] = &userptr;
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_check_alias_provenance(imports,
+						      ARRAY_SIZE(imports),
+						      &dmabuf),
+			-EOPNOTSUPP);
+
+	/*
+	 * Anonymous memory is never a DMA-BUF mapping, so the same pair is
+	 * admitted once the pin has proved the range anonymous. This is the
+	 * ordinary "CPU-filled source into a DMA-BUF destination" legacy blit.
+	 */
+	userptr.userptr_anon_backed = true;
+	imports[0] = &dmabuf;
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_check_alias_provenance(imports,
+						      ARRAY_SIZE(imports),
+						      &userptr),
+			0);
+	imports[0] = &userptr;
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_check_alias_provenance(imports,
+						      ARRAY_SIZE(imports),
+						      &dmabuf),
+			0);
+
+	/*
+	 * The anonymous verdict belongs to the USERPTR side only: a DMA-BUF
+	 * import carrying a stale flag must not stand in for it, in either
+	 * resolution order.
+	 */
+	dmabuf.userptr_anon_backed = true;
+	userptr.userptr_anon_backed = false;
+	imports[0] = &dmabuf;
 	KUNIT_EXPECT_EQ(test,
 			rk_rga_check_alias_provenance(imports,
 						      ARRAY_SIZE(imports),
@@ -24982,6 +25063,40 @@ static int rk_rga_import_dmabuf(struct rk_rga_service *rga,
 	return rk_rga_import_dmabuf_object(rga, dmabuf, fd, import_out);
 }
 
+/*
+ * Decide whether a pinned USERPTR range could share memory with a DMA-BUF.
+ *
+ * This asks the pages themselves, not the address range that produced them.
+ * The pages are already pinned, so the answer cannot go stale, and it needs
+ * no mmap_lock and no untagging of the user address -- a VMA scan would have
+ * to re-derive both and would race the pin that follows it.
+ *
+ * The DMA-BUF exporters reachable on this platform allocate their own pages
+ * (dma-heap, DRM/GEM) or wrap page-cache folios (udmabuf over memfd/shmem);
+ * none of those is anonymous, so an all-anonymous pin cannot overlap one.
+ * This is a platform property, not a Linux-wide guarantee: a driver that
+ * pins the caller's anonymous pages and exports them as a DMA-BUF, such as
+ * etnaviv's userptr GEM (amdgpu explicitly refuses that export), would
+ * defeat it.  No such exporter probes on RK3588.  The residual is a
+ * corrupted blit into the caller's own memory, not a kernel-safety problem,
+ * and the vendor driver performs no aliasing check at all.
+ */
+static bool rk_rga_userptr_pages_are_anon(struct page **pages,
+					  unsigned int page_count)
+{
+	unsigned int i;
+
+	if (!pages || !page_count)
+		return false;
+
+	for (i = 0; i < page_count; i++) {
+		if (!pages[i] || !PageAnon(pages[i]))
+			return false;
+	}
+
+	return true;
+}
+
 static int rk_rga_import_userptr(struct rk_rga_service *rga,
 				 struct rga_external_buffer *buffer,
 				 struct rk_rga_import **import_out)
@@ -24998,6 +25113,7 @@ static int rk_rga_import_userptr(struct rk_rga_service *rga,
 	size_t span;
 	size_t size;
 	int pinned;
+	bool anon_backed;
 	int ret;
 	bool rga2_mmu;
 
@@ -25041,6 +25157,7 @@ static int rk_rga_import_userptr(struct rk_rga_service *rga,
 		kvfree(pages);
 		return pinned < 0 ? pinned : -EFAULT;
 	}
+	anon_backed = rk_rga_userptr_pages_are_anon(pages, page_count);
 
 	import = kzalloc(sizeof(*import), GFP_KERNEL);
 	if (!import) {
@@ -25055,6 +25172,7 @@ static int rk_rga_import_userptr(struct rk_rga_service *rga,
 	import->page_count = page_count;
 	import->pinned_pages = page_count;
 	import->page_offset = page_offset;
+	import->userptr_anon_backed = anon_backed;
 
 	ret = rk_rga_userptr_build_extents(import);
 	if (ret) {
