@@ -155,11 +155,6 @@ Asynchronous submission publishes its release fence while the acquire fence is
 pending and dispatches later.  An already-signaled successful acquire fence
 takes the ready path.  A negative acquire-fence result becomes the job result.
 Kernel-owned acquire fds are closed on both success and preparation failure.
-Legacy ``RGA_BLIT_SYNC``/``RGA_BLIT_ASYNC`` requests follow the BSP sentinel
-rule: ``in_fence_fd == 0`` means that no acquire fence was supplied.  This
-normalization applies only to the kernel's legacy task copy; an asynchronous
-reply preserves the caller's zero field, and modern ``REQUEST_*`` submissions
-retain normal fd-zero semantics.
 
 Closing ``/dev/rga`` prevents new work, cancels acquire-blocked work, removes
 queued work, recovers active work, signals outstanding release fences, and
