@@ -8700,8 +8700,13 @@ static int rk_rga2_validate_rop(const struct rga_req *task)
 	if (task->src.act_w != task->dst.act_w ||
 	    task->src.act_h != task->dst.act_h)
 		return -EOPNOTSUPP;
-	if (task->src.rotate_mode || task->dst.rotate_mode ||
-	    task->rotate_mode || task->sina || task->cosa)
+	/*
+	 * The common bitblt path decodes the global rotate_mode/sina/cosa
+	 * transform and emits it independently of the ROP controls.  In
+	 * particular, librga leaves cosa at 1.0 (65536) for an identity imrop,
+	 * so the raw trigonometric fields cannot be used as a transform gate.
+	 */
+	if (task->src.rotate_mode || task->dst.rotate_mode)
 		return -EOPNOTSUPP;
 	if (task->yuv2rgb_mode || task->full_csc.flag)
 		return -EOPNOTSUPP;
@@ -10197,6 +10202,8 @@ static void rk_rga2_rop_emit_kunit(struct kunit *test)
 	task.alpha_rop_flag = BIT(0) | BIT(1);
 	task.alpha_rop_mode = 0x1;
 	task.rop_code = RK_RGA_ROP_AND;
+	/* Exact librga imrop identity tuple: rotate_mode=0, sina=0, cosa=1.0. */
+	task.cosa = 65536;
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
@@ -10209,6 +10216,14 @@ static void rk_rga2_rop_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_ROP_CTRL0_OFFSET / 4],
 			0x00000070U);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_ROP_CTRL1_OFFSET / 4], 0U);
+	KUNIT_EXPECT_EQ(test,
+			cmd[RK_RGA2_SRC_INFO_OFFSET / 4] &
+			RK_RGA2_SRC_ROT_MODE,
+			0U);
+	KUNIT_EXPECT_EQ(test,
+			cmd[RK_RGA2_SRC_INFO_OFFSET / 4] &
+			RK_RGA2_SRC_MIR_MODE,
+			0U);
 
 	memset(cmd, 0, sizeof(cmd));
 	job.cmd_ready = false;
@@ -10224,6 +10239,34 @@ static void rk_rga2_rop_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
 			-EOPNOTSUPP);
 	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+
+	memset(cmd, 0, sizeof(cmd));
+	job.cmd_ready = false;
+	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
+				    64, 32);
+	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_RGBA_8888,
+				    32, 64);
+	/* librga submits a 90-degree destination window pre-swapped. */
+	swap(task.dst.act_w, task.dst.act_h);
+	task.rotate_mode = 1;
+	task.sina = 65536;
+	task.cosa = 0;
+	type = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
+	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_EQ(test,
+			cmd[RK_RGA2_SRC_INFO_OFFSET / 4] &
+			RK_RGA2_SRC_ROT_MODE,
+			FIELD_PREP(RK_RGA2_SRC_ROT_MODE, 1));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_ACT_INFO_OFFSET / 4],
+			31U | (63U << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_ALPHA_CTRL0_OFFSET / 4],
+			RK_RGA2_ALPHA_ROP_0 | RK_RGA2_ALPHA_ROP_SEL |
+			FIELD_PREP(RK_RGA2_ALPHA_ROP_MODE, 1));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_ROP_CTRL0_OFFSET / 4],
+			0x00000070U);
 }
 
 static void rk_rga2_colorkey_emit_kunit(struct kunit *test)

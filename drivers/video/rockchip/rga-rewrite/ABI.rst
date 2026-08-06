@@ -262,9 +262,12 @@ Special operations    RGB mosaic; ROP2 AND, OR, NOT_DST, NOT_SRC, XOR, and
                       key; and pre-interrupt on an otherwise supported job.
 ====================  ========================================================
 
-Gaussian, quantize, ROP, color-key, alpha-bitmap, OSD, and palette conversion
-use raster images with the profile-specific same-size/no-transform limits.
-Line-only RGA2 pre-interrupts do not complete a job.
+Gaussian, quantize, color-key, alpha-bitmap, OSD, and palette conversion use
+raster images with the profile-specific same-size/no-transform limits.  ROP
+uses same-format, same-size raster RGB source/destination requests and accepts
+the ordinary RGA2E rotate/mirror transforms; 90/270-degree requests use
+librga's pre-swapped destination-window wire form.  Line-only RGA2
+pre-interrupts do not complete a job.
 
 Format rules
 ------------
