@@ -14702,10 +14702,8 @@ static void rk_rga_explicit_plane_distinct_kunit(struct kunit *test)
 
 static void rk_rga_iova_import_identity_kunit(struct kunit *test)
 {
-	u8 source_token;
 	u8 core_a_token;
 	u8 core_b_token;
-	struct device *source_dev = (struct device *)&source_token;
 	struct device *core_a_dev = (struct device *)&core_a_token;
 	struct device *core_b_dev = (struct device *)&core_b_token;
 	struct rk_rga_hw core_a = {
@@ -14715,11 +14713,9 @@ static void rk_rga_iova_import_identity_kunit(struct kunit *test)
 		.dev = core_b_dev,
 	};
 	struct rk_rga_import import_a = {
-		.dev = source_dev,
 		.iova = 0x10000000,
 	};
 	struct rk_rga_import import_b = {
-		.dev = source_dev,
 		.iova = 0x50000000,
 	};
 	struct rk_rga_job_mapping mappings[] = {
@@ -14761,7 +14757,7 @@ static void rk_rga_iova_import_identity_kunit(struct kunit *test)
 	refcount_set(&core_b.refs, 1);
 
 	/*
-	 * B's source-device IOVA deliberately equals A's core-A IOVA. Rebase
+	 * B's logical identity deliberately equals A's core-A IOVA. Rebase
 	 * must select B's core-A mapping by import identity, not short-circuit
 	 * on the colliding numeric address.
 	 */
