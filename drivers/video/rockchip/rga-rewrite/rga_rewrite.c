@@ -1122,23 +1122,15 @@ struct rk_rga_import {
 	struct rk_rga_service *rga;
 	enum rk_rga_import_type type;
 	int fd;
-	struct rk_rga_hw *map_hw;
-	struct device *dev;
 	struct dma_buf *dmabuf;
-	struct dma_buf_attachment *attach;
-	struct sg_table *sgt;
 	struct page **pages;
-	struct rk_rga_userptr_view *userptr_view;
 	struct rk_rga_userptr_extent *userptr_extents;
-	struct iommu_domain *domain;
 	dma_addr_t iova;
-	size_t iova_size;
 	size_t size;
 	unsigned int page_count;
 	unsigned int pinned_pages;
 	unsigned int userptr_extent_count;
 	unsigned int page_offset;
-	bool iommu_mapped;
 	bool counted;
 	bool service_linked;
 	bool userptr_anon_backed;
@@ -2082,59 +2074,6 @@ static bool rk_rga_hw_accepting_jobs(const struct rk_rga_hw *hw)
 	       !READ_ONCE(hw->recovery_failed);
 }
 
-static struct rk_rga_hw *rk_rga_get_map_hw(struct rk_rga_service *rga)
-{
-	struct rk_rga_hw *candidate = NULL;
-	struct rk_rga_hw *hw;
-
-	mutex_lock(&rga->hw_lock);
-	list_for_each_entry(hw, &rga->hw_list, node) {
-		if (!rk_rga_hw_accepting_jobs(hw))
-			continue;
-		if (hw->type == RK_RGA_HW_RGA3) {
-			candidate = hw;
-			break;
-		}
-	}
-	list_for_each_entry(hw, &rga->hw_list, node) {
-		if (candidate)
-			break;
-		if (!rk_rga_hw_accepting_jobs(hw))
-			continue;
-		candidate = hw;
-		break;
-	}
-	if (candidate)
-		refcount_inc(&candidate->refs);
-	mutex_unlock(&rga->hw_lock);
-
-	return candidate;
-}
-
-/*
- * Return a hardware reference with import_lock held. Rechecking the removal
- * state under import_lock closes the gap between selection and registration:
- * removal marks/delists under hw_lock before taking import_lock to detach the
- * mappings it owns.
- */
-static struct rk_rga_hw *
-rk_rga_get_map_hw_for_import(struct rk_rga_service *rga)
-{
-	struct rk_rga_hw *hw;
-
-	for (;;) {
-		hw = rk_rga_get_map_hw(rga);
-		if (!hw)
-			return NULL;
-
-		mutex_lock(&rga->import_lock);
-		if (rk_rga_hw_accepting_jobs(hw))
-			return hw;
-		mutex_unlock(&rga->import_lock);
-		rk_rga_hw_put(hw);
-	}
-}
-
 static u32 rk_rga_available_core_mask(struct rk_rga_service *rga)
 {
 	struct rk_rga_hw *hw;
@@ -2752,6 +2691,13 @@ static void rk_rga_import_init(struct rk_rga_import *import,
 	import->type = type;
 	import->fd = -1;
 	/*
+	 * An import carries logical identity only. Its selected-core DMA address
+	 * is installed by rk_rga_job_rebase_img_to_hw() after the core is powered.
+	 * Keeping USERPTR consistent with DMA-BUF here prevents an import-time
+	 * IOMMU mapping from bypassing that power-domain ordering.
+	 */
+	import->iova = (dma_addr_t)(unsigned long)import;
+	/*
 	 * Every caller zeroes the import first, but this field gates the
 	 * mixed-provenance alias check, so make the conservative default
 	 * structural rather than conventional.
@@ -2765,44 +2711,6 @@ static void rk_rga_import_register_locked(struct rk_rga_import *import)
 	import->service_linked = true;
 }
 
-static void rk_rga_import_detach_map_locked(struct rk_rga_import *import)
-{
-	struct rk_rga_hw *map_hw = import->map_hw;
-
-	if (!map_hw)
-		return;
-
-	/*
-	 * Only rk_rga_import_userptr() ever sets map_hw, so a DMA-BUF import
-	 * cannot reach here. Since the 2026-07-31 multi-SG rework those carry
-	 * no persistent attachment at all -- they are mapped and unmapped per
-	 * job -- so there is nothing to detach and nothing to invalidate.
-	 */
-	if (WARN_ON_ONCE(import->type != RK_RGA_IMPORT_USERPTR)) {
-		import->map_hw = NULL;
-		return;
-	}
-	if (import->type == RK_RGA_IMPORT_USERPTR) {
-		rk_rga_unmap_userptr_sgt(import->rga, import->dev, import->sgt,
-					 import->userptr_view,
-					 import->domain, import->iova,
-					 import->iova_size,
-					 import->page_offset,
-					 import->iommu_mapped);
-		import->sgt = NULL;
-		import->userptr_view = NULL;
-		import->domain = NULL;
-		import->iova_size = 0;
-		import->iommu_mapped = false;
-	}
-
-	if (import->dev)
-		put_device(import->dev);
-	import->dev = NULL;
-	import->map_hw = NULL;
-	rk_rga_hw_put(map_hw);
-}
-
 static void rk_rga_import_destroy(struct rk_rga_import *import)
 {
 	struct rk_rga_service *rga = import->rga;
@@ -2813,10 +2721,6 @@ static void rk_rga_import_destroy(struct rk_rga_import *import)
 		import->service_linked = false;
 	}
 	mutex_unlock(&rga->import_lock);
-
-	mutex_lock(&import->map_lock);
-	rk_rga_import_detach_map_locked(import);
-	mutex_unlock(&import->map_lock);
 
 	if (import->type == RK_RGA_IMPORT_DMABUF) {
 		if (import->dmabuf)
@@ -2839,21 +2743,6 @@ static void rk_rga_import_put(struct rk_rga_import *import)
 {
 	if (refcount_dec_and_test(&import->refs))
 		rk_rga_import_destroy(import);
-}
-
-static void rk_rga_detach_hw_imports(struct rk_rga_hw *hw)
-{
-	struct rk_rga_service *rga = hw->rga;
-	struct rk_rga_import *import;
-
-	mutex_lock(&rga->import_lock);
-	list_for_each_entry(import, &rga->imports, service_node) {
-		mutex_lock(&import->map_lock);
-		if (import->map_hw == hw)
-			rk_rga_import_detach_map_locked(import);
-		mutex_unlock(&import->map_lock);
-	}
-	mutex_unlock(&rga->import_lock);
 }
 
 static int rk_rga_import_dmabuf_fd(const struct rga_external_buffer *buffer,
@@ -4772,18 +4661,6 @@ rk_rga_sync_userptr_sgt(struct device *dev, struct sg_table *sgt,
 static void rk_rga_job_sync_userptr_for_device(struct rk_rga_job *job,
 					       struct device *dev)
 {
-	for (u32 i = 0; i < job->import_count; i++) {
-		struct rk_rga_import *import = job->imports[i];
-
-		mutex_lock(&import->map_lock);
-		if (import->type == RK_RGA_IMPORT_USERPTR &&
-		    import->dev == dev && import->sgt)
-			rk_rga_sync_userptr_sgt(dev, import->sgt,
-						import->userptr_view,
-						import->iommu_mapped, true);
-		mutex_unlock(&import->map_lock);
-	}
-
 	for (u32 i = 0; i < job->mapping_count; i++) {
 		struct rk_rga_job_mapping *mapping = &job->mappings[i];
 
@@ -4797,18 +4674,6 @@ static void rk_rga_job_sync_userptr_for_device(struct rk_rga_job *job,
 static void rk_rga_job_sync_userptr_for_cpu(struct rk_rga_job *job,
 					    struct device *dev)
 {
-	for (u32 i = 0; i < job->import_count; i++) {
-		struct rk_rga_import *import = job->imports[i];
-
-		mutex_lock(&import->map_lock);
-		if (import->type == RK_RGA_IMPORT_USERPTR &&
-		    import->dev == dev && import->sgt)
-			rk_rga_sync_userptr_sgt(import->dev, import->sgt,
-						import->userptr_view,
-						import->iommu_mapped, false);
-		mutex_unlock(&import->map_lock);
-	}
-
 	for (u32 i = 0; i < job->mapping_count; i++) {
 		struct rk_rga_job_mapping *mapping = &job->mappings[i];
 
@@ -5009,14 +4874,6 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 	u32 count;
 	int ret;
 
-	mutex_lock(&import->map_lock);
-	if (import->type == RK_RGA_IMPORT_USERPTR && import->map_hw == hw) {
-		*iova = import->iova;
-		mutex_unlock(&import->map_lock);
-		return 0;
-	}
-	mutex_unlock(&import->map_lock);
-
 	for (u32 i = 0; i < job->mapping_count; i++) {
 		struct rk_rga_job_mapping *mapping = &job->mappings[i];
 
@@ -5099,9 +4956,9 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 	}
 
 	/*
-	 * Serialize the secondary attachment with core-removal invalidation.
-	 * Once mapped, this job-owned attachment pins the same backing that
-	 * was covered by alias validation until the job releases it.
+	 * Serialize attachment setup for callers sharing one imported object.
+	 * Once mapped, this job-owned attachment pins the same backing that was
+	 * covered by alias validation until the job releases it.
 	 */
 	mutex_lock(&import->map_lock);
 	attach = dma_buf_attach(import->dmabuf, dev);
@@ -5281,14 +5138,6 @@ static int rk_rga2_get_mmu_view(struct rk_rga_job *job,
 			.size = import->size,
 			.linear = mapping->iommu_mapped,
 			.required = mapping->rga2_mmu_required,
-		};
-	} else if (import->type == RK_RGA_IMPORT_USERPTR &&
-		   import->map_hw == hw) {
-		*view = (struct rk_rga2_mmu_view) {
-			.sgt = import->sgt,
-			.iova = import->iova,
-			.size = import->size,
-			.linear = import->iommu_mapped,
 		};
 	} else {
 		return -ENOENT;
@@ -14209,14 +14058,24 @@ static void rk_rga_raster_stride_backend_mask_kunit(struct kunit *test)
 
 static void rk_rga_direct_import_identity_kunit(struct kunit *test)
 {
+	struct rk_rga_service rga = {};
 	struct dma_buf dmabuf0 = {};
 	struct dma_buf dmabuf1 = {};
+	struct rk_rga_import dmabuf_identity = {};
+	struct rk_rga_import userptr_identity = {};
 	struct rk_rga_import dmabuf_import = {
 		.type = RK_RGA_IMPORT_DMABUF,
 		.fd = 7,
 		.dmabuf = &dmabuf0,
 	};
 	struct rk_rga_import *imports[] = { &dmabuf_import };
+
+	rk_rga_import_init(&dmabuf_identity, &rga, RK_RGA_IMPORT_DMABUF);
+	rk_rga_import_init(&userptr_identity, &rga, RK_RGA_IMPORT_USERPTR);
+	KUNIT_EXPECT_EQ(test, dmabuf_identity.iova,
+			(dma_addr_t)(unsigned long)&dmabuf_identity);
+	KUNIT_EXPECT_EQ(test, userptr_identity.iova,
+			(dma_addr_t)(unsigned long)&userptr_identity);
 
 	/* Object identity reuses aliases across fds, not reused fd numbers. */
 	KUNIT_EXPECT_PTR_EQ(test,
@@ -15086,36 +14945,12 @@ static void rk_rga_task_import_alias_kunit(struct kunit *test)
 
 static void rk_rga_dma_mapping_hw_lifetime_kunit(struct kunit *test)
 {
-	struct rk_rga_service *rga;
 	struct rk_rga_hw hw = {};
-	struct rk_rga_import *import;
 	struct rk_rga_job job = {};
 
-	rga = rk_rga_kunit_alloc_service(test);
-	KUNIT_ASSERT_NOT_NULL(test, rga);
-	hw.rga = rga;
 	spin_lock_init(&hw.job_lock);
-	refcount_set(&hw.refs, 2);
+	refcount_set(&hw.refs, 1);
 	init_waitqueue_head(&hw.idle);
-	import = kzalloc_obj(*import, GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, import);
-	/*
-	 * Since the multi-SG rework only userptr imports hold a persistent
-	 * map_hw; a DMA-BUF import with one is WARN territory. The sgt is
-	 * left NULL so detach skips the DMA unmap and the test observes only
-	 * the hw reference drop.
-	 */
-	rk_rga_import_init(import, rga, RK_RGA_IMPORT_USERPTR);
-	import->map_hw = &hw;
-	import->size = 16 * 16 * 4;
-	mutex_lock(&rga->import_lock);
-	rk_rga_import_register_locked(import);
-	mutex_unlock(&rga->import_lock);
-	rk_rga_detach_hw_imports(&hw);
-	KUNIT_EXPECT_EQ(test, refcount_read(&hw.refs), 1);
-	KUNIT_EXPECT_PTR_EQ(test, import->map_hw, NULL);
-	KUNIT_EXPECT_TRUE(test, import->service_linked);
-	rk_rga_import_put(import);
 
 	job.mappings = kcalloc(1, sizeof(*job.mappings), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, job.mappings);
@@ -25067,18 +24902,12 @@ static int rk_rga_import_dmabuf_object(struct rk_rga_service *rga,
 	import->dmabuf = dmabuf;
 	import->size = dmabuf->size;
 	/*
-	 * Imports retain logical identity, not a roleless DMA mapping. A
-	 * persistent DMA_TO_DEVICE attachment disagrees with later destination
+	 * A persistent DMA_TO_DEVICE attachment disagrees with later destination
 	 * CPU access, while a persistent bidirectional SWIOTLB mapping could copy
 	 * an unused stale snapshot over output written through the selected job's
-	 * attachment. The job path maps this object only after it knows the core
-	 * and data direction.
-	 *
-	 * Materialized requests use this non-hardware placeholder only until
-	 * rk_rga_job_rebase_img_to_hw() installs selected-core addresses.
+	 * attachment. The common import identity remains in iova until the job
+	 * path knows the selected core and data direction.
 	 */
-	import->iova = (dma_addr_t)(unsigned long)import;
-
 	mutex_lock(&rga->import_lock);
 	rk_rga_import_register_locked(import);
 	mutex_unlock(&rga->import_lock);
@@ -25145,8 +24974,6 @@ static int rk_rga_import_userptr(struct rk_rga_service *rga,
 				 struct rk_rga_import **import_out)
 {
 	struct rk_rga_import *import;
-	struct rk_rga_hw *map_hw;
-	struct device *dev;
 	struct page **pages;
 	unsigned long start;
 	unsigned long addr;
@@ -25158,7 +24985,6 @@ static int rk_rga_import_userptr(struct rk_rga_service *rga,
 	int pinned;
 	bool anon_backed;
 	int ret;
-	bool rga2_mmu;
 
 	if ((u64)(unsigned long)buffer->memory != buffer->memory)
 		return -EINVAL;
@@ -25223,29 +25049,14 @@ static int rk_rga_import_userptr(struct rk_rga_service *rga,
 		return ret;
 	}
 
-	map_hw = rk_rga_get_map_hw_for_import(rga);
-	if (!map_hw) {
-		rk_rga_import_put(import);
-		return -ENODEV;
-	}
-	dev = get_device(map_hw->dev);
-
-	ret = rk_rga_map_userptr_sgt(import, dev, &import->sgt,
-				     &import->userptr_view,
-				     &import->iova, &import->domain,
-				     &import->iova_size,
-				     &import->iommu_mapped, false,
-				     &rga2_mmu);
-	if (ret) {
-		put_device(dev);
-		rk_rga_hw_put(map_hw);
-		mutex_unlock(&rga->import_lock);
-		rk_rga_import_put(import);
-		return ret;
-	}
-
-	import->map_hw = map_hw;
-	import->dev = dev;
+	/*
+	 * Do not map against an arbitrary core here. Legacy requests synthesize
+	 * these imports before scheduling, while Rockchip IOMMU invalidation is
+	 * effective only with the selected core's power domain enabled. The job
+	 * path maps the pinned pages after rk_rga_hw_power_on() and releases that
+	 * mapping before the matching power-off.
+	 */
+	mutex_lock(&rga->import_lock);
 	rk_rga_import_register_locked(import);
 	mutex_unlock(&rga->import_lock);
 	*import_out = import;
@@ -26040,7 +25851,6 @@ static void rk_rga_hw_remove(struct platform_device *pdev)
 		msleep(1000);
 	}
 	cancel_work_sync(&hw->iommu_fault_work);
-	rk_rga_detach_hw_imports(hw);
 	wait_event(hw->idle, rk_rga_hw_unreferenced(hw));
 	/* The fail-fast handler makes balancing safe before devres frees the IRQ. */
 	rk_rga_hw_restore_irq_depth(hw);
