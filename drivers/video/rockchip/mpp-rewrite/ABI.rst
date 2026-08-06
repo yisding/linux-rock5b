@@ -19,6 +19,13 @@ AV1 decoder    ``4``       RK3588 AV1      ``0x80019000``
 This document describes the userspace contract.  Internal locking, recovery,
 KUnit coverage, and implementation history are intentionally kept out of it.
 
+The read-only ``/proc/mpp_service/supports-cmd`` and compatibility alias
+``support_cmd`` enumerate the supported command values.  The read-only
+``supports-device`` entry uses the BSP text format to list each currently
+usable device type and its validated hardware ID.  Its contents track the same
+live support state reported by ``MPP_CMD_QUERY_HW_SUPPORT`` and
+``MPP_CMD_QUERY_HW_ID``.
+
 Transport
 ---------
 

@@ -2128,6 +2128,11 @@ struct rk_mpp_support_cmd {
 	__u32 cmd;
 };
 
+struct rk_mpp_support_device {
+	const char *name;
+	enum rk_mpp_device_type type;
+};
+
 static const struct rk_mpp_support_cmd rk_mpp_support_cmds[] = {
 	{ "QUERY_HW_SUPPORT:", MPP_CMD_QUERY_HW_SUPPORT },
 	{ "QUERY_HW_ID:", MPP_CMD_QUERY_HW_ID },
@@ -2158,6 +2163,12 @@ static const struct rk_mpp_support_cmd rk_mpp_support_cmds[] = {
 	{ "CONTROL_BUTT:", MPP_CMD_CONTROL_BUTT },
 };
 
+static const struct rk_mpp_support_device rk_mpp_support_devices[] = {
+	{ "AV1DEC", RK_MPP_DEVICE_AV1DEC },
+	{ "RKVDEC", RK_MPP_DEVICE_RKVDEC },
+	{ "RKVENC", RK_MPP_DEVICE_RKVENC },
+};
+
 static void rk_mpp_msg_v1_to_request(const struct rk_mpp_msg_v1 *msg,
 				     struct mpp_request *req)
 {
@@ -2186,6 +2197,31 @@ static int rk_mpp_support_cmd_show(struct seq_file *s, void *unused)
 	return 0;
 }
 
+static int rk_mpp_support_device_show(struct seq_file *s, void *unused)
+{
+	struct rk_mpp_service *srv = s->private;
+	u32 support = rk_mpp_get_hw_support(srv);
+	u32 i;
+
+	seq_puts(s, "---- SUPPORT DEVICES ----\n");
+	for (i = 0; i < ARRAY_SIZE(rk_mpp_support_devices); i++) {
+		const struct rk_mpp_support_device *device =
+			&rk_mpp_support_devices[i];
+		u32 hw_id;
+
+		if (!(support & BIT(device->type)))
+			continue;
+		hw_id = rk_mpp_get_hw_id(srv, device->type);
+		seq_printf(s, "DEVICE[%2u]:%-10s", device->type,
+			   device->name);
+		if (hw_id)
+			seq_printf(s, "HW_ID:0x%08x", hw_id);
+		seq_putc(s, '\n');
+	}
+
+	return 0;
+}
+
 static int rk_mpp_create_procfs(struct rk_mpp_service *srv)
 {
 	srv->procfs_root = proc_mkdir("mpp_service", NULL);
@@ -2199,7 +2235,10 @@ static int rk_mpp_create_procfs(struct rk_mpp_service *srv)
 	if (!proc_create_single("supports-cmd", 0444, srv->procfs_root,
 				rk_mpp_support_cmd_show) ||
 	    !proc_create_single("support_cmd", 0444, srv->procfs_root,
-				rk_mpp_support_cmd_show)) {
+				rk_mpp_support_cmd_show) ||
+	    !proc_create_single_data("supports-device", 0444,
+				     srv->procfs_root,
+				     rk_mpp_support_device_show, srv)) {
 		proc_remove(srv->procfs_root);
 		srv->procfs_root = NULL;
 		return -ENOMEM;
@@ -4241,6 +4280,11 @@ static void rk_mpp_support_cmds_kunit(struct kunit *test)
 		{ "SET_ERR_REF_HACK:", MPP_CMD_SET_ERR_REF_HACK },
 		{ "CONTROL_BUTT:", MPP_CMD_CONTROL_BUTT },
 	};
+	static const struct rk_mpp_support_device expected_devices[] = {
+		{ "AV1DEC", RK_MPP_DEVICE_AV1DEC },
+		{ "RKVDEC", RK_MPP_DEVICE_RKVDEC },
+		{ "RKVENC", RK_MPP_DEVICE_RKVENC },
+	};
 	u32 i;
 
 	KUNIT_ASSERT_EQ(test, ARRAY_SIZE(rk_mpp_support_cmds),
@@ -4257,6 +4301,15 @@ static void rk_mpp_support_cmds_kunit(struct kunit *test)
 		}
 		KUNIT_EXPECT_EQ(test, rk_mpp_support_cmds[i].cmd,
 				expected[i].cmd);
+	}
+
+	KUNIT_ASSERT_EQ(test, ARRAY_SIZE(rk_mpp_support_devices),
+			ARRAY_SIZE(expected_devices));
+	for (i = 0; i < ARRAY_SIZE(expected_devices); i++) {
+		KUNIT_EXPECT_STREQ(test, rk_mpp_support_devices[i].name,
+				   expected_devices[i].name);
+		KUNIT_EXPECT_EQ(test, rk_mpp_support_devices[i].type,
+				expected_devices[i].type);
 	}
 }
 
