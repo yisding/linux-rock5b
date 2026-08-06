@@ -9424,10 +9424,27 @@ static int rk_rga_kunit_install_fence_fd(struct kunit *test,
 					  struct dma_fence *fence)
 {
 	struct sync_file *sync_file;
+	int reserved_fd;
 	int fd;
 	int ret;
 
+	/*
+	 * A case runs in a fresh kthread whose file table starts empty, so the
+	 * lowest descriptor handed out here would be zero.  A process never
+	 * submits descriptor zero as an acquire fence -- there it is stdin --
+	 * which is why the legacy BLIT ABI reads in_fence_fd == 0 as "no
+	 * fence".  A fixture that installs its sync-file there hands over a
+	 * fence the ABI is required to ignore, which un-gates the jobs the
+	 * pending-acquire cases need to stay blocked.  Burn the low descriptor
+	 * first, the way the MPP suite does for its dma-buf descriptors, so
+	 * this one is positive like a process's.
+	 */
+	reserved_fd = get_unused_fd_flags(O_CLOEXEC);
+	if (reserved_fd < 0)
+		return reserved_fd;
+
 	fd = rk_rga_fence_create_fd(fence, &sync_file);
+	put_unused_fd(reserved_fd);
 	if (fd < 0)
 		return fd;
 
