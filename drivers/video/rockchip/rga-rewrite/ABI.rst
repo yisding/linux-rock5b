@@ -156,9 +156,12 @@ pending and dispatches later.  An already-signaled successful acquire fence
 takes the ready path.  A negative acquire-fence result becomes the job result.
 Kernel-owned acquire fds are closed on both success and preparation failure.
 Legacy ``RGA_BLIT_SYNC``/``RGA_BLIT_ASYNC`` requests follow the BSP sentinel
-rule: ``in_fence_fd == 0`` means that no acquire fence was supplied.  This
-normalization applies only to the kernel's legacy task copy; an asynchronous
-reply preserves the caller's zero field, and modern ``REQUEST_*`` submissions
+rule: ``in_fence_fd == 0`` means that no acquire fence was supplied.  Modern
+``REQUEST_*`` submissions apply the same rule to the request-level
+``acquire_fence_fd`` because zero is the public ``imendJob()`` default and the
+BSP imports only positive request-fence descriptors.  The normalization
+changes only the kernel-owned fence lookup; asynchronous replies preserve the
+caller's zero field.  Task-local ``in_fence_fd`` fields in a modern request
 retain normal fd-zero semantics.
 
 Closing ``/dev/rga`` prevents new work, cancels acquire-blocked work, removes
