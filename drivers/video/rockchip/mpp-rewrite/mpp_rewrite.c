@@ -582,6 +582,7 @@ struct rk_mpp_service {
 						  [RK_MPP_CORE_COUNTER_COUNT];
 	atomic_t irq_count;
 	atomic_t spurious_irq_count;
+	atomic_t rkvdec_bus_not_idle_count;
 	atomic_t started_core_count[RK_MPP_DEBUG_CLIENT_COUNT]
 					   [RK_MPP_CORE_COUNTER_COUNT];
 	atomic64_t hw_total_ns;
@@ -851,6 +852,7 @@ static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu);
 static int
 rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(struct rk_mpp_hw *ccu);
 static u32 rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu);
+static void rk_mpp_rkvdec2_wait_bus_idle(struct rk_mpp_hw *hw);
 static int rk_mpp_rkvdec2_reset_soft_ccu_job(struct rk_mpp_job *job);
 static int rk_mpp_rkvdec2_start_soft_ccu_job(struct rk_mpp_job *job,
 					     u32 start_value);
@@ -7485,6 +7487,40 @@ static void rk_mpp_scheduler_session_start_order_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->queued_job_count), 0);
 }
 
+static void rk_mpp_rkvdec2_wait_bus_idle_kunit(struct kunit *test)
+{
+	struct rk_mpp_service *srv;
+	struct rk_mpp_hw *hw;
+	u32 *regs;
+
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
+	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
+	regs = kunit_kzalloc(test,
+			     RK_MPP_RKVDEC_DEBUG_INT_BASE + sizeof(u32),
+			     GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, regs);
+
+	hw->srv = srv;
+	hw->regs[0] = (void __iomem *)regs;
+	hw->reg_size[0] = RK_MPP_RKVDEC_DEBUG_INT_BASE + sizeof(u32);
+
+	/* Unpowered cores must not be touched or counted. */
+	rk_mpp_rkvdec2_wait_bus_idle(hw);
+	KUNIT_EXPECT_EQ(test, atomic_read(&srv->rkvdec_bus_not_idle_count), 0);
+
+	atomic_set(&hw->power_count, 1);
+	regs[RK_MPP_RKVDEC_DEBUG_INT_BASE / sizeof(u32)] =
+		RK_MPP_RKVDEC_DEBUG_BUS_IDLE;
+	rk_mpp_rkvdec2_wait_bus_idle(hw);
+	KUNIT_EXPECT_EQ(test, atomic_read(&srv->rkvdec_bus_not_idle_count), 0);
+
+	regs[RK_MPP_RKVDEC_DEBUG_INT_BASE / sizeof(u32)] = 0;
+	rk_mpp_rkvdec2_wait_bus_idle(hw);
+	KUNIT_EXPECT_EQ(test, atomic_read(&srv->rkvdec_bus_not_idle_count), 1);
+}
+
 static void rk_mpp_explicit_iova_affinity_kunit(struct kunit *test)
 {
 	struct rk_mpp_service srv = {};
@@ -9741,6 +9777,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_hw_select_rotation_kunit),
 	KUNIT_CASE(rk_mpp_scheduler_skips_recovery_failed_kunit),
 	KUNIT_CASE(rk_mpp_scheduler_session_start_order_kunit),
+	KUNIT_CASE(rk_mpp_rkvdec2_wait_bus_idle_kunit),
 	KUNIT_CASE(rk_mpp_explicit_iova_affinity_kunit),
 	KUNIT_CASE(rk_mpp_explicit_iova_validation_kunit),
 	KUNIT_CASE(rk_mpp_iommu_fault_match_kunit),
@@ -13228,6 +13265,39 @@ out_put_jobs:
 	return ret ?: (int)count;
 }
 
+/*
+ * Ready status only proves the core finished consuming the task; its write
+ * channel can still hold reconstruction data on the bus.  Poll the BUS_IDLE
+ * flag before a completion is acted on, so completing a job also proves its
+ * writeback drained -- the same proof the recovery path demands before it
+ * reuses a core.  A timeout is counted and reported but does not fail the
+ * job: the data race it indicates is already the caller's status quo.
+ *
+ * Callers hold the core's run_lock with the completing job still accounted
+ * as in flight, so the register window is provably powered.
+ */
+static void rk_mpp_rkvdec2_wait_bus_idle(struct rk_mpp_hw *hw)
+{
+	u32 value;
+	int ret;
+
+	if (atomic_read(&hw->power_count) <= 0 ||
+	    !rk_mpp_hw_reg_range_valid(hw, 0, RK_MPP_RKVDEC_DEBUG_INT_BASE,
+				       sizeof(u32)))
+		return;
+
+	ret = readl_poll_timeout(hw->regs[0] + RK_MPP_RKVDEC_DEBUG_INT_BASE,
+				 value, value & RK_MPP_RKVDEC_DEBUG_BUS_IDLE,
+				 1, RK_MPP_CCU_STOP_TIMEOUT_US);
+	if (ret) {
+		atomic_inc(&hw->srv->rkvdec_bus_not_idle_count);
+		if (hw->dev)
+			dev_warn_ratelimited(hw->dev,
+					     "completing job with bus not idle after %uus\n",
+					     RK_MPP_CCU_STOP_TIMEOUT_US);
+	}
+}
+
 static u32 rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu)
 {
 	const struct rk_mpp_rkvdec2_link_info *link_info =
@@ -13302,6 +13372,12 @@ static u32 rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu)
 			reset_ret = rk_mpp_hw_stop_active(hw);
 		if (!ret)
 			ret = stop_ret ?: reset_ret;
+		/*
+		 * The CCU can run a descriptor on a core other than its
+		 * software owner, so this proves the owner core drained; a
+		 * cross-core finish is proved by that core's own IRQ path.
+		 */
+		rk_mpp_rkvdec2_wait_bus_idle(hw);
 		rk_mpp_hw_power_off(hw);
 		rk_mpp_job_complete(job, ret);
 		mutex_unlock(&hw->run_lock);
@@ -15323,6 +15399,7 @@ static irqreturn_t rk_mpp_rkvdec2_thread(struct rk_mpp_hw *hw)
 		if (!ret)
 			ret = reset_ret;
 	}
+	rk_mpp_rkvdec2_wait_bus_idle(hw);
 	rk_mpp_hw_power_off(hw);
 	rk_mpp_job_complete(job, ret);
 	mutex_unlock(&hw->run_lock);
@@ -17220,7 +17297,7 @@ static int rk_mpp_debug_state_show(struct seq_file *s, void *unused)
 		   atomic_read(&srv->completed_job_count),
 		   atomic_read(&srv->failed_job_count),
 		   atomic_read(&srv->aborted_job_count));
-	seq_printf(s, "errors unsupported=%d rejected=%d timeout=%d reset=%d recovery_failure=%d reset_deassert_contended=%d reset_deassert=%d iommu_fault=%d iommu_refresh=%d iommu_idle_fault=%d irq=%d spurious_irq=%d av1_afbc_irq=%d av1_afbc_prestart_status=%d av1_afbc_stale_status_timeout=%d av1_afbc_before_vcd=%d av1_afbc_after_vcd=%d av1_afbc_observed_at_vcd=%d av1_afbc_not_observed_at_vcd=%d av1_afbc_observed_at_quiesce=%d av1_afbc_not_observed_at_quiesce=%d av1_reset_idle_unproven=%d av1_vcd_to_afbc_observed_max_ns=%lld\n",
+	seq_printf(s, "errors unsupported=%d rejected=%d timeout=%d reset=%d recovery_failure=%d reset_deassert_contended=%d reset_deassert=%d iommu_fault=%d iommu_refresh=%d iommu_idle_fault=%d irq=%d spurious_irq=%d rkvdec_bus_not_idle=%d av1_afbc_irq=%d av1_afbc_prestart_status=%d av1_afbc_stale_status_timeout=%d av1_afbc_before_vcd=%d av1_afbc_after_vcd=%d av1_afbc_observed_at_vcd=%d av1_afbc_not_observed_at_vcd=%d av1_afbc_observed_at_quiesce=%d av1_afbc_not_observed_at_quiesce=%d av1_reset_idle_unproven=%d av1_vcd_to_afbc_observed_max_ns=%lld\n",
 		   atomic_read(&srv->unsupported_count),
 		   atomic_read(&srv->rejected_job_count),
 		   atomic_read(&srv->timeout_count),
@@ -17233,6 +17310,7 @@ static int rk_mpp_debug_state_show(struct seq_file *s, void *unused)
 		   atomic_read(&srv->iommu_idle_fault_count),
 		   atomic_read(&srv->irq_count),
 		   atomic_read(&srv->spurious_irq_count),
+		   atomic_read(&srv->rkvdec_bus_not_idle_count),
 		   atomic_read(&srv->av1_afbc_irq_count),
 		   atomic_read(&srv->av1_afbc_prestart_status_count),
 		   atomic_read(&srv->av1_afbc_stale_status_timeout_count),
@@ -18239,6 +18317,9 @@ static int rk_mpp_runtime_register(void)
 					  rk_mpp_srv.reset_deassert_core_count);
 	debugfs_create_atomic_t("irq_count", 0444, rk_mpp_srv.debugfs_root,
 				&rk_mpp_srv.irq_count);
+	debugfs_create_atomic_t("rkvdec_bus_not_idle_count", 0444,
+				rk_mpp_srv.debugfs_root,
+				&rk_mpp_srv.rkvdec_bus_not_idle_count);
 	debugfs_create_atomic_t("spurious_irq_count", 0444,
 				rk_mpp_srv.debugfs_root,
 				&rk_mpp_srv.spurious_irq_count);
