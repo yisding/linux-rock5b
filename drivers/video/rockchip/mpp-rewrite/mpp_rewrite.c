@@ -13093,6 +13093,18 @@ static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
 	writel_relaxed(rk_mpp_rkvdec2_ccu_link_mode(job, add_mode),
 		       ccu_regs + RK_MPP_RKVDEC_CCU_LINK_MODE_BASE);
 
+	/*
+	 * Match rkvdec2_hard_ccu_enqueue(): invalidate the IOTLB before every
+	 * CFG_DONE, in add mode too, so the descriptor the CCU is about to
+	 * fetch and the task's buffers cannot be resolved through stale
+	 * translations left over from a previous job's mappings.  Admission
+	 * (rk_mpp_rkvdec2_hard_ccu_dma_ready_locked) has proved every sibling
+	 * core shares this domain, so one flush covers whichever core the CCU
+	 * dispatches the descriptor to.
+	 */
+	if (hw->iommu_domain && hw->iommu_domain->ops)
+		iommu_flush_iotlb_all(hw->iommu_domain);
+
 	rk_mpp_rkvdec2_ccu_job_add(job);
 	rk_mpp_hw_schedule_timeout(hw);
 	rk_mpp_rkvdec2_commit_ccu_descriptor(job, ccu_regs);
