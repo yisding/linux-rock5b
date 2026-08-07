@@ -529,7 +529,7 @@ struct rk_mpp_service {
 	struct rk_mpp_reset_domain reset_domains[RK_MPP_MAX_RESET_DOMAINS];
 	u32 reset_domain_count;
 	struct mutex dma_group_lock;
-	struct mutex sched_lock; /* protects queued_jobs */
+	struct mutex sched_lock; /* protects queued_jobs and dispatch stamps */
 	/*
 	 * Lock order: core run_lock -> rkvenc_dchs_lifecycle_lock ->
 	 * rkvenc_dchs_lock. Serializes a consumer's DCHS patch-through-START
@@ -549,6 +549,13 @@ struct rk_mpp_service {
 	struct list_head dma_groups;
 	struct list_head fault_hws;
 	struct list_head queued_jobs;
+	/*
+	 * Bumped at the start of every scheduler scan, under sched_lock.
+	 * Compared against each session's sched_defer_stamp so one scan can
+	 * mark a session whose head job could not start and refuse to start
+	 * any later job of that session behind it.
+	 */
+	u64 sched_scan_stamp;
 	struct work_struct sched_work;
 	atomic_t ioctl_count;
 	atomic_t unsupported_count;
@@ -634,6 +641,13 @@ struct rk_mpp_session {
 	u32 next_job_id;
 	u32 active_job_count;
 	u64 state_seq;
+	/*
+	 * Scheduler scan stamp, written and read only under srv->sched_lock.
+	 * Set to the current scan's sched_scan_stamp when a queued job of
+	 * this session is passed over, so the same scan cannot start a later
+	 * job of the session ahead of it.
+	 */
+	u64 sched_defer_stamp;
 	struct device *explicit_map_dev;
 	struct rk_mpp_rcb_desc rcb_descs[RK_MPP_MAX_RCB_ELEMS];
 	u32 rcb_count;
@@ -7388,6 +7402,89 @@ static void rk_mpp_scheduler_skips_recovery_failed_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->queued_job_count), 0);
 }
 
+static void rk_mpp_scheduler_session_start_order_kunit(struct kunit *test)
+{
+	struct rk_mpp_service *srv;
+	struct rk_mpp_session *session_a;
+	struct rk_mpp_session *session_b;
+	struct rk_mpp_hw *busy_hw;
+	struct rk_mpp_hw *idle_hw;
+	struct rk_mpp_job *active;
+	struct rk_mpp_job *job1;
+	struct rk_mpp_job *job2;
+	struct rk_mpp_job *other;
+
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
+	session_a = kunit_kzalloc(test, sizeof(*session_a), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, session_a);
+	session_b = kunit_kzalloc(test, sizeof(*session_b), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, session_b);
+	busy_hw = kunit_kzalloc(test, sizeof(*busy_hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, busy_hw);
+	idle_hw = kunit_kzalloc(test, sizeof(*idle_hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, idle_hw);
+	active = kunit_kzalloc(test, sizeof(*active), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, active);
+	job1 = kunit_kzalloc(test, sizeof(*job1), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job1);
+	job2 = kunit_kzalloc(test, sizeof(*job2), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job2);
+	other = kunit_kzalloc(test, sizeof(*other), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, other);
+
+	session_a->srv = srv;
+	session_b->srv = srv;
+	busy_hw->online = true;
+	busy_hw->active_job = active;
+	idle_hw->online = true;
+	mutex_init(&srv->sched_lock);
+	INIT_LIST_HEAD(&srv->queued_jobs);
+	spin_lock_init(&busy_hw->lock);
+	spin_lock_init(&idle_hw->lock);
+	raw_spin_lock_init(&busy_hw->regs_lock);
+	raw_spin_lock_init(&idle_hw->regs_lock);
+
+	job1->session = session_a;
+	job1->hw = busy_hw;
+	job2->session = session_a;
+	job2->hw = idle_hw;
+	other->session = session_b;
+	other->hw = idle_hw;
+	INIT_LIST_HEAD(&job1->sched_link);
+	INIT_LIST_HEAD(&job2->sched_link);
+	INIT_LIST_HEAD(&other->sched_link);
+	INIT_LIST_HEAD(&job1->abort_link);
+	INIT_LIST_HEAD(&job2->abort_link);
+	INIT_LIST_HEAD(&other->abort_link);
+	list_add_tail(&job1->sched_link, &srv->queued_jobs);
+	list_add_tail(&job2->sched_link, &srv->queued_jobs);
+	list_add_tail(&other->sched_link, &srv->queued_jobs);
+	atomic_set(&busy_hw->queued_job_count, 1);
+	atomic_set(&idle_hw->queued_job_count, 2);
+	atomic_set(&srv->queued_job_count, 3);
+
+	/*
+	 * job2's core is free, but job1 of the same session is still queued
+	 * behind a busy core: job2 must not overtake it, while session_b's
+	 * job on the free core may run.
+	 */
+	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_scheduler_take_job(srv), other);
+	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_scheduler_take_job(srv), NULL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&srv->queued_job_count), 2);
+
+	/*
+	 * Once the head job can start, the session drains in submission
+	 * order; job2 may then start with job1 merely running, which is the
+	 * in-order dual-core overlap the hardware handshake supports.
+	 */
+	busy_hw->active_job = NULL;
+	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_scheduler_take_job(srv), job1);
+	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_scheduler_take_job(srv), job2);
+	KUNIT_EXPECT_TRUE(test, list_empty(&srv->queued_jobs));
+	KUNIT_EXPECT_EQ(test, atomic_read(&srv->queued_job_count), 0);
+}
+
 static void rk_mpp_explicit_iova_affinity_kunit(struct kunit *test)
 {
 	struct rk_mpp_service srv = {};
@@ -9643,6 +9740,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_core_counter_kunit),
 	KUNIT_CASE(rk_mpp_hw_select_rotation_kunit),
 	KUNIT_CASE(rk_mpp_scheduler_skips_recovery_failed_kunit),
+	KUNIT_CASE(rk_mpp_scheduler_session_start_order_kunit),
 	KUNIT_CASE(rk_mpp_explicit_iova_affinity_kunit),
 	KUNIT_CASE(rk_mpp_explicit_iova_validation_kunit),
 	KUNIT_CASE(rk_mpp_iommu_fault_match_kunit),
@@ -11598,15 +11696,36 @@ static struct rk_mpp_job *
 rk_mpp_scheduler_take_job(struct rk_mpp_service *srv)
 {
 	struct rk_mpp_job *job;
+	u64 scan_stamp;
 
 	mutex_lock(&srv->sched_lock);
+	scan_stamp = ++srv->sched_scan_stamp;
 	list_for_each_entry(job, &srv->queued_jobs, sched_link) {
+		struct rk_mpp_session *session = job->session;
+
+		/*
+		 * Never start a job while an earlier job of the same session
+		 * is still queued.  Consecutive frames of one session run on
+		 * both decoder cores in parallel, and the hardware inter-core
+		 * reference handshake only pairs a consumer with a producer
+		 * that has already started: starting frame N+1 with frame N
+		 * still queued lets N+1's reference fetches free-run against
+		 * memory N has not reconstructed yet.  The queue is FIFO per
+		 * session, so one pass over it sees a session's jobs in
+		 * submission order and this stamp holds back everything
+		 * behind a job that could not start.
+		 */
+		if (session->sched_defer_stamp == scan_stamp)
+			continue;
+
 		if (!READ_ONCE(job->canceled) && rk_mpp_hw_usable(job->hw) &&
 		    rk_mpp_hw_is_idle(job->hw)) {
 			rk_mpp_job_unqueue_locked(job);
 			mutex_unlock(&srv->sched_lock);
 			return job;
 		}
+
+		session->sched_defer_stamp = scan_stamp;
 	}
 	mutex_unlock(&srv->sched_lock);
 
