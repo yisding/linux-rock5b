@@ -15,6 +15,8 @@
 
 static void rga_job_free(struct rga_job *job)
 {
+	WARN_ON_ONCE(!list_empty(&job->rga2_stage_list));
+
 	if (job->cmd_buf) {
 		if (job->task_count > 1)
 			rga_dma_free(job->cmd_buf);
@@ -88,7 +90,9 @@ static int rga_job_judgment_support_core(struct rga_job *job, struct rga_req *re
 		if (ret < 0)
 			goto out_finish;
 
-		if (!ret) {
+		if (ret == RGA2_BUFFER_STAGEABLE) {
+			job->flags |= RGA_JOB_RGA2_STAGEABLE_DMA_BUF;
+		} else if (!ret) {
 			job->flags |= RGA_JOB_UNSUPPORT_RGA_MMU;
 			goto out_finish;
 		}
@@ -99,7 +103,9 @@ static int rga_job_judgment_support_core(struct rga_job *job, struct rga_req *re
 		if (ret < 0)
 			goto out_finish;
 
-		if (!ret) {
+		if (ret == RGA2_BUFFER_STAGEABLE) {
+			job->flags |= RGA_JOB_RGA2_STAGEABLE_DMA_BUF;
+		} else if (!ret) {
 			job->flags |= RGA_JOB_UNSUPPORT_RGA_MMU;
 			goto out_finish;
 		}
@@ -110,7 +116,9 @@ static int rga_job_judgment_support_core(struct rga_job *job, struct rga_req *re
 		if (ret < 0)
 			goto out_finish;
 
-		if (!ret) {
+		if (ret == RGA2_BUFFER_STAGEABLE) {
+			job->flags |= RGA_JOB_RGA2_STAGEABLE_DMA_BUF;
+		} else if (!ret) {
 			job->flags |= RGA_JOB_UNSUPPORT_RGA_MMU;
 			goto out_finish;
 		}
@@ -132,6 +140,7 @@ static struct rga_job *rga_job_alloc(struct rga_req *task_list, size_t task_coun
 		return NULL;
 
 	INIT_LIST_HEAD(&job->head);
+	INIT_LIST_HEAD(&job->rga2_stage_list);
 	kref_init(&job->refcount);
 
 	job->timestamp.init = ktime_get();
@@ -165,7 +174,8 @@ static struct rga_job *rga_job_alloc(struct rga_req *task_list, size_t task_coun
 		if (job->task_list[i].handle_flag & 1) {
 			job->flags |= RGA_JOB_USE_HANDLE;
 			rga_job_judgment_support_core(job, &job->task_list[i]);
-			break;
+			if (job->flags & RGA_JOB_UNSUPPORT_RGA_MMU)
+				break;
 		}
 	}
 

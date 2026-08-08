@@ -340,6 +340,24 @@ static int rga_mm_session_show(struct seq_file *m, void *data)
 	return 0;
 }
 
+static int rga_rga2_stage_show(struct seq_file *m, void *data)
+{
+	rga_mm_rga2_stage_show(m);
+
+	return 0;
+}
+
+static int rga_rga2_stage_counter_show(struct seq_file *m, void *data)
+{
+	struct rga_debugger_node *node = m->private;
+	enum rga2_stage_counter counter =
+		(unsigned long)node->info_ent->data;
+
+	seq_printf(m, "%llu\n", rga_mm_rga2_stage_counter(counter));
+
+	return 0;
+}
+
 static int rga_request_manager_show(struct seq_file *m, void *data)
 {
 	int id, i;
@@ -561,6 +579,27 @@ static struct rga_debugger_list rga_debugger_root_list[] = {
 	{"load", rga_load_show, NULL, NULL},
 	{"scheduler_status", rga_scheduler_show, NULL, NULL},
 	{"mm_session", rga_mm_session_show, NULL, NULL},
+	{"rga2_stage", rga_rga2_stage_show, NULL, NULL},
+	{"rga2_stage_attempt_count", rga_rga2_stage_counter_show, NULL,
+	 (void *)RGA2_STAGE_ATTEMPT},
+	{"rga2_stage_success_count", rga_rga2_stage_counter_show, NULL,
+	 (void *)RGA2_STAGE_SUCCESS},
+	{"rga2_stage_failure_count", rga_rga2_stage_counter_show, NULL,
+	 (void *)RGA2_STAGE_FAILURE},
+	{"rga2_stage_reuse_count", rga_rga2_stage_counter_show, NULL,
+	 (void *)RGA2_STAGE_REUSE},
+	{"active", rga_rga2_stage_counter_show, NULL,
+	 (void *)RGA2_STAGE_ACTIVE},
+	{"rga2_stage_active_count", rga_rga2_stage_counter_show, NULL,
+	 (void *)RGA2_STAGE_ACTIVE},
+	{"rga2_stage_active_bytes", rga_rga2_stage_counter_show, NULL,
+	 (void *)RGA2_STAGE_ACTIVE_BYTES},
+	{"rga2_stage_peak_bytes", rga_rga2_stage_counter_show, NULL,
+	 (void *)RGA2_STAGE_PEAK_BYTES},
+	{"rga2_stage_copy_in_bytes", rga_rga2_stage_counter_show, NULL,
+	 (void *)RGA2_STAGE_COPY_IN_BYTES},
+	{"rga2_stage_copy_out_bytes", rga_rga2_stage_counter_show, NULL,
+	 (void *)RGA2_STAGE_COPY_OUT_BYTES},
 	{"request_manager", rga_request_manager_show, NULL, NULL},
 #ifdef CONFIG_NO_GKI
 	{"dump_path", rga_dump_path_show, rga_dump_path_write, NULL},

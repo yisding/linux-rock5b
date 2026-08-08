@@ -255,9 +255,13 @@ struct rga_internal_buffer {
 
 	/* The scheduler of the mapping */
 	struct rga_scheduler_t *scheduler;
+
+	/* The RGA2 attachment hit the exporter/SWIOTLB segment-size limit. */
+	bool rga2_dma_incompatible;
 };
 
 struct rga_scheduler_t;
+struct rga_rga2_stage;
 
 struct rga_session {
 	int id;
@@ -312,6 +316,10 @@ struct rga_job_buffer {
 	struct rga_dma_buffer *rga2_bounce[3];
 	struct rga_internal_buffer *rga2_bounce_origin[3];
 	int rga2_bounce_count;
+
+	/* Shared, job-owned DMA32 staging references for incompatible DMA-BUFs. */
+	struct rga_rga2_stage *rga2_stage[3];
+	int rga2_stage_count;
 };
 
 struct rga_job_task_buffers {
@@ -335,6 +343,7 @@ struct rga_job_timestamp {
 
 struct rga_job {
 	struct list_head head;
+	struct list_head rga2_stage_list;
 
 	struct rga_scheduler_t *scheduler;
 	struct rga_session *session;

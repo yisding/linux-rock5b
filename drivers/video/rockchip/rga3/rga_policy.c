@@ -534,6 +534,19 @@ int rga_job_assign(struct rga_job *job)
 		optional_cores &= ret;
 	}
 
+	/*
+	 * Keep the zero-copy RGA3 path ahead of DMA32 staging. RGA2 remains
+	 * eligible when userspace explicitly selected it or when the operation
+	 * has no compatible RGA3 core, because rga_task_assign() has already
+	 * applied those constraints to optional_cores.
+	 */
+	if (job->flags & RGA_JOB_RGA2_STAGEABLE_DMA_BUF) {
+		int rga3_cores = RGA3_SCHEDULER_CORE0 | RGA3_SCHEDULER_CORE1;
+
+		if (optional_cores & rga3_cores)
+			optional_cores &= rga3_cores;
+	}
+
 	for (i = 0; i < rga_drvdata->num_of_scheduler; i++) {
 		scheduler = rga_drvdata->scheduler[i];
 
