@@ -6797,7 +6797,8 @@ static u32 rk_rga3_start_sys_ctrl(const struct rk_rga_hw_match *match)
 	return sys_ctrl;
 }
 
-static int rk_rga2_start_hw(struct rk_rga_hw *hw, struct rk_rga_job *job)
+static int rk_rga2_publish_and_start(struct rk_rga_hw *hw,
+				     struct rk_rga_job *job)
 {
 	const struct rga_pre_intr_info *intr =
 		&job->tasks[job->current_task].pre_intr_info;
@@ -6834,7 +6835,8 @@ static int rk_rga2_start_hw(struct rk_rga_hw *hw, struct rk_rga_job *job)
 	return 0;
 }
 
-static int rk_rga3_start_hw(struct rk_rga_hw *hw, struct rk_rga_job *job)
+static int rk_rga3_publish_and_start(struct rk_rga_hw *hw,
+				     struct rk_rga_job *job)
 {
 	rk_rga3_clear_irq(hw);
 	rk_rga_write(hw, RK_RGA3_INT_DONE_MASK | RK_RGA3_INT_ERROR_MASK,
@@ -6908,18 +6910,29 @@ static void rk_rga_hw_schedule_timeout(struct rk_rga_hw *hw,
 			 msecs_to_jiffies(RK_RGA_JOB_TIMEOUT_MS));
 }
 
-static int rk_rga_hw_start(struct rk_rga_hw *hw, struct rk_rga_job *job)
+static int rk_rga_publish_and_start(struct rk_rga_hw *hw,
+				    struct rk_rga_job *job)
 {
 	int ret;
+
+	lockdep_assert_held(&hw->run_lock);
+	/*
+	 * Publish every coherent command-buffer store before the MMIO doorbell.
+	 * Coherent allocation makes CPU and device views agree, but does not by
+	 * itself order the final register-image writes against starting the DMA
+	 * command fetch. That ordering matters when pipelined jobs rapidly reuse
+	 * command-buffer IOVAs.
+	 */
+	dma_wmb();
 
 	job->irq_result = 0;
 	job->irq_seen = false;
 	job->hw_start_ns = ktime_get_ns();
 
 	if (hw->type == RK_RGA_HW_RGA3)
-		ret = rk_rga3_start_hw(hw, job);
+		ret = rk_rga3_publish_and_start(hw, job);
 	else
-		ret = rk_rga2_start_hw(hw, job);
+		ret = rk_rga2_publish_and_start(hw, job);
 	if (ret)
 		return ret;
 
@@ -23615,16 +23628,7 @@ static int rk_rga_backend_start(struct rk_rga_hw *hw, struct rk_rga_job *job)
 		goto err_release;
 	}
 
-	/*
-	 * Publish every coherent command-buffer store before the MMIO doorbell.
-	 * Coherent allocation makes CPU and device views agree, but does not by
-	 * itself order the final register-image writes against starting the DMA
-	 * command fetch. That ordering matters when pipelined jobs rapidly reuse
-	 * command-buffer IOVAs.
-	 */
-	dma_wmb();
-
-	ret = rk_rga_hw_start(hw, job);
+	ret = rk_rga_publish_and_start(hw, job);
 	if (ret)
 		goto err_release;
 
