@@ -3314,6 +3314,14 @@ static u32 rk_mpp_rkvdec2_powered_ccu_core_count(const struct rk_mpp_job *job)
 	return job->rkvdec_ccu_powered_core_count;
 }
 
+static bool
+rk_mpp_rkvdec2_job_has_live_leases(const struct rk_mpp_job *job)
+{
+	return job->rkvdec_ccu_started || job->rkvdec_ccu_listed ||
+	       job->rkvdec_ccu_powered ||
+	       rk_mpp_rkvdec2_powered_ccu_core_count(job);
+}
+
 static struct rk_mpp_hw *
 rk_mpp_rkvdec2_powered_ccu_core(const struct rk_mpp_job *job, u32 index)
 {
@@ -3973,6 +3981,7 @@ static void
 rk_mpp_rkvdec2_publish_and_start_ccu(struct rk_mpp_job *job,
 				     void __iomem *regs)
 {
+	lockdep_assert_held(&job->hw->run_lock);
 	lockdep_assert_held(&job->rkvdec_ccu->run_lock);
 
 	rk_mpp_rkvdec2_ccu_job_add(job);
@@ -5183,6 +5192,7 @@ static void rk_mpp_av1_afbc_status_observation_kunit(struct kunit *test)
 	unsigned long flags;
 	bool generation_observed = false;
 	bool observed;
+	int ret;
 
 	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, srv);
@@ -5201,6 +5211,7 @@ static void rk_mpp_av1_afbc_status_observation_kunit(struct kunit *test)
 	hw.reg_size[RK_MPP_AV1_AFBC_REGION] =
 		RK_MPP_AV1_AFBC_MIN_REG_SIZE;
 	raw_spin_lock_init(&hw.aux_lock);
+	mutex_init(&hw.run_lock);
 
 	writel(RK_MPP_AV1_AFBC_CONTROL_STREAMS,
 	       afbc + RK_MPP_AV1_AFBC_CONTROL);
@@ -5241,9 +5252,10 @@ static void rk_mpp_av1_afbc_status_observation_kunit(struct kunit *test)
 	hw.av1_afbc_status_generation = 0;
 	hw.av1_start_ns = 0;
 	writel(0, afbc + RK_MPP_AV1_AFBC_ACKNOWLEDGE);
-	KUNIT_ASSERT_EQ(test,
-			rk_mpp_av1_publish_and_start(&hw, 6, true, 0x1234),
-			0);
+	mutex_lock(&hw.run_lock);
+	ret = rk_mpp_av1_publish_and_start(&hw, 6, true, 0x1234);
+	mutex_unlock(&hw.run_lock);
+	KUNIT_ASSERT_EQ(test, ret, 0);
 	KUNIT_EXPECT_EQ(test, hw.av1_afbc_armed_generation, 6ULL);
 	KUNIT_EXPECT_EQ(test, readl(vcd + RK_MPP_AV1_IRQ_BASE), 0x1234U);
 
@@ -5252,8 +5264,10 @@ static void rk_mpp_av1_afbc_status_observation_kunit(struct kunit *test)
 	hw.av1_start_ns = 0;
 	writel(0, vcd + RK_MPP_AV1_IRQ_BASE);
 	writel(BIT(0), afbc + RK_MPP_AV1_AFBC_ACKNOWLEDGE);
-	KUNIT_EXPECT_EQ(test, rk_mpp_av1_publish_and_start(&hw, 7, true, 0x5678),
-			-ETIMEDOUT);
+	mutex_lock(&hw.run_lock);
+	ret = rk_mpp_av1_publish_and_start(&hw, 7, true, 0x5678);
+	mutex_unlock(&hw.run_lock);
+	KUNIT_EXPECT_EQ(test, ret, -ETIMEDOUT);
 	KUNIT_EXPECT_EQ(test, readl(vcd + RK_MPP_AV1_IRQ_BASE), 0U);
 	KUNIT_EXPECT_EQ(test,
 			atomic_read(&srv->av1_afbc_stale_status_timeout_count),
@@ -5809,6 +5823,7 @@ static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
 	hw->reg_size[RK_MPP_RKVDEC_LINK_REGION] = 0x60;
 	ccu->regs[0] = (void __iomem *)ccu_regs;
 	ccu->reg_size[0] = RK_MPP_RKVDEC_CCU_CORE_ERR_BASE + sizeof(*ccu_regs);
+	mutex_init(&hw->run_lock);
 	mutex_init(&ccu->run_lock);
 	hw->terminally_stopped = true;
 	/* Simulate a powered core+coordinator so the MMIO power assertions
@@ -5817,7 +5832,8 @@ static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
 	atomic_set(&hw->power_count, 1);
 	atomic_set(&ccu->power_count, 1);
 
-	/* The submit path holds ccu->run_lock across arm -> start. */
+	/* The submit path holds both run locks across arm -> start. */
+	mutex_lock(&hw->run_lock);
 	mutex_lock(&ccu->run_lock);
 	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_program_soft_ccu(job), 0);
 	KUNIT_EXPECT_EQ(test,
@@ -5858,6 +5874,7 @@ static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
 			core_regs[RK_MPP_RKVDEC_START_BASE / sizeof(*core_regs)],
 			0x100U | RK_MPP_RKVDEC_START_EN);
 	mutex_unlock(&ccu->run_lock);
+	mutex_unlock(&hw->run_lock);
 
 	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_reset_soft_ccu_job(job), 0);
 	KUNIT_EXPECT_EQ(test,
@@ -6964,6 +6981,7 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 
 	spin_lock_init(&hw.lock);
 	raw_spin_lock_init(&hw.regs_lock);
+	mutex_init(&hw.run_lock);
 	hw.iommu_domain = &domain;
 	job0->session = &session;
 	job1->session = &session;
@@ -6988,11 +7006,15 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, hw.iommu_fault_generation, 0ULL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->iommu_refresh_count), 0);
 
+	mutex_lock(&hw.run_lock);
 	rk_mpp_hw_refresh_iommu(&hw, job0);
+	mutex_unlock(&hw.run_lock);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->iommu_refresh_count), 1);
 
 	hw.iommu_domain = NULL;
+	mutex_lock(&hw.run_lock);
 	rk_mpp_hw_refresh_iommu(&hw, job0);
+	mutex_unlock(&hw.run_lock);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->iommu_refresh_count), 1);
 }
 
@@ -11447,6 +11469,7 @@ static void rk_mpp_job_release(struct rk_mpp_job *job)
 		kfree(job->reqs[i].payload);
 	for (i = 0; i < job->import_count; i++)
 		rk_mpp_import_put(job->imports[i]);
+	WARN_ON_ONCE(rk_mpp_rkvdec2_job_has_live_leases(job));
 	rk_mpp_rkvdec2_release_link_table(job);
 	rk_mpp_hw_put(job->hw);
 	for (i = 0; i < RK_MPP_MAX_REGIONS; i++)
@@ -12191,6 +12214,8 @@ static int rk_mpp_rkvdec2_publish_and_start_core(struct rk_mpp_job *job,
 	struct rk_mpp_hw *hw = job->hw;
 	struct rk_mpp_hw *ccu = job->rkvdec_ccu;
 
+	lockdep_assert_held(&hw->run_lock);
+
 	if (!ccu) {
 		rk_mpp_hw_assert_powered(hw);
 		rk_mpp_hw_schedule_timeout(hw);
@@ -12800,6 +12825,8 @@ static int rk_mpp_hw_begin_active_job(struct rk_mpp_hw *hw,
 	u64 installed_generation = 0;
 	int ret = 0;
 
+	lockdep_assert_held(&hw->run_lock);
+
 	if (!rk_mpp_hw_ccu_online(job->session->srv, hw))
 		return -ENODEV;
 
@@ -13106,6 +13133,8 @@ static int rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw,
 	struct rk_mpp_service *srv = job && job->session ?
 					     job->session->srv : hw->srv;
 	int ret = 0;
+
+	lockdep_assert_held(&hw->run_lock);
 
 	if (!hw->iommu_domain)
 		return 0;
@@ -16117,6 +16146,8 @@ static int rk_mpp_av1_publish_and_start(struct rk_mpp_hw *hw, u64 generation,
 	unsigned long flags;
 	u32 status;
 	int ret;
+
+	lockdep_assert_held(&hw->run_lock);
 
 	if (!afbc_enabled) {
 		/* Publish every decoder register before the START doorbell. */

@@ -1381,6 +1381,7 @@ static u64 rk_rga_hw_active_generation_locked(const struct rk_rga_hw *hw)
 static void rk_rga_hw_install_active_locked(struct rk_rga_hw *hw,
 					    struct rk_rga_job *job)
 {
+	lockdep_assert_held(&hw->run_lock);
 	lockdep_assert_held(&hw->job_lock);
 
 	WARN_ON_ONCE(hw->active_job);
@@ -6724,6 +6725,8 @@ static int rk_rga3_soft_reset(struct rk_rga_hw *hw)
 
 static void rk_rga_hw_refresh_iommu(struct rk_rga_hw *hw)
 {
+	lockdep_assert_held(&hw->run_lock);
+
 	if (!hw->iommu_domain)
 		return;
 
@@ -16260,9 +16263,11 @@ static void rk_rga_iommu_fault_generation_kunit(struct kunit *test)
 
 	hw->active_generation = U64_MAX;
 	hw->iommu_fault_generation = 7;
+	mutex_lock(&hw->run_lock);
 	spin_lock_irqsave(&hw->job_lock, flags);
 	rk_rga_hw_install_active_locked(hw, &target);
 	spin_unlock_irqrestore(&hw->job_lock, flags);
+	mutex_unlock(&hw->run_lock);
 	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, &target);
 	KUNIT_EXPECT_EQ(test, hw->active_generation, 1ULL);
 	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 0ULL);
@@ -16416,6 +16421,7 @@ static void rk_rga_timeout_target_replacement_kunit(struct kunit *test)
 
 	rk_rga_hw_schedule_timeout(hw, &replacement);
 	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_job, &replacement);
+	KUNIT_EXPECT_EQ(test, hw->timeout_generation, 1ULL);
 	KUNIT_EXPECT_EQ(test, refcount_read(&replacement.refs), 2);
 	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&hw->timeout_work));
 	rk_rga_hw_cancel_timeout_sync(hw);
@@ -16541,12 +16547,17 @@ static void rk_rga_iommu_refresh_kunit(struct kunit *test)
 	rga = rk_rga_kunit_alloc_service(test);
 	KUNIT_ASSERT_NOT_NULL(test, rga);
 	hw.rga = rga;
+	mutex_init(&hw.run_lock);
 	atomic_set(&rga->iommu_refresh_count, 0);
+	mutex_lock(&hw.run_lock);
 	rk_rga_hw_refresh_iommu(&hw);
+	mutex_unlock(&hw.run_lock);
 	KUNIT_EXPECT_EQ(test, atomic_read(&rga->iommu_refresh_count), 1);
 
 	hw.iommu_domain = NULL;
+	mutex_lock(&hw.run_lock);
 	rk_rga_hw_refresh_iommu(&hw);
+	mutex_unlock(&hw.run_lock);
 	KUNIT_EXPECT_EQ(test, atomic_read(&rga->iommu_refresh_count), 1);
 }
 
@@ -23619,6 +23630,8 @@ static struct rk_rga_hw *rk_rga_hw_get_for_job(struct rk_rga_job *job,
 static int rk_rga_backend_start(struct rk_rga_hw *hw, struct rk_rga_job *job)
 {
 	int ret;
+
+	lockdep_assert_held(&hw->run_lock);
 
 	/*
 	 * Power the core before establishing its IOMMU mappings, and keep it
