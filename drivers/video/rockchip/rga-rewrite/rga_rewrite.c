@@ -1417,8 +1417,8 @@ rk_rga_hw_take_active_if_locked(struct rk_rga_hw *hw,
 }
 
 static bool rk_rga_hw_restore_active_locked(struct rk_rga_hw *hw,
-					     struct rk_rga_job *job,
-					     bool iommu_fault)
+					    struct rk_rga_job *job,
+					    bool iommu_fault)
 {
 	lockdep_assert_held(&hw->job_lock);
 
