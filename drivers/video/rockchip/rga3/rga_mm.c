@@ -5,6 +5,7 @@
  * Author: Cerf Yu <cerf.yu@rock-chips.com>
  */
 
+#include <linux/limits.h>
 #include <linux/overflow.h>
 
 #include "rga.h"
@@ -416,9 +417,21 @@ static void rga_free_sgt(struct sg_table **sgt_ptr)
 	*sgt_ptr = NULL;
 }
 
-static struct sg_table *rga_alloc_sgt(struct page **pages,
-				      int page_count, size_t offset,
-				      size_t size, gfp_t gfp_mask)
+static unsigned int rga_dma_max_segment_size(struct device *dev)
+{
+	size_t max_segment = dma_max_mapping_size(dev);
+
+	if (!max_segment || max_segment > UINT_MAX)
+		return UINT_MAX;
+
+	return max_segment;
+}
+
+static struct sg_table *rga_alloc_sgt_segment(struct page **pages,
+					      int page_count, size_t offset,
+					      size_t size,
+					      unsigned int max_segment,
+					      gfp_t gfp_mask)
 {
 	int ret;
 	struct sg_table *sgt = NULL;
@@ -430,9 +443,11 @@ static struct sg_table *rga_alloc_sgt(struct page **pages,
 	}
 
 	/* get sg form pages. */
-	ret = sg_alloc_table_from_pages(sgt, pages, page_count, offset, size, gfp_mask);
+	ret = sg_alloc_table_from_pages_segment(sgt, pages, page_count,
+						offset, size, max_segment,
+						gfp_mask);
 	if (ret) {
-		rga_err("sg_alloc_table_from_pages failed");
+		rga_err("sg_alloc_table_from_pages_segment failed");
 		goto out_free_sgt;
 	}
 
@@ -442,6 +457,14 @@ out_free_sgt:
 	kfree(sgt);
 
 	return ERR_PTR(ret);
+}
+
+static struct sg_table *rga_alloc_sgt(struct page **pages,
+				      int page_count, size_t offset,
+				      size_t size, gfp_t gfp_mask)
+{
+	return rga_alloc_sgt_segment(pages, page_count, offset, size,
+				     UINT_MAX, gfp_mask);
 }
 
 static void rga_free_virt_addr(struct rga_virt_addr **virt_addr_p)
@@ -869,10 +892,20 @@ static int rga_mm_map_virt_addr(struct rga_external_buffer *external_buffer,
 		map_size = virt_addr->size;
 	}
 
-	sgt = rga_alloc_sgt(virt_addr->pages,
-			    virt_addr->page_count,
-			    map_offset,
-			    map_size, GFP_KERNEL);
+	if (scheduler->data->mmu == RGA_MMU) {
+		/*
+		 * RGA2 may bounce high pages through SWIOTLB, whose per-entry
+		 * mapping ceiling is smaller than a merged USERPTR run.
+		 */
+		sgt = rga_alloc_sgt_segment(virt_addr->pages,
+					    virt_addr->page_count,
+					    map_offset, map_size,
+					    rga_dma_max_segment_size(scheduler->dev),
+					    GFP_KERNEL);
+	} else {
+		sgt = rga_alloc_sgt(virt_addr->pages, virt_addr->page_count,
+				    map_offset, map_size, GFP_KERNEL);
+	}
 	if (IS_ERR(sgt)) {
 		rga_err("alloc sgt error!\n");
 		ret = PTR_ERR(sgt);
@@ -1781,10 +1814,11 @@ static struct sg_table *rga_mm_get_rga2_sgt(struct rga_job *job,
 			break;
 		}
 
-		sgt = rga_alloc_sgt(buffer->virt_addr->pages,
-				    buffer->virt_addr->page_count, 0,
-				    (size_t)buffer->virt_addr->page_count << PAGE_SHIFT,
-				    GFP_KERNEL);
+		sgt = rga_alloc_sgt_segment(buffer->virt_addr->pages,
+					    buffer->virt_addr->page_count, 0,
+					    (size_t)buffer->virt_addr->page_count << PAGE_SHIFT,
+					    rga_dma_max_segment_size(job->scheduler->dev),
+					    GFP_KERNEL);
 		if (IS_ERR(sgt)) {
 			ret = PTR_ERR(sgt);
 			break;
