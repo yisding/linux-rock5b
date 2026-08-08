@@ -12175,6 +12175,22 @@ static void rk_mpp_hw_reset_domain_unlock(struct rk_mpp_hw *hw)
 }
 
 /*
+ * Phase-one reset write funnel. Locking, pulse timing, accounting and failure
+ * handling deliberately remain with the existing callers until the reset
+ * domain owns complete operations. No raw MPP reset write belongs outside
+ * these helpers.
+ */
+static int rk_mpp_reset_domain_assert(struct rk_mpp_hw *hw)
+{
+	return reset_control_assert(hw->resets);
+}
+
+static int rk_mpp_reset_domain_deassert(struct rk_mpp_hw *hw)
+{
+	return reset_control_deassert(hw->resets);
+}
+
+/*
  * Bind a core to the reset domain of its CCU group.  Called once from probe,
  * before the core is reachable through the service list and before
  * rk_mpp_hw_read_id() first powers it on.  A core outside a group is left
@@ -12269,7 +12285,7 @@ static int rk_mpp_hw_power_on(struct rk_mpp_hw *hw)
 	rk_mpp_hw_reset_domain_lock(hw);
 	if (atomic_read(&hw->reset_pulse_active))
 		atomic_inc(&hw->srv->reset_deassert_contended_count);
-	ret = reset_control_deassert(hw->resets);
+	ret = rk_mpp_reset_domain_deassert(hw);
 	rk_mpp_hw_reset_domain_unlock(hw);
 	if (ret) {
 		rk_mpp_hw_handle_reset_failure(hw, ret);
@@ -12461,12 +12477,12 @@ static int rk_mpp_hw_reset_active(struct rk_mpp_hw *hw)
 	 */
 	rk_mpp_hw_reset_domain_lock(hw);
 	atomic_inc(&hw->reset_pulse_active);
-	ret = reset_control_assert(hw->resets);
+	ret = rk_mpp_reset_domain_assert(hw);
 	if (ret)
 		goto err_reset;
 
 	udelay(10);
-	ret = reset_control_deassert(hw->resets);
+	ret = rk_mpp_reset_domain_deassert(hw);
 	if (ret)
 		goto err_reset;
 	atomic_dec(&hw->reset_pulse_active);
@@ -13991,7 +14007,7 @@ static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu)
 		}
 		if (hw->resets) {
 			atomic_inc(&hw->srv->reset_count);
-			reset_ret = reset_control_assert(hw->resets);
+			reset_ret = rk_mpp_reset_domain_assert(hw);
 			cores[i].reset_asserted = !reset_ret;
 		}
 		if (reset_ret) {
@@ -14010,7 +14026,7 @@ static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu)
 
 	if (ccu->resets) {
 		atomic_inc(&ccu->srv->reset_count);
-		ccu_assert_ret = reset_control_assert(ccu->resets);
+		ccu_assert_ret = rk_mpp_reset_domain_assert(ccu);
 		ccu_reset_asserted = !ccu_assert_ret;
 	}
 	if (ccu_assert_ret) {
@@ -14028,14 +14044,14 @@ static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu)
 		if (!cores[i].reset_asserted ||
 		    READ_ONCE(hw->terminally_stopped))
 			continue;
-		ret = reset_control_deassert(hw->resets);
+		ret = rk_mpp_reset_domain_deassert(hw);
 		if (ret) {
 			rk_mpp_hw_handle_reset_failure(hw, ret);
 			terminal = true;
 		}
 	}
 	if (ccu_reset_asserted && !READ_ONCE(ccu->terminally_stopped)) {
-		ccu_deassert_ret = reset_control_deassert(ccu->resets);
+		ccu_deassert_ret = rk_mpp_reset_domain_deassert(ccu);
 		if (ccu_deassert_ret) {
 			rk_mpp_hw_handle_reset_failure(ccu, ccu_deassert_ret);
 			terminal = true;
