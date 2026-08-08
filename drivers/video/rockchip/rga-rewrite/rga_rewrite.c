@@ -16198,6 +16198,7 @@ static void rk_rga_iommu_fault_generation_kunit(struct kunit *test)
 	struct rk_rga_hw *hw;
 	struct rk_rga_job target = {};
 	struct rk_rga_job replacement = {};
+	struct rk_rga_job *taken;
 	unsigned long flags;
 	bool matches;
 	bool queued;
@@ -16214,6 +16215,20 @@ static void rk_rga_iommu_fault_generation_kunit(struct kunit *test)
 	ret = kunit_add_action_or_reset(test, rk_rga_kunit_cancel_hw_work,
 					hw);
 	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	hw->active_generation = U64_MAX;
+	hw->iommu_fault_generation = 7;
+	spin_lock_irqsave(&hw->job_lock, flags);
+	rk_rga_hw_install_active_locked(hw, &target);
+	spin_unlock_irqrestore(&hw->job_lock, flags);
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, &target);
+	KUNIT_EXPECT_EQ(test, hw->active_generation, 1ULL);
+	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 0ULL);
+	spin_lock_irqsave(&hw->job_lock, flags);
+	taken = rk_rga_hw_take_active_locked(hw);
+	spin_unlock_irqrestore(&hw->job_lock, flags);
+	KUNIT_EXPECT_PTR_EQ(test, taken, &target);
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, NULL);
 
 	hw->active_job = &target;
 	hw->active_generation = 1;
