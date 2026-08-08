@@ -23527,6 +23527,15 @@ static int rk_rga_backend_start(struct rk_rga_hw *hw, struct rk_rga_job *job)
 		goto err_release;
 	}
 
+	/*
+	 * Publish every coherent command-buffer store before the MMIO doorbell.
+	 * Coherent allocation makes CPU and device views agree, but does not by
+	 * itself order the final register-image writes against starting the DMA
+	 * command fetch. That ordering matters when pipelined jobs rapidly reuse
+	 * command-buffer IOVAs.
+	 */
+	dma_wmb();
+
 	ret = rk_rga_hw_start(hw, job);
 	if (ret)
 		goto err_release;
