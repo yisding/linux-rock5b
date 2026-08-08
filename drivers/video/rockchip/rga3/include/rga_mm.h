@@ -11,6 +11,8 @@
 
 #include "rga_drv.h"
 
+struct seq_file;
+
 enum rga_mm_flag {
 	/* It will identify whether the buffer is within 0 ~ 4G. */
 	RGA_MEM_UNDER_4G		= 1 << 0,
@@ -20,6 +22,24 @@ enum rga_mm_flag {
 	RGA_MEM_PHYSICAL_CONTIGUOUS	= 1 << 2,
 	/* need force flush cache */
 	RGA_MEM_FORCE_FLUSH_CACHE	= 1 << 3,
+};
+
+enum rga2_buffer_support {
+	RGA2_BUFFER_UNSUPPORTED = 0,
+	RGA2_BUFFER_DIRECT = 1,
+	RGA2_BUFFER_STAGEABLE = 2,
+};
+
+enum rga2_stage_counter {
+	RGA2_STAGE_ATTEMPT,
+	RGA2_STAGE_SUCCESS,
+	RGA2_STAGE_FAILURE,
+	RGA2_STAGE_REUSE,
+	RGA2_STAGE_ACTIVE,
+	RGA2_STAGE_ACTIVE_BYTES,
+	RGA2_STAGE_PEAK_BYTES,
+	RGA2_STAGE_COPY_IN_BYTES,
+	RGA2_STAGE_COPY_OUT_BYTES,
 };
 
 struct rga_mm {
@@ -53,6 +73,8 @@ struct sg_table *rga_mm_lookup_sgt(struct rga_internal_buffer *buffer);
 
 void rga_mm_dump_buffer(struct rga_internal_buffer *dump_buffer);
 void rga_mm_dump_info(struct rga_mm *session);
+void rga_mm_rga2_stage_show(struct seq_file *m);
+u64 rga_mm_rga2_stage_counter(enum rga2_stage_counter counter);
 
 int rga_mm_map_job_info(struct rga_job *job);
 void rga_mm_unmap_job_info(struct rga_job *job);

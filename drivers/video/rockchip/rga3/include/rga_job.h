@@ -20,6 +20,7 @@ enum job_flags {
 	RGA_JOB_USE_HANDLE		= 1 << 3,
 	RGA_JOB_UNSUPPORT_RGA_MMU	= 1 << 4,
 	RGA_JOB_DEBUG_FAKE_BUFFER	= 1 << 5,
+	RGA_JOB_RGA2_STAGEABLE_DMA_BUF	= 1 << 6,
 };
 
 void rga_job_scheduler_dump_info(struct rga_scheduler_t *scheduler);
