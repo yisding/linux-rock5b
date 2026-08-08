@@ -440,6 +440,8 @@ static struct mpp_session *mpp_session_init(void)
 
 	session->pid = current->pid;
 
+	mutex_init(&session->state_lock);
+	mutex_init(&session->result_lock);
 	mutex_init(&session->pending_lock);
 	INIT_LIST_HEAD(&session->pending_list);
 	INIT_LIST_HEAD(&session->service_link);
@@ -858,6 +860,7 @@ static int mpp_task_run(struct mpp_dev *mpp,
 			struct mpp_task *task)
 {
 	int ret;
+	unsigned long flags;
 	struct mpp_session *session = task->session;
 
 	mpp_debug_enter();
@@ -909,9 +912,37 @@ static int mpp_task_run(struct mpp_dev *mpp,
 	if (mpp->auto_freq_en && mpp->hw_ops->set_freq)
 		mpp->hw_ops->set_freq(mpp, task);
 
-	ret = mpp_iommu_dev_activate(mpp->iommu_info, mpp);
+	ret = mpp_iommu_dev_prepare_task(mpp->iommu_info, mpp);
+	if (ret) {
+		dev_err(mpp->dev, "failed to prepare iommu task admission: %d\n",
+			ret);
+		mpp_power_off(mpp);
+		mpp_reset_up_read(mpp->reset_group);
+		return ret;
+	}
+
+	/* Keep completion from deactivating the admission before commit. */
+	disable_irq(mpp->irq);
+
+	/*
+	 * Publish the new owner before installing its fault callback.  The
+	 * provider IRQ remains masked until dev_ops->run has written START and
+	 * returned, so neither stale nor immediate hardware faults can observe
+	 * an absent task.
+	 */
+	spin_lock_irqsave(&mpp->queue->running_lock, flags);
+	mpp->cur_task = task;
+	spin_unlock_irqrestore(&mpp->queue->running_lock, flags);
+
+	ret = mpp_iommu_dev_activate_task(mpp->iommu_info, mpp);
 	if (ret) {
 		dev_err(mpp->dev, "mpp_iommu_dev_activate failed: %d\n", ret);
+		mpp_iommu_dev_abort_task(mpp->iommu_info, mpp);
+		spin_lock_irqsave(&mpp->queue->running_lock, flags);
+		if (mpp->cur_task == task)
+			mpp->cur_task = NULL;
+		spin_unlock_irqrestore(&mpp->queue->running_lock, flags);
+		enable_irq(mpp->irq);
 		mpp_power_off(mpp);
 		mpp_reset_up_read(mpp->reset_group);
 		return ret;
@@ -920,12 +951,44 @@ static int mpp_task_run(struct mpp_dev *mpp,
 		ret = mpp->dev_ops->run(mpp, task);
 		if (ret) {
 			dev_err(mpp->dev, "device run failed: %d\n", ret);
-			mpp_iommu_dev_deactivate(mpp->iommu_info, mpp);
+			mpp_iommu_dev_abort_task(mpp->iommu_info, mpp);
+			spin_lock_irqsave(&mpp->queue->running_lock, flags);
+			if (mpp->cur_task == task)
+				mpp->cur_task = NULL;
+			spin_unlock_irqrestore(&mpp->queue->running_lock, flags);
+			enable_irq(mpp->irq);
 			mpp_power_off(mpp);
 			mpp_reset_up_read(mpp->reset_group);
 			return ret;
 		}
 	}
+
+	ret = mpp_iommu_dev_commit_task(mpp->iommu_info, mpp);
+	if (ret) {
+		dev_err(mpp->dev, "failed to commit iommu task admission: %d\n",
+			ret);
+		/*
+		 * START has already been written.  Keep both IRQ paths quiesced,
+		 * withdraw the published owner only after the fault callback is
+		 * gone, and reset the hardware before reporting submission failure.
+		 */
+		set_bit(TASK_STATE_ABORT, &task->state);
+		mpp_iommu_dev_abort_task(mpp->iommu_info, mpp);
+		spin_lock_irqsave(&mpp->queue->running_lock, flags);
+		if (mpp->cur_task == task)
+			mpp->cur_task = NULL;
+		spin_unlock_irqrestore(&mpp->queue->running_lock, flags);
+		atomic_inc(&mpp->reset_request);
+		mpp_reset_up_read(mpp->reset_group);
+		mpp_dev_reset(mpp);
+		/* Balance the admission disable; mpp_dev_reset balances its own. */
+		enable_irq(mpp->irq);
+		mpp_power_off(mpp);
+		return ret;
+	}
+
+	/* Fault admission is live before a pending codec completion can run. */
+	enable_irq(mpp->irq);
 
 	mpp_debug_leave();
 
@@ -1031,6 +1094,12 @@ static void try_process_running_task(struct mpp_dev *mpp)
 		    list_empty(&mpp->queue->pending_list))
 			mpp->hw_ops->reduce_freq(mpp);
 		mpp_dev_load(mpp, mpp_task);
+		/*
+		 * The codec hard IRQ removed the provider handler, but could not
+		 * sleep waiting for a provider IRQ already in flight.  Do that here
+		 * before a backend ISR clears cur_task or releases task state.
+		 */
+		mpp_iommu_quiesce_fault_handler(mpp->iommu_info);
 		if (mpp->dev_ops->isr)
 			mpp->dev_ops->isr(mpp);
 		enable_irq(mpp->irq);
@@ -1167,11 +1236,33 @@ static int mpp_wait_result_default(struct mpp_session *session,
 static int mpp_wait_result(struct mpp_session *session,
 			   struct mpp_task_msgs *msgs)
 {
-	if (likely(session->wait_result))
-		return session->wait_result(session, msgs);
+	int ret;
 
-	pr_err("invalid NULL wait result function\n");
-	return -EINVAL;
+	/*
+	 * A pending-list lookup does not itself claim the task.  Serialize the
+	 * complete lookup/wait/copy/pop sequence so two pollers cannot consume
+	 * and drop the same pending reference.  A nonblocking poll must not wait
+	 * behind a blocking one merely to discover that no result is available.
+	 */
+	if (msgs->flags & MPP_FLAGS_POLL_NON_BLOCK) {
+		if (!mutex_trylock(&session->result_lock))
+			return -EAGAIN;
+	} else {
+		ret = mutex_lock_interruptible(&session->result_lock);
+		if (ret)
+			return ret;
+	}
+
+	if (likely(session->wait_result)) {
+		ret = session->wait_result(session, msgs);
+	} else {
+		pr_err("invalid NULL wait result function\n");
+		ret = -EINVAL;
+	}
+
+	mutex_unlock(&session->result_lock);
+
+	return ret;
 }
 
 static int mpp_attach_service(struct mpp_dev *mpp, struct device *dev)
@@ -1395,10 +1486,10 @@ static __u32 mpp_get_cmd_butt(__u32 cmd)
 	return mask;
 }
 
-static int mpp_process_request(struct mpp_session *session,
-			       struct mpp_service *srv,
-			       struct mpp_request *req,
-			       struct mpp_task_msgs *msgs)
+static int __mpp_process_request(struct mpp_session *session,
+				 struct mpp_service *srv,
+				 struct mpp_request *req,
+				 struct mpp_task_msgs *msgs)
 {
 	int ret;
 	struct mpp_dev *mpp;
@@ -1479,7 +1570,23 @@ static int mpp_process_request(struct mpp_session *session,
 
 		session->device_type = (enum MPP_DEVICE_TYPE)client_type;
 		session->dma = mpp_dma_session_create(mpp->dev, mpp->session_max_buffers);
+		if (!session->dma)
+			return -ENOMEM;
 		session->mpp = mpp;
+		session->index = atomic_fetch_inc(&mpp->session_index);
+		if (mpp->dev_ops && mpp->dev_ops->init_session) {
+			ret = mpp->dev_ops->init_session(session);
+			if (ret) {
+				if (mpp->dev_ops->free_session)
+					mpp->dev_ops->free_session(session);
+				mpp_iommu_down_read(mpp->iommu_info);
+				mpp_dma_session_destroy(session->dma);
+				mpp_iommu_up_read(mpp->iommu_info);
+				session->dma = NULL;
+				session->mpp = NULL;
+				return ret;
+			}
+		}
 		if (mpp->dev_ops) {
 			if (mpp->dev_ops->process_task)
 				session->process_task =
@@ -1491,12 +1598,6 @@ static int mpp_process_request(struct mpp_session *session,
 
 			if (mpp->dev_ops->deinit)
 				session->deinit = mpp->dev_ops->deinit;
-		}
-		session->index = atomic_fetch_inc(&mpp->session_index);
-		if (mpp->dev_ops && mpp->dev_ops->init_session) {
-			ret = mpp->dev_ops->init_session(session);
-			if (ret)
-				return ret;
 		}
 
 		mpp_session_attach_workqueue(session, mpp->queue);
@@ -1577,6 +1678,8 @@ static int mpp_process_request(struct mpp_session *session,
 			if (!mpp)
 				return -EINVAL;
 
+			/* Exclude a result pop that still owns the pending task. */
+			mutex_lock(&session->result_lock);
 			mpp_session_clear_pending(session);
 			/*
 			 * Publish the NULL under session_lock before freeing,
@@ -1598,6 +1701,7 @@ static int mpp_process_request(struct mpp_session *session,
 			mpp_iommu_down_write(mpp->iommu_info);
 			ret = mpp_dma_session_destroy(dma);
 			mpp_iommu_up_write(mpp->iommu_info);
+			mutex_unlock(&session->result_lock);
 		}
 		return ret;
 	} break;
@@ -1706,6 +1810,26 @@ static int mpp_process_request(struct mpp_session *session,
 	return 0;
 }
 
+static int mpp_process_request(struct mpp_session *session,
+			       struct mpp_service *srv,
+			       struct mpp_request *req,
+			       struct mpp_task_msgs *msgs)
+{
+	int ret;
+
+	/*
+	 * Protect device binding, session configuration and the DMA-session
+	 * pointer from concurrent ioctls on the same file.  Task construction
+	 * takes this same lock in task_msgs_add(), closing the reset-vs-import
+	 * window without holding the lock over a blocking result wait.
+	 */
+	mutex_lock(&session->state_lock);
+	ret = __mpp_process_request(session, srv, req, msgs);
+	mutex_unlock(&session->state_lock);
+
+	return ret;
+}
+
 static void task_msgs_add(struct mpp_task_msgs *msgs, struct list_head *head)
 {
 	struct mpp_session *session = msgs->session;
@@ -1714,8 +1838,10 @@ static void task_msgs_add(struct mpp_task_msgs *msgs, struct list_head *head)
 	/* process each task */
 	if (msgs->set_cnt) {
 		/* NOTE: update msg_flags for fd over 1024 */
+		mutex_lock(&session->state_lock);
 		session->msg_flags = msgs->flags;
 		ret = mpp_process_task(session, msgs);
+		mutex_unlock(&session->state_lock);
 	}
 
 	if (!ret) {

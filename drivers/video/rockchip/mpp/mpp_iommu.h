@@ -103,6 +103,8 @@ struct mpp_iommu_info {
 
 	spinlock_t dev_lock;
 	struct mpp_dev *dev_active;
+	/* reservation held from task prepare through task deactivate/abort */
+	struct mpp_dev *task_admission_owner;
 
 	int irq;
 	int got_irq;
@@ -205,7 +207,15 @@ int mpp_iommu_refresh(struct mpp_iommu_info *info, struct device *dev);
 int mpp_iommu_flush_tlb(struct mpp_iommu_info *info);
 
 int mpp_iommu_dev_activate(struct mpp_iommu_info *info, struct mpp_dev *dev);
+int mpp_iommu_dev_activate_task(struct mpp_iommu_info *info,
+				struct mpp_dev *dev);
 int mpp_iommu_dev_deactivate(struct mpp_iommu_info *info, struct mpp_dev *dev);
+int mpp_iommu_dev_prepare_task(struct mpp_iommu_info *info,
+			       struct mpp_dev *dev);
+int mpp_iommu_dev_commit_task(struct mpp_iommu_info *info,
+			      struct mpp_dev *dev);
+int mpp_iommu_dev_abort_task(struct mpp_iommu_info *info,
+			     struct mpp_dev *dev);
 int mpp_iommu_reserve_iova(struct mpp_iommu_info *info, dma_addr_t iova, size_t size);
 void mpp_iommu_unreserve_iova(struct mpp_iommu_info *info, dma_addr_t iova, size_t size);
 

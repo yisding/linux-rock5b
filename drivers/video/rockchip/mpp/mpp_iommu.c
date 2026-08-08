@@ -352,28 +352,42 @@ struct mpp_dma_buffer *mpp_dma_import_fd(struct mpp_iommu_info *iommu_info,
 	if (!IS_ENABLED(CONFIG_DMABUF_CACHE))
 		mpp_dma_remove_extra_buffer(dma);
 
-	/* Check whether in dma session */
-	buffer = mpp_dma_find_buffer_fd(dma, fd);
-	if (!IS_ERR_OR_NULL(buffer)) {
-		if (kref_get_unless_zero(&buffer->ref)) {
-			if (static_use) {
-				mutex_lock(&dma->list_mutex);
-				buffer->static_cnt++;
-				mutex_unlock(&dma->list_mutex);
-			}
-			return buffer;
-		}
-		dev_dbg(dma->dev, "missing the fd %d\n", fd);
-	}
-
 	dmabuf = dma_buf_get(fd);
 	if (IS_ERR(dmabuf)) {
 		ret = PTR_ERR(dmabuf);
 		mpp_err("dma_buf_get fd %d failed(%d)\n", fd, ret);
 		return ERR_PTR(ret);
 	}
-	/* A new DMA buffer */
+
+	/*
+	 * Keep identity lookup, reference acquisition and new-slot publication
+	 * under one lock.  Dropping list_mutex after returning a bare slot used
+	 * to let its last reference recycle it for another dma-buf before the
+	 * caller's kref_get; two simultaneous first imports could also map and
+	 * publish duplicate slots for the same dma-buf.
+	 */
 	mutex_lock(&dma->list_mutex);
+	buffer = mpp_dma_find_buffer_locked(dma, dmabuf);
+	if (buffer) {
+		/* TRANS_FD_TO_IOVA is a session pin, not a pin per invocation. */
+		if (static_use && buffer->static_cnt) {
+			mutex_unlock(&dma->list_mutex);
+			dma_buf_put(dmabuf);
+			return buffer;
+		}
+		if (!kref_get_unless_zero(&buffer->ref)) {
+			mutex_unlock(&dma->list_mutex);
+			dma_buf_put(dmabuf);
+			return ERR_PTR(-ENOENT);
+		}
+		if (static_use)
+			buffer->static_cnt = 1;
+		mutex_unlock(&dma->list_mutex);
+		dma_buf_put(dmabuf);
+		return buffer;
+	}
+
+	/* A new DMA buffer.  Retain the lock until the slot is fully published. */
 	buffer = list_first_entry_or_null(&dma->unused_list,
 					   struct mpp_dma_buffer,
 					   link);
@@ -383,7 +397,6 @@ struct mpp_dma_buffer *mpp_dma_import_fd(struct mpp_iommu_info *iommu_info,
 		goto fail;
 	}
 	list_del_init(&buffer->link);
-	mutex_unlock(&dma->list_mutex);
 
 	buffer->dmabuf = dmabuf;
 	buffer->dir = DMA_BIDIRECTIONAL;
@@ -392,7 +405,7 @@ struct mpp_dma_buffer *mpp_dma_import_fd(struct mpp_iommu_info *iommu_info,
 	if (IS_ERR(attach)) {
 		ret = PTR_ERR(attach);
 		mpp_err("dma_buf_attach fd %d failed(%d)\n", fd, ret);
-		goto fail_attach;
+		goto fail_attach_locked;
 	}
 
 	/* 6.18: locked variant now asserts dma_resv held; use _unlocked */
@@ -400,11 +413,11 @@ struct mpp_dma_buffer *mpp_dma_import_fd(struct mpp_iommu_info *iommu_info,
 	if (IS_ERR(sgt)) {
 		ret = PTR_ERR(sgt);
 		mpp_err("dma_buf_map_attachment fd %d failed(%d)\n", fd, ret);
-		goto fail_map;
+		goto fail_map_locked;
 	}
 	ret = mpp_dma_check_iova_contract(dma, fd, sgt);
 	if (ret)
-		goto fail_map_attachment;
+		goto fail_map_attachment_locked;
 
 	buffer->iova = sg_dma_address(sgt->sgl);
 	buffer->size = sg_dma_len(sgt->sgl);
@@ -418,7 +431,6 @@ struct mpp_dma_buffer *mpp_dma_import_fd(struct mpp_iommu_info *iommu_info,
 		/* Increase the reference for used outside the buffer pool */
 		kref_get(&buffer->ref);
 
-	mutex_lock(&dma->list_mutex);
 	dma->buffer_count++;
 	if (static_use) {
 		buffer->static_cnt = 1;
@@ -431,12 +443,14 @@ struct mpp_dma_buffer *mpp_dma_import_fd(struct mpp_iommu_info *iommu_info,
 
 	return buffer;
 
-fail_map_attachment:
+fail_map_attachment_locked:
 	dma_buf_unmap_attachment_unlocked(attach, sgt, buffer->dir);
-fail_map:
+fail_map_locked:
 	dma_buf_detach(buffer->dmabuf, attach);
-fail_attach:
-	mutex_lock(&dma->list_mutex);
+fail_attach_locked:
+	buffer->dmabuf = NULL;
+	buffer->attach = NULL;
+	buffer->sgt = NULL;
 	list_add_tail(&buffer->link, &dma->unused_list);
 	mutex_unlock(&dma->list_mutex);
 fail:
@@ -508,12 +522,28 @@ int mpp_dma_session_destroy(struct mpp_dma_session *dma)
 	list_for_each_entry_safe(buffer, n,
 				 &dma->used_list,
 				 link) {
-		kref_put(&buffer->ref, mpp_dma_release_buffer);
+		u32 refs = buffer->static_cnt;
+
+		/* used_list owns a cache pin only when the cache is disabled. */
+		if (!IS_ENABLED(CONFIG_DMABUF_CACHE))
+			refs++;
+		buffer->static_cnt = 0;
+		while (refs--)
+			kref_put(&buffer->ref, mpp_dma_release_buffer);
 	}
 	list_for_each_entry_safe(buffer, n,
 				 &dma->static_list,
 				 link) {
-		kref_put(&buffer->ref, mpp_dma_release_buffer);
+		u32 refs = buffer->static_cnt;
+
+		/*
+		 * Older userspace may have repeated the static translation ioctl.
+		 * Drain every session-owned pin before freeing the embedded slot
+		 * array; new imports are idempotent and normally leave refs == 1.
+		 */
+		buffer->static_cnt = 0;
+		while (refs--)
+			kref_put(&buffer->ref, mpp_dma_release_buffer);
 	}
 	mutex_unlock(&dma->list_mutex);
 
@@ -1122,6 +1152,37 @@ int mpp_iommu_flush_tlb(struct mpp_iommu_info *info)
 	return 0;
 }
 
+/* Caller holds info->dev_lock. */
+static int mpp_iommu_install_fault_handler(struct mpp_iommu_info *info,
+					   struct mpp_dev *dev)
+{
+	iommu_fault_handler_t handler;
+	int ret;
+
+	/*
+	 * MPP uses normal DMA domains, so the generic fault-handler cookie path
+	 * cannot be used for Rockchip IOMMUs. The provider hook handles that
+	 * path and we keep the generic fallback for any cookie-less domain.
+	 */
+	handler = dev->fault_handler ? dev->fault_handler : mpp_iommu_handle;
+	ret = rockchip_iommu_set_fault_handler(info->dev, handler, dev);
+	if (!ret) {
+		info->rockchip_fault_handler = true;
+	} else if (ret == -ENODEV) {
+		ret = vsi_iommu_set_fault_handler(info->dev, handler, dev);
+		if (!ret)
+			info->vsi_fault_handler = true;
+	}
+	if (ret == -ENODEV && info->domain &&
+	    info->domain->cookie_type == IOMMU_COOKIE_NONE) {
+		iommu_set_fault_handler(info->domain, handler, dev);
+		info->generic_fault_handler = true;
+		ret = 0;
+	}
+
+	return ret;
+}
+
 int mpp_iommu_dev_activate(struct mpp_iommu_info *info, struct mpp_dev *dev)
 {
 	unsigned long flags;
@@ -1132,40 +1193,13 @@ int mpp_iommu_dev_activate(struct mpp_iommu_info *info, struct mpp_dev *dev)
 
 	spin_lock_irqsave(&info->dev_lock, flags);
 
-	if (info->dev_active || !dev) {
+	if (info->dev_active || info->task_admission_owner || !dev) {
 		dev_err(info->dev, "can not activate %s -> %s\n",
 			info->dev_active ? dev_name(info->dev_active->dev) : NULL,
 			dev ? dev_name(dev->dev) : NULL);
 		ret = -EINVAL;
 	} else {
-		iommu_fault_handler_t handler;
-
-		/*
-		 * MPP uses normal DMA domains, so the generic fault-handler cookie path
-		 * cannot be used for Rockchip IOMMUs. The provider hook handles that
-		 * path and we keep the generic fallback for any cookie-less domain.
-		 */
-		handler = dev->fault_handler ? dev->fault_handler : mpp_iommu_handle;
-		ret = rockchip_iommu_set_fault_handler(info->dev,
-						       handler, dev);
-		if (!ret) {
-			info->rockchip_fault_handler = true;
-		} else if (ret == -ENODEV) {
-			ret = vsi_iommu_set_fault_handler(info->dev,
-							  handler, dev);
-			if (!ret)
-				info->vsi_fault_handler = true;
-		}
-		if (ret == -ENODEV) {
-			if (info->domain &&
-			    info->domain->cookie_type == IOMMU_COOKIE_NONE) {
-				iommu_set_fault_handler(info->domain,
-							handler, dev);
-				info->generic_fault_handler = true;
-				ret = 0;
-			}
-		}
-
+		ret = mpp_iommu_install_fault_handler(info, dev);
 		if (!ret) {
 			info->dev_active = dev;
 			dev_dbg(info->dev, "activate -> %p %s\n", dev, dev_name(dev->dev));
@@ -1177,26 +1211,204 @@ int mpp_iommu_dev_activate(struct mpp_iommu_info *info, struct mpp_dev *dev)
 	return ret;
 }
 
+int mpp_iommu_dev_activate_task(struct mpp_iommu_info *info,
+				struct mpp_dev *dev)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	if (!info)
+		return 0;
+
+	spin_lock_irqsave(&info->dev_lock, flags);
+	if (!dev || info->task_admission_owner != dev || info->dev_active) {
+		ret = -EBUSY;
+	} else {
+		ret = mpp_iommu_install_fault_handler(info, dev);
+		if (!ret)
+			info->dev_active = dev;
+	}
+	spin_unlock_irqrestore(&info->dev_lock, flags);
+
+	return ret;
+}
+
+int mpp_iommu_dev_prepare_task(struct mpp_iommu_info *info,
+			       struct mpp_dev *dev)
+{
+	unsigned long flags;
+	int ret;
+
+	if (!info)
+		return 0;
+	if (!dev)
+		return -EINVAL;
+
+	/* Reserve admission before any provider state can be changed. */
+	spin_lock_irqsave(&info->dev_lock, flags);
+	if (info->dev_active || info->task_admission_owner) {
+		ret = -EBUSY;
+	} else {
+		info->task_admission_owner = dev;
+		ret = 0;
+	}
+	spin_unlock_irqrestore(&info->dev_lock, flags);
+	if (ret)
+		return ret;
+
+	/*
+	 * Provider prepare masks delivery, synchronizes an in-flight IRQ and
+	 * acknowledges only pre-task status while remaining masked.  It never
+	 * refreshes paging and never opens an unmask/remask window.
+	 */
+	ret = rockchip_iommu_prepare_irq(info->dev);
+	if (ret == -ENODEV)
+		ret = vsi_iommu_prepare_irq(info->dev);
+	if (ret == -ENODEV)
+		ret = 0;
+
+	if (ret) {
+		/* Restore legacy delivery while the failed prepare still owns it. */
+		rockchip_iommu_unmask_irq(info->dev);
+		vsi_iommu_unmask_irq(info->dev);
+		spin_lock_irqsave(&info->dev_lock, flags);
+		if (info->task_admission_owner == dev && !info->dev_active)
+			info->task_admission_owner = NULL;
+		spin_unlock_irqrestore(&info->dev_lock, flags);
+	}
+
+	return ret;
+}
+
+int mpp_iommu_dev_commit_task(struct mpp_iommu_info *info,
+			      struct mpp_dev *dev)
+{
+	unsigned long flags;
+	bool rockchip;
+	bool vsi;
+	int ret = 0;
+
+	if (!info)
+		return 0;
+
+	/*
+	 * mpp_task_run() keeps the codec IRQ disabled from publication through
+	 * this commit, so hard-IRQ deactivation cannot race this ownership check.
+	 * Do not hold dev_lock while enabling provider delivery: both providers
+	 * use runtime-PM APIs and their own spinlocks internally.
+	 */
+	spin_lock_irqsave(&info->dev_lock, flags);
+	if (info->task_admission_owner != dev || info->dev_active != dev) {
+		ret = -EBUSY;
+		rockchip = false;
+		vsi = false;
+	} else {
+		rockchip = info->rockchip_fault_handler;
+		vsi = info->vsi_fault_handler;
+	}
+	spin_unlock_irqrestore(&info->dev_lock, flags);
+
+	/* Enable delivery only; preserve a task fault latched after START. */
+	if (!ret && rockchip)
+		ret = rockchip_iommu_enable_irq_delivery(info->dev);
+	else if (!ret && vsi)
+		ret = vsi_iommu_enable_irq_delivery(info->dev);
+
+	return ret;
+}
+
+int mpp_iommu_dev_abort_task(struct mpp_iommu_info *info,
+			     struct mpp_dev *dev)
+{
+	unsigned long flags;
+	bool cancel_prepare;
+	int ret;
+
+	if (!info)
+		return 0;
+
+	/* Activation can fail after prepare but before a callback is installed. */
+	spin_lock_irqsave(&info->dev_lock, flags);
+	if (info->task_admission_owner != dev) {
+		ret = -EBUSY;
+		cancel_prepare = false;
+	} else if (!info->dev_active) {
+		cancel_prepare = true;
+		ret = 0;
+	} else if (info->dev_active != dev) {
+		ret = -EBUSY;
+		cancel_prepare = false;
+	} else {
+		ret = 0;
+		cancel_prepare = false;
+	}
+	spin_unlock_irqrestore(&info->dev_lock, flags);
+	if (ret)
+		return ret;
+	if (cancel_prepare) {
+		/* No START occurred, so recovery-style acknowledgment is safe. */
+		rockchip_iommu_unmask_irq(info->dev);
+		vsi_iommu_unmask_irq(info->dev);
+		spin_lock_irqsave(&info->dev_lock, flags);
+		if (info->task_admission_owner == dev && !info->dev_active) {
+			info->task_admission_owner = NULL;
+			ret = 0;
+		} else {
+			ret = -EBUSY;
+		}
+		spin_unlock_irqrestore(&info->dev_lock, flags);
+		return ret;
+	}
+
+	ret = mpp_iommu_dev_deactivate(info, dev);
+	/* Run-error unwind is process context: wait out any old callback token. */
+	rockchip_iommu_sync_fault_handler(info->dev);
+	vsi_iommu_sync_fault_handler(info->dev);
+
+	return ret;
+}
+
 int mpp_iommu_dev_deactivate(struct mpp_iommu_info *info, struct mpp_dev *dev)
 {
 	unsigned long flags;
+	bool task_admission;
 
 	if (!info)
 		return 0;
 
 	spin_lock_irqsave(&info->dev_lock, flags);
 
-	if (info->dev_active != dev) {
+	if (info->dev_active != dev ||
+	    (info->task_admission_owner &&
+	     info->task_admission_owner != dev)) {
 		dev_err(info->dev, "can not deactivate %s when %s activated\n",
 			dev_name(dev->dev),
 			info->dev_active ? dev_name(info->dev_active->dev) : NULL);
 		spin_unlock_irqrestore(&info->dev_lock, flags);
 		return -EBUSY;
 	}
+	task_admission = info->task_admission_owner == dev;
+	if (!task_admission) {
+		mpp_iommu_clear_fault_handler(info);
+		info->dev_active = NULL;
+		spin_unlock_irqrestore(&info->dev_lock, flags);
+		return 0;
+	}
+	spin_unlock_irqrestore(&info->dev_lock, flags);
 
 	dev_dbg(info->dev, "deactivate %p\n", info->dev_active);
+	/* Stop new provider IRQs before removing the task callback token. */
+	rockchip_iommu_mask_irq(info->dev);
+	vsi_iommu_mask_irq(info->dev);
+
+	spin_lock_irqsave(&info->dev_lock, flags);
+	if (info->dev_active != dev || info->task_admission_owner != dev) {
+		spin_unlock_irqrestore(&info->dev_lock, flags);
+		return -EBUSY;
+	}
 	mpp_iommu_clear_fault_handler(info);
 	info->dev_active = NULL;
+	info->task_admission_owner = NULL;
 	spin_unlock_irqrestore(&info->dev_lock, flags);
 
 	return 0;

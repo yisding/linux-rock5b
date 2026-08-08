@@ -1476,8 +1476,10 @@ int rkvdec2_link_wait_result(struct mpp_session *session,
 	}
 
 	ret = wait_event_interruptible(mpp_task->wait, task_is_done(mpp_task));
-	if (ret == -ERESTARTSYS)
+	if (ret) {
 		mpp_err("wait task break by signal\n");
+		return ret;
+	}
 
 	ret = rkvdec2_result(mpp, mpp_task, msgs);
 	if (!ret && test_bit(TASK_STATE_ABORT, &mpp_task->state))
@@ -1636,6 +1638,16 @@ int rkvdec2_attach_ccu(struct device *dev, struct rkvdec2_dev *dec)
 
 	INIT_LIST_HEAD(&dec->core_link);
 	mutex_lock(&ccu->lock);
+	/*
+	 * Hard CCU mode can retire timed-out tasks while the hardware may still
+	 * be fetching their link tables and DMA mappings.  Keep that unsupported
+	 * path unreachable: attach runs before core probe selects task_worker.
+	 */
+	if (ccu->ccu_mode == RKVDEC2_CCU_TASK_HARD) {
+		dev_warn_once(ccu->dev,
+			      "hard CCU mode is disabled; using soft CCU mode\n");
+		ccu->ccu_mode = RKVDEC2_CCU_TASK_SOFT;
+	}
 	list_add_tail(&dec->core_link, &ccu->core_list);
 
 	/*

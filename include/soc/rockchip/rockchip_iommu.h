@@ -20,6 +20,8 @@ bool rockchip_iommu_is_enabled(struct device *dev);
 int rockchip_iommu_force_reset(struct device *dev);
 void rockchip_iommu_mask_irq(struct device *dev);
 void rockchip_iommu_unmask_irq(struct device *dev);
+int rockchip_iommu_prepare_irq(struct device *dev);
+int rockchip_iommu_enable_irq_delivery(struct device *dev);
 int rockchip_pagefault_done(struct device *dev);
 int rockchip_iommu_set_fault_handler(struct device *dev,
 				     iommu_fault_handler_t handler, void *token);
@@ -52,6 +54,16 @@ static inline void rockchip_iommu_mask_irq(struct device *dev)
 
 static inline void rockchip_iommu_unmask_irq(struct device *dev)
 {
+}
+
+static inline int rockchip_iommu_prepare_irq(struct device *dev)
+{
+	return -ENODEV;
+}
+
+static inline int rockchip_iommu_enable_irq_delivery(struct device *dev)
+{
+	return -ENODEV;
 }
 
 static inline int rockchip_pagefault_done(struct device *dev)
