@@ -642,6 +642,8 @@ struct rk_mpp_session {
 	u32 next_job_id;
 	u32 active_job_count;
 	u64 state_seq;
+	/* Protected by srv->sched_lock; see rk_mpp_scheduler_take_job(). */
+	bool rkvdec_dispatch_active;
 	/*
 	 * Scheduler scan stamp, written and read only under srv->sched_lock.
 	 * Set to the current scan's sched_scan_stamp when a queued job of
@@ -786,6 +788,8 @@ struct rk_mpp_job {
 	bool rkvenc_slice_overflow;
 	bool av1_afbc_enabled;
 	bool session_initialized;
+	/* Protected by session->srv->sched_lock. */
+	bool rkvdec_session_dispatch;
 	u64 hw_start_ns;
 	u64 hw_elapsed_ns;
 	u64 queued_ns;
@@ -824,6 +828,7 @@ static void rk_mpp_job_get(struct rk_mpp_job *job);
 static void rk_mpp_job_put(struct rk_mpp_job *job);
 static struct rk_mpp_hw *rk_mpp_job_get_hw(struct rk_mpp_job *job);
 static void rk_mpp_job_drop_hw(struct rk_mpp_job *job);
+static void rk_mpp_scheduler_release_session(struct rk_mpp_job *job);
 static int rk_mpp_job_queue_current_locked(struct rk_mpp_job *job);
 static struct rk_mpp_job *rk_mpp_hw_take_active_job(struct rk_mpp_hw *hw,
 						    u32 *irq_status);
@@ -7436,7 +7441,9 @@ static void rk_mpp_scheduler_session_start_order_kunit(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, other);
 
 	session_a->srv = srv;
+	session_a->client_type = RK_MPP_DEVICE_RKVDEC;
 	session_b->srv = srv;
+	session_b->client_type = RK_MPP_DEVICE_RKVDEC;
 	busy_hw->online = true;
 	busy_hw->active_job = active;
 	idle_hw->online = true;
@@ -7448,10 +7455,13 @@ static void rk_mpp_scheduler_session_start_order_kunit(struct kunit *test)
 	raw_spin_lock_init(&idle_hw->regs_lock);
 
 	job1->session = session_a;
+	job1->client_type = RK_MPP_DEVICE_RKVDEC;
 	job1->hw = busy_hw;
 	job2->session = session_a;
+	job2->client_type = RK_MPP_DEVICE_RKVDEC;
 	job2->hw = idle_hw;
 	other->session = session_b;
+	other->client_type = RK_MPP_DEVICE_RKVDEC;
 	other->hw = idle_hw;
 	INIT_LIST_HEAD(&job1->sched_link);
 	INIT_LIST_HEAD(&job2->sched_link);
@@ -7472,17 +7482,38 @@ static void rk_mpp_scheduler_session_start_order_kunit(struct kunit *test)
 	 * job on the free core may run.
 	 */
 	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_scheduler_take_job(srv), other);
+	KUNIT_EXPECT_TRUE(test, session_b->rkvdec_dispatch_active);
+	rk_mpp_scheduler_release_session(other);
 	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_scheduler_take_job(srv), NULL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->queued_job_count), 2);
 
 	/*
-	 * Once the head job can start, the session drains in submission
-	 * order; job2 may then start with job1 merely running, which is the
-	 * in-order dual-core overlap the hardware handshake supports.
+	 * Once the head job can start, no later decode job from that session
+	 * may overlap it. Runtime evidence showed that even in-order dual-core
+	 * overlap can corrupt references, so only another session may use the
+	 * second decoder core until job1 completes.
 	 */
 	busy_hw->active_job = NULL;
 	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_scheduler_take_job(srv), job1);
+	KUNIT_EXPECT_TRUE(test, session_a->rkvdec_dispatch_active);
+	KUNIT_EXPECT_TRUE(test, job1->rkvdec_session_dispatch);
+	busy_hw->active_job = job1;
+	list_add_tail(&other->sched_link, &srv->queued_jobs);
+	atomic_inc(&idle_hw->queued_job_count);
+	atomic_inc(&srv->queued_job_count);
+	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_scheduler_take_job(srv), other);
+	KUNIT_EXPECT_TRUE(test, session_b->rkvdec_dispatch_active);
+	rk_mpp_scheduler_release_session(other);
+	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_scheduler_take_job(srv), NULL);
+
+	busy_hw->active_job = NULL;
+	rk_mpp_scheduler_release_session(job1);
+	KUNIT_EXPECT_FALSE(test, session_a->rkvdec_dispatch_active);
+	KUNIT_EXPECT_FALSE(test, job1->rkvdec_session_dispatch);
 	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_scheduler_take_job(srv), job2);
+	KUNIT_EXPECT_TRUE(test, session_a->rkvdec_dispatch_active);
+	KUNIT_EXPECT_TRUE(test, job2->rkvdec_session_dispatch);
+	rk_mpp_scheduler_release_session(job2);
 	KUNIT_EXPECT_TRUE(test, list_empty(&srv->queued_jobs));
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->queued_job_count), 0);
 }
@@ -9401,6 +9432,8 @@ static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 	atomic_set(&srv.queued_job_count, 1);
 
 	active->session = &session;
+	active->client_type = RK_MPP_DEVICE_RKVDEC;
+	active->rkvdec_session_dispatch = true;
 	active->state = RK_MPP_JOB_ACTIVE;
 	active->result = -EINPROGRESS;
 	refcount_set(&active->refs, 2);
@@ -9409,6 +9442,7 @@ static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&active->sched_link);
 	INIT_LIST_HEAD(&active->rkvdec_ccu_node);
 	list_add_tail(&active->session_link, &session.active_jobs);
+	session.rkvdec_dispatch_active = true;
 
 	rk_mpp_session_abort_jobs(&session);
 
@@ -9430,6 +9464,8 @@ static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&hw->queued_job_count), 0);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv.queued_job_count), 0);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv.aborted_job_count), 2);
+	KUNIT_EXPECT_FALSE(test, session.rkvdec_dispatch_active);
+	KUNIT_EXPECT_FALSE(test, active->rkvdec_session_dispatch);
 	KUNIT_EXPECT_EQ(test,
 			rk_mpp_session_poll_job(&session,
 						MPP_FLAGS_POLL_NON_BLOCK),
@@ -11287,6 +11323,25 @@ static void rk_mpp_job_drop_hw(struct rk_mpp_job *job)
 	rk_mpp_hw_put(hw);
 }
 
+static bool rk_mpp_job_serializes_session(const struct rk_mpp_job *job)
+{
+	return job->client_type == RK_MPP_DEVICE_RKVDEC;
+}
+
+static void rk_mpp_scheduler_release_session(struct rk_mpp_job *job)
+{
+	struct rk_mpp_session *session = job->session;
+	struct rk_mpp_service *srv = session->srv;
+
+	mutex_lock(&srv->sched_lock);
+	if (job->rkvdec_session_dispatch) {
+		WARN_ON_ONCE(!session->rkvdec_dispatch_active);
+		job->rkvdec_session_dispatch = false;
+		session->rkvdec_dispatch_active = false;
+	}
+	mutex_unlock(&srv->sched_lock);
+}
+
 static void rk_mpp_batch_release_jobs(struct rk_mpp_batch_state *batch)
 {
 	struct rk_mpp_job *job, *tmp;
@@ -11381,6 +11436,7 @@ static void rk_mpp_job_complete(struct rk_mpp_job *job, int result)
 	rk_mpp_rkvenc2_dchs_release(job);
 	rk_mpp_rkvdec2_release_link_table(job);
 	rk_mpp_job_drop_hw(job);
+	rk_mpp_scheduler_release_session(job);
 	rk_mpp_session_poll_notify(session);
 	schedule_work(&session->srv->sched_work);
 }
@@ -11742,21 +11798,28 @@ rk_mpp_scheduler_take_job(struct rk_mpp_service *srv)
 
 		/*
 		 * Never start a job while an earlier job of the same session
-		 * is still queued.  Consecutive frames of one session run on
-		 * both decoder cores in parallel, and the hardware inter-core
-		 * reference handshake only pairs a consumer with a producer
-		 * that has already started: starting frame N+1 with frame N
-		 * still queued lets N+1's reference fetches free-run against
-		 * memory N has not reconstructed yet.  The queue is FIFO per
-		 * session, so one pass over it sees a session's jobs in
-		 * submission order and this stamp holds back everything
-		 * behind a job that could not start.
+		 * is still queued. The original scheduler ran consecutive frames
+		 * on both decoder cores in parallel, but the hardware inter-core
+		 * reference handshake only paired a consumer with a producer that
+		 * had already started. Starting frame N+1 with frame N still queued
+		 * therefore let reference fetches free-run against unfinished
+		 * memory. The queue is FIFO per session, so this scan stamp holds
+		 * back everything behind a job that could not start. The active
+		 * dispatch token below additionally blocks even in-order overlap.
 		 */
 		if (session->sched_defer_stamp == scan_stamp)
+			continue;
+		if (rk_mpp_job_serializes_session(job) &&
+		    session->rkvdec_dispatch_active)
 			continue;
 
 		if (!READ_ONCE(job->canceled) && rk_mpp_hw_usable(job->hw) &&
 		    rk_mpp_hw_is_idle(job->hw)) {
+			if (rk_mpp_job_serializes_session(job)) {
+				WARN_ON_ONCE(job->rkvdec_session_dispatch);
+				session->rkvdec_dispatch_active = true;
+				job->rkvdec_session_dispatch = true;
+			}
 			rk_mpp_job_unqueue_locked(job);
 			mutex_unlock(&srv->sched_lock);
 			return job;
@@ -12874,7 +12937,8 @@ rk_mpp_hw_get_active_ccu_if(struct rk_mpp_hw *hw,
 	return ccu;
 }
 
-static void rk_mpp_hw_abort_job(struct rk_mpp_job *job)
+/* Return true only when this dispatch can no longer start or own hardware. */
+static bool rk_mpp_hw_abort_job(struct rk_mpp_job *job)
 {
 	struct rk_mpp_hw *hw = rk_mpp_job_get_hw(job);
 	struct rk_mpp_hw *ccu;
@@ -12882,11 +12946,12 @@ static void rk_mpp_hw_abort_job(struct rk_mpp_job *job)
 	bool dchs_lifecycle_locked = false;
 	bool hard_ccu_abort = false;
 	bool irq_disabled;
+	bool dispatch_retired = false;
 	int ccu_stop_ret = 0;
 	int reset_ret = 0;
 
 	if (!hw)
-		return;
+		return true;
 
 	rk_mpp_hw_cancel_timeout_sync(hw);
 	irq_disabled = rk_mpp_hw_disable_irq(hw);
@@ -12897,6 +12962,7 @@ static void rk_mpp_hw_abort_job(struct rk_mpp_job *job)
 	mutex_lock(&hw->run_lock);
 	active_owned = rk_mpp_hw_active_job_is(hw, job);
 	if (!active_owned) {
+		dispatch_retired = true;
 		/*
 		 * The synchronous drain above had to run before run_lock (the
 		 * timeout worker takes run_lock), so it cleared the watchdog
@@ -12950,6 +13016,7 @@ static void rk_mpp_hw_abort_job(struct rk_mpp_job *job)
 				rk_mpp_job_put(job);
 			goto out_unlock_core;
 		}
+		dispatch_retired = true;
 		rk_mpp_rkvenc2_dchs_release(job);
 		rk_mpp_hw_power_off(hw);
 		/*
@@ -12992,6 +13059,8 @@ out_unlock_core:
 		mutex_unlock(&ccu->ccu_recovery_lock);
 	rk_mpp_hw_put(ccu);
 	rk_mpp_hw_put(hw);
+
+	return dispatch_retired;
 }
 
 static void rk_mpp_hw_schedule_timeout(struct rk_mpp_hw *hw)
@@ -16239,7 +16308,8 @@ static void rk_mpp_session_abort_jobs(struct rk_mpp_session *session)
 		list_del_init(&job->session_link);
 		atomic_inc(&session->srv->aborted_job_count);
 		rk_mpp_job_dequeue(job);
-		rk_mpp_hw_abort_job(job);
+		if (rk_mpp_hw_abort_job(job))
+			rk_mpp_scheduler_release_session(job);
 		rk_mpp_debug_record_job(job, RK_MPP_DEBUG_ABORT, -ECANCELED,
 					0, 0);
 		rk_mpp_job_put(job);
