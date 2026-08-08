@@ -115,30 +115,15 @@ int rga_dma_fence_wait(struct dma_fence *fence)
 	return ret;
 }
 
-int rga_dma_fence_add_callback(struct dma_fence *fence, dma_fence_func_t func, void *private)
+int rga_dma_fence_add_callback(struct dma_fence *fence,
+			       struct dma_fence_cb *callback,
+			       dma_fence_func_t func)
 {
 	int ret;
-	struct rga_fence_waiter *waiter = NULL;
 
-	waiter = kmalloc(sizeof(*waiter), GFP_KERNEL);
-	if (!waiter) {
-		rga_err("%s: Failed to allocate waiter\n", __func__);
-		return -ENOMEM;
-	}
-
-	waiter->private = private;
-
-	ret = dma_fence_add_callback(fence, &waiter->waiter, func);
-	if (ret == -ENOENT) {
-		goto err_free_waiter;
-	} else if (ret == -EINVAL) {
+	ret = dma_fence_add_callback(fence, callback, func);
+	if (ret == -EINVAL)
 		rga_err("%s: failed to add callback to dma_fence, err: %d\n", __func__, ret);
-		goto err_free_waiter;
-	}
 
-	return ret;
-
-err_free_waiter:
-	kfree(waiter);
 	return ret;
 }

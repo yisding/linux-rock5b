@@ -41,9 +41,10 @@
 
 #define rga_buf_log(buf, fmt, args...) \
 	pr_info("%-6d %-6d: handle[%d]: " fmt, \
-	buf->session->tgid, current->pid, buf->handle, ##args)
+	buf->session ? buf->session->tgid : -1, current->pid, buf->handle, ##args)
 #define rga_buf_err(buf, fmt, args...) \
-	pr_err("%-6d %-6d: handle[%d]: " fmt, buf->session->tgid, current->pid, buf->handle, ##args)
+	pr_err("%-6d %-6d: handle[%d]: " fmt, \
+	buf->session ? buf->session->tgid : -1, current->pid, buf->handle, ##args)
 
 #define RGA_GET_PAGE_COUNT(size) (((size) >> PAGE_SHIFT) + (((size) & (~PAGE_MASK)) ? 1 : 0))
 

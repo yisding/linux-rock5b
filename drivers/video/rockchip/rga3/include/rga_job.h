@@ -41,16 +41,17 @@ int rga_request_commit(struct rga_request *user_request);
 void rga_request_scheduler_shutdown(struct rga_scheduler_t *scheduler);
 void rga_request_scheduler_abort(struct rga_scheduler_t *scheduler);
 void rga_request_session_destroy_abort(struct rga_session *session);
+void rga_request_cancel(struct rga_request *request, int err_code);
 int rga_request_put(struct rga_request *request);
 void rga_request_release_ref(struct rga_request *request);
 void rga_request_get(struct rga_request *request);
 int rga_request_free(struct rga_request *request);
 int rga_request_alloc(uint32_t flags, struct rga_session *session);
 
-struct rga_request *rga_request_config(struct rga_user_request *user_request,
-				       struct rga_session *session);
-struct rga_request *rga_request_kernel_config(struct rga_user_request *user_request);
-int rga_request_submit(struct rga_request *request);
+struct rga_request *rga_request_config_locked(struct rga_user_request *user_request,
+					      struct rga_session *session);
+struct rga_request *rga_request_kernel_config_locked(struct rga_user_request *user_request);
+int rga_request_submit_locked(struct rga_request *request);
 int rga_request_mpi_submit(struct rga_req *req, struct rga_request *request);
 int rga_request_release_signal(struct rga_scheduler_t *scheduler, struct rga_job *job);
 
