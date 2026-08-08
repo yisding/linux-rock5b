@@ -3916,7 +3916,7 @@ static int rk_mpp_rkvdec2_fill_ccu_descriptor(struct rk_mpp_job *job,
 
 static void
 rk_mpp_rkvdec2_publish_ccu_doorbell(struct rk_mpp_job *job,
-					    void __iomem *regs)
+				    void __iomem *regs)
 {
 	/* Fault routing must see the software owner before hardware can fault. */
 	WRITE_ONCE(job->rkvdec_ccu_started, true);
@@ -3928,7 +3928,7 @@ rk_mpp_rkvdec2_publish_ccu_doorbell(struct rk_mpp_job *job,
 
 static void
 rk_mpp_rkvdec2_publish_and_start_ccu(struct rk_mpp_job *job,
-					     void __iomem *regs)
+				     void __iomem *regs)
 {
 	lockdep_assert_held(&job->rkvdec_ccu->run_lock);
 
@@ -4077,8 +4077,8 @@ static bool
 rk_mpp_av1_afbc_ack_locked(struct rk_mpp_hw *hw,
 			   bool *generation_observed);
 static int rk_mpp_av1_publish_and_start(struct rk_mpp_hw *hw,
-					 u64 generation, bool afbc_enabled,
-					 u32 start_value);
+					u64 generation, bool afbc_enabled,
+					u32 start_value);
 static int rk_mpp_job_select_hw(struct rk_mpp_job *job);
 static void rk_mpp_kunit_device_release(struct device *dev);
 
@@ -6632,7 +6632,7 @@ static void rk_mpp_rkvdec2_ccu_descriptor_kunit(struct kunit *test)
 			      RK_MPP_RKVDEC_LINK_ADD_CFG_NUM));
 	KUNIT_EXPECT_FALSE(test, READ_ONCE(job->rkvdec_ccu_started));
 	rk_mpp_rkvdec2_publish_ccu_doorbell(job,
-					      (void __iomem *)ccu_regs);
+					    (void __iomem *)ccu_regs);
 	KUNIT_EXPECT_TRUE(test, READ_ONCE(job->rkvdec_ccu_started));
 	KUNIT_EXPECT_EQ(test,
 			ccu_regs[RK_MPP_RKVDEC_CCU_CFG_DONE_BASE /
@@ -14887,7 +14887,7 @@ static int rk_mpp_rkvenc2_validate(struct rk_mpp_job *job)
 }
 
 static void rk_mpp_rkvenc2_publish_and_start(struct rk_mpp_job *job,
-					      u32 start_value)
+					     u32 start_value)
 {
 	struct rk_mpp_hw *hw = job->hw;
 
@@ -16036,7 +16036,7 @@ static void rk_mpp_av1_disarm_afbc(struct rk_mpp_hw *hw)
 }
 
 static int rk_mpp_av1_publish_and_start(struct rk_mpp_hw *hw, u64 generation,
-					 bool afbc_enabled, u32 start_value)
+					bool afbc_enabled, u32 start_value)
 {
 	void __iomem *afbc = hw->regs[2];
 	unsigned long flags;
