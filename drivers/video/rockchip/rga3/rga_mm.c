@@ -29,7 +29,9 @@
  * must be 16-byte aligned to read/write the intended bytes.
  */
 #define RGA_IOMMU_ADDR_ALIGN 16
-#define RGA2_STAGE_MAX_SIZE SZ_64M
+#define RGA2_STAGE_MAX_SIZE		SZ_64M
+#define RGA2_STAGE_SESSION_MAX_SIZE	SZ_128M
+#define RGA2_STAGE_GLOBAL_MAX_SIZE	SZ_256M
 
 struct rga_rga2_stage {
 	struct list_head node;
@@ -39,9 +41,11 @@ struct rga_rga2_stage {
 	void *vaddr;
 	struct sg_table *sgt;
 	struct rga_dma_buffer mapping;
+	struct rga_session *session;
 	size_t size;
 	unsigned int users;
 	bool copy_back;
+	bool budget_charged;
 };
 
 static atomic64_t rga2_stage_attempt_count = ATOMIC64_INIT(0);
@@ -70,7 +74,11 @@ static void rga2_stage_update_peak(s64 active_bytes)
 
 void rga_mm_rga2_stage_show(struct seq_file *m)
 {
-	seq_printf(m, "max_bytes: %u\n", RGA2_STAGE_MAX_SIZE);
+	seq_printf(m, "job_max_bytes: %u\n", RGA2_STAGE_MAX_SIZE);
+	seq_printf(m, "session_max_bytes: %u\n",
+		   RGA2_STAGE_SESSION_MAX_SIZE);
+	seq_printf(m, "global_max_bytes: %u\n",
+		   RGA2_STAGE_GLOBAL_MAX_SIZE);
 	seq_printf(m, "attempt_count: %lld\n",
 		   atomic64_read(&rga2_stage_attempt_count));
 	seq_printf(m, "success_count: %lld\n",
@@ -1340,7 +1348,7 @@ static void rga_mm_kref_release_buffer(struct kref *ref)
 	mm->buffer_count--;
 	mutex_unlock(&mm->lock);
 
-
+	WARN_ON_ONCE(!list_empty(&internal_buffer->import_list));
 	rga_mm_unmap_buffer(internal_buffer);
 	kfree(internal_buffer);
 
@@ -1351,11 +1359,16 @@ static void rga_mm_kref_release_buffer(struct kref *ref)
 static void rga_mm_force_releaser_buffer(struct rga_internal_buffer *buffer)
 {
 	struct rga_mm *mm = rga_drvdata->mm;
+	struct rga_buffer_import *import, *next;
 
 	WARN_ON(!mutex_is_locked(&mm->lock));
 
 	idr_remove(&mm->memory_idr, buffer->handle);
 	mm->buffer_count--;
+	list_for_each_entry_safe(import, next, &buffer->import_list, node) {
+		list_del(&import->node);
+		kfree(import);
+	}
 
 	rga_mm_unmap_buffer(buffer);
 	kfree(buffer);
@@ -1473,6 +1486,46 @@ rga_mm_lookup_external(struct rga_mm *mm_session,
 	return output_buffer;
 }
 
+/* Compare a completed mapping without resolving a userspace fd a second time. */
+static struct rga_internal_buffer *
+rga_mm_lookup_mapped(struct rga_mm *mm, struct rga_internal_buffer *mapped)
+{
+	struct rga_internal_buffer *buffer;
+	int id;
+
+	WARN_ON(!mutex_is_locked(&mm->lock));
+
+	idr_for_each_entry(&mm->memory_idr, buffer, id) {
+		switch (mapped->type) {
+		case RGA_DMA_BUFFER:
+		case RGA_DMA_BUFFER_PTR:
+			if ((buffer->type == RGA_DMA_BUFFER ||
+			     buffer->type == RGA_DMA_BUFFER_PTR) &&
+			    buffer->dma_buffer && mapped->dma_buffer &&
+			    buffer->dma_buffer->dma_buf ==
+				mapped->dma_buffer->dma_buf)
+				return buffer;
+			break;
+		case RGA_VIRTUAL_ADDRESS:
+			if (buffer->type == RGA_VIRTUAL_ADDRESS &&
+			    buffer->virt_addr && mapped->virt_addr &&
+			    buffer->current_mm == mapped->current_mm &&
+			    buffer->virt_addr->addr == mapped->virt_addr->addr)
+				return buffer;
+			break;
+		case RGA_PHYSICAL_ADDRESS:
+			if (buffer->type == RGA_PHYSICAL_ADDRESS &&
+			    buffer->phys_addr == mapped->phys_addr)
+				return buffer;
+			break;
+		default:
+			return NULL;
+		}
+	}
+
+	return NULL;
+}
+
 struct rga_internal_buffer *rga_mm_lookup_handle(struct rga_mm *mm_session, uint32_t handle)
 {
 	struct rga_internal_buffer *output_buffer;
@@ -1482,6 +1535,70 @@ struct rga_internal_buffer *rga_mm_lookup_handle(struct rga_mm *mm_session, uint
 	output_buffer = idr_find(&mm_session->memory_idr, handle);
 
 	return output_buffer;
+}
+
+static struct rga_buffer_import *
+rga_mm_lookup_import(struct rga_internal_buffer *buffer,
+		     struct rga_session *session)
+{
+	struct rga_buffer_import *import;
+
+	list_for_each_entry(import, &buffer->import_list, node)
+		if (import->session == session)
+			return import;
+
+	return NULL;
+}
+
+static bool rga_mm_handle_authorized(struct rga_internal_buffer *buffer,
+				     struct rga_session *session)
+{
+	return session && rga_mm_lookup_import(buffer, session);
+}
+
+static int rga_mm_record_import(struct rga_internal_buffer *buffer,
+				struct rga_session *session, bool take_ref)
+{
+	struct rga_buffer_import *import;
+
+	if (!session)
+		return -EINVAL;
+
+	import = rga_mm_lookup_import(buffer, session);
+	if (import) {
+		if (import->count == UINT_MAX)
+			return -EOVERFLOW;
+		import->count++;
+	} else {
+		import = kzalloc(sizeof(*import), GFP_KERNEL);
+		if (!import)
+			return -ENOMEM;
+
+		import->session = session;
+		import->count = 1;
+		list_add_tail(&import->node, &buffer->import_list);
+		if (!buffer->session)
+			buffer->session = session;
+	}
+
+	if (take_ref)
+		kref_get(&buffer->refcount);
+
+	return 0;
+}
+
+static void rga_mm_refresh_diagnostic_owner(struct rga_internal_buffer *buffer)
+{
+	struct rga_buffer_import *import;
+
+	if (list_empty(&buffer->import_list)) {
+		buffer->session = NULL;
+		return;
+	}
+
+	import = list_first_entry(&buffer->import_list,
+				  struct rga_buffer_import, node);
+	buffer->session = import->session;
 }
 
 int rga_mm_lookup_flag(struct rga_mm *mm_session, uint64_t handle)
@@ -1497,7 +1614,8 @@ int rga_mm_lookup_flag(struct rga_mm *mm_session, uint64_t handle)
 	return output_buffer->mm_flag;
 }
 
-int rga_mm_lookup_rga2_support(struct rga_mm *mm_session, uint64_t handle)
+int rga_mm_lookup_rga2_support(struct rga_mm *mm_session, uint64_t handle,
+			       struct rga_session *session)
 {
 	struct rga_internal_buffer *buffer;
 
@@ -1505,6 +1623,11 @@ int rga_mm_lookup_rga2_support(struct rga_mm *mm_session, uint64_t handle)
 	if (buffer == NULL) {
 		rga_err("This handle[%ld] is illegal.\n", (unsigned long)handle);
 		return -EINVAL;
+	}
+	if (!rga_mm_handle_authorized(buffer, session)) {
+		rga_err("This session did not import handle[%ld].\n",
+			(unsigned long)handle);
+		return -EPERM;
 	}
 
 	if (buffer->mm_flag & RGA_MEM_UNDER_4G)
@@ -1899,9 +2022,57 @@ static int rga2_stage_copy_to_origin(struct rga_rga2_stage *stage)
 	return ret;
 }
 
+static int rga2_stage_reserve(atomic64_t *counter, size_t size, s64 limit)
+{
+	s64 old = atomic64_read(counter);
+
+	for (;;) {
+		if (old < 0 || size > limit - old)
+			return -EDQUOT;
+		if (atomic64_try_cmpxchg(counter, &old, old + size))
+			return 0;
+	}
+}
+
+static int rga2_stage_charge(struct rga_rga2_stage *stage,
+			     struct rga_session *session)
+{
+	int ret;
+
+	ret = rga2_stage_reserve(&session->rga2_stage_active_bytes,
+				 stage->size, RGA2_STAGE_SESSION_MAX_SIZE);
+	if (ret)
+		return ret;
+
+	ret = rga2_stage_reserve(&rga2_stage_active_bytes, stage->size,
+				 RGA2_STAGE_GLOBAL_MAX_SIZE);
+	if (ret) {
+		atomic64_sub(stage->size, &session->rga2_stage_active_bytes);
+		return ret;
+	}
+
+	stage->session = session;
+	stage->budget_charged = true;
+	rga2_stage_update_peak(atomic64_read(&rga2_stage_active_bytes));
+
+	return 0;
+}
+
+static void rga2_stage_uncharge(struct rga_rga2_stage *stage)
+{
+	if (!stage->budget_charged)
+		return;
+
+	atomic64_sub(stage->size, &rga2_stage_active_bytes);
+	atomic64_sub(stage->size, &stage->session->rga2_stage_active_bytes);
+	stage->budget_charged = false;
+}
+
 static void rga2_stage_free(struct rga_rga2_stage *stage)
 {
 	unsigned int i;
+
+	rga2_stage_uncharge(stage);
 
 	if (stage->mapping.map_dev)
 		rga_dma_unmap_sgt(&stage->mapping);
@@ -1925,7 +2096,6 @@ rga2_stage_get(struct rga_job *job, struct rga_internal_buffer *buffer)
 {
 	struct rga_rga2_stage *stage;
 	struct dma_buf *origin;
-	s64 active_bytes;
 	size_t staged_bytes = 0;
 	unsigned int i;
 	int ret;
@@ -1964,6 +2134,10 @@ rga2_stage_get(struct rga_job *job, struct rga_internal_buffer *buffer)
 	stage->origin = origin;
 	get_dma_buf(origin);
 	stage->size = origin->size;
+	ret = rga2_stage_charge(stage, job->session);
+	if (ret)
+		goto err_free;
+
 	stage->page_count = DIV_ROUND_UP(stage->size, PAGE_SIZE);
 	stage->pages = kvcalloc(stage->page_count, sizeof(*stage->pages),
 				GFP_KERNEL);
@@ -2011,9 +2185,6 @@ rga2_stage_get(struct rga_job *job, struct rga_internal_buffer *buffer)
 	list_add_tail(&stage->node, &job->rga2_stage_list);
 	atomic64_inc(&rga2_stage_success_count);
 	atomic64_inc(&rga2_stage_active_count);
-	active_bytes = atomic64_add_return(stage->size,
-					   &rga2_stage_active_bytes);
-	rga2_stage_update_peak(active_bytes);
 
 	return stage;
 
@@ -2057,7 +2228,6 @@ static void rga2_stage_put(struct rga_job *job,
 	}
 
 	atomic64_dec(&rga2_stage_active_count);
-	atomic64_sub(stage->size, &rga2_stage_active_bytes);
 	rga2_stage_free(stage);
 }
 
@@ -2135,6 +2305,17 @@ static struct sg_table *rga_mm_get_rga2_sgt(struct rga_job *job,
 	if (buffer == NULL)
 		return NULL;
 
+	/*
+	 * High DMA-BUFs always use the job-shared stage. A successful SWIOTLB
+	 * mapping is still private to one channel, so aliases in a sequential
+	 * job would otherwise operate on independent snapshots and copy back
+	 * stale data in unmap order.
+	 */
+	if (!(buffer->mm_flag & RGA_MEM_UNDER_4G) &&
+	    (buffer->type == RGA_DMA_BUFFER ||
+	     buffer->type == RGA_DMA_BUFFER_PTR))
+		goto stage_dma_buf;
+
 	if (rga_mm_buffer_uses_dma_address(job, buffer)) {
 		*use_dma_address = true;
 		return rga_mm_lookup_sgt(buffer);
@@ -2142,11 +2323,6 @@ static struct sg_table *rga_mm_get_rga2_sgt(struct rga_job *job,
 
 	if (buffer->mm_flag & RGA_MEM_UNDER_4G)
 		return rga_mm_lookup_sgt(buffer);
-	if ((buffer->type == RGA_DMA_BUFFER ||
-	     buffer->type == RGA_DMA_BUFFER_PTR) &&
-	    READ_ONCE(buffer->rga2_dma_incompatible))
-		goto stage_dma_buf;
-
 	if (job_buf->rga2_bounce_count >= ARRAY_SIZE(job_buf->rga2_bounce))
 		return ERR_PTR(-EOPNOTSUPP);
 
@@ -2208,12 +2384,6 @@ static struct sg_table *rga_mm_get_rga2_sgt(struct rga_job *job,
 
 	if (ret < 0) {
 		kfree(bounce);
-		if (ret == -EIO &&
-		    (buffer->type == RGA_DMA_BUFFER ||
-		     buffer->type == RGA_DMA_BUFFER_PTR)) {
-			WRITE_ONCE(buffer->rga2_dma_incompatible, true);
-			goto stage_dma_buf;
-		}
 		rga_job_err(job,
 			    "RGA2: can not map over-4G buffer below 4G (%d); use below-4G (e.g. CMA/DMA32) buffers\n",
 			    ret);
@@ -2686,6 +2856,14 @@ static int rga_mm_get_buffer(struct rga_mm *mm,
 
 		mutex_unlock(&mm->lock);
 		return -EFAULT;
+	}
+	if (!rga_mm_handle_authorized(*buf, job->session)) {
+		rga_job_err(job,
+			    "session did not import handle[%ld]\n",
+			    (unsigned long)handle);
+		*buf = NULL;
+		mutex_unlock(&mm->lock);
+		return -EPERM;
 	}
 
 	internal_buffer = *buf;
@@ -3609,6 +3787,8 @@ int rga_mm_import_buffer(struct rga_external_buffer *external_buffer,
 	int ret = 0, new_id;
 	struct rga_mm *mm;
 	struct rga_internal_buffer *internal_buffer;
+	struct rga_internal_buffer *existing;
+	u32 handle;
 	ktime_t timestamp = ktime_get();
 
 	mm = rga_drvdata->mm;
@@ -3621,36 +3801,26 @@ int rga_mm_import_buffer(struct rga_external_buffer *external_buffer,
 
 	/* first, Check whether to rga_mm */
 	internal_buffer = rga_mm_lookup_external(mm, external_buffer, current->mm);
-	if (!IS_ERR_OR_NULL(internal_buffer)) {
-		kref_get(&internal_buffer->refcount);
-		/*
-		 * Adopt an orphaned buffer. rga_mm_release_buffer() clears the
-		 * owner when the last import reference goes away, so a buffer
-		 * that a job still referenced could otherwise sit unowned and be
-		 * skipped by every session-teardown walk.
-		 */
-		if (!internal_buffer->session)
-			internal_buffer->session = session;
-
-		/*
-		 * import_cnt is what the *owner* took, and is spent as such at
-		 * session teardown. Lookup is global -- another session, or a
-		 * second fd in this one, can de-dup onto this buffer -- so
-		 * counting a foreign import here would make the owner's close
-		 * hand back references it never held, freeing the buffer under
-		 * the other session's handle or its running job.
-		 */
-		if (internal_buffer->session == session)
-			internal_buffer->import_cnt++;
-
+	if (IS_ERR(internal_buffer)) {
+		ret = PTR_ERR(internal_buffer);
 		mutex_unlock(&mm->lock);
+		return ret;
+	}
+	if (internal_buffer) {
+		ret = rga_mm_record_import(internal_buffer, session, true);
+		if (ret) {
+			mutex_unlock(&mm->lock);
+			return ret;
+		}
+		handle = internal_buffer->handle;
 
 		if (DEBUGGER_EN(MM)) {
 			rga_buf_log(internal_buffer, "import existing buffer:\n");
 			rga_mm_dump_buffer(internal_buffer);
 		}
+		mutex_unlock(&mm->lock);
 
-		return internal_buffer->handle;
+		return handle;
 	}
 
 	mutex_unlock(&mm->lock);
@@ -3662,15 +3832,33 @@ int rga_mm_import_buffer(struct rga_external_buffer *external_buffer,
 		return -ENOMEM;
 	}
 
+	INIT_LIST_HEAD(&internal_buffer->import_list);
 	ret = rga_mm_map_buffer(external_buffer, internal_buffer, NULL, true);
 	if (ret < 0)
 		goto FREE_INTERNAL_BUFFER;
 
 	kref_init(&internal_buffer->refcount);
-	internal_buffer->session = session;
-	internal_buffer->import_cnt = 1;
 
 	mutex_lock(&mm->lock);
+	/* Another importer may have published this object while mapping slept. */
+	existing = rga_mm_lookup_mapped(mm, internal_buffer);
+	if (existing) {
+		ret = rga_mm_record_import(existing, session, true);
+		handle = existing->handle;
+		mutex_unlock(&mm->lock);
+		rga_mm_unmap_buffer(internal_buffer);
+		kfree(internal_buffer);
+		if (ret)
+			return ret;
+		return handle;
+	}
+
+	ret = rga_mm_record_import(internal_buffer, session, false);
+	if (ret) {
+		mutex_unlock(&mm->lock);
+		goto UNMAP_INTERNAL_BUFFER;
+	}
+
 	/*
 	 * Get the user-visible handle using idr. Preload and perform
 	 * allocation under our spinlock.
@@ -3682,26 +3870,36 @@ int rga_mm_import_buffer(struct rga_external_buffer *external_buffer,
 		rga_err("internal_buffer alloc id failed!\n");
 		ret = new_id;
 
+		while (!list_empty(&internal_buffer->import_list)) {
+			struct rga_buffer_import *import;
+
+			import = list_first_entry(&internal_buffer->import_list,
+						  struct rga_buffer_import, node);
+			list_del(&import->node);
+			kfree(import);
+		}
 		mutex_unlock(&mm->lock);
-		goto FREE_INTERNAL_BUFFER;
+		goto UNMAP_INTERNAL_BUFFER;
 	}
 
 	internal_buffer->handle = new_id;
+	handle = new_id;
 	mm->buffer_count++;
 
 	if (DEBUGGER_EN(MM)) {
 		rga_buf_log(internal_buffer, "import buffer:\n");
 		rga_mm_dump_buffer(internal_buffer);
 	}
-
-	mutex_unlock(&mm->lock);
-
 	if (DEBUGGER_EN(TIME))
 		rga_buf_log(internal_buffer, "import buffer cost %lld us\n",
 			ktime_us_delta(ktime_get(), timestamp));
 
-	return internal_buffer->handle;
+	mutex_unlock(&mm->lock);
 
+	return handle;
+
+UNMAP_INTERNAL_BUFFER:
+	rga_mm_unmap_buffer(internal_buffer);
 FREE_INTERNAL_BUFFER:
 	kfree(internal_buffer);
 
@@ -3712,6 +3910,7 @@ int rga_mm_release_buffer(uint32_t handle, struct rga_session *session)
 {
 	struct rga_mm *mm;
 	struct rga_internal_buffer *internal_buffer;
+	struct rga_buffer_import *import;
 	ktime_t timestamp = ktime_get();
 
 	mm = rga_drvdata->mm;
@@ -3731,14 +3930,9 @@ int rga_mm_release_buffer(uint32_t handle, struct rga_session *session)
 		return -ENOENT;
 	}
 
-	/*
-	 * Handles are a single global idr, so without this any /dev/rga opener
-	 * could release a handle another session imported -- the same
-	 * unauthenticated-put shape as MPP_CMD_RELEASE_FD. In-kernel callers
-	 * pass NULL and keep the old unchecked behaviour.
-	 */
-	if (session && internal_buffer->session != session) {
-		rga_err("handle[%d] does not belong to this session\n",
+	import = rga_mm_lookup_import(internal_buffer, session);
+	if (!import) {
+		rga_err("handle[%d] was not imported by this session\n",
 			(int)handle);
 
 		mutex_unlock(&mm->lock);
@@ -3750,27 +3944,11 @@ int rga_mm_release_buffer(uint32_t handle, struct rga_session *session)
 		rga_mm_dump_buffer(internal_buffer);
 	}
 
-	/*
-	 * Surrender one import reference. Ownership is dropped only when the
-	 * last one goes, which matters in both directions:
-	 *
-	 * Clearing it at all is what stops rga_mm_session_release_buffer()
-	 * treating a refcount of 1 on a buffer it still owns as "the last
-	 * reference is mine" and freeing it in place -- handles are global, so
-	 * a session could import, hand the handle to a job in another session,
-	 * release its own, and free the buffer under that running job on close.
-	 *
-	 * Clearing it only on the *last* import is what stops the opposite
-	 * failure: imports are de-duplicated, so releasing one of several left
-	 * the buffer unowned while an import reference was still outstanding,
-	 * and every session-teardown walk then skipped it -- leaking the
-	 * buffer, its pinned pages, its mapping and its mm reference for the
-	 * lifetime of the driver.
-	 */
-	if (internal_buffer->import_cnt)
-		internal_buffer->import_cnt--;
-	if (!internal_buffer->import_cnt)
-		internal_buffer->session = NULL;
+	if (--import->count == 0) {
+		list_del(&import->node);
+		kfree(import);
+		rga_mm_refresh_diagnostic_owner(internal_buffer);
+	}
 
 	kref_put(&internal_buffer->refcount, rga_mm_kref_release_buffer);
 
@@ -3788,6 +3966,7 @@ int rga_mm_session_release_buffer(struct rga_session *session)
 	int i;
 	struct rga_mm *mm;
 	struct rga_internal_buffer *buffer;
+	struct rga_buffer_import *import;
 
 	mm = rga_drvdata->mm;
 	if (mm == NULL) {
@@ -3795,69 +3974,31 @@ int rga_mm_session_release_buffer(struct rga_session *session)
 		return -EFAULT;
 	}
 
-	mutex_lock(&mm->lock);
+	for (;;) {
+		u32 n = 0;
 
-	idr_for_each_entry(&mm->memory_idr, buffer, i) {
-		if (session != buffer->session)
-			continue;
-
-		/*
-		 * Imports are de-duplicated across the whole memory_idr
-		 * (rga_mm_lookup_external() has no session filter), and a
-		 * running job also holds a reference (rga_mm_get_buffer()).
-		 * So a buffer owned by the exiting session may still be
-		 * referenced elsewhere. Drop only this session's reference
-		 * through the normal kref path instead of forcibly unmapping
-		 * and freeing, so a surviving reference is never left pointing
-		 * at freed memory.
-		 */
-		/*
-		 * The session may hold more than one import reference on the
-		 * same buffer, because imports are de-duplicated. Give back
-		 * exactly what it took.
-		 */
-		if (kref_read(&buffer->refcount) > buffer->import_cnt) {
-			uint32_t n = buffer->import_cnt;
-
-			rga_err("[tgid:%d] handle[%d] still referenced at exit (refcount=%u, imports=%u), dropping session references only\n",
-			       session->tgid, buffer->handle,
-			       kref_read(&buffer->refcount), n);
-			/*
-			 * The session is going away; detach it so the surviving
-			 * reference does not dereference the freed session and a
-			 * future session reusing this address is not mistaken
-			 * for the owner here.
-			 */
-			buffer->session = NULL;
-			buffer->import_cnt = 0;
-			/*
-			 * refcount > n, so these only decrement: they never run
-			 * rga_mm_kref_release_buffer() and therefore never drop
-			 * mm->lock -- safe to call inside idr_for_each_entry().
-			 */
-			while (n--)
-				kref_put(&buffer->refcount,
-					 rga_mm_kref_release_buffer);
-		} else {
-			rga_err("[tgid:%d] Destroy handle[%d] when the user exits\n",
-			       session->tgid, buffer->handle);
-			/*
-			 * Last reference: free it while still holding mm->lock.
-			 * Must NOT use kref_put(rga_mm_kref_release_buffer) here --
-			 * that release callback drops and re-acquires mm->lock
-			 * around the sleeping unmap, i.e. mid-idr_for_each_entry().
-			 * On heavy session teardown that left mm->lock owned by an
-			 * exited/freed task and wedged the next mm->lock waiter
-			 * (e.g. rga_mm_session_show) in an unkillable D state with a
-			 * KASAN use-after-free on the freed task_struct. Freeing in
-			 * place under the held lock (as the BSP does) is
-			 * iteration-safe and drops no lock.
-			 */
-			rga_mm_force_releaser_buffer(buffer);
+		mutex_lock(&mm->lock);
+		buffer = NULL;
+		idr_for_each_entry(&mm->memory_idr, buffer, i) {
+			import = rga_mm_lookup_import(buffer, session);
+			if (import)
+				break;
+			buffer = NULL;
 		}
+		if (!buffer) {
+			mutex_unlock(&mm->lock);
+			break;
+		}
+
+		n = import->count;
+		list_del(&import->node);
+		kfree(import);
+		rga_mm_refresh_diagnostic_owner(buffer);
+		while (n--)
+			kref_put(&buffer->refcount, rga_mm_kref_release_buffer);
+		mutex_unlock(&mm->lock);
 	}
 
-	mutex_unlock(&mm->lock);
 	return 0;
 }
 

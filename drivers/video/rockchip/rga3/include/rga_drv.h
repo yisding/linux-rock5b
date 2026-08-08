@@ -238,26 +238,23 @@ struct rga_internal_buffer {
 	uint32_t mm_flag;
 
 	struct kref refcount;
+	/* Per-open import authorizations, protected by rga_mm::lock. */
+	struct list_head import_list;
+	/* First authorized session, retained only for diagnostics. */
 	struct rga_session *session;
-	/*
-	 * Outstanding RGA_IOC_IMPORT_BUFFER references held by `session`, the
-	 * owner -- not by any other session that de-dupped onto this buffer,
-	 * since teardown spends this count on the owner's behalf. Guarded by
-	 * mm->lock once the buffer is published in memory_idr; the initial
-	 * store happens before publication, alongside kref_init().
-	 *
-	 * Imports are de-duplicated, so one buffer can be imported several
-	 * times; ownership must survive until the last of those is released,
-	 * otherwise the buffer is orphaned (session == NULL) and the owning
-	 * session's teardown walk skips it, leaking its pages and mm ref.
-	 */
-	uint32_t import_cnt;
 
 	/* The scheduler of the mapping */
 	struct rga_scheduler_t *scheduler;
 
-	/* The RGA2 attachment hit the exporter/SWIOTLB segment-size limit. */
+	/* The persistent RGA2 attachment required an alternate map device. */
 	bool rga2_dma_incompatible;
+
+};
+
+struct rga_buffer_import {
+	struct list_head node;
+	struct rga_session *session;
+	u32 count;
 };
 
 struct rga_scheduler_t;
@@ -275,6 +272,7 @@ struct rga_session {
 	bool release;
 	struct rw_semaphore release_rwsem;
 	struct kref refcount;
+	atomic64_t rga2_stage_active_bytes;
 };
 
 struct rga_job_buffer {
@@ -347,6 +345,8 @@ struct rga_job {
 
 	struct rga_scheduler_t *scheduler;
 	struct rga_session *session;
+	/* Stable even after cancel retires the request's initial reference. */
+	struct rga_request *request;
 
 	struct rga_full_csc full_csc;
 	struct rga_csc_clip full_csc_clip;
@@ -412,6 +412,10 @@ struct rga_scheduler_t {
 
 	struct rga_job *running_job;
 	struct list_head todo_list;
+	/* Serializes PREPARE/start, completion and every abort/reset path. */
+	struct mutex job_mutex;
+	/* Once set at remove, no queued work may start on this scheduler. */
+	bool shutdown;
 	spinlock_t irq_lock;
 	wait_queue_head_t job_done_wq;
 
@@ -437,12 +441,20 @@ struct rga_request {
 
 	bool is_running;
 	bool is_done;
+	bool aborting;
+	/* Permanent retirement; retryable MPI run failures leave this clear. */
+	bool terminal;
+	/* MPI contexts retain their initial IDR reference across runs. */
+	bool reusable;
 	int ret;
 	uint32_t sync_mode;
 
 	int32_t acquire_fence_fd;
 	int32_t release_fence_fd;
 	struct dma_fence *release_fence;
+	struct dma_fence *acquire_fence;
+	struct dma_fence_cb acquire_fence_cb;
+	atomic_t acquire_fence_state;
 	spinlock_t fence_lock;
 	struct work_struct fence_work;
 
@@ -454,6 +466,10 @@ struct rga_request {
 	struct rga_session *session;
 
 	spinlock_t lock;
+	/* Serializes job publication against cancel/session teardown. */
+	struct mutex commit_lock;
+	/* Serializes reusable callers through synchronous completion. */
+	struct mutex run_lock;
 	struct kref refcount;
 	/*
 	 * Set once the initial reference taken by rga_request_alloc() has been

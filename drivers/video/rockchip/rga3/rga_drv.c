@@ -136,9 +136,12 @@ int rga_mpi_commit(struct rga_mpi_job_t *mpi_job)
 	struct rga_pending_request_manager *request_manager;
 	struct rga_request *request;
 	struct rga_req *cached_cmd;
-	struct rga_req mpi_cmd;
+	struct rga_req mpi_cmd = {};
 	unsigned long flags;
 	bool need_swap_act = false;
+	bool src0_imported = false;
+	bool src1_imported = false;
+	bool dst_imported = false;
 
 	request_manager = rga_drvdata->pend_request_manager;
 
@@ -149,12 +152,9 @@ int rga_mpi_commit(struct rga_mpi_job_t *mpi_job)
 		mutex_unlock(&request_manager->lock);
 		return -EINVAL;
 	}
-
-	if (request->task_count > 1) {
-		/* TODO */
-		rga_req_err(request, "Currently request does not support multiple tasks!");
+	if (request->release_ref_dropped) {
 		mutex_unlock(&request_manager->lock);
-		return -EINVAL;
+		return -ENOENT;
 	}
 
 	rga_request_get(request);
@@ -167,7 +167,23 @@ int rga_mpi_commit(struct rga_mpi_job_t *mpi_job)
 		goto err_release_rwsem;
 	}
 
+	mutex_lock(&request->run_lock);
+	mutex_lock(&request->commit_lock);
 	spin_lock_irqsave(&request->lock, flags);
+	if (request->terminal || request->is_running ||
+	    (request->aborting && (!request->reusable || !request->is_done)) ||
+	    !request->task_list) {
+		spin_unlock_irqrestore(&request->lock, flags);
+		ret = -EBUSY;
+		goto err_unlock_config;
+	}
+	if (request->task_count > 1) {
+		spin_unlock_irqrestore(&request->lock, flags);
+		rga_req_err(request,
+			    "Currently request does not support multiple tasks!");
+		ret = -EINVAL;
+		goto err_unlock_config;
+	}
 
 	/* TODO: batch mode need mpi async mode */
 	request->sync_mode = RGA_BLIT_SYNC;
@@ -220,8 +236,9 @@ int rga_mpi_commit(struct rga_mpi_job_t *mpi_job)
 						 request->session);
 		if (ret < 0) {
 			rga_req_err(request, "src channel set buffer handle failed!\n");
-			goto err_put_request;
+			goto err_unlock_config;
 		}
+		src0_imported = true;
 	}
 
 	if (mpi_job->dma_buf_src1 != NULL) {
@@ -230,8 +247,9 @@ int rga_mpi_commit(struct rga_mpi_job_t *mpi_job)
 						 request->session);
 		if (ret < 0) {
 			rga_req_err(request, "src1 channel set buffer handle failed!\n");
-			goto err_put_request;
+			goto err_unlock_config;
 		}
+		src1_imported = true;
 	}
 
 	if (mpi_job->dma_buf_dst != NULL) {
@@ -240,8 +258,9 @@ int rga_mpi_commit(struct rga_mpi_job_t *mpi_job)
 						 request->session);
 		if (ret < 0) {
 			rga_req_err(request, "dst channel set buffer handle failed!\n");
-			goto err_put_request;
+			goto err_unlock_config;
 		}
+		dst_imported = true;
 	}
 
 	rga_mpi_scale_protect(&mpi_cmd);
@@ -253,6 +272,7 @@ int rga_mpi_commit(struct rga_mpi_job_t *mpi_job)
 	if (DEBUGGER_EN(MSG))
 		rga_dump_req(request, &mpi_cmd);
 
+	/* rga_request_mpi_submit() consumes commit_lock before it waits. */
 	ret = rga_request_mpi_submit(&mpi_cmd, request);
 	if (ret < 0) {
 		if (ret == -ERESTARTSYS) {
@@ -281,14 +301,19 @@ int rga_mpi_commit(struct rga_mpi_job_t *mpi_job)
 		if (need_swap_act)
 			swap(mpi_job->output->width, mpi_job->output->height);
 	}
+	goto err_put_request;
+
+err_unlock_config:
+	mutex_unlock(&request->commit_lock);
 
 err_put_request:
-	if ((mpi_job->dma_buf_src0 != NULL) && (mpi_cmd.src.yrgb_addr > 0))
-		rga_mm_release_buffer(mpi_cmd.src.yrgb_addr, NULL);
-	if ((mpi_job->dma_buf_src1 != NULL) && (mpi_cmd.pat.yrgb_addr > 0))
-		rga_mm_release_buffer(mpi_cmd.pat.yrgb_addr, NULL);
-	if ((mpi_job->dma_buf_dst != NULL) && (mpi_cmd.dst.yrgb_addr > 0))
-		rga_mm_release_buffer(mpi_cmd.dst.yrgb_addr, NULL);
+	if (src0_imported)
+		rga_mm_release_buffer(mpi_cmd.src.yrgb_addr, request->session);
+	if (src1_imported)
+		rga_mm_release_buffer(mpi_cmd.pat.yrgb_addr, request->session);
+	if (dst_imported)
+		rga_mm_release_buffer(mpi_cmd.dst.yrgb_addr, request->session);
+	mutex_unlock(&request->run_lock);
 
 err_release_rwsem:
 	up_read(&request->session->release_rwsem);
@@ -335,10 +360,11 @@ int rga_kernel_commit(struct rga_req *cmd)
 		goto err_put_request;
 	}
 
-	request = rga_request_kernel_config(&kernel_request);
+	request = rga_request_kernel_config_locked(&kernel_request);
 	if (IS_ERR(request)) {
 		rga_err("ID[%d]: config failed!\n", kernel_request.id);
-		ret = -EFAULT;
+		ret = PTR_ERR(request);
+		request = NULL;
 		goto err_put_request;
 	}
 
@@ -347,7 +373,8 @@ int rga_kernel_commit(struct rga_req *cmd)
 		rga_dump_req(request, cmd);
 	}
 
-	ret = rga_request_submit(request);
+	ret = rga_request_submit_locked(request);
+	mutex_unlock(&request->run_lock);
 	if (ret < 0)
 		rga_req_err(request, "submit failed!\n");
 
@@ -360,12 +387,12 @@ err_put_request:
 			rga_err("can not find request from id[%d]", request_id);
 
 			mutex_unlock(&request_manager->lock);
-			ret = -EINVAL;
 			goto err_put_session;
 		}
+		rga_request_release_ref(request);
+	} else {
+		rga_request_put(request);
 	}
-
-	rga_request_put(request);
 
 	mutex_unlock(&request_manager->lock);
 
@@ -428,7 +455,10 @@ int rga_power_enable(struct rga_scheduler_t *scheduler)
 	int ret = -EINVAL;
 	unsigned long flags;
 
-	pm_runtime_get_sync(scheduler->dev);
+	ret = pm_runtime_resume_and_get(scheduler->dev);
+	if (ret < 0)
+		return ret;
+
 	pm_stay_awake(scheduler->dev);
 
 	ret = clk_bulk_prepare_enable(scheduler->num_clks, scheduler->clks);
@@ -479,18 +509,24 @@ int rga_power_disable(struct rga_scheduler_t *scheduler)
 	return 0;
 }
 
-static void rga_power_enable_all(void)
+static int rga_power_enable_all(void)
 {
 	struct rga_scheduler_t *scheduler = NULL;
-	int ret = 0;
+	int ret;
 	int i;
 
 	for (i = 0; i < rga_drvdata->num_of_scheduler; i++) {
 		scheduler = rga_drvdata->scheduler[i];
 		ret = rga_power_enable(scheduler);
-		if (ret < 0)
-			rga_err("power enable failed");
+		if (ret < 0) {
+			rga_err("power enable failed: %d\n", ret);
+			while (--i >= 0)
+				rga_power_disable(rga_drvdata->scheduler[i]);
+			return ret;
+		}
 	}
+
+	return 0;
 }
 
 static void rga_power_disable_all(void)
@@ -515,7 +551,7 @@ int rga_power_disable(struct rga_scheduler_t *scheduler)
 	return 0;
 }
 
-static inline void rga_power_enable_all(void) {}
+static inline int rga_power_enable_all(void) { return 0; }
 static inline void rga_power_disable_all(void) {}
 #endif /* #ifndef RGA_DISABLE_PM */
 
@@ -629,6 +665,7 @@ static struct rga_session *rga_session_init(void)
 	session->release = false;
 	init_rwsem(&session->release_rwsem);
 	kref_init(&session->refcount);
+	atomic64_set(&session->rga2_stage_active_bytes, 0);
 
 	return session;
 }
@@ -658,6 +695,7 @@ void rga_session_get(struct rga_session *session)
 static long rga_ioctl_import_buffer(unsigned long arg, struct rga_session *session)
 {
 	int i;
+	int imported = 0;
 	int ret = 0;
 	struct rga_buffer_pool buffer_pool;
 	struct rga_external_buffer *external_buffer = NULL;
@@ -736,10 +774,11 @@ static long rga_ioctl_import_buffer(unsigned long arg, struct rga_session *sessi
 			       rga_get_memory_type_str(external_buffer[i].type),
 			       external_buffer[i].type);
 
-			goto err_free_external_buffer;
+			goto err_rollback_imports;
 		}
 
 		external_buffer[i].handle = ret;
+		imported++;
 	}
 
 	if (unlikely(copy_to_user(u64_to_user_ptr(buffer_pool.buffers_ptr),
@@ -748,7 +787,21 @@ static long rga_ioctl_import_buffer(unsigned long arg, struct rga_session *sessi
 		rga_err("rga_buffer_pool external_buffer list copy_to_user failed\n");
 		ret = -EFAULT;
 
-		goto err_free_external_buffer;
+		goto err_rollback_imports;
+	}
+
+	goto err_free_external_buffer;
+
+err_rollback_imports:
+	/* The pool ioctl is transactional: never strand invisible handles. */
+	while (imported-- > 0) {
+		int release_ret;
+
+		release_ret = rga_mm_release_buffer(external_buffer[imported].handle,
+						    session);
+		if (release_ret)
+			rga_err("failed to roll back imported handle[%d]: %d\n",
+				external_buffer[imported].handle, release_ret);
 	}
 
 err_free_external_buffer:
@@ -818,7 +871,10 @@ err_free_external_buffer:
 
 static long rga_ioctl_request_create(unsigned long arg, struct rga_session *session)
 {
-	uint32_t id;
+	struct rga_pending_request_manager *request_manager;
+	struct rga_request *request;
+	u32 user_id;
+	int id;
 	uint32_t flags;
 
 	if (copy_from_user(&flags, (void *)arg, sizeof(uint32_t))) {
@@ -827,9 +883,19 @@ static long rga_ioctl_request_create(unsigned long arg, struct rga_session *sess
 	}
 
 	id = rga_request_alloc(flags, session);
+	if (id < 0)
+		return id;
+	user_id = id;
 
-	if (copy_to_user((void *)arg, &id, sizeof(uint32_t))) {
+	if (copy_to_user((void *)arg, &user_id, sizeof(user_id))) {
 		rga_err("%s failed to copy to user!\n", __func__);
+		/* The new id was never published to userspace; retire it now. */
+		request_manager = rga_drvdata->pend_request_manager;
+		mutex_lock(&request_manager->lock);
+		request = rga_request_lookup(request_manager, id);
+		if (request && request->session == session)
+			rga_request_release_ref(request);
+		mutex_unlock(&request_manager->lock);
 		return -EFAULT;
 	}
 
@@ -862,14 +928,15 @@ static long rga_ioctl_request_submit(unsigned long arg, bool run_enbale,
 	if (DEBUGGER_EN(MSG))
 		rga_log("config request id = %d", user_request.id);
 
-	request = rga_request_config(&user_request, session);
+	request = rga_request_config_locked(&user_request, session);
 	if (IS_ERR_OR_NULL(request)) {
 		rga_err("request[%d] config failed!\n", user_request.id);
 		return -EFAULT;
 	}
 
 	if (run_enbale) {
-		ret = rga_request_submit(request);
+		ret = rga_request_submit_locked(request);
+		mutex_unlock(&request->run_lock);
 		if (ret < 0) {
 			rga_err("request[%d] submit failed!\n", user_request.id);
 		} else if (request->sync_mode == RGA_BLIT_ASYNC) {
@@ -880,6 +947,9 @@ static long rga_ioctl_request_submit(unsigned long arg, bool run_enbale,
 				ret = -EFAULT;
 			}
 		}
+	} else {
+		mutex_unlock(&request->commit_lock);
+		mutex_unlock(&request->run_lock);
 	}
 
 	mutex_lock(&request_manager->lock);
@@ -931,9 +1001,14 @@ static long rga_ioctl_request_cancel(unsigned long arg,
 		return -EPERM;
 	}
 
-	/* Retire the request's initial reference (idempotent). */
-	rga_request_release_ref(request);
+	/* Keep the object alive while abort/reset runs outside the idr lock. */
+	rga_request_get(request);
+	mutex_unlock(&request_manager->lock);
 
+	rga_request_cancel(request, -ECANCELED);
+
+	mutex_lock(&request_manager->lock);
+	rga_request_put(request);
 	mutex_unlock(&request_manager->lock);
 
 	return 0;
@@ -967,7 +1042,7 @@ static long rga_ioctl_blit(unsigned long arg, uint32_t cmd, struct rga_session *
 		goto err_free_request_by_id;
 	}
 
-	request = rga_request_config(&user_request, session);
+	request = rga_request_config_locked(&user_request, session);
 	if (IS_ERR(request)) {
 		rga_err("ID[%d]: config failed!\n", user_request.id);
 		ret = -EFAULT;
@@ -978,7 +1053,8 @@ static long rga_ioctl_blit(unsigned long arg, uint32_t cmd, struct rga_session *
 	/* In the BLIT_SYNC/BLIT_ASYNC command, in_fence_fd needs to be set. */
 	request->acquire_fence_fd = rga_req->in_fence_fd;
 
-	ret = rga_request_submit(request);
+	ret = rga_request_submit_locked(request);
+	mutex_unlock(&request->run_lock);
 	if (ret < 0) {
 		rga_req_err(request, "submit failed!\n");
 		goto err_put_request;
@@ -1013,7 +1089,7 @@ err_free_request_by_id:
 	/*
 	 * Retire through the refcount, never rga_request_free(). That is the
 	 * raw destructor -- it idr_removes, kfrees task_list and kfrees the
-	 * request without consulting the kref -- while rga_request_config()
+	 * request without consulting the kref -- while rga_request_config_locked()
 	 * holds a reference across a sleeping copy_from_user(). A concurrent
 	 * config on this id would then walk, write and kfree through freed
 	 * memory. Every other retire path in the driver uses this helper.
@@ -1147,7 +1223,9 @@ static long rga_ioctl(struct file *file, uint32_t cmd, unsigned long arg)
 		break;
 
 	case RGA_IOC_IMPORT_BUFFER:
-		rga_power_enable_all();
+		ret = rga_power_enable_all();
+		if (ret)
+			break;
 
 		ret = rga_ioctl_import_buffer(arg, session);
 
@@ -1156,7 +1234,9 @@ static long rga_ioctl(struct file *file, uint32_t cmd, unsigned long arg)
 		break;
 
 	case RGA_IOC_RELEASE_BUFFER:
-		rga_power_enable_all();
+		ret = rga_power_enable_all();
+		if (ret)
+			break;
 
 		ret = rga_ioctl_release_buffer(arg, session);
 
@@ -1422,6 +1502,8 @@ static int init_scheduler(struct rga_scheduler_t *scheduler,
 	scheduler->ops = match_data->ops;
 	scheduler->dev = dev;
 
+	mutex_init(&scheduler->job_mutex);
+	scheduler->shutdown = false;
 	spin_lock_init(&scheduler->irq_lock);
 	INIT_LIST_HEAD(&scheduler->todo_list);
 	init_waitqueue_head(&scheduler->job_done_wq);
@@ -1515,7 +1597,7 @@ static int rga_drv_probe(struct platform_device *pdev)
 	device_init_wakeup(dev, true);
 	pm_runtime_enable(scheduler->dev);
 
-	ret = pm_runtime_get_sync(scheduler->dev);
+	ret = pm_runtime_resume_and_get(scheduler->dev);
 	if (ret < 0) {
 		dev_err(dev, "failed to get pm runtime, ret = %d\n", ret);
 		goto pm_disable;
@@ -1524,7 +1606,7 @@ static int rga_drv_probe(struct platform_device *pdev)
 	ret = clk_bulk_prepare_enable(scheduler->num_clks, scheduler->clks);
 	if (ret < 0) {
 		dev_err(dev, "failed to enable clk\n");
-		goto pm_disable;
+		goto pm_put;
 	}
 #endif /* #ifndef RGA_DISABLE_PM */
 
@@ -1609,6 +1691,8 @@ static int rga_drv_probe(struct platform_device *pdev)
 	return 0;
 
 #ifndef RGA_DISABLE_PM
+pm_put:
+	pm_runtime_put_sync(dev);
 pm_disable:
 	device_init_wakeup(dev, false);
 	pm_runtime_disable(dev);

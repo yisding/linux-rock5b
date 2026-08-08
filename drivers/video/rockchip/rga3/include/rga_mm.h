@@ -67,7 +67,8 @@ static inline bool rga_mm_is_invalid_dma_buffer(struct rga_dma_buffer *buffer)
 
 struct rga_internal_buffer *rga_mm_lookup_handle(struct rga_mm *mm_session, uint32_t handle);
 int rga_mm_lookup_flag(struct rga_mm *mm_session, uint64_t handle);
-int rga_mm_lookup_rga2_support(struct rga_mm *mm_session, uint64_t handle);
+int rga_mm_lookup_rga2_support(struct rga_mm *mm_session, uint64_t handle,
+			       struct rga_session *session);
 dma_addr_t rga_mm_lookup_iova(struct rga_internal_buffer *buffer);
 struct sg_table *rga_mm_lookup_sgt(struct rga_internal_buffer *buffer);
 

@@ -14,13 +14,6 @@ struct rga_fence_context {
 	spinlock_t spinlock;
 };
 
-struct rga_fence_waiter {
-	/* Base sync driver waiter structure */
-	struct dma_fence_cb waiter;
-
-	void *private;
-};
-
 #ifdef CONFIG_ROCKCHIP_RGA_ASYNC
 int rga_fence_context_init(struct rga_fence_context **ctx);
 void rga_fence_context_remove(struct rga_fence_context **ctx);
@@ -29,7 +22,15 @@ struct dma_fence *rga_dma_fence_alloc(void);
 int rga_dma_fence_get_fd(struct dma_fence *fence);
 struct dma_fence *rga_get_dma_fence_from_fd(int fence_fd);
 int rga_dma_fence_wait(struct dma_fence *fence);
-int rga_dma_fence_add_callback(struct dma_fence *fence, dma_fence_func_t func, void *private);
+int rga_dma_fence_add_callback(struct dma_fence *fence,
+			       struct dma_fence_cb *callback,
+			       dma_fence_func_t func);
+
+static inline bool rga_dma_fence_remove_callback(struct dma_fence *fence,
+						 struct dma_fence_cb *callback)
+{
+	return dma_fence_remove_callback(fence, callback);
+}
 
 
 static inline void rga_dma_fence_put(struct dma_fence *fence)
@@ -77,10 +78,16 @@ static inline int rga_dma_fence_wait(struct dma_fence *fence)
 }
 
 static inline int rga_dma_fence_add_callback(struct dma_fence *fence,
-					     dma_fence_func_t func,
-					     void *private)
+					     struct dma_fence_cb *callback,
+					     dma_fence_func_t func)
 {
 	return -EINVAL;
+}
+
+static inline bool rga_dma_fence_remove_callback(struct dma_fence *fence,
+						 struct dma_fence_cb *callback)
+{
+	return false;
 }
 
 static inline void rga_dma_fence_put(struct dma_fence *fence)

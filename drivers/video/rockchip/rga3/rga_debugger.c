@@ -219,17 +219,19 @@ static int rga_load_show(struct seq_file *m, void *data)
 	}
 
 	seq_puts(m, "=========================================\n");
-	seq_puts(m, "<session>  <status>  <tgid>  <process>\n");
+	seq_puts(m, "<session>  <status>  <tgid>  <rga2-stage-bytes>  <process>\n");
 
 	mutex_lock(&session_manager->lock);
 
 	now = ktime_get();
 	idr_for_each_entry(&session_manager->ctx_id_idr, session, id)
-		seq_printf(m, "%-9d  %-8s  %-6d  %-s\n",
-			session->id,
-			ktime_us_delta(now, session->last_active) < RGA_LOAD_ACTIVE_MAX_US ?
-				"active" : "idle",
-			session->tgid, session->pname);
+		seq_printf(m, "%-9d  %-8s  %-6d  %-18lld  %-s\n",
+			   session->id,
+			   ktime_us_delta(now, session->last_active) < RGA_LOAD_ACTIVE_MAX_US ?
+				   "active" : "idle",
+			   session->tgid,
+			   atomic64_read(&session->rga2_stage_active_bytes),
+			   session->pname);
 
 	mutex_unlock(&session_manager->lock);
 
@@ -399,7 +401,7 @@ static int rga_request_manager_show(struct seq_file *m, void *data)
 		seq_puts(m, "\t cmd dump:\n\n");
 
 		/*
-		 * Stay under request->lock for the dump: rga_request_config()
+		 * Stay under request->lock for the dump: rga_request_config_locked()
 		 * swaps task_list and frees the old one, so dropping the lock
 		 * here would walk freed memory. The bound must be the snapshot
 		 * too -- the live count describes the replacement list.
