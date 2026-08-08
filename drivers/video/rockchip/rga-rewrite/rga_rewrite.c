@@ -1358,6 +1358,79 @@ struct rk_rga_hw {
 	bool removing;
 };
 
+/*
+ * Phase-one active-slot funnel. Callers still own job_lock and the existing
+ * run_lock ordering; these helpers only make the slot and its generation a
+ * single typed write/read boundary for the later task-execution migration.
+ */
+static struct rk_rga_job *
+rk_rga_hw_active_job_locked(const struct rk_rga_hw *hw)
+{
+	lockdep_assert_held(&hw->job_lock);
+
+	return hw->active_job;
+}
+
+static u64 rk_rga_hw_active_generation_locked(const struct rk_rga_hw *hw)
+{
+	lockdep_assert_held(&hw->job_lock);
+
+	return hw->active_generation;
+}
+
+static void rk_rga_hw_install_active_locked(struct rk_rga_hw *hw,
+					    struct rk_rga_job *job)
+{
+	lockdep_assert_held(&hw->job_lock);
+
+	WARN_ON_ONCE(hw->active_job);
+	hw->active_job = job;
+	hw->active_generation++;
+	if (!hw->active_generation)
+		hw->active_generation++;
+	hw->iommu_fault_generation = 0;
+}
+
+static struct rk_rga_job *rk_rga_hw_take_active_locked(struct rk_rga_hw *hw)
+{
+	struct rk_rga_job *job;
+
+	lockdep_assert_held(&hw->job_lock);
+
+	job = hw->active_job;
+	hw->active_job = NULL;
+
+	return job;
+}
+
+static struct rk_rga_job *
+rk_rga_hw_take_active_if_locked(struct rk_rga_hw *hw,
+				struct rk_rga_job *match)
+{
+	lockdep_assert_held(&hw->job_lock);
+
+	if (hw->active_job != match)
+		return NULL;
+
+	return rk_rga_hw_take_active_locked(hw);
+}
+
+static bool rk_rga_hw_restore_active_locked(struct rk_rga_hw *hw,
+					     struct rk_rga_job *job,
+					     bool iommu_fault)
+{
+	lockdep_assert_held(&hw->job_lock);
+
+	if (hw->active_job)
+		return false;
+
+	hw->active_job = job;
+	if (iommu_fault)
+		hw->iommu_fault_generation = hw->active_generation;
+
+	return true;
+}
+
 struct rk_rga_session {
 	struct mutex lock;
 	spinlock_t job_lock;
@@ -6827,7 +6900,7 @@ static void rk_rga_hw_schedule_timeout(struct rk_rga_hw *hw,
 	 * caller reaches here from rk_rga_hw_dispatch() under run_lock, right
 	 * after that dispatch bumped active_generation.
 	 */
-	hw->timeout_generation = hw->active_generation;
+	hw->timeout_generation = rk_rga_hw_active_generation_locked(hw);
 	spin_unlock_irqrestore(&hw->job_lock, flags);
 	rk_rga_job_put(old);
 
@@ -23173,7 +23246,7 @@ static u32 rk_rga_hw_load(struct rk_rga_hw *hw)
 
 	spin_lock_irqsave(&hw->job_lock, flags);
 	load = hw->queued_jobs;
-	if (hw->active_job && load < U32_MAX)
+	if (rk_rga_hw_active_job_locked(hw) && load < U32_MAX)
 		load++;
 	spin_unlock_irqrestore(&hw->job_lock, flags);
 
@@ -23572,7 +23645,7 @@ static irqreturn_t rk_rga_irq_handler(int irq, void *data)
 		spin_unlock_irqrestore(&hw->job_lock, flags);
 		return IRQ_NONE;
 	}
-	job = hw->active_job;
+	job = rk_rga_hw_active_job_locked(hw);
 	if (job)
 		ret = rk_rga_hw_irq_status(hw, job);
 	else
@@ -23693,8 +23766,7 @@ static struct rk_rga_job *rk_rga_hw_take_active(struct rk_rga_hw *hw)
 	unsigned long flags;
 
 	spin_lock_irqsave(&hw->job_lock, flags);
-	job = hw->active_job;
-	hw->active_job = NULL;
+	job = rk_rga_hw_take_active_locked(hw);
 	spin_unlock_irqrestore(&hw->job_lock, flags);
 
 	return job;
@@ -23714,12 +23786,7 @@ static bool rk_rga_hw_restore_active_after_reset_failure(
 	bool restored = false;
 
 	spin_lock_irqsave(&hw->job_lock, flags);
-	if (!hw->active_job) {
-		hw->active_job = job;
-		if (iommu_fault)
-			hw->iommu_fault_generation = hw->active_generation;
-		restored = true;
-	}
+	restored = rk_rga_hw_restore_active_locked(hw, job, iommu_fault);
 	spin_unlock_irqrestore(&hw->job_lock, flags);
 
 	/*
@@ -23733,11 +23800,13 @@ static bool rk_rga_hw_restore_active_after_reset_failure(
 static bool rk_rga_hw_mark_iommu_fault(struct rk_rga_hw *hw)
 {
 	unsigned long flags;
+	u64 generation;
 	bool marked = false;
 
 	spin_lock_irqsave(&hw->job_lock, flags);
-	if (hw->active_job && hw->active_generation) {
-		hw->iommu_fault_generation = hw->active_generation;
+	generation = rk_rga_hw_active_generation_locked(hw);
+	if (rk_rga_hw_active_job_locked(hw) && generation) {
+		hw->iommu_fault_generation = generation;
 		marked = true;
 	}
 	spin_unlock_irqrestore(&hw->job_lock, flags);
@@ -23752,8 +23821,8 @@ static bool rk_rga_hw_iommu_fault_matches_locked(struct rk_rga_hw *hw)
 	generation = hw->iommu_fault_generation;
 	hw->iommu_fault_generation = 0;
 
-	return generation && hw->active_job &&
-	       generation == hw->active_generation;
+	return generation && rk_rga_hw_active_job_locked(hw) &&
+	       generation == rk_rga_hw_active_generation_locked(hw);
 }
 
 static void rk_rga_hw_recover_active(struct rk_rga_hw *hw, bool iommu_fault,
@@ -23770,7 +23839,7 @@ static void rk_rga_hw_recover_active(struct rk_rga_hw *hw, bool iommu_fault,
 	irq_disabled = rk_rga_hw_disable_irq(hw);
 	mutex_lock(&hw->run_lock);
 	spin_lock_irqsave(&hw->job_lock, flags);
-	job = hw->active_job;
+	job = rk_rga_hw_active_job_locked(hw);
 	if (iommu_fault)
 		recover = rk_rga_hw_iommu_fault_matches_locked(hw);
 	else
@@ -23781,7 +23850,8 @@ static void rk_rga_hw_recover_active(struct rk_rga_hw *hw, bool iommu_fault,
 		 * the completion IRQ would reset the job's *next* task.
 		 */
 		recover = job && job == timeout_job && timeout_generation &&
-			  timeout_generation == hw->active_generation &&
+			  timeout_generation ==
+				rk_rga_hw_active_generation_locked(hw) &&
 			  !job->irq_seen;
 	if (!recover) {
 		spin_unlock_irqrestore(&hw->job_lock, flags);
@@ -23795,7 +23865,7 @@ static void rk_rga_hw_recover_active(struct rk_rga_hw *hw, bool iommu_fault,
 	else
 		rk_rga2_read_irq_status(hw, job);
 
-	hw->active_job = NULL;
+	rk_rga_hw_take_active_locked(hw);
 	spin_unlock_irqrestore(&hw->job_lock, flags);
 	if (iommu_fault)
 		rk_rga_hw_cancel_timeout(hw);
@@ -24022,7 +24092,7 @@ static void rk_rga_hw_dispatch(struct rk_rga_hw *hw)
 
 		mutex_lock(&hw->run_lock);
 		spin_lock_irqsave(&hw->job_lock, flags);
-		if (hw->removing || hw->active_job ||
+		if (hw->removing || rk_rga_hw_active_job_locked(hw) ||
 		    list_empty(&hw->job_queue)) {
 			spin_unlock_irqrestore(&hw->job_lock, flags);
 			mutex_unlock(&hw->run_lock);
@@ -24036,11 +24106,7 @@ static void rk_rga_hw_dispatch(struct rk_rga_hw *hw)
 		hw->queued_jobs--;
 		recovery_failed = hw->recovery_failed;
 		if (!recovery_failed) {
-			hw->active_job = job;
-			hw->active_generation++;
-			if (!hw->active_generation)
-				hw->active_generation++;
-			hw->iommu_fault_generation = 0;
+			rk_rga_hw_install_active_locked(hw, job);
 		}
 		spin_unlock_irqrestore(&hw->job_lock, flags);
 		if (recovery_failed) {
@@ -24058,8 +24124,7 @@ static void rk_rga_hw_dispatch(struct rk_rga_hw *hw)
 		}
 
 		spin_lock_irqsave(&hw->job_lock, flags);
-		if (hw->active_job == job)
-			hw->active_job = NULL;
+		rk_rga_hw_take_active_if_locked(hw, job);
 		spin_unlock_irqrestore(&hw->job_lock, flags);
 
 		if (ret == -EIO && hw->type == RK_RGA_HW_RGA2 &&
@@ -24239,8 +24304,7 @@ static int rk_rga_hw_abort_jobs(struct rk_rga_hw *hw, int result)
 
 	mutex_lock(&hw->run_lock);
 	spin_lock_irqsave(&hw->job_lock, flags);
-	active = hw->active_job;
-	hw->active_job = NULL;
+	active = rk_rga_hw_take_active_locked(hw);
 	list_for_each_entry_safe(job, tmp, &hw->job_queue, node) {
 		list_del_init(&job->node);
 		job->queued = false;
@@ -24294,10 +24358,11 @@ static bool rk_rga_hw_abort_session_jobs(struct rk_rga_hw *hw,
 	irq_disabled = rk_rga_hw_disable_irq(hw);
 	mutex_lock(&hw->run_lock);
 	spin_lock_irqsave(&hw->job_lock, flags);
-	if (hw->active_job && hw->active_job->session == session) {
-		active = hw->active_job;
-		hw->active_job = NULL;
-	}
+	active = rk_rga_hw_active_job_locked(hw);
+	if (active && active->session == session)
+		active = rk_rga_hw_take_active_locked(hw);
+	else
+		active = NULL;
 
 	list_for_each_entry_safe(job, tmp, &hw->job_queue, node) {
 		if (job->session != session)
