@@ -3309,12 +3309,57 @@ static void rk_mpp_hw_power_off(struct rk_mpp_hw *hw);
 static void rk_mpp_job_get(struct rk_mpp_job *job);
 static void rk_mpp_job_put(struct rk_mpp_job *job);
 
+static u32 rk_mpp_rkvdec2_powered_ccu_core_count(const struct rk_mpp_job *job)
+{
+	return job->rkvdec_ccu_powered_core_count;
+}
+
+static struct rk_mpp_hw *
+rk_mpp_rkvdec2_powered_ccu_core(const struct rk_mpp_job *job, u32 index)
+{
+	if (WARN_ON_ONCE(index >= rk_mpp_rkvdec2_powered_ccu_core_count(job)))
+		return NULL;
+
+	return job->rkvdec_ccu_powered_cores[index];
+}
+
+static int rk_mpp_rkvdec2_acquire_ccu_power(struct rk_mpp_job *job,
+					    struct rk_mpp_hw *ccu,
+					    bool *acquired_now)
+{
+	int ret;
+
+	if (acquired_now)
+		*acquired_now = false;
+	if (job->rkvdec_ccu_powered)
+		return 0;
+
+	ret = rk_mpp_hw_power_on(ccu);
+	if (ret)
+		return ret;
+	job->rkvdec_ccu_powered = true;
+	if (acquired_now)
+		*acquired_now = true;
+
+	return 0;
+}
+
+static void rk_mpp_rkvdec2_release_ccu_power(struct rk_mpp_job *job,
+					     struct rk_mpp_hw *ccu)
+{
+	if (!job->rkvdec_ccu_powered)
+		return;
+	if (ccu)
+		rk_mpp_hw_power_off(ccu);
+	job->rkvdec_ccu_powered = false;
+}
+
 static void rk_mpp_rkvdec2_power_off_ccu_cores(struct rk_mpp_job *job)
 {
 	u32 i;
 
-	for (i = 0; i < job->rkvdec_ccu_powered_core_count; i++) {
-		struct rk_mpp_hw *hw = job->rkvdec_ccu_powered_cores[i];
+	for (i = 0; i < rk_mpp_rkvdec2_powered_ccu_core_count(job); i++) {
+		struct rk_mpp_hw *hw = rk_mpp_rkvdec2_powered_ccu_core(job, i);
 
 		rk_mpp_hw_power_off(hw);
 		rk_mpp_hw_put(hw);
@@ -3734,7 +3779,7 @@ static void rk_mpp_rkvdec2_transfer_powered_ccu_cores(struct rk_mpp_job *from,
 	struct rk_mpp_job *to;
 	unsigned long flags;
 
-	if (!ccu || !from->rkvdec_ccu_powered_core_count)
+	if (!ccu || !rk_mpp_rkvdec2_powered_ccu_core_count(from))
 		return;
 
 	spin_lock_irqsave(&ccu->lock, flags);
@@ -3814,8 +3859,7 @@ static void rk_mpp_rkvdec2_release_link_table(struct rk_mpp_job *job)
 		rk_mpp_rkvdec2_ccu_job_del(job, ccu);
 	}
 
-	if (job->rkvdec_ccu_powered && ccu)
-		rk_mpp_hw_power_off(ccu);
+	rk_mpp_rkvdec2_release_ccu_power(job, ccu);
 	rk_mpp_rkvdec2_power_off_ccu_cores(job);
 
 	/*
@@ -3844,7 +3888,6 @@ static void rk_mpp_rkvdec2_release_link_table(struct rk_mpp_job *job)
 	job->rkvdec_ccu_work = 0;
 	job->rkvdec_ccu_cfg_done = 0;
 	job->rkvdec_ccu_desc_valid = false;
-	job->rkvdec_ccu_powered = false;
 	job->rkvdec_ccu_started = false;
 
 	rk_mpp_hw_put(ccu);
@@ -6372,6 +6415,7 @@ static void rk_mpp_rkvdec2_ccu_power_transfer_kunit(struct kunit *test)
 	struct rk_mpp_hw *core2;
 	struct rk_mpp_job *from;
 	struct rk_mpp_job *to;
+	bool acquired_now = true;
 
 	ccu = kunit_kzalloc(test, sizeof(*ccu), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, ccu);
@@ -6385,6 +6429,24 @@ static void rk_mpp_rkvdec2_ccu_power_transfer_kunit(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, from);
 	to = kunit_kzalloc(test, sizeof(*to), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, to);
+	refcount_set(&core0->refs, 2);
+	refcount_set(&core1->refs, 3);
+	refcount_set(&core2->refs, 4);
+	atomic_set(&core0->power_count, 1);
+	atomic_set(&core1->power_count, 2);
+	atomic_set(&core2->power_count, 3);
+
+	from->rkvdec_ccu_powered = true;
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_rkvdec2_acquire_ccu_power(from, NULL,
+							 &acquired_now),
+			0);
+	KUNIT_EXPECT_FALSE(test, acquired_now);
+	KUNIT_EXPECT_TRUE(test, from->rkvdec_ccu_powered);
+	rk_mpp_rkvdec2_release_ccu_power(from, NULL);
+	KUNIT_EXPECT_FALSE(test, from->rkvdec_ccu_powered);
+	rk_mpp_rkvdec2_release_ccu_power(from, NULL);
+	KUNIT_EXPECT_FALSE(test, from->rkvdec_ccu_powered);
 
 	spin_lock_init(&ccu->lock);
 	INIT_LIST_HEAD(&ccu->rkvdec_ccu_jobs);
@@ -6396,22 +6458,28 @@ static void rk_mpp_rkvdec2_ccu_power_transfer_kunit(struct kunit *test)
 
 	rk_mpp_rkvdec2_transfer_powered_ccu_cores(from, ccu);
 
-	KUNIT_EXPECT_EQ(test, from->rkvdec_ccu_powered_core_count, 0U);
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_powered_ccu_core_count(from), 0U);
 	KUNIT_EXPECT_PTR_EQ(test, from->rkvdec_ccu_powered_cores[0], NULL);
 	KUNIT_EXPECT_PTR_EQ(test, from->rkvdec_ccu_powered_cores[1], NULL);
-	KUNIT_EXPECT_EQ(test, to->rkvdec_ccu_powered_core_count, 2U);
-	KUNIT_EXPECT_PTR_EQ(test, to->rkvdec_ccu_powered_cores[0], core0);
-	KUNIT_EXPECT_PTR_EQ(test, to->rkvdec_ccu_powered_cores[1], core1);
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_powered_ccu_core_count(to), 2U);
+	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_rkvdec2_powered_ccu_core(to, 0), core0);
+	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_rkvdec2_powered_ccu_core(to, 1), core1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&core0->refs), 2U);
+	KUNIT_EXPECT_EQ(test, refcount_read(&core1->refs), 3U);
+	KUNIT_EXPECT_EQ(test, atomic_read(&core0->power_count), 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&core1->power_count), 2);
 
 	from->rkvdec_ccu_powered_cores[0] = core2;
 	from->rkvdec_ccu_powered_core_count = 1;
 	rk_mpp_rkvdec2_transfer_powered_ccu_cores(from, ccu);
 
-	KUNIT_EXPECT_EQ(test, from->rkvdec_ccu_powered_core_count, 1U);
-	KUNIT_EXPECT_PTR_EQ(test, from->rkvdec_ccu_powered_cores[0], core2);
-	KUNIT_EXPECT_EQ(test, to->rkvdec_ccu_powered_core_count, 2U);
-	KUNIT_EXPECT_PTR_EQ(test, to->rkvdec_ccu_powered_cores[0], core0);
-	KUNIT_EXPECT_PTR_EQ(test, to->rkvdec_ccu_powered_cores[1], core1);
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_powered_ccu_core_count(from), 1U);
+	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_rkvdec2_powered_ccu_core(from, 0), core2);
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_powered_ccu_core_count(to), 2U);
+	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_rkvdec2_powered_ccu_core(to, 0), core0);
+	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_rkvdec2_powered_ccu_core(to, 1), core1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&core2->refs), 4U);
+	KUNIT_EXPECT_EQ(test, atomic_read(&core2->power_count), 3);
 }
 
 static void rk_mpp_rkvdec2_release_power_transfer_kunit(struct kunit *test)
@@ -6455,11 +6523,12 @@ static void rk_mpp_rkvdec2_release_power_transfer_kunit(struct kunit *test)
 
 	KUNIT_EXPECT_PTR_EQ(test, from->rkvdec_ccu, NULL);
 	KUNIT_EXPECT_FALSE(test, from->rkvdec_ccu_started);
-	KUNIT_EXPECT_EQ(test, from->rkvdec_ccu_powered_core_count, 0U);
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_powered_ccu_core_count(from), 0U);
 	KUNIT_EXPECT_FALSE(test, from->rkvdec_ccu_listed);
-	KUNIT_EXPECT_EQ(test, to->rkvdec_ccu_powered_core_count, 2U);
-	KUNIT_EXPECT_PTR_EQ(test, to->rkvdec_ccu_powered_cores[0], from->hw);
-	KUNIT_EXPECT_PTR_EQ(test, to->rkvdec_ccu_powered_cores[1], core1);
+	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_powered_ccu_core_count(to), 2U);
+	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_rkvdec2_powered_ccu_core(to, 0),
+			    from->hw);
+	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_rkvdec2_powered_ccu_core(to, 1), core1);
 	KUNIT_EXPECT_TRUE(test, completion_done(&ccu->released));
 }
 
@@ -12157,12 +12226,9 @@ static int rk_mpp_rkvdec2_acquire_soft_ccu(struct rk_mpp_job *job)
 	if (!rk_mpp_rkvdec2_soft_ccu_regs_ready(ccu))
 		return -EOPNOTSUPP;
 
-	if (!job->rkvdec_ccu_powered) {
-		ret = rk_mpp_hw_power_on(ccu);
-		if (ret)
-			return ret;
-		job->rkvdec_ccu_powered = true;
-	}
+	ret = rk_mpp_rkvdec2_acquire_ccu_power(job, ccu, NULL);
+	if (ret)
+		return ret;
 	if (!rk_mpp_hw_usable(ccu))
 		return -ENODEV;
 
@@ -12179,7 +12245,7 @@ static int rk_mpp_rkvdec2_acquire_soft_ccu(struct rk_mpp_job *job)
 	 * job-owned and released with the job's coordinator reference in the
 	 * common CCU-release path.
 	 */
-	if (!job->rkvdec_ccu_powered_core_count) {
+	if (!rk_mpp_rkvdec2_powered_ccu_core_count(job)) {
 		u32 ccu_cores = 0;
 
 		ret = rk_mpp_rkvdec2_ccu_core_mask(job->session->srv, ccu,
@@ -13292,13 +13358,9 @@ static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
 
 	lockdep_assert_held(&ccu->ccu_recovery_lock);
 
-	if (!job->rkvdec_ccu_powered) {
-		ret = rk_mpp_hw_power_on(ccu);
-		if (ret)
-			return ret;
-		job->rkvdec_ccu_powered = true;
-		ccu_powered_now = true;
-	}
+	ret = rk_mpp_rkvdec2_acquire_ccu_power(job, ccu, &ccu_powered_now);
+	if (ret)
+		return ret;
 
 	if (!rk_mpp_hw_usable(ccu) || !rk_mpp_hw_usable(hw) ||
 	    READ_ONCE(job->canceled)) {
@@ -13321,7 +13383,7 @@ static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
 	}
 
 	if (!add_mode) {
-		if (!job->rkvdec_ccu_powered_core_count) {
+		if (!rk_mpp_rkvdec2_powered_ccu_core_count(job)) {
 			ret = rk_mpp_rkvdec2_power_on_ccu_cores(job,
 					job->rkvdec_ccu_core_work);
 			if (ret)
@@ -13333,9 +13395,9 @@ static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
 		if (ret)
 			goto err_unlock_ccu;
 		rk_mpp_rkvdec2_prepare_core_for_ccu(hw);
-		for (i = 0; i < job->rkvdec_ccu_powered_core_count; i++) {
+		for (i = 0; i < rk_mpp_rkvdec2_powered_ccu_core_count(job); i++) {
 			struct rk_mpp_hw *core =
-				job->rkvdec_ccu_powered_cores[i];
+				rk_mpp_rkvdec2_powered_ccu_core(job, i);
 
 			if (core == hw)
 				continue;
@@ -13380,10 +13442,8 @@ err_unlock_ccu:
 err_power_off:
 	if (cores_powered_now)
 		rk_mpp_rkvdec2_power_off_ccu_cores(job);
-	if (ccu_powered_now) {
-		rk_mpp_hw_power_off(ccu);
-		job->rkvdec_ccu_powered = false;
-	}
+	if (ccu_powered_now)
+		rk_mpp_rkvdec2_release_ccu_power(job, ccu);
 	return ret;
 }
 
@@ -14014,10 +14074,10 @@ rk_mpp_rkvdec2_collect_stop_cores(
 		*core_work |= job->rkvdec_ccu_core_work;
 		complete &= rk_mpp_rkvdec2_add_stop_core(cores, count,
 							 job->hw);
-		for (i = 0; i < job->rkvdec_ccu_powered_core_count; i++)
+		for (i = 0; i < rk_mpp_rkvdec2_powered_ccu_core_count(job); i++)
 			complete &= rk_mpp_rkvdec2_add_stop_core(
 				cores, count,
-				job->rkvdec_ccu_powered_cores[i]);
+				rk_mpp_rkvdec2_powered_ccu_core(job, i));
 	}
 	spin_unlock_irqrestore(&ccu->lock, flags);
 
