@@ -536,7 +536,7 @@ static u64 rk_mpp_hw_advance_active_generation_locked(struct rk_mpp_hw *hw)
 }
 
 static u64 rk_mpp_hw_install_active_locked(struct rk_mpp_hw *hw,
-					    struct rk_mpp_job *job)
+					   struct rk_mpp_job *job)
 {
 	lockdep_assert_held(&hw->lock);
 
@@ -559,7 +559,7 @@ static struct rk_mpp_job *rk_mpp_hw_take_active_locked(struct rk_mpp_hw *hw)
 }
 
 static bool rk_mpp_hw_restore_active_locked(struct rk_mpp_hw *hw,
-					     struct rk_mpp_job *job)
+					    struct rk_mpp_job *job)
 {
 	lockdep_assert_held(&hw->lock);
 
