@@ -926,8 +926,8 @@ rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(struct rk_mpp_hw *ccu);
 static u32 rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu);
 static void rk_mpp_rkvdec2_wait_bus_idle(struct rk_mpp_hw *hw);
 static int rk_mpp_rkvdec2_reset_soft_ccu_job(struct rk_mpp_job *job);
-static int rk_mpp_rkvdec2_start_soft_ccu_job(struct rk_mpp_job *job,
-					     u32 start_value);
+static int rk_mpp_rkvdec2_publish_and_start_core(struct rk_mpp_job *job,
+						 u32 start_value);
 static int rk_mpp_hw_abort_ccu_dependents(struct rk_mpp_hw *ccu);
 static void
 rk_mpp_hw_abort_ccu_active_dependents(struct rk_mpp_hw *ccu,
@@ -3915,7 +3915,8 @@ static int rk_mpp_rkvdec2_fill_ccu_descriptor(struct rk_mpp_job *job,
 }
 
 static void
-rk_mpp_rkvdec2_commit_ccu_descriptor(struct rk_mpp_job *job, void __iomem *regs)
+rk_mpp_rkvdec2_publish_ccu_doorbell(struct rk_mpp_job *job,
+					    void __iomem *regs)
 {
 	/* Fault routing must see the software owner before hardware can fault. */
 	WRITE_ONCE(job->rkvdec_ccu_started, true);
@@ -3923,6 +3924,17 @@ rk_mpp_rkvdec2_commit_ccu_descriptor(struct rk_mpp_job *job, void __iomem *regs)
 	wmb();
 	writel(job->rkvdec_ccu_cfg_done,
 	       regs + RK_MPP_RKVDEC_CCU_CFG_DONE_BASE);
+}
+
+static void
+rk_mpp_rkvdec2_publish_and_start_ccu(struct rk_mpp_job *job,
+					     void __iomem *regs)
+{
+	lockdep_assert_held(&job->rkvdec_ccu->run_lock);
+
+	rk_mpp_rkvdec2_ccu_job_add(job);
+	rk_mpp_hw_schedule_timeout(job->hw);
+	rk_mpp_rkvdec2_publish_ccu_doorbell(job, regs);
 }
 
 static int rk_mpp_rkvdec2_prepare_ccu_descriptor(struct rk_mpp_job *job)
@@ -4064,8 +4076,9 @@ rk_mpp_av1_afbc_required_span(u32 width, u32 height, u32 bits_per_pixel,
 static bool
 rk_mpp_av1_afbc_ack_locked(struct rk_mpp_hw *hw,
 			   bool *generation_observed);
-static int rk_mpp_av1_start(struct rk_mpp_hw *hw, u64 generation,
-			    bool afbc_enabled, u32 start_value);
+static int rk_mpp_av1_publish_and_start(struct rk_mpp_hw *hw,
+					 u64 generation, bool afbc_enabled,
+					 u32 start_value);
 static int rk_mpp_job_select_hw(struct rk_mpp_job *job);
 static void rk_mpp_kunit_device_release(struct device *dev);
 
@@ -5185,7 +5198,9 @@ static void rk_mpp_av1_afbc_status_observation_kunit(struct kunit *test)
 	hw.av1_afbc_status_generation = 0;
 	hw.av1_start_ns = 0;
 	writel(0, afbc + RK_MPP_AV1_AFBC_ACKNOWLEDGE);
-	KUNIT_ASSERT_EQ(test, rk_mpp_av1_start(&hw, 6, true, 0x1234), 0);
+	KUNIT_ASSERT_EQ(test,
+			rk_mpp_av1_publish_and_start(&hw, 6, true, 0x1234),
+			0);
 	KUNIT_EXPECT_EQ(test, hw.av1_afbc_armed_generation, 6ULL);
 	KUNIT_EXPECT_EQ(test, readl(vcd + RK_MPP_AV1_IRQ_BASE), 0x1234U);
 
@@ -5194,7 +5209,7 @@ static void rk_mpp_av1_afbc_status_observation_kunit(struct kunit *test)
 	hw.av1_start_ns = 0;
 	writel(0, vcd + RK_MPP_AV1_IRQ_BASE);
 	writel(BIT(0), afbc + RK_MPP_AV1_AFBC_ACKNOWLEDGE);
-	KUNIT_EXPECT_EQ(test, rk_mpp_av1_start(&hw, 7, true, 0x5678),
+	KUNIT_EXPECT_EQ(test, rk_mpp_av1_publish_and_start(&hw, 7, true, 0x5678),
 			-ETIMEDOUT);
 	KUNIT_EXPECT_EQ(test, readl(vcd + RK_MPP_AV1_IRQ_BASE), 0U);
 	KUNIT_EXPECT_EQ(test,
@@ -5792,7 +5807,7 @@ static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
 	spin_lock_init(&hw->lock);
 	raw_spin_lock_init(&hw->regs_lock);
 	KUNIT_EXPECT_EQ(test,
-			rk_mpp_rkvdec2_start_soft_ccu_job(job, 0x100), 0);
+			rk_mpp_rkvdec2_publish_and_start_core(job, 0x100), 0);
 	KUNIT_EXPECT_EQ(test,
 			ccu_regs[RK_MPP_RKVDEC_CCU_CORE_STA_BASE / sizeof(*ccu_regs)],
 			hw->core_mask);
@@ -6616,7 +6631,8 @@ static void rk_mpp_rkvdec2_ccu_descriptor_kunit(struct kunit *test)
 			(u32)(RK_MPP_RKVDEC_CCU_ADD_MODE |
 			      RK_MPP_RKVDEC_LINK_ADD_CFG_NUM));
 	KUNIT_EXPECT_FALSE(test, READ_ONCE(job->rkvdec_ccu_started));
-	rk_mpp_rkvdec2_commit_ccu_descriptor(job, (void __iomem *)ccu_regs);
+	rk_mpp_rkvdec2_publish_ccu_doorbell(job,
+					      (void __iomem *)ccu_regs);
 	KUNIT_EXPECT_TRUE(test, READ_ONCE(job->rkvdec_ccu_started));
 	KUNIT_EXPECT_EQ(test,
 			ccu_regs[RK_MPP_RKVDEC_CCU_CFG_DONE_BASE /
@@ -12085,8 +12101,8 @@ static int rk_mpp_rkvdec2_program_soft_ccu(struct rk_mpp_job *job)
  * task-register window, 2026-07-30). The caller holds ccu->run_lock from
  * before rk_mpp_rkvdec2_program_soft_ccu() until this helper returns.
  */
-static int rk_mpp_rkvdec2_start_soft_ccu_job(struct rk_mpp_job *job,
-					     u32 start_value)
+static int rk_mpp_rkvdec2_publish_and_start_core(struct rk_mpp_job *job,
+						 u32 start_value)
 {
 	struct rk_mpp_hw *hw = job->hw;
 	struct rk_mpp_hw *ccu = job->rkvdec_ccu;
@@ -12094,6 +12110,7 @@ static int rk_mpp_rkvdec2_start_soft_ccu_job(struct rk_mpp_job *job,
 	if (!ccu) {
 		rk_mpp_hw_assert_powered(hw);
 		rk_mpp_hw_schedule_timeout(hw);
+		/* Publish the register image and watchdog generation before START. */
 		wmb();
 		writel(start_value | RK_MPP_RKVDEC_START_EN,
 		       hw->regs[0] + RK_MPP_RKVDEC_START_BASE);
@@ -12113,6 +12130,7 @@ static int rk_mpp_rkvdec2_start_soft_ccu_job(struct rk_mpp_job *job,
 	writel_relaxed(hw->core_mask,
 		       ccu->regs[0] + RK_MPP_RKVDEC_CCU_CORE_STA_BASE);
 	rk_mpp_hw_schedule_timeout(hw);
+	/* Publish the register image and watchdog generation before START. */
 	wmb();
 	writel(start_value | RK_MPP_RKVDEC_START_EN,
 	       hw->regs[0] + RK_MPP_RKVDEC_START_BASE);
@@ -13351,9 +13369,7 @@ static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
 	if (hw->iommu_domain && hw->iommu_domain->ops)
 		iommu_flush_iotlb_all(hw->iommu_domain);
 
-	rk_mpp_rkvdec2_ccu_job_add(job);
-	rk_mpp_hw_schedule_timeout(hw);
-	rk_mpp_rkvdec2_commit_ccu_descriptor(job, ccu_regs);
+	rk_mpp_rkvdec2_publish_and_start_ccu(job, ccu_regs);
 	rk_mpp_count_started_core(job);
 	mutex_unlock(&ccu->run_lock);
 
@@ -14870,6 +14886,18 @@ static int rk_mpp_rkvenc2_validate(struct rk_mpp_job *job)
 	return rk_mpp_job_validate_write_regs(job, RK_MPP_RKVENC_START_BASE);
 }
 
+static void rk_mpp_rkvenc2_publish_and_start(struct rk_mpp_job *job,
+					      u32 start_value)
+{
+	struct rk_mpp_hw *hw = job->hw;
+
+	lockdep_assert_held(&hw->run_lock);
+	rk_mpp_hw_schedule_timeout(hw);
+	/* Publish the register image and watchdog generation before START. */
+	wmb();
+	writel(start_value, hw->regs[0] + RK_MPP_RKVENC_START_BASE);
+}
+
 static int rk_mpp_rkvenc2_submit(struct rk_mpp_job *job)
 {
 	struct rk_mpp_hw *hw = job->hw;
@@ -14963,9 +14991,7 @@ static int rk_mpp_rkvenc2_submit(struct rk_mpp_job *job)
 		goto err_power_off;
 	}
 
-	rk_mpp_hw_schedule_timeout(hw);
-	wmb();
-	writel(start_value, hw->regs[0] + RK_MPP_RKVENC_START_BASE);
+	rk_mpp_rkvenc2_publish_and_start(job, start_value);
 	rk_mpp_count_started_core(job);
 	rk_mpp_rkvenc2_dchs_lifecycle_unlock(job, dchs_lifecycle_locked);
 	mutex_unlock(&hw->run_lock);
@@ -15393,7 +15419,7 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 		goto err_deregister_soft_ccu;
 	}
 
-	ret = rk_mpp_rkvdec2_start_soft_ccu_job(job, start_value);
+	ret = rk_mpp_rkvdec2_publish_and_start_core(job, start_value);
 	if (ret)
 		goto err_deregister_soft_ccu;
 	if (soft_ccu)
@@ -16009,8 +16035,8 @@ static void rk_mpp_av1_disarm_afbc(struct rk_mpp_hw *hw)
 	raw_spin_unlock_irqrestore(&hw->aux_lock, flags);
 }
 
-static int rk_mpp_av1_start(struct rk_mpp_hw *hw, u64 generation,
-			    bool afbc_enabled, u32 start_value)
+static int rk_mpp_av1_publish_and_start(struct rk_mpp_hw *hw, u64 generation,
+					 bool afbc_enabled, u32 start_value)
 {
 	void __iomem *afbc = hw->regs[2];
 	unsigned long flags;
@@ -16190,8 +16216,8 @@ static int rk_mpp_av1_submit(struct rk_mpp_job *job)
 	}
 
 	rk_mpp_hw_schedule_timeout(hw);
-	ret = rk_mpp_av1_start(hw, generation, config.enabled,
-			       start_value);
+	ret = rk_mpp_av1_publish_and_start(hw, generation, config.enabled,
+					   start_value);
 	if (iommu_reserved) {
 		vsi_iommu_release_dma(hw->dev);
 		iommu_reserved = false;
