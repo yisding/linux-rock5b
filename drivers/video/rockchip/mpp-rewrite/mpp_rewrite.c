@@ -11623,6 +11623,24 @@ rk_mpp_batch_get_job(struct rk_mpp_batch_state *batch,
 	return job;
 }
 
+static void rk_mpp_job_publish_outcome_locked(struct rk_mpp_job *job,
+					      int result)
+{
+	lockdep_assert_held(&job->session->lock);
+
+	job->result = result;
+	job->state = RK_MPP_JOB_DONE;
+}
+
+static void rk_mpp_job_publish_outcome(struct rk_mpp_job *job, int result)
+{
+	struct rk_mpp_session *session = job->session;
+
+	mutex_lock(&session->lock);
+	rk_mpp_job_publish_outcome_locked(job, result);
+	mutex_unlock(&session->lock);
+}
+
 static void rk_mpp_job_complete(struct rk_mpp_job *job, int result)
 {
 	struct rk_mpp_session *session = job->session;
@@ -11631,10 +11649,7 @@ static void rk_mpp_job_complete(struct rk_mpp_job *job, int result)
 	rk_mpp_job_note_hw_done(job);
 	hw_elapsed_ns = job->hw_elapsed_ns;
 	rk_mpp_job_record_hw_stats(job);
-	mutex_lock(&session->lock);
-	job->result = result;
-	job->state = RK_MPP_JOB_DONE;
-	mutex_unlock(&session->lock);
+	rk_mpp_job_publish_outcome(job, result);
 	atomic_inc(&session->srv->completed_job_count);
 	if (result)
 		atomic_inc(&session->srv->failed_job_count);
@@ -16524,8 +16539,7 @@ static void rk_mpp_session_abort_jobs(struct rk_mpp_session *session)
 	list_for_each_entry_safe(job, tmp, &session->active_jobs, session_link) {
 		WRITE_ONCE(job->canceled, true);
 		list_move_tail(&job->session_link, &aborted);
-		job->result = -ECANCELED;
-		job->state = RK_MPP_JOB_DONE;
+		rk_mpp_job_publish_outcome_locked(job, -ECANCELED);
 	}
 	session->active_job_count = 0;
 	mutex_unlock(&session->lock);
