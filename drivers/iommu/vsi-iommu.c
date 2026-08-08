@@ -242,13 +242,17 @@ static irqreturn_t vsi_iommu_irq(int irq, void *dev_id)
 	spin_lock_irqsave(&iommu->lock, flags);
 
 	status = readl(iommu->regs + VSI_MMU_STATUS_BASE);
-	if (status & VSI_MMU_IRQ_MASK) {
-		dev_err(iommu->dev, "unexpected int_status=%08x\n", status);
-		iova = readl(iommu->regs + VSI_MMU_PAGE_FAULT_ADDR);
-		domain = iommu->domain;
-		fault = true;
-		vsi_iommu_mask_irq_locked(iommu);
+	if (!(status & VSI_MMU_IRQ_MASK)) {
+		spin_unlock_irqrestore(&iommu->lock, flags);
+		pm_runtime_put_autosuspend(iommu->dev);
+		return IRQ_NONE;
 	}
+
+	dev_err(iommu->dev, "unexpected int_status=%08x\n", status);
+	iova = readl(iommu->regs + VSI_MMU_PAGE_FAULT_ADDR);
+	domain = iommu->domain;
+	fault = true;
+	vsi_iommu_mask_irq_locked(iommu);
 	writel(0, iommu->regs + VSI_MMU_STATUS_BASE);
 
 	spin_unlock_irqrestore(&iommu->lock, flags);
@@ -768,8 +772,11 @@ static struct iommu_device *vsi_iommu_probe_device(struct device *dev)
 
 	link = device_link_add(dev, provider_dev,
 			       DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME);
-	if (!link)
+	if (!link) {
 		dev_err(dev, "Unable to link %s\n", dev_name(provider_dev));
+		put_device(provider_dev);
+		return ERR_PTR(-ENOMEM);
+	}
 	put_device(provider_dev);
 
 	/*
@@ -880,6 +887,104 @@ void vsi_iommu_mask_irq(struct device *dev)
 	spin_unlock_irqrestore(&iommu->lock, flags);
 }
 EXPORT_SYMBOL_GPL(vsi_iommu_mask_irq);
+
+void vsi_iommu_unmask_irq(struct device *dev)
+{
+	struct vsi_iommu *iommu = vsi_iommu_from_dev_checked(dev);
+	unsigned long flags;
+	u32 status;
+	int ret;
+
+	if (!iommu)
+		return;
+
+	ret = pm_runtime_get_if_active(iommu->dev);
+	if (ret <= 0)
+		return;
+
+	spin_lock_irqsave(&iommu->lock, flags);
+	if (iommu->enable) {
+		/* Discard only a stale VSI fault before accepting a new one. */
+		status = readl(iommu->regs + VSI_MMU_STATUS_BASE);
+		if (status & VSI_MMU_IRQ_MASK)
+			writel(0, iommu->regs + VSI_MMU_STATUS_BASE);
+		writel(VSI_MMU_BIT_ENABLE,
+		       iommu->regs + VSI_MMU_AHB_EXCEPTION_BASE);
+	}
+	spin_unlock_irqrestore(&iommu->lock, flags);
+
+	pm_runtime_put_autosuspend(iommu->dev);
+}
+EXPORT_SYMBOL_GPL(vsi_iommu_unmask_irq);
+
+int vsi_iommu_prepare_irq(struct device *dev)
+{
+	struct vsi_iommu *iommu = vsi_iommu_from_dev_checked(dev);
+	unsigned long flags;
+	u32 status;
+	int ret;
+
+	if (!iommu)
+		return -ENODEV;
+
+	might_sleep();
+	ret = pm_runtime_get_if_active(iommu->dev);
+	if (ret <= 0)
+		return ret < 0 ? ret : -EAGAIN;
+
+	spin_lock_irqsave(&iommu->lock, flags);
+	vsi_iommu_mask_irq_locked(iommu);
+	spin_unlock_irqrestore(&iommu->lock, flags);
+	pm_runtime_put_autosuspend(iommu->dev);
+
+	ret = vsi_iommu_sync_fault_handler(dev);
+	if (ret)
+		return ret;
+
+	ret = pm_runtime_get_if_active(iommu->dev);
+	if (ret <= 0)
+		return ret < 0 ? ret : -EAGAIN;
+
+	/* Before START, any pending status belongs to an earlier task. */
+	spin_lock_irqsave(&iommu->lock, flags);
+	vsi_iommu_mask_irq_locked(iommu);
+	status = readl(iommu->regs + VSI_MMU_STATUS_BASE);
+	if (status & VSI_MMU_IRQ_MASK)
+		writel(0, iommu->regs + VSI_MMU_STATUS_BASE);
+	spin_unlock_irqrestore(&iommu->lock, flags);
+
+	pm_runtime_put_autosuspend(iommu->dev);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(vsi_iommu_prepare_irq);
+
+int vsi_iommu_enable_irq_delivery(struct device *dev)
+{
+	struct vsi_iommu *iommu = vsi_iommu_from_dev_checked(dev);
+	unsigned long flags;
+	int ret;
+
+	if (!iommu)
+		return -ENODEV;
+
+	ret = pm_runtime_get_if_active(iommu->dev);
+	if (ret <= 0)
+		return ret < 0 ? ret : -EAGAIN;
+
+	spin_lock_irqsave(&iommu->lock, flags);
+	if (iommu->enable)
+		writel(VSI_MMU_BIT_ENABLE,
+		       iommu->regs + VSI_MMU_AHB_EXCEPTION_BASE);
+	else
+		ret = -EIO;
+	spin_unlock_irqrestore(&iommu->lock, flags);
+
+	pm_runtime_put_autosuspend(iommu->dev);
+
+	return ret < 0 ? ret : 0;
+}
+EXPORT_SYMBOL_GPL(vsi_iommu_enable_irq_delivery);
 
 int vsi_iommu_set_fault_handler(struct device *dev,
 					iommu_fault_handler_t handler, void *token)

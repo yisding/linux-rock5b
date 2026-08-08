@@ -347,6 +347,10 @@ struct mpp_session {
 	struct mpp_service *srv;
 	struct mpp_dev *mpp;
 	struct mpp_dma_session *dma;
+	/* serialize mutable session state and task construction */
+	struct mutex state_lock;
+	/* serialize consumption of the head pending result */
+	struct mutex result_lock;
 
 	/* lock for session task pending list */
 	struct mutex pending_lock;

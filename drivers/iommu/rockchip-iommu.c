@@ -1232,6 +1232,10 @@ static struct iommu_device *rk_iommu_probe_device(struct device *dev)
 
 	data->link = device_link_add(dev, iommu->dev,
 				     DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME);
+	if (!data->link) {
+		dev_err(dev, "Unable to link %s\n", dev_name(iommu->dev));
+		return ERR_PTR(-ENOMEM);
+	}
 
 	/*
 	 * RGA and other Rockchip multimedia clients can depend on dma_map_sg()
@@ -1446,6 +1450,81 @@ void rockchip_iommu_unmask_irq(struct device *dev)
 	pm_runtime_put(iommu->dev);
 }
 EXPORT_SYMBOL_GPL(rockchip_iommu_unmask_irq);
+
+int rockchip_iommu_prepare_irq(struct device *dev)
+{
+	struct rk_iommu *iommu = rk_iommu_from_dev_checked(dev);
+	int i;
+	int ret;
+
+	if (!iommu)
+		return -ENODEV;
+
+	might_sleep();
+	ret = rk_iommu_runtime_get_if_active(iommu);
+	if (ret)
+		return ret;
+
+	/* Stop new delivery before waiting out a provider IRQ already in flight. */
+	for (i = 0; i < iommu->num_mmu; i++)
+		rk_iommu_write(iommu->bases[i], RK_MMU_INT_MASK, 0);
+	pm_runtime_put(iommu->dev);
+
+	ret = rockchip_iommu_sync_fault_handler(dev);
+	if (ret)
+		return ret;
+
+	ret = rk_iommu_runtime_get_if_active(iommu);
+	if (ret)
+		return ret;
+
+	/*
+	 * Hardware has not been started for the new task, so RAWSTAT can only
+	 * describe stale work.  Acknowledge it while delivery remains masked.
+	 */
+	for (i = 0; i < iommu->num_mmu; i++) {
+		u32 status = rk_iommu_read(iommu->bases[i], RK_MMU_INT_RAWSTAT);
+
+		status &= RK_MMU_IRQ_MASK;
+		if (status & RK_MMU_IRQ_PAGE_FAULT) {
+			rk_iommu_base_command(iommu->bases[i],
+					      RK_MMU_CMD_ZAP_CACHE);
+			rk_iommu_base_command(iommu->bases[i],
+					      RK_MMU_CMD_PAGE_FAULT_DONE);
+		}
+		if (status)
+			rk_iommu_write(iommu->bases[i], RK_MMU_INT_CLEAR, status);
+		rk_iommu_write(iommu->bases[i], RK_MMU_INT_MASK, 0);
+	}
+
+	pm_runtime_put(iommu->dev);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(rockchip_iommu_prepare_irq);
+
+int rockchip_iommu_enable_irq_delivery(struct device *dev)
+{
+	struct rk_iommu *iommu = rk_iommu_from_dev_checked(dev);
+	int i;
+	int ret;
+
+	if (!iommu)
+		return -ENODEV;
+
+	ret = rk_iommu_runtime_get_if_active(iommu);
+	if (ret)
+		return ret;
+
+	/* Preserve any task fault latched while delivery was masked. */
+	for (i = 0; i < iommu->num_mmu; i++)
+		rk_iommu_write(iommu->bases[i], RK_MMU_INT_MASK, RK_MMU_IRQ_MASK);
+
+	pm_runtime_put(iommu->dev);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(rockchip_iommu_enable_irq_delivery);
 
 int rockchip_pagefault_done(struct device *dev)
 {
