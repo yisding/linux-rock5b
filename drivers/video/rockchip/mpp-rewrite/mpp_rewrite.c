@@ -89,6 +89,7 @@
 #define RK_MPP_RKVENC_MAX_DCHS_ID	4
 #define RK_MPP_CORE_COUNTER_COUNT	4
 #define RK_MPP_RKVDEC_MAX_CCU_CORES	4
+#define RK_MPP_CLUSTER_MAX_DMA_GROUPS	(RK_MPP_RKVDEC_MAX_CCU_CORES + 1)
 #define RK_MPP_MAX_RESET_DOMAINS	4
 #define RK_MPP_MAX_CLUSTERS		4
 #define RK_MPP_RKVDEC_PERF_SEL_NUM	64
@@ -431,6 +432,12 @@ struct rk_mpp_cluster_reset_result {
 	bool ccu_reset_asserted;
 };
 
+struct rk_mpp_cluster_dma_set {
+	struct rk_mpp_dma_group *groups[RK_MPP_CLUSTER_MAX_DMA_GROUPS];
+	struct rk_mpp_hw *owners[RK_MPP_CLUSTER_MAX_DMA_GROUPS];
+	u32 count;
+};
+
 /*
  * One reset/translation outcome. A zero function return means hardware is
  * quiesced enough for the caller to retire its current job; only reusable
@@ -443,6 +450,9 @@ struct rk_mpp_cluster_recovery_result {
 	int reset_error;
 	int refresh_error;
 	int isolation_error;
+	u32 dma_group_count;
+	u32 dma_group_refresh_count;
+	u32 dma_group_isolation_count;
 	bool quiesced;
 	bool reusable;
 };
@@ -1058,11 +1068,25 @@ rk_mpp_reset_domain_register_member(struct rk_mpp_reset_domain *domain,
 static int rk_mpp_reset_domain_unregister_member(struct rk_mpp_hw *hw);
 static bool rk_mpp_hw_terminal_drain_power(struct rk_mpp_hw *hw);
 static int rk_mpp_hw_terminal_isolate(struct rk_mpp_hw *hw);
+static void
+rk_mpp_recovery_result_init(struct rk_mpp_cluster_recovery_result *result);
+static int
+rk_mpp_cluster_collect_dma(const struct rk_mpp_cluster_reset_request *request,
+			   struct rk_mpp_cluster_dma_set *set);
+static int
+rk_mpp_cluster_refresh_dma(const struct rk_mpp_cluster_reset_request *request,
+			   const struct rk_mpp_cluster_dma_set *set,
+			   struct rk_mpp_cluster_recovery_result *result,
+			   struct rk_mpp_hw **failed_hw);
+static u32
+rk_mpp_cluster_isolated_dma_count(const struct rk_mpp_cluster_dma_set *set);
 static int
 rk_mpp_hw_stop_and_recover(struct rk_mpp_hw *hw, struct rk_mpp_job *job,
 			   struct rk_mpp_cluster_recovery_result *result);
 static u32 rk_mpp_rkvdec2_stop_command(u32 core_work);
-static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu);
+static int
+rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu,
+			      struct rk_mpp_cluster_recovery_result *result);
 static int
 rk_mpp_cluster_reset_group(struct rk_mpp_cluster_reset_request *request,
 			   struct rk_mpp_cluster_reset_result *result);
@@ -10822,6 +10846,107 @@ static const struct rk_mpp_reset_backend_ops rk_mpp_kunit_reset_ops = {
 	.deassert = rk_mpp_kunit_reset_deassert,
 };
 
+static void rk_mpp_cluster_dma_recovery_kunit(struct kunit *test)
+{
+	static const struct iommu_domain_ops iommu_ops;
+	struct rk_mpp_rkvdec2_stop_core cores[3] = {};
+	struct rk_mpp_cluster_recovery_result result;
+	struct rk_mpp_cluster_reset_request request;
+	struct rk_mpp_cluster_dma_set set;
+	struct rk_mpp_dma_group *group0;
+	struct rk_mpp_dma_group *group1;
+	struct rk_mpp_service *srv;
+	struct iommu_domain *domain0;
+	struct iommu_domain *domain1;
+	struct rk_mpp_hw *failed_hw;
+	struct rk_mpp_hw *core0;
+	struct rk_mpp_hw *core1;
+	struct rk_mpp_hw *core2;
+	struct rk_mpp_hw *ccu;
+	int ret;
+
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
+	group0 = kunit_kzalloc(test, sizeof(*group0), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, group0);
+	group1 = kunit_kzalloc(test, sizeof(*group1), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, group1);
+	domain0 = kunit_kzalloc(test, sizeof(*domain0), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, domain0);
+	domain1 = kunit_kzalloc(test, sizeof(*domain1), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, domain1);
+	core0 = kunit_kzalloc(test, sizeof(*core0), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, core0);
+	core1 = kunit_kzalloc(test, sizeof(*core1), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, core1);
+	core2 = kunit_kzalloc(test, sizeof(*core2), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, core2);
+	ccu = kunit_kzalloc(test, sizeof(*ccu), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ccu);
+
+	domain0->ops = &iommu_ops;
+	domain1->ops = &iommu_ops;
+	mutex_init(&srv->dma_group_lock);
+	group0->dma_domain = domain0;
+	group1->dma_domain = domain1;
+	core0->srv = srv;
+	core0->dma_group = group0;
+	core0->iommu_domain = domain0;
+	core0->iommu_provider = RK_MPP_IOMMU_ROCKCHIP;
+	core1->srv = srv;
+	core1->dma_group = group0;
+	core1->iommu_domain = domain0;
+	core1->iommu_provider = RK_MPP_IOMMU_ROCKCHIP;
+	core2->srv = srv;
+	core2->dma_group = group1;
+	core2->iommu_domain = domain1;
+	core2->iommu_provider = RK_MPP_IOMMU_ROCKCHIP;
+	ccu->srv = srv;
+	mutex_init(&ccu->ccu_recovery_lock);
+	mutex_init(&ccu->run_lock);
+	cores[0].hw = core0;
+	cores[1].hw = core1;
+	cores[2].hw = core2;
+	request.ccu = ccu;
+	request.cores = cores;
+	request.count = ARRAY_SIZE(cores);
+
+	rk_mpp_recovery_result_init(&result);
+	mutex_lock(&ccu->ccu_recovery_lock);
+	mutex_lock(&ccu->run_lock);
+	ret = rk_mpp_cluster_collect_dma(&request, &set);
+	result.dma_group_count = set.count;
+	if (!ret)
+		ret = rk_mpp_cluster_refresh_dma(&request, &set, &result,
+						 &failed_hw);
+	mutex_unlock(&ccu->run_lock);
+	mutex_unlock(&ccu->ccu_recovery_lock);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, set.count, 2U);
+	KUNIT_EXPECT_EQ(test, result.dma_group_count, 2U);
+	KUNIT_EXPECT_EQ(test, result.dma_group_refresh_count, 2U);
+	KUNIT_EXPECT_EQ(test, atomic_read(&srv->iommu_refresh_count), 2);
+	KUNIT_EXPECT_PTR_EQ(test, failed_hw, NULL);
+
+	WRITE_ONCE(group1->isolated, true);
+	rk_mpp_recovery_result_init(&result);
+	mutex_lock(&ccu->ccu_recovery_lock);
+	mutex_lock(&ccu->run_lock);
+	ret = rk_mpp_cluster_collect_dma(&request, &set);
+	result.dma_group_count = set.count;
+	if (!ret)
+		ret = rk_mpp_cluster_refresh_dma(&request, &set, &result,
+						 &failed_hw);
+	mutex_unlock(&ccu->run_lock);
+	mutex_unlock(&ccu->ccu_recovery_lock);
+	KUNIT_EXPECT_EQ(test, ret, -EIO);
+	KUNIT_EXPECT_EQ(test, result.dma_group_count, 2U);
+	KUNIT_EXPECT_EQ(test, result.dma_group_refresh_count, 1U);
+	KUNIT_EXPECT_EQ(test, atomic_read(&srv->iommu_refresh_count), 3);
+	KUNIT_EXPECT_PTR_EQ(test, failed_hw, core2);
+	KUNIT_EXPECT_EQ(test, rk_mpp_cluster_isolated_dma_count(&set), 1U);
+}
+
 static void rk_mpp_cluster_recovery_result_kunit(struct kunit *test)
 {
 	struct rk_mpp_cluster_recovery_result result;
@@ -10864,6 +10989,9 @@ static void rk_mpp_cluster_recovery_result_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, result.reset_error, 0);
 	KUNIT_EXPECT_EQ(test, result.refresh_error, 0);
 	KUNIT_EXPECT_EQ(test, result.isolation_error, 0);
+	KUNIT_EXPECT_EQ(test, result.dma_group_count, 0U);
+	KUNIT_EXPECT_EQ(test, result.dma_group_refresh_count, 0U);
+	KUNIT_EXPECT_EQ(test, result.dma_group_isolation_count, 0U);
 	KUNIT_EXPECT_TRUE(test, result.quiesced);
 	KUNIT_EXPECT_TRUE(test, result.reusable);
 	KUNIT_EXPECT_EQ(test, trace->count, 2U);
@@ -11278,6 +11406,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_debug_event_ring_kunit),
 	KUNIT_CASE(rk_mpp_cluster_registry_kunit),
 	KUNIT_CASE(rk_mpp_cluster_membership_kunit),
+	KUNIT_CASE(rk_mpp_cluster_dma_recovery_kunit),
 	KUNIT_CASE(rk_mpp_cluster_recovery_result_kunit),
 	KUNIT_CASE(rk_mpp_cluster_reset_group_kunit),
 	KUNIT_CASE(rk_mpp_reset_domain_registry_kunit),
@@ -14661,19 +14790,12 @@ static bool rk_mpp_hw_prepare_active_retry(struct rk_mpp_hw *hw,
 	return active;
 }
 
-static int rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw,
-				   struct rk_mpp_job *job)
+static int
+__rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw, struct rk_mpp_service *srv)
 {
-	struct rk_mpp_service *srv = job && job->session ?
-					     job->session->srv : hw->srv;
 	int ret = 0;
 
-	lockdep_assert_held(&hw->run_lock);
-
 	if (!hw->iommu_domain)
-		return 0;
-	if (READ_ONCE(hw->terminally_stopped) ||
-	    READ_ONCE(hw->terminal_power_drained))
 		return 0;
 
 	if (hw->iommu_provider == RK_MPP_IOMMU_VSI)
@@ -14686,6 +14808,149 @@ static int rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw,
 		atomic_inc(&srv->iommu_refresh_count);
 
 	return 0;
+}
+
+static int rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw,
+				   struct rk_mpp_job *job)
+{
+	struct rk_mpp_service *srv = job && job->session ?
+					     job->session->srv : hw->srv;
+
+	lockdep_assert_held(&hw->run_lock);
+	if (READ_ONCE(hw->terminally_stopped) ||
+	    READ_ONCE(hw->terminal_power_drained))
+		return 0;
+
+	return __rk_mpp_hw_refresh_iommu(hw, srv);
+}
+
+static int
+rk_mpp_cluster_dma_set_add(struct rk_mpp_cluster_dma_set *set,
+			   struct rk_mpp_hw *hw)
+{
+	struct rk_mpp_dma_group *group = READ_ONCE(hw->dma_group);
+	struct iommu_domain *domain = READ_ONCE(hw->iommu_domain);
+	u32 i;
+
+	if (!domain)
+		return group ? -EXDEV : 0;
+	if (!group || READ_ONCE(group->dma_domain) != domain)
+		return -EXDEV;
+
+	for (i = 0; i < set->count; i++) {
+		if (set->groups[i] != group)
+			continue;
+		if (set->owners[i]->iommu_provider != hw->iommu_provider)
+			return -EXDEV;
+		return 0;
+	}
+	if (WARN_ON_ONCE(set->count >= ARRAY_SIZE(set->groups)))
+		return -E2BIG;
+
+	set->groups[set->count] = group;
+	set->owners[set->count] = hw;
+	set->count++;
+
+	return 0;
+}
+
+static int
+rk_mpp_cluster_collect_dma(const struct rk_mpp_cluster_reset_request *request,
+			   struct rk_mpp_cluster_dma_set *set)
+{
+	int ret;
+	u32 i;
+
+	lockdep_assert_held(&request->ccu->ccu_recovery_lock);
+	lockdep_assert_held(&request->ccu->run_lock);
+	memset(set, 0, sizeof(*set));
+
+	ret = rk_mpp_cluster_dma_set_add(set, request->ccu);
+	if (ret)
+		return ret;
+	for (i = 0; i < request->count; i++) {
+		ret = rk_mpp_cluster_dma_set_add(set, request->cores[i].hw);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int
+rk_mpp_cluster_refresh_dma(const struct rk_mpp_cluster_reset_request *request,
+			   const struct rk_mpp_cluster_dma_set *set,
+			   struct rk_mpp_cluster_recovery_result *result,
+			   struct rk_mpp_hw **failed_hw)
+{
+	u32 i;
+
+	lockdep_assert_held(&request->ccu->ccu_recovery_lock);
+	lockdep_assert_held(&request->ccu->run_lock);
+	*failed_hw = NULL;
+
+	for (i = 0; i < set->count; i++) {
+		struct rk_mpp_dma_group *group = set->groups[i];
+		struct rk_mpp_hw *owner = set->owners[i];
+		int ret;
+
+		mutex_lock(&owner->srv->dma_group_lock);
+		if (READ_ONCE(owner->dma_group) != group ||
+		    READ_ONCE(owner->iommu_domain) !=
+			    READ_ONCE(group->dma_domain) ||
+		    READ_ONCE(group->isolated) ||
+		    READ_ONCE(owner->terminally_stopped) ||
+		    READ_ONCE(owner->terminal_power_drained)) {
+			mutex_unlock(&owner->srv->dma_group_lock);
+			*failed_hw = owner;
+			return -EIO;
+		}
+		if (owner->dev &&
+		    iommu_get_domain_for_dev(owner->dev) != group->dma_domain) {
+			mutex_unlock(&owner->srv->dma_group_lock);
+			*failed_hw = owner;
+			return -EBUSY;
+		}
+
+		ret = __rk_mpp_hw_refresh_iommu(owner, owner->srv);
+		mutex_unlock(&owner->srv->dma_group_lock);
+		if (ret) {
+			*failed_hw = owner;
+			return ret;
+		}
+		result->dma_group_refresh_count++;
+	}
+
+	return 0;
+}
+
+static u32
+rk_mpp_cluster_isolated_dma_count(const struct rk_mpp_cluster_dma_set *set)
+{
+	u32 count = 0;
+	u32 i;
+
+	for (i = 0; i < set->count; i++) {
+		if (READ_ONCE(set->groups[i]->isolated))
+			count++;
+	}
+
+	return count;
+}
+
+static bool
+rk_mpp_cluster_reset_usable(const struct rk_mpp_cluster_reset_request *request)
+{
+	u32 i;
+
+	if (!rk_mpp_hw_usable(request->ccu))
+		return false;
+	for (i = 0; i < request->count; i++) {
+		if (!rk_mpp_hw_usable(request->cores[i].hw))
+			return false;
+	}
+
+	return true;
 }
 
 /*
@@ -14802,6 +15067,9 @@ rk_mpp_hw_get_active_ccu_if(struct rk_mpp_hw *hw,
 static bool rk_mpp_hw_abort_job(struct rk_mpp_job *job)
 {
 	struct rk_mpp_hw *hw = rk_mpp_job_get_hw(job);
+	struct rk_mpp_cluster_recovery_result ccu_recovery = {
+		.reusable = true,
+	};
 	struct rk_mpp_cluster_recovery_result recovery = {
 		.reusable = true,
 	};
@@ -14847,7 +15115,8 @@ static bool rk_mpp_hw_abort_job(struct rk_mpp_job *job)
 	 * hardware may still fetch.
 	 */
 	if (hard_ccu_abort) {
-		ccu_stop_ret = rk_mpp_rkvdec2_force_stop_ccu(ccu);
+		ccu_stop_ret =
+			rk_mpp_rkvdec2_force_stop_ccu(ccu, &ccu_recovery);
 		if (ccu_stop_ret)
 			goto out_unlock_core;
 	}
@@ -14909,14 +15178,15 @@ out_unlock_core:
 		int restart_ret = -EIO;
 
 		rk_mpp_rkvdec2_drain_ccu_done_jobs(ccu);
-		if (!ccu_stop_ret && !reset_ret && recovery.reusable) {
+		if (!ccu_stop_ret && !reset_ret && ccu_recovery.reusable &&
+		    recovery.reusable) {
 			rk_mpp_cluster_prepare_resend_chain(READ_ONCE(ccu->cluster),
 							    ccu);
 			restart_ret =
 				rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(ccu);
 		}
 		if (restart_ret < 0) {
-			ccu_stop_ret = rk_mpp_rkvdec2_force_stop_ccu(ccu);
+			ccu_stop_ret = rk_mpp_rkvdec2_force_stop_ccu(ccu, &ccu_recovery);
 			if (!ccu_stop_ret)
 				rk_mpp_hw_abort_ccu_active_dependents(
 					ccu, hw, -ECANCELED);
@@ -15248,6 +15518,7 @@ static u32 rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu)
 
 	while ((job = rk_mpp_cluster_first_done_job(cluster, ccu))) {
 		struct rk_mpp_hw *hw = rk_mpp_job_get_hw(job);
+		struct rk_mpp_cluster_recovery_result ccu_recovery;
 		struct rk_mpp_cluster_recovery_result recovery;
 		bool ccu_error;
 		u32 completed_status;
@@ -15282,7 +15553,7 @@ static u32 rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu)
 		ccu_error = !ret &&
 			rk_mpp_rkvdec2_ccu_job_error(job, link_info);
 		if (ccu_error)
-			stop_ret = rk_mpp_rkvdec2_force_stop_ccu(ccu);
+			stop_ret = rk_mpp_rkvdec2_force_stop_ccu(ccu, &ccu_recovery);
 		if (stop_ret) {
 			/*
 			 * The descriptor may still be DMA-visible. Transfer the
@@ -15343,6 +15614,9 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 {
 	struct rk_mpp_job *job;
 	struct rk_mpp_hw *ccu = NULL;
+	struct rk_mpp_cluster_recovery_result ccu_recovery = {
+		.reusable = true,
+	};
 	struct rk_mpp_cluster_recovery_result recovery;
 	struct rk_mpp_cluster_recovery_result idle_recovery;
 	bool irq_disabled;
@@ -15413,7 +15687,8 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 	hard_ccu_recovery = ccu && job->rkvdec_ccu_started &&
 			    job->rkvdec_ccu == ccu;
 	if (hard_ccu_recovery) {
-		ccu_stop_ret = rk_mpp_rkvdec2_force_stop_ccu(ccu);
+		ccu_stop_ret =
+			rk_mpp_rkvdec2_force_stop_ccu(ccu, &ccu_recovery);
 		if (ccu_stop_ret) {
 			/*
 			 * Preserve the active reference and all DMA-visible
@@ -15519,14 +15794,14 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 
 		rk_mpp_rkvdec2_drain_ccu_done_jobs(ccu);
 		if (!iommu_fault && !ccu_stop_ret && !reset_ret &&
-		    recovery.reusable) {
+		    ccu_recovery.reusable && recovery.reusable) {
 			rk_mpp_cluster_prepare_resend_chain(READ_ONCE(ccu->cluster),
 							    ccu);
 			restart_ret =
 				rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(ccu);
 		}
 		if (restart_ret < 0) {
-			ccu_stop_ret = rk_mpp_rkvdec2_force_stop_ccu(ccu);
+			ccu_stop_ret = rk_mpp_rkvdec2_force_stop_ccu(ccu, &ccu_recovery);
 			if (!ccu_stop_ret)
 				rk_mpp_hw_abort_ccu_active_dependents(
 					ccu, hw, recovery_result);
@@ -15883,12 +16158,22 @@ rk_mpp_cluster_reset_group(struct rk_mpp_cluster_reset_request *request,
 	return 0;
 }
 
-static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu)
+/*
+ * Stop one HARD-CCU chain and complete the reset's DMA disposition before
+ * returning. The caller-pinned participants define the affected set; a zero
+ * return proves cleanup-safe quiescence, while only result->reusable permits
+ * descriptor resend or later admission through this recovery transaction.
+ */
+static int
+rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu,
+			      struct rk_mpp_cluster_recovery_result *result)
 {
 	struct rk_mpp_rkvdec2_stop_core cores[RK_MPP_RKVDEC_MAX_CCU_CORES] = {};
+	struct rk_mpp_cluster_dma_set dma_set;
 	struct rk_mpp_cluster_reset_request reset_request;
 	struct rk_mpp_cluster_reset_result reset_result;
 	struct rk_mpp_cluster *cluster;
+	struct rk_mpp_hw *refresh_failed_hw = NULL;
 	void __iomem *regs;
 	u32 core_command;
 	u32 covered = 0;
@@ -15899,25 +16184,41 @@ static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu)
 	u32 i;
 	bool ccu_reset_asserted = false;
 	bool collection_complete;
+	bool coverage_failed;
 	bool register_quiesced = false;
+	bool reset_failed = false;
+	bool reset_quiesced = false;
 	bool terminal = false;
 	int ccu_assert_ret = -ENODEV;
 	int ccu_deassert_ret = 0;
+	int dma_collect_ret = 0;
 	int group_reset_ret;
+	int refresh_ret = 0;
 	int status_ret = -ENODEV;
 	int terminal_ret = 0;
 	int work_ret = -ENODEV;
 	int error = -EIO;
 
-	if (!ccu)
+	if (WARN_ON_ONCE(!result))
+		return -EINVAL;
+	rk_mpp_recovery_result_init(result);
+	if (!ccu) {
+		result->quiesced = true;
+		result->reusable = true;
 		return 0;
+	}
 	lockdep_assert_held(&ccu->ccu_recovery_lock);
 
 	cluster = READ_ONCE(ccu->cluster);
-	if (rk_mpp_cluster_validate_ccu(cluster, ccu))
+	if (rk_mpp_cluster_validate_ccu(cluster, ccu)) {
+		result->reset_error = -EXDEV;
 		return -EXDEV;
-	if (!rk_mpp_cluster_ccu_has_jobs(cluster, ccu))
+	}
+	if (!rk_mpp_cluster_ccu_has_jobs(cluster, ccu)) {
+		result->quiesced = true;
+		result->reusable = rk_mpp_hw_usable(ccu);
 		return 0;
+	}
 
 	collection_complete =
 		rk_mpp_cluster_collect_stop_cores(cluster, ccu, cores, &count,
@@ -15932,6 +16233,11 @@ static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu)
 			 ~covered;
 	if (uncovered_work)
 		terminal = true;
+	coverage_failed = !collection_complete || uncovered_work;
+	reset_request.cluster = cluster;
+	reset_request.ccu = ccu;
+	reset_request.cores = cores;
+	reset_request.count = count;
 
 	/*
 	 * Once a previous terminal attempt drained coordinator power, MMIO is
@@ -15943,6 +16249,12 @@ static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu)
 	    READ_ONCE(ccu->terminally_stopped)) {
 		int ret;
 
+		mutex_lock(&ccu->run_lock);
+		dma_collect_ret =
+			rk_mpp_cluster_collect_dma(&reset_request, &dma_set);
+		mutex_unlock(&ccu->run_lock);
+		result->dma_group_count = dma_set.count;
+		result->refresh_error = dma_collect_ret;
 		if (!collection_complete || uncovered_work)
 			terminal_ret = -ENODEV;
 		for (i = 0; i < count; i++) {
@@ -15953,6 +16265,14 @@ static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu)
 		ret = rk_mpp_hw_terminal_isolate(ccu);
 		if (ret && !terminal_ret)
 			terminal_ret = ret;
+		result->dma_group_isolation_count =
+			rk_mpp_cluster_isolated_dma_count(&dma_set);
+		if (!terminal_ret && result->dma_group_isolation_count !=
+					     result->dma_group_count)
+			terminal_ret = -EIO;
+		result->isolation_error = terminal_ret;
+		if (!terminal_ret)
+			rk_mpp_recovery_result_terminal(result);
 		for (i = 0; i < count; i++)
 			rk_mpp_hw_put(cores[i].hw);
 
@@ -16004,15 +16324,21 @@ static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu)
 		cores[i].bus_ret = rk_mpp_rkvdec2_poll_reset_bus_idle(hw);
 	}
 
-	reset_request.cluster = cluster;
-	reset_request.ccu = ccu;
-	reset_request.cores = cores;
-	reset_request.count = count;
+	dma_collect_ret =
+		rk_mpp_cluster_collect_dma(&reset_request, &dma_set);
+	result->dma_group_count = dma_set.count;
+	if (dma_collect_ret) {
+		result->refresh_error = dma_collect_ret;
+		error = dma_collect_ret;
+		terminal = true;
+	}
 	group_reset_ret =
 		rk_mpp_cluster_reset_group(&reset_request, &reset_result);
 	if (group_reset_ret) {
 		ccu_assert_ret = group_reset_ret;
+		result->reset_error = group_reset_ret;
 		error = group_reset_ret;
+		reset_failed = true;
 		for (i = 0; i < count; i++) {
 			struct rk_mpp_hw *hw = cores[i].hw;
 
@@ -16025,6 +16351,8 @@ static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu)
 		ccu_assert_ret = reset_result.ccu_assert_ret;
 		ccu_deassert_ret = reset_result.ccu_deassert_ret;
 		ccu_reset_asserted = reset_result.ccu_reset_asserted;
+		result->reset_effect = RK_MPP_RESET_TRANSLATIONS_LOST;
+		result->reset_epoch = reset_result.epoch;
 	}
 
 	for (i = 0; !group_reset_ret && i < count; i++) {
@@ -16040,16 +16368,22 @@ static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu)
 			 */
 			error = reset_ret != -ENODEV ? reset_ret :
 				cores[i].bus_ret ?: -EOPNOTSUPP;
+			if (!result->reset_error)
+				result->reset_error = error;
 			rk_mpp_hw_handle_reset_failure(hw, error);
 			terminal = true;
+			reset_failed = true;
 		}
 	}
 
 	if (!group_reset_ret && ccu_assert_ret) {
 		error = ccu_assert_ret != -ENODEV ? ccu_assert_ret :
 			work_ret ?: status_ret ?: -EOPNOTSUPP;
+		if (!result->reset_error)
+			result->reset_error = error;
 		rk_mpp_hw_handle_reset_failure(ccu, error);
 		terminal = true;
+		reset_failed = true;
 	}
 
 	for (i = 0; !group_reset_ret && i < count; i++) {
@@ -16057,13 +16391,39 @@ static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu)
 		int ret = cores[i].reset_deassert_ret;
 
 		if (ret) {
+			error = ret;
+			if (!result->reset_error)
+				result->reset_error = ret;
 			rk_mpp_hw_handle_reset_failure(hw, ret);
 			terminal = true;
+			reset_failed = true;
 		}
 	}
 	if (!group_reset_ret && ccu_deassert_ret) {
+		error = ccu_deassert_ret;
+		if (!result->reset_error)
+			result->reset_error = ccu_deassert_ret;
 		rk_mpp_hw_handle_reset_failure(ccu, ccu_deassert_ret);
 		terminal = true;
+		reset_failed = true;
+	}
+	if (reset_failed && !result->reset_error)
+		result->reset_error = error;
+	reset_quiesced = !coverage_failed && !reset_failed;
+	result->quiesced = reset_quiesced;
+
+	if (!terminal) {
+		refresh_ret =
+			rk_mpp_cluster_refresh_dma(&reset_request, &dma_set,
+						   result, &refresh_failed_hw);
+		if (refresh_ret) {
+			result->refresh_error = refresh_ret;
+			error = refresh_ret;
+			if (refresh_failed_hw)
+				rk_mpp_hw_handle_reset_failure(refresh_failed_hw,
+							       refresh_ret);
+			terminal = true;
+		}
 	}
 
 	if (terminal) {
@@ -16085,14 +16445,27 @@ static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu)
 		ret = rk_mpp_hw_terminal_isolate(ccu);
 		if (ret && !terminal_ret)
 			terminal_ret = ret;
+		result->dma_group_isolation_count =
+			rk_mpp_cluster_isolated_dma_count(&dma_set);
 		if (uncovered_work && !register_quiesced && !terminal_ret)
 			terminal_ret = -ENODEV;
+		if (!terminal_ret && result->dma_group_isolation_count !=
+					     result->dma_group_count)
+			terminal_ret = -EIO;
+		result->isolation_error = terminal_ret;
+		if (!terminal_ret)
+			rk_mpp_recovery_result_terminal(result);
 		dev_err_ratelimited(
 			ccu->dev,
 			"CCU recovery used terminal isolation (work %d status %d assert %d deassert %d isolate %d)\n",
 			work_ret, status_ret, ccu_assert_ret, ccu_deassert_ret,
 			terminal_ret);
 	}
+	if (!terminal)
+		result->reusable = result->quiesced &&
+			result->dma_group_refresh_count ==
+				result->dma_group_count &&
+			rk_mpp_cluster_reset_usable(&reset_request);
 	mutex_unlock(&ccu->run_lock);
 
 	for (i = 0; i < count; i++) {
@@ -16100,8 +16473,11 @@ static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu)
 		rk_mpp_hw_put(cores[i].hw);
 	}
 
-	WARN_ON_ONCE(!terminal && !register_quiesced &&
+	WARN_ON_ONCE(!result->quiesced && !terminal && !register_quiesced &&
 		     !ccu_reset_asserted && !count);
+	if (terminal_ret && reset_quiesced)
+		return 0;
+
 	return terminal_ret;
 }
 
@@ -20053,6 +20429,7 @@ static void rk_mpp_hw_remove(struct platform_device *pdev)
 {
 	struct rk_mpp_hw *hw = platform_get_drvdata(pdev);
 	struct rk_mpp_hw *ccu = NULL;
+	struct rk_mpp_cluster_recovery_result ccu_recovery;
 	bool ccu_was_online = false;
 	bool dma_unquiesced = false;
 	unsigned int stop_attempt = 0;
@@ -20089,7 +20466,7 @@ retry_stop:
 	if (ccu) {
 		mutex_lock(&ccu->ccu_recovery_lock);
 		if (rk_mpp_rkvdec2_hard_ccu_enabled(hw))
-			stop_ret = rk_mpp_rkvdec2_force_stop_ccu(ccu);
+			stop_ret = rk_mpp_rkvdec2_force_stop_ccu(ccu, &ccu_recovery);
 		if (!stop_ret)
 			stop_ret = rk_mpp_hw_abort_ccu_dependents(ccu);
 		if (stop_ret) {
@@ -20099,7 +20476,8 @@ retry_stop:
 		mutex_unlock(&ccu->ccu_recovery_lock);
 	} else if (!hw->match->contributes_support) {
 		mutex_lock(&hw->ccu_recovery_lock);
-		stop_ret = rk_mpp_rkvdec2_force_stop_ccu(hw);
+		stop_ret =
+			rk_mpp_rkvdec2_force_stop_ccu(hw, &ccu_recovery);
 		if (!stop_ret)
 			stop_ret = rk_mpp_hw_abort_ccu_dependents(hw);
 		if (stop_ret)
