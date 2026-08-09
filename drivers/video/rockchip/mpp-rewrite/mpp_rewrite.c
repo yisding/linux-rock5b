@@ -184,6 +184,12 @@ enum rk_mpp_reset_domain_state {
 	RK_MPP_RESET_DOMAIN_QUARANTINED,
 };
 
+enum rk_mpp_reset_effect {
+	RK_MPP_RESET_NONE,
+	RK_MPP_RESET_TRANSLATIONS_LOST,
+	RK_MPP_RESET_TERMINALLY_ISOLATED,
+};
+
 struct rk_mpp_msg_v1 {
 	__u32 cmd;
 	__u32 flags;
@@ -423,6 +429,22 @@ struct rk_mpp_cluster_reset_result {
 	int ccu_assert_ret;
 	int ccu_deassert_ret;
 	bool ccu_reset_asserted;
+};
+
+/*
+ * One reset/translation outcome. A zero function return means hardware is
+ * quiesced enough for the caller to retire its current job; only reusable
+ * permits another activation. Terminal isolation is therefore a successful
+ * retirement proof, never a reusable recovery.
+ */
+struct rk_mpp_cluster_recovery_result {
+	enum rk_mpp_reset_effect reset_effect;
+	u64 reset_epoch;
+	int reset_error;
+	int refresh_error;
+	int isolation_error;
+	bool quiesced;
+	bool reusable;
 };
 
 /*
@@ -1036,6 +1058,9 @@ rk_mpp_reset_domain_register_member(struct rk_mpp_reset_domain *domain,
 static int rk_mpp_reset_domain_unregister_member(struct rk_mpp_hw *hw);
 static bool rk_mpp_hw_terminal_drain_power(struct rk_mpp_hw *hw);
 static int rk_mpp_hw_terminal_isolate(struct rk_mpp_hw *hw);
+static int
+rk_mpp_hw_stop_and_recover(struct rk_mpp_hw *hw, struct rk_mpp_job *job,
+			   struct rk_mpp_cluster_recovery_result *result);
 static u32 rk_mpp_rkvdec2_stop_command(u32 core_work);
 static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu);
 static int
@@ -1045,7 +1070,9 @@ static int
 rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(struct rk_mpp_hw *ccu);
 static u32 rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu);
 static void rk_mpp_rkvdec2_wait_bus_idle(struct rk_mpp_hw *hw);
-static int rk_mpp_rkvdec2_reset_soft_ccu_job(struct rk_mpp_job *job);
+static int
+rk_mpp_rkvdec2_reset_soft_ccu_job(struct rk_mpp_job *job,
+				  struct rk_mpp_cluster_recovery_result *result);
 static int rk_mpp_rkvdec2_publish_and_start_core(struct rk_mpp_job *job,
 						 u32 start_value);
 static int rk_mpp_hw_abort_ccu_dependents(struct rk_mpp_hw *ccu);
@@ -6269,6 +6296,7 @@ static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
 	struct rk_mpp_hw *hw;
 	struct rk_mpp_hw *ccu;
 	struct rk_mpp_job *job;
+	struct rk_mpp_cluster_recovery_result recovery;
 	u32 *ccu_regs;
 	u32 *core_regs;
 	u32 *link;
@@ -6354,10 +6382,18 @@ static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
 	mutex_unlock(&ccu->run_lock);
 	mutex_unlock(&hw->run_lock);
 
-	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_reset_soft_ccu_job(job), 0);
+	mutex_lock(&hw->run_lock);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_rkvdec2_reset_soft_ccu_job(job, &recovery), 0);
+	mutex_unlock(&hw->run_lock);
+	KUNIT_EXPECT_EQ(test, recovery.reset_effect,
+			(enum rk_mpp_reset_effect)
+			RK_MPP_RESET_TERMINALLY_ISOLATED);
+	KUNIT_EXPECT_TRUE(test, recovery.quiesced);
+	KUNIT_EXPECT_FALSE(test, recovery.reusable);
 	KUNIT_EXPECT_EQ(test,
 			ccu_regs[RK_MPP_RKVDEC_CCU_CORE_ERR_BASE / sizeof(*ccu_regs)],
-			hw->core_mask & RK_MPP_RKVDEC_CCU_CORE_RW_MASK);
+			0U);
 	KUNIT_EXPECT_EQ(test,
 			ccu_regs[RK_MPP_RKVDEC_CCU_CORE_IDLE_BASE / sizeof(*ccu_regs)],
 			hw->core_mask & RK_MPP_RKVDEC_CCU_CORE_RW_MASK);
@@ -10786,6 +10822,68 @@ static const struct rk_mpp_reset_backend_ops rk_mpp_kunit_reset_ops = {
 	.deassert = rk_mpp_kunit_reset_deassert,
 };
 
+static void rk_mpp_cluster_recovery_result_kunit(struct kunit *test)
+{
+	struct rk_mpp_cluster_recovery_result result;
+	struct rk_mpp_kunit_reset_trace *trace;
+	struct rk_mpp_reset_domain *domain;
+	struct rk_mpp_service *srv;
+	struct rk_mpp_hw *hw;
+	int ret;
+
+	trace = kunit_kzalloc(test, sizeof(*trace), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, trace);
+	domain = kunit_kzalloc(test, sizeof(*domain), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, domain);
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
+	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
+
+	rk_mpp_reset_domain_init(domain, NULL);
+	domain->backend_ops = &rk_mpp_kunit_reset_ops;
+	domain->backend_data = trace;
+	hw->srv = srv;
+	hw->match = &rk_mpp_rkvdec2_core;
+	hw->resets = (struct reset_control *)&hw->reset_pulse_active;
+	hw->online = true;
+	INIT_LIST_HEAD(&hw->reset_domain_link);
+	mutex_init(&hw->run_lock);
+	trace->fail_at = U32_MAX;
+	ret = rk_mpp_reset_domain_register_member(domain, hw);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	mutex_lock(&hw->run_lock);
+	ret = rk_mpp_hw_stop_and_recover(hw, NULL, &result);
+	mutex_unlock(&hw->run_lock);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, result.reset_effect,
+			(enum rk_mpp_reset_effect)
+			RK_MPP_RESET_TRANSLATIONS_LOST);
+	KUNIT_EXPECT_EQ(test, result.reset_epoch, 1ULL);
+	KUNIT_EXPECT_EQ(test, result.reset_error, 0);
+	KUNIT_EXPECT_EQ(test, result.refresh_error, 0);
+	KUNIT_EXPECT_EQ(test, result.isolation_error, 0);
+	KUNIT_EXPECT_TRUE(test, result.quiesced);
+	KUNIT_EXPECT_TRUE(test, result.reusable);
+	KUNIT_EXPECT_EQ(test, trace->count, 2U);
+
+	WRITE_ONCE(hw->terminally_stopped, true);
+	mutex_lock(&hw->run_lock);
+	ret = rk_mpp_hw_stop_and_recover(hw, NULL, &result);
+	mutex_unlock(&hw->run_lock);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, result.reset_effect,
+			(enum rk_mpp_reset_effect)
+			RK_MPP_RESET_TERMINALLY_ISOLATED);
+	KUNIT_EXPECT_EQ(test, result.reset_epoch, 0ULL);
+	KUNIT_EXPECT_TRUE(test, result.quiesced);
+	KUNIT_EXPECT_FALSE(test, result.reusable);
+	KUNIT_EXPECT_EQ(test, trace->count, 2U);
+
+	KUNIT_EXPECT_EQ(test, rk_mpp_reset_domain_unregister_member(hw), 0);
+}
+
 static void rk_mpp_cluster_reset_group_kunit(struct kunit *test)
 {
 	struct rk_mpp_rkvdec2_stop_core cores[2] = {};
@@ -11180,6 +11278,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_debug_event_ring_kunit),
 	KUNIT_CASE(rk_mpp_cluster_registry_kunit),
 	KUNIT_CASE(rk_mpp_cluster_membership_kunit),
+	KUNIT_CASE(rk_mpp_cluster_recovery_result_kunit),
 	KUNIT_CASE(rk_mpp_cluster_reset_group_kunit),
 	KUNIT_CASE(rk_mpp_reset_domain_registry_kunit),
 	KUNIT_CASE(rk_mpp_reset_domain_state_kunit),
@@ -13813,7 +13912,8 @@ static int rk_mpp_reset_domain_power_deassert(struct rk_mpp_hw *hw)
 	return ret;
 }
 
-static int rk_mpp_reset_domain_recovery_pulse(struct rk_mpp_hw *hw)
+static int
+rk_mpp_reset_domain_recovery_pulse(struct rk_mpp_hw *hw, u64 *epoch)
 {
 	struct rk_mpp_reset_domain *domain;
 	int ret;
@@ -13824,6 +13924,8 @@ static int rk_mpp_reset_domain_recovery_pulse(struct rk_mpp_hw *hw)
 		return ret;
 
 	domain = hw->reset_domain;
+	if (epoch)
+		*epoch = domain->reset_domain_epoch;
 	atomic_inc(&hw->reset_pulse_active);
 	ret = rk_mpp_reset_domain_assert(hw);
 	if (ret)
@@ -14113,7 +14215,23 @@ static void rk_mpp_hw_restore_irq_depth(struct rk_mpp_hw *hw)
 	}
 }
 
-static int rk_mpp_hw_reset_active(struct rk_mpp_hw *hw)
+static void
+rk_mpp_recovery_result_init(struct rk_mpp_cluster_recovery_result *result)
+{
+	memset(result, 0, sizeof(*result));
+}
+
+static void
+rk_mpp_recovery_result_terminal(struct rk_mpp_cluster_recovery_result *result)
+{
+	result->reset_effect = RK_MPP_RESET_TERMINALLY_ISOLATED;
+	result->quiesced = true;
+	result->reusable = false;
+}
+
+static int
+rk_mpp_hw_reset_active(struct rk_mpp_hw *hw,
+		       struct rk_mpp_cluster_recovery_result *result)
 {
 	int ret;
 
@@ -14122,34 +14240,53 @@ static int rk_mpp_hw_reset_active(struct rk_mpp_hw *hw)
 
 	atomic_inc(&hw->srv->reset_count);
 	rk_mpp_count_core(hw->srv->reset_core_count, hw);
-	ret = rk_mpp_reset_domain_recovery_pulse(hw);
-	if (!ret)
+	ret = rk_mpp_reset_domain_recovery_pulse(hw, &result->reset_epoch);
+	if (!ret) {
+		result->reset_effect = RK_MPP_RESET_TRANSLATIONS_LOST;
+		result->quiesced = true;
 		return 0;
+	}
 
+	result->reset_error = ret;
 	dev_err_ratelimited(hw->dev, "hardware reset failed: %d\n", ret);
 	rk_mpp_hw_handle_reset_failure(hw, ret);
 	return ret;
 }
 
-static int rk_mpp_hw_stop_active(struct rk_mpp_hw *hw)
+static int
+rk_mpp_hw_stop_active(struct rk_mpp_hw *hw,
+		      struct rk_mpp_cluster_recovery_result *result)
 {
 	int isolate_ret;
 	int ret;
 
-	if (READ_ONCE(hw->terminally_stopped))
+	lockdep_assert_held(&hw->run_lock);
+	rk_mpp_recovery_result_init(result);
+	if (READ_ONCE(hw->terminally_stopped)) {
+		rk_mpp_recovery_result_terminal(result);
 		return 0;
-	if (READ_ONCE(hw->terminal_power_drained))
-		return rk_mpp_hw_terminal_isolate(hw);
+	}
+	if (READ_ONCE(hw->terminal_power_drained)) {
+		isolate_ret = rk_mpp_hw_terminal_isolate(hw);
+		result->isolation_error = isolate_ret;
+		if (!isolate_ret)
+			rk_mpp_recovery_result_terminal(result);
+		return isolate_ret;
+	}
 
 	rk_mpp_hw_deactivate_aux_irqs(hw);
 	if (!hw->resets) {
 		ret = -EOPNOTSUPP;
+		result->reset_error = ret;
 		rk_mpp_hw_handle_reset_failure(hw, ret);
 		isolate_ret = rk_mpp_hw_terminal_isolate(hw);
+		result->isolation_error = isolate_ret;
+		if (!isolate_ret)
+			rk_mpp_recovery_result_terminal(result);
 		return isolate_ret ?: 0;
 	}
 
-	ret = rk_mpp_hw_reset_active(hw);
+	ret = rk_mpp_hw_reset_active(hw, result);
 	if (!ret && !hw->match->reset_requires_terminal_isolation)
 		return 0;
 	if (!ret) {
@@ -14162,14 +14299,22 @@ static int rk_mpp_hw_stop_active(struct rk_mpp_hw *hw)
 		atomic_inc(&hw->srv->av1_reset_idle_unproven_count);
 		rk_mpp_hw_handle_reset_failure(hw, -EOPNOTSUPP);
 		isolate_ret = rk_mpp_hw_terminal_isolate(hw);
+		result->isolation_error = isolate_ret;
+		if (!isolate_ret)
+			rk_mpp_recovery_result_terminal(result);
 		return isolate_ret;
 	}
 
 	isolate_ret = rk_mpp_hw_terminal_isolate(hw);
+	result->isolation_error = isolate_ret;
+	if (!isolate_ret)
+		rk_mpp_recovery_result_terminal(result);
 	return isolate_ret ?: 0;
 }
 
-static int rk_mpp_rkvdec2_reset_soft_ccu_job(struct rk_mpp_job *job)
+static int
+rk_mpp_rkvdec2_reset_soft_ccu_job(struct rk_mpp_job *job,
+				  struct rk_mpp_cluster_recovery_result *result)
 {
 	struct rk_mpp_hw *hw = job->hw;
 	struct rk_mpp_hw *ccu = job->rkvdec_ccu;
@@ -14185,7 +14330,7 @@ static int rk_mpp_rkvdec2_reset_soft_ccu_job(struct rk_mpp_job *job)
 	    !rk_mpp_hw_reg_range_valid(ccu, 0,
 				       RK_MPP_RKVDEC_CCU_CORE_ERR_BASE,
 				       sizeof(u32))) {
-		return rk_mpp_hw_stop_active(hw);
+		return rk_mpp_hw_stop_and_recover(hw, job, result);
 	}
 
 	core_mask = hw->core_mask & RK_MPP_RKVDEC_CCU_CORE_RW_MASK;
@@ -14194,8 +14339,8 @@ static int rk_mpp_rkvdec2_reset_soft_ccu_job(struct rk_mpp_job *job)
 	rk_mpp_hw_assert_powered(ccu);
 	writel(hw->core_mask,
 	       ccu->regs[0] + RK_MPP_RKVDEC_CCU_CORE_IDLE_BASE);
-	ret = rk_mpp_hw_stop_active(hw);
-	if (!ret) {
+	ret = rk_mpp_hw_stop_and_recover(hw, job, result);
+	if (!ret && result->reusable) {
 		writel(core_mask,
 		       ccu->regs[0] + RK_MPP_RKVDEC_CCU_CORE_ERR_BASE);
 		writel(core_mask,
@@ -14543,6 +14688,67 @@ static int rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw,
 	return 0;
 }
 
+/*
+ * Complete the DMA side of one reset before any caller may report the core as
+ * reusable. A failed refresh permanently closes admission and attempts
+ * terminal isolation, but a successful physical reset remains sufficient to
+ * retire the current job even when that final isolation proof also fails.
+ */
+static int
+rk_mpp_hw_finish_recovery(struct rk_mpp_hw *hw, struct rk_mpp_job *job,
+			  struct rk_mpp_cluster_recovery_result *result)
+{
+	int isolate_ret;
+	int ret;
+
+	lockdep_assert_held(&hw->run_lock);
+	if (result->reset_effect == RK_MPP_RESET_TERMINALLY_ISOLATED)
+		return 0;
+	if (WARN_ON_ONCE(result->reset_effect !=
+			 RK_MPP_RESET_TRANSLATIONS_LOST ||
+			 !result->quiesced))
+		return -EIO;
+
+	ret = rk_mpp_hw_refresh_iommu(hw, job);
+	if (!ret) {
+		result->reusable = rk_mpp_hw_usable(hw);
+		return 0;
+	}
+
+	result->refresh_error = ret;
+	rk_mpp_hw_handle_reset_failure(hw, ret);
+	isolate_ret = rk_mpp_hw_terminal_isolate(hw);
+	result->isolation_error = isolate_ret;
+	if (!isolate_ret)
+		rk_mpp_recovery_result_terminal(result);
+
+	return 0;
+}
+
+static int
+rk_mpp_hw_stop_and_recover(struct rk_mpp_hw *hw, struct rk_mpp_job *job,
+			   struct rk_mpp_cluster_recovery_result *result)
+{
+	int ret;
+
+	ret = rk_mpp_hw_stop_active(hw, result);
+	if (ret)
+		return ret;
+
+	return rk_mpp_hw_finish_recovery(hw, job, result);
+}
+
+static int
+rk_mpp_hw_recover_iommu_fault(struct rk_mpp_hw *hw,
+			      struct rk_mpp_cluster_recovery_result *result)
+{
+	rk_mpp_recovery_result_init(result);
+	result->reset_effect = RK_MPP_RESET_TRANSLATIONS_LOST;
+	result->quiesced = true;
+
+	return rk_mpp_hw_finish_recovery(hw, NULL, result);
+}
+
 static struct rk_mpp_job *rk_mpp_hw_get_active_job(struct rk_mpp_hw *hw)
 {
 	struct rk_mpp_job *job;
@@ -14596,6 +14802,9 @@ rk_mpp_hw_get_active_ccu_if(struct rk_mpp_hw *hw,
 static bool rk_mpp_hw_abort_job(struct rk_mpp_job *job)
 {
 	struct rk_mpp_hw *hw = rk_mpp_job_get_hw(job);
+	struct rk_mpp_cluster_recovery_result recovery = {
+		.reusable = true,
+	};
 	struct rk_mpp_hw *ccu;
 	bool active_owned;
 	bool dchs_lifecycle_locked = false;
@@ -14662,9 +14871,11 @@ static bool rk_mpp_hw_abort_job(struct rk_mpp_job *job)
 		 * run_lock pair.
 		 */
 		if (rk_mpp_rkvdec2_soft_ccu_enabled(hw))
-			reset_ret = rk_mpp_rkvdec2_reset_soft_ccu_job(job);
+			reset_ret =
+				rk_mpp_rkvdec2_reset_soft_ccu_job(job, &recovery);
 		else
-			reset_ret = rk_mpp_hw_stop_active(hw);
+			reset_ret =
+				rk_mpp_hw_stop_and_recover(hw, job, &recovery);
 		if (reset_ret) {
 			rk_mpp_job_get(job);
 			if (WARN_ON_ONCE(!rk_mpp_hw_restore_active_job(hw, job)))
@@ -14698,7 +14909,7 @@ out_unlock_core:
 		int restart_ret = -EIO;
 
 		rk_mpp_rkvdec2_drain_ccu_done_jobs(ccu);
-		if (!ccu_stop_ret && !reset_ret) {
+		if (!ccu_stop_ret && !reset_ret && recovery.reusable) {
 			rk_mpp_cluster_prepare_resend_chain(READ_ONCE(ccu->cluster),
 							    ccu);
 			restart_ret =
@@ -14920,6 +15131,7 @@ out_put:
 static int rk_mpp_rkvdec2_prepare_ccu_retry_job(struct rk_mpp_job *job)
 {
 	struct rk_mpp_hw *hw = rk_mpp_job_get_hw(job);
+	struct rk_mpp_cluster_recovery_result recovery;
 	bool irq_disabled;
 	int ret = 0;
 
@@ -14946,10 +15158,11 @@ static int rk_mpp_rkvdec2_prepare_ccu_retry_job(struct rk_mpp_job *job)
 	}
 
 	rk_mpp_hw_cancel_timeout(hw);
-	ret = rk_mpp_hw_stop_active(hw);
+	ret = rk_mpp_hw_stop_and_recover(hw, job, &recovery);
 	if (ret)
 		goto out_unlock;
-	ret = rk_mpp_hw_refresh_iommu(hw, job);
+	if (!recovery.reusable)
+		ret = -EIO;
 
 out_unlock:
 	rk_mpp_hw_enable_irq(hw, irq_disabled);
@@ -15035,6 +15248,7 @@ static u32 rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu)
 
 	while ((job = rk_mpp_cluster_first_done_job(cluster, ccu))) {
 		struct rk_mpp_hw *hw = rk_mpp_job_get_hw(job);
+		struct rk_mpp_cluster_recovery_result recovery;
 		bool ccu_error;
 		u32 completed_status;
 		u32 irq_status = 0;
@@ -15097,7 +15311,8 @@ static u32 rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu)
 		}
 
 		if (ccu_error)
-			reset_ret = rk_mpp_hw_stop_active(hw);
+			reset_ret =
+				rk_mpp_hw_stop_and_recover(hw, job, &recovery);
 		if (!ret)
 			ret = stop_ret ?: reset_ret;
 		/*
@@ -15128,6 +15343,8 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 {
 	struct rk_mpp_job *job;
 	struct rk_mpp_hw *ccu = NULL;
+	struct rk_mpp_cluster_recovery_result recovery;
+	struct rk_mpp_cluster_recovery_result idle_recovery;
 	bool irq_disabled;
 	bool hard_ccu_recovery;
 	bool dchs_lifecycle_locked = false;
@@ -15177,17 +15394,16 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 		 * before allowing another generation onto the core.
 		 */
 		if (iommu_fault) {
-			refresh_ret = rk_mpp_hw_refresh_iommu(hw, NULL);
-			if (refresh_ret)
-				rk_mpp_hw_handle_reset_failure(hw,
-							       refresh_ret);
+			refresh_ret =
+				rk_mpp_hw_recover_iommu_fault(hw, &idle_recovery);
 		}
 		rk_mpp_hw_enable_irq(hw, irq_disabled);
 		mutex_unlock(&hw->run_lock);
 		if (ccu)
 			mutex_unlock(&ccu->ccu_recovery_lock);
 		rk_mpp_hw_put(ccu);
-		if (iommu_fault && hw->iommu_domain)
+		if (iommu_fault && hw->iommu_domain &&
+		    !refresh_ret && idle_recovery.reusable)
 			schedule_work(&hw->srv->sched_work);
 		return;
 	}
@@ -15259,9 +15475,9 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 	}
 
 	if (rk_mpp_rkvdec2_soft_ccu_enabled(hw))
-		reset_ret = rk_mpp_rkvdec2_reset_soft_ccu_job(job);
+		reset_ret = rk_mpp_rkvdec2_reset_soft_ccu_job(job, &recovery);
 	else
-		reset_ret = rk_mpp_hw_stop_active(hw);
+		reset_ret = rk_mpp_hw_stop_and_recover(hw, job, &recovery);
 	if (reset_ret && !hard_ccu_recovery) {
 		restored = iommu_fault ?
 			rk_mpp_hw_restore_iommu_fault_job(hw, job) :
@@ -15288,15 +15504,10 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 	}
 	if (!result)
 		result = ccu_stop_ret ?: reset_ret;
-	if (iommu_fault) {
-		refresh_ret = rk_mpp_hw_refresh_iommu(hw, job);
-		if (refresh_ret) {
-			dev_err_ratelimited(hw->dev,
-					    "IOMMU refresh failed after fault: %d\n",
-					    refresh_ret);
-			rk_mpp_hw_handle_reset_failure(hw, refresh_ret);
-		}
-	}
+	if (iommu_fault && recovery.refresh_error)
+		dev_err_ratelimited(hw->dev,
+				    "IOMMU refresh failed after fault: %d\n",
+				    recovery.refresh_error);
 	rk_mpp_hw_power_off(hw);
 	rk_mpp_job_complete(job, result);
 	rk_mpp_rkvenc2_dchs_lifecycle_unlock(job, dchs_lifecycle_locked);
@@ -15307,7 +15518,8 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 		int restart_ret = -EIO;
 
 		rk_mpp_rkvdec2_drain_ccu_done_jobs(ccu);
-		if (!iommu_fault && !ccu_stop_ret && !reset_ret) {
+		if (!iommu_fault && !ccu_stop_ret && !reset_ret &&
+		    recovery.reusable) {
 			rk_mpp_cluster_prepare_resend_chain(READ_ONCE(ccu->cluster),
 							    ccu);
 			restart_ret =
@@ -15351,6 +15563,7 @@ static void rk_mpp_hw_iommu_fault_work(struct work_struct *work)
 static int rk_mpp_hw_abort_active(struct rk_mpp_hw *hw, int result)
 {
 	struct rk_mpp_job *job;
+	struct rk_mpp_cluster_recovery_result recovery;
 	bool dchs_lifecycle_locked;
 	bool irq_disabled;
 	int stop_ret;
@@ -15368,7 +15581,7 @@ static int rk_mpp_hw_abort_active(struct rk_mpp_hw *hw, int result)
 	}
 
 	dchs_lifecycle_locked = rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
-	stop_ret = rk_mpp_hw_stop_active(hw);
+	stop_ret = rk_mpp_hw_stop_and_recover(hw, job, &recovery);
 	if (stop_ret) {
 		bool restored = rk_mpp_hw_restore_active_job(hw, job);
 
@@ -15408,6 +15621,7 @@ static int
 rk_mpp_hw_abort_active_recovery_locked(struct rk_mpp_hw *hw, int result)
 {
 	struct rk_mpp_job *job;
+	struct rk_mpp_cluster_recovery_result recovery;
 	/*
 	 * Held separately because job is cleared once the active slot takes
 	 * its reference back, and the unlock still needs the job it locked.
@@ -15441,7 +15655,7 @@ rk_mpp_hw_abort_active_recovery_locked(struct rk_mpp_hw *hw, int result)
 		 */
 		dchs_lifecycle_locked = rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
 		dchs_job = job;
-		stop_ret = rk_mpp_hw_stop_active(hw);
+		stop_ret = rk_mpp_hw_stop_and_recover(hw, job, &recovery);
 		if (stop_ret) {
 			bool restored = rk_mpp_hw_restore_active_job(hw, job);
 
@@ -16890,6 +17104,7 @@ static void rk_mpp_rkvenc2_drain_int_status(struct rk_mpp_hw *hw)
 static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 {
 	struct rk_mpp_job *job;
+	struct rk_mpp_cluster_recovery_result recovery;
 	bool dchs_lifecycle_locked;
 	bool fault_pending = false;
 	u32 irq_status = 0;
@@ -16921,7 +17136,7 @@ static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 
 	dchs_lifecycle_locked = rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
 	if (rk_mpp_rkvenc2_irq_needs_reset(irq_status)) {
-		reset_ret = rk_mpp_hw_stop_active(hw);
+		reset_ret = rk_mpp_hw_stop_and_recover(hw, job, &recovery);
 		if (reset_ret) {
 			WARN_ON_ONCE(!rk_mpp_hw_restore_active_job(hw, job));
 			rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
@@ -17239,6 +17454,7 @@ static irqreturn_t rk_mpp_rkvdec2_thread(struct rk_mpp_hw *hw)
 	const struct rk_mpp_rkvdec2_link_info *link_info =
 		&rk_mpp_rkvdec2_vdpu381_link_info;
 	struct rk_mpp_job *job;
+	struct rk_mpp_cluster_recovery_result recovery;
 	bool fault_pending = false;
 	u32 irq_status = 0;
 	int reset_ret;
@@ -17279,7 +17495,7 @@ static irqreturn_t rk_mpp_rkvdec2_thread(struct rk_mpp_hw *hw)
 	}
 
 	if (irq_status & link_info->err_mask) {
-		reset_ret = rk_mpp_rkvdec2_reset_soft_ccu_job(job);
+		reset_ret = rk_mpp_rkvdec2_reset_soft_ccu_job(job, &recovery);
 		if (reset_ret) {
 			WARN_ON_ONCE(!rk_mpp_hw_restore_active_job(hw, job));
 			mutex_unlock(&hw->run_lock);
@@ -17805,6 +18021,7 @@ static int rk_mpp_av1_submit(struct rk_mpp_job *job)
 {
 	struct rk_mpp_av1_afbc_config config;
 	struct rk_mpp_hw *hw = job->hw;
+	struct rk_mpp_cluster_recovery_result recovery;
 	u32 start_value = 0;
 	bool active_owned = false;
 	bool iommu_reserved = false;
@@ -17895,7 +18112,7 @@ err_power_off:
 	irq_disabled = rk_mpp_hw_disable_irq_nosync(hw);
 	rk_mpp_hw_synchronize_hardirq(hw);
 	if (start_failed_untrusted && active_owned) {
-		stop_ret = rk_mpp_hw_stop_active(hw);
+		stop_ret = rk_mpp_hw_stop_and_recover(hw, job, &recovery);
 		if (stop_ret) {
 			rk_mpp_hw_handle_reset_failure(hw, stop_ret);
 			/*
@@ -17947,6 +18164,7 @@ static irqreturn_t rk_mpp_av1_irq(struct rk_mpp_hw *hw)
 static irqreturn_t rk_mpp_av1_thread(struct rk_mpp_hw *hw)
 {
 	struct rk_mpp_job *job;
+	struct rk_mpp_cluster_recovery_result recovery;
 	bool fault_pending = false;
 	u64 generation = 0;
 	u32 irq_status = 0;
@@ -17991,7 +18209,7 @@ static irqreturn_t rk_mpp_av1_thread(struct rk_mpp_hw *hw)
 	if (!ret && (irq_status & RK_MPP_AV1_ERR_MASK))
 		ret = -EIO;
 	if (irq_status & RK_MPP_AV1_ERR_MASK) {
-		reset_ret = rk_mpp_hw_stop_active(hw);
+		reset_ret = rk_mpp_hw_stop_and_recover(hw, job, &recovery);
 		if (reset_ret) {
 			WARN_ON_ONCE(!rk_mpp_hw_restore_active_job(hw, job));
 			mutex_unlock(&hw->run_lock);
