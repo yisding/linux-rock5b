@@ -1027,7 +1027,7 @@ struct rk_mpp_session {
 	u32 active_job_count;
 	u64 state_seq;
 	/* Protected by srv->sched_lock; see rk_mpp_scheduler_take_job(). */
-	bool rkvdec_dispatch_active;
+	struct rk_mpp_activation *rkvdec_dispatch_owner;
 	/*
 	 * Scheduler scan stamp, written and read only under srv->sched_lock.
 	 * Set to the current scan's sched_scan_stamp when a queued job of
@@ -1173,8 +1173,6 @@ struct rk_mpp_job {
 	bool rkvenc_slice_overflow;
 	bool av1_afbc_enabled;
 	bool session_initialized;
-	/* Protected by session->srv->sched_lock. */
-	bool rkvdec_session_dispatch;
 	u64 hw_start_ns;
 	u64 hw_elapsed_ns;
 	u64 queued_ns;
@@ -1237,6 +1235,7 @@ static void rk_mpp_job_get(struct rk_mpp_job *job);
 static void rk_mpp_job_put(struct rk_mpp_job *job);
 static struct rk_mpp_hw *rk_mpp_job_get_hw(struct rk_mpp_job *job);
 static void rk_mpp_job_drop_hw(struct rk_mpp_job *job);
+static bool rk_mpp_dispatch_lease_released(const struct rk_mpp_job *job);
 static void rk_mpp_scheduler_release_session(struct rk_mpp_job *job);
 static int rk_mpp_job_queue_current_locked(struct rk_mpp_job *job);
 static struct rk_mpp_job *rk_mpp_hw_take_active_job(struct rk_mpp_hw *hw,
@@ -7905,6 +7904,7 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, hw);
 	session.srv = srv;
+	mutex_init(&srv->sched_lock);
 	job0 = kunit_kzalloc(test, sizeof(*job0), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, job0);
 	job1 = kunit_kzalloc(test, sizeof(*job1), GFP_KERNEL);
@@ -7923,6 +7923,7 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	job0->activation.generation = 7;
 	job0->activation.watchdog_deadline = 123;
 	job0->activation.watchdog_deadline_valid = true;
+	session.rkvdec_dispatch_owner = &job0->activation;
 	hw->irq_status = 0x1234;
 	hw->iommu_fault_pending = true;
 	hw->iommu_fault_generation = 7;
@@ -7935,6 +7936,8 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, hw->iommu_fault_pending);
 	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 7ULL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->iommu_refresh_count), 0);
+	KUNIT_EXPECT_PTR_EQ(test, session.rkvdec_dispatch_owner,
+			    &job0->activation);
 
 	KUNIT_EXPECT_TRUE(test, rk_mpp_hw_prepare_active_retry(hw, job0));
 	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, job0);
@@ -7946,6 +7949,8 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, hw->iommu_fault_pending);
 	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 0ULL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->iommu_refresh_count), 0);
+	KUNIT_EXPECT_PTR_EQ(test, session.rkvdec_dispatch_owner,
+			    &job0->activation);
 
 	mutex_lock(&hw->run_lock);
 	rk_mpp_hw_refresh_iommu(hw, job0);
@@ -8604,12 +8609,15 @@ static void rk_mpp_scheduler_session_start_order_kunit(struct kunit *test)
 	job1->session = session_a;
 	job1->client_type = RK_MPP_DEVICE_RKVDEC;
 	job1->hw = busy_hw;
+	rk_mpp_activation_init(job1);
 	job2->session = session_a;
 	job2->client_type = RK_MPP_DEVICE_RKVDEC;
 	job2->hw = idle_hw;
+	rk_mpp_activation_init(job2);
 	other->session = session_b;
 	other->client_type = RK_MPP_DEVICE_RKVDEC;
 	other->hw = idle_hw;
+	rk_mpp_activation_init(other);
 	INIT_LIST_HEAD(&job1->sched_link);
 	INIT_LIST_HEAD(&job2->sched_link);
 	INIT_LIST_HEAD(&other->sched_link);
@@ -8629,8 +8637,10 @@ static void rk_mpp_scheduler_session_start_order_kunit(struct kunit *test)
 	 * job on the free core may run.
 	 */
 	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_scheduler_take_job(srv), other);
-	KUNIT_EXPECT_TRUE(test, session_b->rkvdec_dispatch_active);
+	KUNIT_EXPECT_PTR_EQ(test, session_b->rkvdec_dispatch_owner,
+			    &other->activation);
 	rk_mpp_scheduler_release_session(other);
+	KUNIT_EXPECT_PTR_EQ(test, session_b->rkvdec_dispatch_owner, NULL);
 	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_scheduler_take_job(srv), NULL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->queued_job_count), 2);
 
@@ -8642,30 +8652,34 @@ static void rk_mpp_scheduler_session_start_order_kunit(struct kunit *test)
 	 */
 	busy_hw->active_job = NULL;
 	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_scheduler_take_job(srv), job1);
-	KUNIT_EXPECT_TRUE(test, session_a->rkvdec_dispatch_active);
-	KUNIT_EXPECT_TRUE(test, job1->rkvdec_session_dispatch);
+	KUNIT_EXPECT_PTR_EQ(test, session_a->rkvdec_dispatch_owner,
+			    &job1->activation);
+	KUNIT_EXPECT_FALSE(test, rk_mpp_dispatch_lease_released(job1));
+	KUNIT_EXPECT_TRUE(test, rk_mpp_dispatch_lease_released(job2));
 	/* A queued sibling cannot release the active job's session lease. */
 	rk_mpp_scheduler_release_session(job2);
-	KUNIT_EXPECT_TRUE(test, session_a->rkvdec_dispatch_active);
-	KUNIT_EXPECT_TRUE(test, job1->rkvdec_session_dispatch);
-	KUNIT_EXPECT_FALSE(test, job2->rkvdec_session_dispatch);
+	KUNIT_EXPECT_PTR_EQ(test, session_a->rkvdec_dispatch_owner,
+			    &job1->activation);
 	busy_hw->active_job = job1;
 	list_add_tail(&other->sched_link, &srv->queued_jobs);
 	atomic_inc(&idle_hw->queued_job_count);
 	atomic_inc(&srv->queued_job_count);
 	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_scheduler_take_job(srv), other);
-	KUNIT_EXPECT_TRUE(test, session_b->rkvdec_dispatch_active);
+	KUNIT_EXPECT_PTR_EQ(test, session_b->rkvdec_dispatch_owner,
+			    &other->activation);
 	rk_mpp_scheduler_release_session(other);
+	KUNIT_EXPECT_PTR_EQ(test, session_b->rkvdec_dispatch_owner, NULL);
 	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_scheduler_take_job(srv), NULL);
 
 	busy_hw->active_job = NULL;
 	rk_mpp_scheduler_release_session(job1);
-	KUNIT_EXPECT_FALSE(test, session_a->rkvdec_dispatch_active);
-	KUNIT_EXPECT_FALSE(test, job1->rkvdec_session_dispatch);
+	KUNIT_EXPECT_PTR_EQ(test, session_a->rkvdec_dispatch_owner, NULL);
+	KUNIT_EXPECT_TRUE(test, rk_mpp_dispatch_lease_released(job1));
 	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_scheduler_take_job(srv), job2);
-	KUNIT_EXPECT_TRUE(test, session_a->rkvdec_dispatch_active);
-	KUNIT_EXPECT_TRUE(test, job2->rkvdec_session_dispatch);
+	KUNIT_EXPECT_PTR_EQ(test, session_a->rkvdec_dispatch_owner,
+			    &job2->activation);
 	rk_mpp_scheduler_release_session(job2);
+	KUNIT_EXPECT_PTR_EQ(test, session_a->rkvdec_dispatch_owner, NULL);
 	KUNIT_EXPECT_TRUE(test, list_empty(&srv->queued_jobs));
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->queued_job_count), 0);
 }
@@ -10582,6 +10596,7 @@ static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 
 	queued->session = &session;
 	queued->hw = hw;
+	rk_mpp_activation_init(queued);
 	queued->state = RK_MPP_JOB_ACTIVE;
 	queued->result = -EINPROGRESS;
 	refcount_set(&queued->refs, 3);
@@ -10596,7 +10611,7 @@ static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 
 	active->session = &session;
 	active->client_type = RK_MPP_DEVICE_RKVDEC;
-	active->rkvdec_session_dispatch = true;
+	rk_mpp_activation_init(active);
 	active->state = RK_MPP_JOB_ACTIVE;
 	active->result = -EINPROGRESS;
 	refcount_set(&active->refs, 2);
@@ -10605,7 +10620,7 @@ static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&active->sched_link);
 	INIT_LIST_HEAD(&active->rkvdec_ccu_node);
 	list_add_tail(&active->session_link, &session.active_jobs);
-	session.rkvdec_dispatch_active = true;
+	session.rkvdec_dispatch_owner = &active->activation;
 
 	rk_mpp_session_abort_jobs(&session);
 
@@ -10627,8 +10642,7 @@ static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&hw->queued_job_count), 0);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->queued_job_count), 0);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->aborted_job_count), 2);
-	KUNIT_EXPECT_FALSE(test, session.rkvdec_dispatch_active);
-	KUNIT_EXPECT_FALSE(test, active->rkvdec_session_dispatch);
+	KUNIT_EXPECT_PTR_EQ(test, session.rkvdec_dispatch_owner, NULL);
 	KUNIT_EXPECT_EQ(test,
 			rk_mpp_session_poll_job(&session,
 						MPP_FLAGS_POLL_NON_BLOCK),
@@ -13188,6 +13202,9 @@ static void rk_mpp_job_release(struct rk_mpp_job *job)
 {
 	u32 i;
 
+	if (WARN_ON_ONCE(!rk_mpp_dispatch_lease_released(job)))
+		return;
+
 	for (i = 0; i < job->req_cnt; i++)
 		kfree(job->reqs[i].payload);
 	for (i = 0; i < job->import_count; i++)
@@ -13239,18 +13256,32 @@ static bool rk_mpp_job_serializes_session(const struct rk_mpp_job *job)
 	return job->client_type == RK_MPP_DEVICE_RKVDEC;
 }
 
+static bool rk_mpp_dispatch_lease_released(const struct rk_mpp_job *job)
+{
+	struct rk_mpp_session *session = job->session;
+	bool released;
+
+	mutex_lock(&session->srv->sched_lock);
+	released = session->rkvdec_dispatch_owner != &job->activation;
+	mutex_unlock(&session->srv->sched_lock);
+
+	return released;
+}
+
 /*
  * The RKVDEC dispatch lease serializes hardware retirement per session.
- * sched_lock remains the lease-state lock; these helpers own only the paired
- * session/job token, acquire no reference, and keep the two views from being
- * updated independently.
+ * sched_lock remains the lease-state lock.  The session points directly to
+ * the exact activation that owns the token, so there is no second job-side
+ * boolean to drift.  The lease acquires no reference; existing job references
+ * in the scheduler, active slot, and terminal paths retain the containing job
+ * until release.
  */
 static bool
 rk_mpp_dispatch_lease_active_locked(const struct rk_mpp_session *session)
 {
 	lockdep_assert_held(&session->srv->sched_lock);
 
-	return session->rkvdec_dispatch_active;
+	return !!session->rkvdec_dispatch_owner;
 }
 
 static bool
@@ -13258,7 +13289,7 @@ rk_mpp_dispatch_lease_owned_locked(const struct rk_mpp_job *job)
 {
 	lockdep_assert_held(&job->session->srv->sched_lock);
 
-	return job->rkvdec_session_dispatch;
+	return job->session->rkvdec_dispatch_owner == &job->activation;
 }
 
 static void rk_mpp_dispatch_lease_acquire_locked(struct rk_mpp_job *job)
@@ -13268,8 +13299,7 @@ static void rk_mpp_dispatch_lease_acquire_locked(struct rk_mpp_job *job)
 	lockdep_assert_held(&session->srv->sched_lock);
 	WARN_ON_ONCE(rk_mpp_dispatch_lease_active_locked(session));
 	WARN_ON_ONCE(rk_mpp_dispatch_lease_owned_locked(job));
-	session->rkvdec_dispatch_active = true;
-	job->rkvdec_session_dispatch = true;
+	session->rkvdec_dispatch_owner = &job->activation;
 }
 
 static void rk_mpp_dispatch_lease_release_locked(struct rk_mpp_job *job)
@@ -13281,8 +13311,7 @@ static void rk_mpp_dispatch_lease_release_locked(struct rk_mpp_job *job)
 		return;
 
 	WARN_ON_ONCE(!rk_mpp_dispatch_lease_active_locked(session));
-	job->rkvdec_session_dispatch = false;
-	session->rkvdec_dispatch_active = false;
+	session->rkvdec_dispatch_owner = NULL;
 }
 
 static void rk_mpp_scheduler_release_session(struct rk_mpp_job *job)
