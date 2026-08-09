@@ -11215,7 +11215,7 @@ static void rk_rga_request_config_direct_phys_reject_kunit(struct kunit *test)
 		.id = 8,
 		.acquire_fence_fd = -1,
 	};
-	struct rk_rga_session session = {};
+	struct rk_rga_session *session;
 	struct rk_rga_request *request;
 	struct rk_rga_import *src_import;
 	struct rk_rga_import *dst_import;
@@ -11225,6 +11225,8 @@ static void rk_rga_request_config_direct_phys_reject_kunit(struct kunit *test)
 
 	task_user = rk_rga_kunit_user_buffer(test, sizeof(tasks));
 	KUNIT_ASSERT_NOT_NULL(test, task_user);
+	session = kunit_kzalloc(test, sizeof(*session), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, session);
 
 	tasks[0].handle_flag = 1;
 	tasks[0].src.yrgb_addr = 81;
@@ -11247,7 +11249,7 @@ static void rk_rga_request_config_direct_phys_reject_kunit(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
 
 	KUNIT_ASSERT_NOT_NULL(test,
-			      rk_rga_kunit_session_init(test, &session));
+			      rk_rga_kunit_session_init(test, session));
 
 	request = kzalloc_obj(*request, GFP_KERNEL);
 	src_import = rk_rga_kunit_import(test);
@@ -11261,21 +11263,21 @@ static void rk_rga_request_config_direct_phys_reject_kunit(struct kunit *test)
 	dst_import->size = (size_t)1280 * 720 * 4;
 
 	KUNIT_ASSERT_EQ(test,
-			idr_alloc(&session.requests, request, 8, 9,
+			idr_alloc(&session->requests, request, 8, 9,
 				  GFP_KERNEL),
 			8);
 	KUNIT_ASSERT_EQ(test,
-			idr_alloc(&session.imports, src_import, 81, 82,
+			idr_alloc(&session->imports, src_import, 81, 82,
 				  GFP_KERNEL),
 			81);
 	KUNIT_ASSERT_EQ(test,
-			idr_alloc(&session.imports, dst_import, 82, 83,
+			idr_alloc(&session->imports, dst_import, 82, 83,
 				  GFP_KERNEL),
 			82);
 
-	ret = rk_rga_request_config(&session, &user, NULL);
+	ret = rk_rga_request_config(session, &user, NULL);
 	KUNIT_EXPECT_EQ(test, ret, -EOPNOTSUPP);
-	KUNIT_EXPECT_PTR_EQ(test, idr_find(&session.requests, 8), request);
+	KUNIT_EXPECT_PTR_EQ(test, idr_find(&session->requests, 8), request);
 	KUNIT_EXPECT_FALSE(test, request->configured);
 	KUNIT_EXPECT_PTR_EQ(test, request->tasks, NULL);
 	KUNIT_EXPECT_PTR_EQ(test, request->imports, NULL);
@@ -11283,15 +11285,15 @@ static void rk_rga_request_config_direct_phys_reject_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&src_import->refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&dst_import->refs), 1);
 
-	KUNIT_EXPECT_TRUE(test, rk_rga_request_remove_free(&session, 8));
-	KUNIT_EXPECT_PTR_EQ(test, idr_remove(&session.imports, 81),
+	KUNIT_EXPECT_TRUE(test, rk_rga_request_remove_free(session, 8));
+	KUNIT_EXPECT_PTR_EQ(test, idr_remove(&session->imports, 81),
 			    src_import);
-	KUNIT_EXPECT_PTR_EQ(test, idr_remove(&session.imports, 82),
+	KUNIT_EXPECT_PTR_EQ(test, idr_remove(&session->imports, 82),
 			    dst_import);
 	rk_rga_import_put(src_import);
 	rk_rga_import_put(dst_import);
-	idr_destroy(&session.requests);
-	idr_destroy(&session.imports);
+	idr_destroy(&session->requests);
+	idr_destroy(&session->imports);
 }
 
 static void rk_rga_request_reconfig_resources_kunit(struct kunit *test)
@@ -12469,7 +12471,7 @@ static void rk_rga_legacy_blit_sync_wait_kunit(struct kunit *test)
 	struct rga_req task =
 		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
 					  RK_RGA_FORMAT_RGBA_8888);
-	struct rga_req user_task;
+	struct rga_req *user_task;
 	struct rk_rga_session session = {};
 	struct rk_rga_import *src_import;
 	struct rk_rga_import *dst_import;
@@ -12486,6 +12488,8 @@ static void rk_rga_legacy_blit_sync_wait_kunit(struct kunit *test)
 
 	task_user = rk_rga_kunit_user_buffer(test, sizeof(task));
 	KUNIT_ASSERT_NOT_NULL(test, task_user);
+	user_task = kunit_kzalloc(test, sizeof(*user_task), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, user_task);
 
 	task.handle_flag = 1;
 	task.src.yrgb_addr = 11;
@@ -12604,13 +12608,13 @@ static void rk_rga_legacy_blit_sync_wait_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&src_import->refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&dst_import->refs), 1);
 
-	uncopied = copy_from_user(&user_task, task_user, sizeof(user_task));
+	uncopied = copy_from_user(user_task, task_user, sizeof(*user_task));
 	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
-	KUNIT_EXPECT_EQ(test, user_task.handle_flag & 1, 1U);
-	KUNIT_EXPECT_EQ(test, user_task.src.yrgb_addr, 11ULL);
-	KUNIT_EXPECT_EQ(test, user_task.dst.yrgb_addr, 12ULL);
-	KUNIT_EXPECT_EQ(test, user_task.in_fence_fd, 0);
-	KUNIT_EXPECT_EQ(test, user_task.out_fence_fd, -1);
+	KUNIT_EXPECT_EQ(test, user_task->handle_flag & 1, 1U);
+	KUNIT_EXPECT_EQ(test, user_task->src.yrgb_addr, 11ULL);
+	KUNIT_EXPECT_EQ(test, user_task->dst.yrgb_addr, 12ULL);
+	KUNIT_EXPECT_EQ(test, user_task->in_fence_fd, 0);
+	KUNIT_EXPECT_EQ(test, user_task->out_fence_fd, -1);
 
 	hw->active_job = NULL;
 	list_del_init(&hw->node);
@@ -12898,24 +12902,8 @@ static void rk_rga_version_queries_kunit(struct kunit *test)
 		.version_minor = 2,
 		.version_revision = 0x63318,
 	};
-	struct rk_rga_hw rga3 = {
-		.type = RK_RGA_HW_RGA3,
-		.match = &rga3_match,
-		.version = {
-			.major = 3,
-			.minor = 0,
-			.revision = 0x76831,
-		},
-	};
-	struct rk_rga_hw rga2 = {
-		.type = RK_RGA_HW_RGA2,
-		.match = &rga2_match,
-		.version = {
-			.major = 3,
-			.minor = 2,
-			.revision = 0x63318,
-		},
-	};
+	struct rk_rga_hw *rga3;
+	struct rk_rga_hw *rga2;
 	struct rga_hw_versions_t hw_versions = {};
 	struct rga_version_t driver_version = {};
 	char legacy_version[RGA_VERSION_SIZE] = {};
@@ -12937,12 +12925,26 @@ static void rk_rga_version_queries_kunit(struct kunit *test)
 
 	rga = rk_rga_kunit_alloc_service(test);
 	KUNIT_ASSERT_NOT_NULL(test, rga);
-	rga3.rga = rga;
-	rga2.rga = rga;
-	INIT_LIST_HEAD(&rga3.node);
-	INIT_LIST_HEAD(&rga2.node);
-	list_add_tail(&rga3.node, &rga->hw_list);
-	list_add_tail(&rga2.node, &rga->hw_list);
+	rga3 = kunit_kzalloc(test, sizeof(*rga3), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, rga3);
+	rga2 = kunit_kzalloc(test, sizeof(*rga2), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, rga2);
+	rga3->type = RK_RGA_HW_RGA3;
+	rga3->match = &rga3_match;
+	rga3->version.major = 3;
+	rga3->version.minor = 0;
+	rga3->version.revision = 0x76831;
+	rga3->rga = rga;
+	rga2->type = RK_RGA_HW_RGA2;
+	rga2->match = &rga2_match;
+	rga2->version.major = 3;
+	rga2->version.minor = 2;
+	rga2->version.revision = 0x63318;
+	rga2->rga = rga;
+	INIT_LIST_HEAD(&rga3->node);
+	INIT_LIST_HEAD(&rga2->node);
+	list_add_tail(&rga3->node, &rga->hw_list);
+	list_add_tail(&rga2->node, &rga->hw_list);
 	rk_rga_refresh_hw_versions(rga);
 
 	KUNIT_EXPECT_EQ(test,
@@ -12989,7 +12991,7 @@ static void rk_rga_version_queries_kunit(struct kunit *test)
 				sizeof(rga2_version));
 	KUNIT_ASSERT_EQ(test, uncopied, 0UL);
 
-	list_del_init(&rga2.node);
+	list_del_init(&rga2->node);
 	rk_rga_refresh_hw_versions(rga);
 	KUNIT_EXPECT_EQ(test,
 			rk_rga_ioctl_get_rga2_version(
@@ -13001,7 +13003,7 @@ static void rk_rga_version_queries_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, uncopied, 0UL);
 	KUNIT_EXPECT_STREQ(test, rga2_version, "unchanged");
 
-	list_del_init(&rga3.node);
+	list_del_init(&rga3->node);
 	rk_rga_refresh_hw_versions(rga);
 }
 
@@ -13209,15 +13211,12 @@ static void rk_rga2_mmu_plane_layout_kunit(struct kunit *test)
 	};
 	struct rk_rga_import y = { .size = PAGE_SIZE };
 	struct rk_rga_import uv = { .size = PAGE_SIZE / 2 };
-	struct rk_rga_hw hw = { .type = RK_RGA_HW_RGA2 };
+	struct rk_rga_hw *hw;
 	struct rk_rga_job_mapping mappings[] = {
-		{ .import = &y, .hw = &hw, .sgt = &y_sgt },
-		{ .import = &uv, .hw = &hw, .sgt = &uv_sgt },
+		{ .import = &y, .sgt = &y_sgt },
+		{ .import = &uv, .sgt = &uv_sgt },
 	};
-	struct rk_rga_job job = {
-		.mappings = mappings,
-		.mapping_count = ARRAY_SIZE(mappings),
-	};
+	struct rk_rga_job *job;
 	struct rk_rga_img_imports imports = {
 		.yrgb = &y,
 		.uv = &uv,
@@ -13234,6 +13233,16 @@ static void rk_rga2_mmu_plane_layout_kunit(struct kunit *test)
 	u32 page_table[3] = {};
 	u32 page_count = 0;
 
+	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
+	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+	hw->type = RK_RGA_HW_RGA2;
+	mappings[0].hw = hw;
+	mappings[1].hw = hw;
+	job->mappings = mappings;
+	job->mapping_count = ARRAY_SIZE(mappings);
+
 	sg_init_table(&y_sg, 1);
 	sg_dma_address(&y_sg) = 0x1003;
 	sg_dma_len(&y_sg) = PAGE_SIZE;
@@ -13242,8 +13251,8 @@ static void rk_rga2_mmu_plane_layout_kunit(struct kunit *test)
 	sg_dma_len(&uv_sg) = PAGE_SIZE / 2;
 
 	KUNIT_ASSERT_EQ(test,
-			rk_rga2_mmu_fill_img(&job, &img, &imports, &layout,
-					     &hw, page_table,
+			rk_rga2_mmu_fill_img(job, &img, &imports, &layout,
+					     hw, page_table,
 					     ARRAY_SIZE(page_table),
 					     &page_count),
 			0);
@@ -14167,7 +14176,7 @@ static void rk_rga_raster_stride_backend_mask_kunit(struct kunit *test)
 
 static void rk_rga_direct_import_identity_kunit(struct kunit *test)
 {
-	struct rk_rga_service rga = {};
+	struct rk_rga_service *rga;
 	struct dma_buf dmabuf0 = {};
 	struct dma_buf dmabuf1 = {};
 	struct rk_rga_import dmabuf_identity = {};
@@ -14179,8 +14188,10 @@ static void rk_rga_direct_import_identity_kunit(struct kunit *test)
 	};
 	struct rk_rga_import *imports[] = { &dmabuf_import };
 
-	rk_rga_import_init(&dmabuf_identity, &rga, RK_RGA_IMPORT_DMABUF);
-	rk_rga_import_init(&userptr_identity, &rga, RK_RGA_IMPORT_USERPTR);
+	rga = kunit_kzalloc(test, sizeof(*rga), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, rga);
+	rk_rga_import_init(&dmabuf_identity, rga, RK_RGA_IMPORT_DMABUF);
+	rk_rga_import_init(&userptr_identity, rga, RK_RGA_IMPORT_USERPTR);
 	KUNIT_EXPECT_EQ(test, dmabuf_identity.iova,
 			(dma_addr_t)(unsigned long)&dmabuf_identity);
 	KUNIT_EXPECT_EQ(test, userptr_identity.iova,
@@ -14238,122 +14249,128 @@ static void rk_rga_userptr_backing_identity_kunit(struct kunit *test)
 		.offset = 512,
 		.length = 512,
 	};
-	struct rk_rga_import first = {
-		.type = RK_RGA_IMPORT_USERPTR,
-		.pages = first_pages,
-		.userptr_extents = first_extents,
-		.size = 2 * PAGE_SIZE,
-		.page_count = ARRAY_SIZE(first_pages),
-		.userptr_extent_count = ARRAY_SIZE(first_extents),
-	};
-	struct rk_rga_import candidate = {
-		.type = RK_RGA_IMPORT_USERPTR,
-		.pages = same_pages,
-		.userptr_extents = same_extents,
-		.size = 2 * PAGE_SIZE,
-		.page_count = ARRAY_SIZE(same_pages),
-		.userptr_extent_count = ARRAY_SIZE(same_extents),
-	};
-	struct rk_rga_import head = {
-		.type = RK_RGA_IMPORT_USERPTR,
-		.pages = head_pages,
-		.userptr_extents = &head_extent,
-		.size = 512,
-		.page_count = ARRAY_SIZE(head_pages),
-		.userptr_extent_count = 1,
-	};
-	struct rk_rga_import tail = {
-		.type = RK_RGA_IMPORT_USERPTR,
-		.pages = tail_pages,
-		.userptr_extents = &tail_extent,
-		.size = 512,
-		.page_count = ARRAY_SIZE(tail_pages),
-		.userptr_extent_count = 1,
-		.page_offset = 512,
-	};
-	struct rk_rga_import built = {
-		.type = RK_RGA_IMPORT_USERPTR,
-		.pages = built_pages,
-		.size = PAGE_SIZE,
-		.page_count = ARRAY_SIZE(built_pages),
-		.page_offset = 100,
-	};
-	struct rk_rga_import duplicate = {
-		.type = RK_RGA_IMPORT_USERPTR,
-		.pages = duplicate_pages,
-		.size = 2 * PAGE_SIZE,
-		.page_count = ARRAY_SIZE(duplicate_pages),
-	};
-	struct rk_rga_import *imports[] = { &first };
+	struct rk_rga_import *fixture;
+	struct rk_rga_import *first;
+	struct rk_rga_import *candidate;
+	struct rk_rga_import *head;
+	struct rk_rga_import *tail;
+	struct rk_rga_import *built;
+	struct rk_rga_import *duplicate;
+	struct rk_rga_import *imports[1];
 	struct rk_rga_import *match = NULL;
+
+	fixture = kunit_kcalloc(test, 6, sizeof(*fixture), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, fixture);
+	first = &fixture[0];
+	candidate = &fixture[1];
+	head = &fixture[2];
+	tail = &fixture[3];
+	built = &fixture[4];
+	duplicate = &fixture[5];
+
+	first->type = RK_RGA_IMPORT_USERPTR;
+	first->pages = first_pages;
+	first->userptr_extents = first_extents;
+	first->size = 2 * PAGE_SIZE;
+	first->page_count = ARRAY_SIZE(first_pages);
+	first->userptr_extent_count = ARRAY_SIZE(first_extents);
+	candidate->type = RK_RGA_IMPORT_USERPTR;
+	candidate->pages = same_pages;
+	candidate->userptr_extents = same_extents;
+	candidate->size = 2 * PAGE_SIZE;
+	candidate->page_count = ARRAY_SIZE(same_pages);
+	candidate->userptr_extent_count = ARRAY_SIZE(same_extents);
+	head->type = RK_RGA_IMPORT_USERPTR;
+	head->pages = head_pages;
+	head->userptr_extents = &head_extent;
+	head->size = 512;
+	head->page_count = ARRAY_SIZE(head_pages);
+	head->userptr_extent_count = 1;
+	tail->type = RK_RGA_IMPORT_USERPTR;
+	tail->pages = tail_pages;
+	tail->userptr_extents = &tail_extent;
+	tail->size = 512;
+	tail->page_count = ARRAY_SIZE(tail_pages);
+	tail->userptr_extent_count = 1;
+	tail->page_offset = 512;
+	built->type = RK_RGA_IMPORT_USERPTR;
+	built->pages = built_pages;
+	built->size = PAGE_SIZE;
+	built->page_count = ARRAY_SIZE(built_pages);
+	built->page_offset = 100;
+	duplicate->type = RK_RGA_IMPORT_USERPTR;
+	duplicate->pages = duplicate_pages;
+	duplicate->size = 2 * PAGE_SIZE;
+	duplicate->page_count = ARRAY_SIZE(duplicate_pages);
+	imports[0] = first;
 
 	/* Different VAs with identical pinned backing canonicalize. */
 	KUNIT_ASSERT_EQ(test,
 			rk_rga_find_userptr_import(imports,
 						   ARRAY_SIZE(imports),
-						   &candidate, &match),
+						   candidate, &match),
 			0);
-	KUNIT_EXPECT_PTR_EQ(test, match, &first);
+	KUNIT_EXPECT_PTR_EQ(test, match, first);
 
 	/* Reusing a VA for different pages must not reuse the old import. */
-	candidate.pages = different_pages;
-	candidate.userptr_extents = different_extents;
+	candidate->pages = different_pages;
+	candidate->userptr_extents = different_extents;
 	match = NULL;
 	KUNIT_ASSERT_EQ(test,
 			rk_rga_find_userptr_import(imports,
 						   ARRAY_SIZE(imports),
-						   &candidate, &match),
+						   candidate, &match),
 			0);
 	KUNIT_EXPECT_PTR_EQ(test, match, NULL);
 
 	/* Any physical-byte overlap short of exact logical identity rejects. */
-	candidate.pages = partial_pages;
-	candidate.userptr_extents = partial_extents;
+	candidate->pages = partial_pages;
+	candidate->userptr_extents = partial_extents;
 	match = NULL;
 	KUNIT_EXPECT_EQ(test,
 			rk_rga_find_userptr_import(imports,
 						   ARRAY_SIZE(imports),
-						   &candidate, &match),
+						   candidate, &match),
 			-EOPNOTSUPP);
 	KUNIT_EXPECT_PTR_EQ(test, match, NULL);
 
 	/* Equal coverage in a different logical page order is still unsafe. */
-	candidate.pages = reordered_pages;
-	candidate.userptr_extents = reordered_extents;
+	candidate->pages = reordered_pages;
+	candidate->userptr_extents = reordered_extents;
 	match = NULL;
 	KUNIT_EXPECT_EQ(test,
 			rk_rga_find_userptr_import(imports,
 						   ARRAY_SIZE(imports),
-						   &candidate, &match),
+						   candidate, &match),
 			-EOPNOTSUPP);
 	KUNIT_EXPECT_PTR_EQ(test, match, NULL);
 
 	/* Sharing a page is safe when the covered byte intervals are disjoint. */
-	imports[0] = &head;
+	imports[0] = head;
 	match = NULL;
 	KUNIT_ASSERT_EQ(test,
 			rk_rga_find_userptr_import(imports,
 						   ARRAY_SIZE(imports),
-						   &tail, &match),
+						   tail, &match),
 			0);
 	KUNIT_EXPECT_PTR_EQ(test, match, NULL);
 
 	/* Extent construction preserves per-page byte coverage while sorting. */
-	KUNIT_ASSERT_EQ(test, rk_rga_userptr_build_extents(&built), 0);
-	KUNIT_EXPECT_PTR_EQ(test, built.userptr_extents[0].page, &backing[0]);
-	KUNIT_EXPECT_EQ(test, built.userptr_extents[0].offset, 0U);
-	KUNIT_EXPECT_EQ(test, built.userptr_extents[0].length, 100U);
-	KUNIT_EXPECT_PTR_EQ(test, built.userptr_extents[1].page, &backing[1]);
-	KUNIT_EXPECT_EQ(test, built.userptr_extents[1].offset, 100U);
-	KUNIT_EXPECT_EQ(test, built.userptr_extents[1].length,
+	KUNIT_ASSERT_EQ(test, rk_rga_userptr_build_extents(built), 0);
+	KUNIT_EXPECT_PTR_EQ(test, built->userptr_extents[0].page, &backing[0]);
+	KUNIT_EXPECT_EQ(test, built->userptr_extents[0].offset, 0U);
+	KUNIT_EXPECT_EQ(test, built->userptr_extents[0].length, 100U);
+	KUNIT_EXPECT_PTR_EQ(test, built->userptr_extents[1].page, &backing[1]);
+	KUNIT_EXPECT_EQ(test, built->userptr_extents[1].offset, 100U);
+	KUNIT_EXPECT_EQ(test, built->userptr_extents[1].length,
 			(u32)PAGE_SIZE - 100);
-	kfree(built.userptr_extents);
+	kfree(built->userptr_extents);
 
 	/* One logical buffer may not map two ranges onto the same physical bytes. */
-	KUNIT_EXPECT_EQ(test, rk_rga_userptr_build_extents(&duplicate),
+	KUNIT_EXPECT_EQ(test, rk_rga_userptr_build_extents(duplicate),
 			-EOPNOTSUPP);
-	KUNIT_EXPECT_PTR_EQ(test, duplicate.userptr_extents, NULL);
-	KUNIT_EXPECT_EQ(test, duplicate.userptr_extent_count, 0U);
+	KUNIT_EXPECT_PTR_EQ(test, duplicate->userptr_extents, NULL);
+	KUNIT_EXPECT_EQ(test, duplicate->userptr_extent_count, 0U);
 }
 
 static void rk_rga_cross_type_alias_kunit(struct kunit *test)
@@ -14568,7 +14585,7 @@ static void rk_rga_handle_dmabuf_alias_kunit(struct kunit *test)
 
 static void rk_rga_explicit_plane_dmabuf_alias_kunit(struct kunit *test)
 {
-	struct rk_rga_session session = {};
+	struct rk_rga_session *session;
 	struct dma_buf dmabuf = {};
 	struct rk_rga_import y = {
 		.type = RK_RGA_IMPORT_DMABUF,
@@ -14595,14 +14612,16 @@ static void rk_rga_explicit_plane_dmabuf_alias_kunit(struct kunit *test)
 	int y_handle;
 	int uv_handle;
 
-	idr_init(&session.imports);
+	session = kunit_kzalloc(test, sizeof(*session), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, session);
+	rk_rga_session_init(session, NULL);
 	refcount_set(&y.refs, 1);
 	refcount_set(&uv.refs, 1);
 	mutex_init(&y.map_lock);
 	mutex_init(&uv.map_lock);
-	y_handle = idr_alloc(&session.imports, &y, 1, 0, GFP_KERNEL);
+	y_handle = idr_alloc(&session->imports, &y, 1, 0, GFP_KERNEL);
 	KUNIT_ASSERT_GT(test, y_handle, 0);
-	uv_handle = idr_alloc(&session.imports, &uv, 1, 0, GFP_KERNEL);
+	uv_handle = idr_alloc(&session->imports, &uv, 1, 0, GFP_KERNEL);
 	KUNIT_ASSERT_GT(test, uv_handle, 0);
 
 	/*
@@ -14614,7 +14633,7 @@ static void rk_rga_explicit_plane_dmabuf_alias_kunit(struct kunit *test)
 	img.v_addr = 32 * 32;
 	KUNIT_ASSERT_EQ(test,
 			rk_rga_resolve_img_handles_with_imports_locked(
-				&session, &img, imports, &import_count,
+				session, &img, imports, &import_count,
 				&img_imports, true),
 			0);
 	KUNIT_EXPECT_EQ(test, import_count, 1U);
@@ -14638,7 +14657,7 @@ static void rk_rga_explicit_plane_dmabuf_alias_kunit(struct kunit *test)
 	img.rd_mode = RK_RGA_FBC_MODE;
 	KUNIT_ASSERT_EQ(test,
 			rk_rga_resolve_img_handles_with_imports_locked(
-				&session, &img, imports, &import_count,
+				session, &img, imports, &import_count,
 				&img_imports, true),
 			0);
 	KUNIT_EXPECT_EQ(test, import_count, 1U);
@@ -14662,7 +14681,7 @@ static void rk_rga_explicit_plane_dmabuf_alias_kunit(struct kunit *test)
 	img.rd_mode = RK_RGA_RASTER_MODE;
 	KUNIT_EXPECT_EQ(test,
 			rk_rga_resolve_img_handles_with_imports_locked(
-				&session, &img, imports, &import_count,
+				session, &img, imports, &import_count,
 				&img_imports, true),
 			-EOPNOTSUPP);
 	KUNIT_EXPECT_EQ(test, import_count, 2U);
@@ -14673,7 +14692,8 @@ static void rk_rga_explicit_plane_dmabuf_alias_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&y.refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&uv.refs), 1);
 
-	idr_destroy(&session.imports);
+	idr_destroy(&session->imports);
+	idr_destroy(&session->requests);
 }
 
 static void rk_rga_explicit_plane_userptr_alias_kunit(struct kunit *test)
@@ -14751,7 +14771,7 @@ static void rk_rga_explicit_plane_userptr_alias_kunit(struct kunit *test)
 
 static void rk_rga_explicit_plane_distinct_kunit(struct kunit *test)
 {
-	struct rk_rga_session session = {};
+	struct rk_rga_session *session;
 	struct dma_buf y_dmabuf = {};
 	struct dma_buf uv_dmabuf = {};
 	struct rk_rga_import y = {
@@ -14778,20 +14798,22 @@ static void rk_rga_explicit_plane_distinct_kunit(struct kunit *test)
 	int y_handle;
 	int uv_handle;
 
-	idr_init(&session.imports);
+	session = kunit_kzalloc(test, sizeof(*session), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, session);
+	rk_rga_session_init(session, NULL);
 	refcount_set(&y.refs, 1);
 	refcount_set(&uv.refs, 1);
 	mutex_init(&y.map_lock);
 	mutex_init(&uv.map_lock);
-	y_handle = idr_alloc(&session.imports, &y, 1, 0, GFP_KERNEL);
+	y_handle = idr_alloc(&session->imports, &y, 1, 0, GFP_KERNEL);
 	KUNIT_ASSERT_GT(test, y_handle, 0);
-	uv_handle = idr_alloc(&session.imports, &uv, 1, 0, GFP_KERNEL);
+	uv_handle = idr_alloc(&session->imports, &uv, 1, 0, GFP_KERNEL);
 	KUNIT_ASSERT_GT(test, uv_handle, 0);
 	img.yrgb_addr = y_handle;
 	img.uv_addr = uv_handle;
 
 	KUNIT_ASSERT_EQ(test,
-			rk_rga_resolve_img_handles_locked(&session, &img,
+			rk_rga_resolve_img_handles_locked(session, &img,
 							  imports,
 							  &import_count,
 							  true),
@@ -14806,7 +14828,8 @@ static void rk_rga_explicit_plane_distinct_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&y.refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&uv.refs), 1);
 
-	idr_destroy(&session.imports);
+	idr_destroy(&session->imports);
+	idr_destroy(&session->requests);
 }
 
 static void rk_rga_iova_import_identity_kunit(struct kunit *test)
@@ -14815,12 +14838,8 @@ static void rk_rga_iova_import_identity_kunit(struct kunit *test)
 	u8 core_b_token;
 	struct device *core_a_dev = (struct device *)&core_a_token;
 	struct device *core_b_dev = (struct device *)&core_b_token;
-	struct rk_rga_hw core_a = {
-		.dev = core_a_dev,
-	};
-	struct rk_rga_hw core_b = {
-		.dev = core_b_dev,
-	};
+	struct rk_rga_hw *core_a;
+	struct rk_rga_hw *core_b;
 	struct rk_rga_import import_a = {
 		.iova = 0x10000000,
 	};
@@ -14830,19 +14849,16 @@ static void rk_rga_iova_import_identity_kunit(struct kunit *test)
 	struct rk_rga_job_mapping mappings[] = {
 		{
 			.import = &import_a,
-			.hw = &core_a,
 			.dev = core_a_dev,
 			.iova = 0x50000000,
 		},
 		{
 			.import = &import_b,
-			.hw = &core_a,
 			.dev = core_a_dev,
 			.iova = 0x60000000,
 		},
 		{
 			.import = &import_b,
-			.hw = &core_b,
 			.dev = core_b_dev,
 			.iova = 0x70000000,
 		},
@@ -14858,12 +14874,22 @@ static void rk_rga_iova_import_identity_kunit(struct kunit *test)
 		rk_rga_kunit_img(import_b.iova, RK_RGA_FORMAT_RGBA_8888,
 				  16, 16);
 
+	core_a = kunit_kzalloc(test, sizeof(*core_a), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, core_a);
+	core_b = kunit_kzalloc(test, sizeof(*core_b), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, core_b);
+	core_a->dev = core_a_dev;
+	core_b->dev = core_b_dev;
+	mappings[0].hw = core_a;
+	mappings[1].hw = core_a;
+	mappings[2].hw = core_b;
+
 	refcount_set(&import_a.refs, 1);
 	refcount_set(&import_b.refs, 1);
 	mutex_init(&import_a.map_lock);
 	mutex_init(&import_b.map_lock);
-	refcount_set(&core_a.refs, 1);
-	refcount_set(&core_b.refs, 1);
+	refcount_set(&core_a->refs, 1);
+	refcount_set(&core_b->refs, 1);
 
 	/*
 	 * B's logical identity deliberately equals A's core-A IOVA. Rebase
@@ -14872,7 +14898,7 @@ static void rk_rga_iova_import_identity_kunit(struct kunit *test)
 	 */
 	KUNIT_ASSERT_EQ(test,
 			rk_rga_job_rebase_img_to_hw(&job, &img, &img_imports,
-						    &core_a,
+						    core_a,
 						    RK_RGA2_MMU_SRC0),
 			0);
 	KUNIT_EXPECT_EQ(test, img.yrgb_addr, (__u64)0x60000000);
@@ -14880,7 +14906,7 @@ static void rk_rga_iova_import_identity_kunit(struct kunit *test)
 	/* A later core handoff remains tied to B despite the mutated address. */
 	KUNIT_ASSERT_EQ(test,
 			rk_rga_job_rebase_img_to_hw(&job, &img, &img_imports,
-						    &core_b,
+						    core_b,
 						    RK_RGA2_MMU_SRC0),
 			0);
 	KUNIT_EXPECT_EQ(test, img.yrgb_addr, (__u64)0x70000000);
@@ -14892,12 +14918,13 @@ static void rk_rga_iova_import_identity_kunit(struct kunit *test)
 static void rk_rga_zero_iova_import_binding_kunit(struct kunit *test)
 {
 	struct rga_req task = {};
-	struct rk_rga_import y = {};
-	struct rk_rga_import uv = {};
-	struct rk_rga_import dst = {};
-	struct rk_rga_import pat = {};
-	struct rk_rga_import *single[] = { &y };
-	struct rk_rga_import *planes[] = { &y, &uv };
+	struct rk_rga_import *fixture;
+	struct rk_rga_import *y;
+	struct rk_rga_import *uv;
+	struct rk_rga_import *dst;
+	struct rk_rga_import *pat;
+	struct rk_rga_import *single[1];
+	struct rk_rga_import *planes[2];
 	struct rk_rga_img_imports img_imports;
 	struct rk_rga_task_imports task_imports = {};
 	struct rk_rga_job job = {
@@ -14910,6 +14937,16 @@ static void rk_rga_zero_iova_import_binding_kunit(struct kunit *test)
 		rk_rga_kunit_img(0, RK_RGA_FORMAT_YCBCR_420_SP, 16, 16);
 	u32 type_mask;
 
+	fixture = kunit_kcalloc(test, 4, sizeof(*fixture), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, fixture);
+	y = &fixture[0];
+	uv = &fixture[1];
+	dst = &fixture[2];
+	pat = &fixture[3];
+	single[0] = y;
+	planes[0] = y;
+	planes[1] = uv;
+
 	/* Single-buffer chroma presence comes from layout, not IOVA truthiness. */
 	img.uv_addr = 0;
 	KUNIT_ASSERT_EQ(test,
@@ -14917,8 +14954,8 @@ static void rk_rga_zero_iova_import_binding_kunit(struct kunit *test)
 						   false, false,
 						   &img_imports),
 			0);
-	KUNIT_EXPECT_PTR_EQ(test, img_imports.yrgb, &y);
-	KUNIT_EXPECT_PTR_EQ(test, img_imports.uv, &y);
+	KUNIT_EXPECT_PTR_EQ(test, img_imports.yrgb, y);
+	KUNIT_EXPECT_PTR_EQ(test, img_imports.uv, y);
 	KUNIT_EXPECT_PTR_EQ(test, img_imports.v, NULL);
 	KUNIT_EXPECT_FALSE(test, rk_rga_img_has_addr(&img));
 
@@ -14928,8 +14965,8 @@ static void rk_rga_zero_iova_import_binding_kunit(struct kunit *test)
 						   true, false,
 						   &img_imports),
 			0);
-	KUNIT_EXPECT_PTR_EQ(test, img_imports.yrgb, &y);
-	KUNIT_EXPECT_PTR_EQ(test, img_imports.uv, &uv);
+	KUNIT_EXPECT_PTR_EQ(test, img_imports.yrgb, y);
+	KUNIT_EXPECT_PTR_EQ(test, img_imports.uv, uv);
 
 	img.format = RK_RGA_FORMAT_RGBA_8888;
 	img.rd_mode = RK_RGA_FBC_MODE;
@@ -14938,15 +14975,15 @@ static void rk_rga_zero_iova_import_binding_kunit(struct kunit *test)
 						   false, false,
 						   &img_imports),
 			0);
-	KUNIT_EXPECT_PTR_EQ(test, img_imports.uv, &y);
+	KUNIT_EXPECT_PTR_EQ(test, img_imports.uv, y);
 
 	task.src = rk_rga_kunit_img(0, RK_RGA_FORMAT_RGBA_8888, 64, 64);
 	task.dst = task.src;
 	task.src.act_w = 32;
 	task.dst.act_w = 32;
 	task.dst.x_offset = 32;
-	task_imports.src.yrgb = &y;
-	task_imports.dst.yrgb = &y;
+	task_imports.src.yrgb = y;
+	task_imports.dst.yrgb = y;
 	rk_rga_task_use_import_identities(&task, &task_imports);
 	KUNIT_EXPECT_TRUE(test, rk_rga_in_place_bitblt_allowed(&task));
 
@@ -14960,14 +14997,14 @@ static void rk_rga_zero_iova_import_binding_kunit(struct kunit *test)
 	task.src = rk_rga_kunit_img(0, RK_RGA_FORMAT_RGBA_8888, 128, 64);
 	task.dst = rk_rga_kunit_img(0, RK_RGA_FORMAT_RGBA_8888, 128, 64);
 	task.pat = rk_rga_kunit_img(0, RK_RGA_FORMAT_RGBA_8888, 128, 64);
-	task_imports.src.yrgb = &y;
-	task_imports.dst.yrgb = &dst;
+	task_imports.src.yrgb = y;
+	task_imports.dst.yrgb = dst;
 	task_imports.pat.yrgb = NULL;
 	KUNIT_ASSERT_EQ(test,
 			rk_rga_task_hw_type_mask(&job, 0, &type_mask), 0);
 	KUNIT_EXPECT_NE(test, type_mask, 0U);
 
-	task_imports.pat.yrgb = &pat;
+	task_imports.pat.yrgb = pat;
 	task.bsfilter_flag = 1;
 	task.alpha_rop_flag = BIT(0) | BIT(3) | BIT(4) | BIT(9);
 	task.PD_mode = RK_RGA_ALPHA_BLEND_SRC_OVER;
@@ -14982,8 +15019,8 @@ static void rk_rga_zero_iova_import_binding_kunit(struct kunit *test)
 
 static void rk_rga_task_import_alias_kunit(struct kunit *test)
 {
-	struct dma_buf object_a = {};
-	struct dma_buf object_b = {};
+	struct dma_buf *object_a;
+	struct dma_buf *object_b;
 	struct rk_rga_import a = {
 		.type = RK_RGA_IMPORT_USERPTR,
 	};
@@ -15006,6 +15043,11 @@ static void rk_rga_task_import_alias_kunit(struct kunit *test)
 	struct rga_req task = {
 		.render_mode = RK_RGA_RENDER_BITBLT,
 	};
+
+	object_a = kunit_kzalloc(test, sizeof(*object_a), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, object_a);
+	object_b = kunit_kzalloc(test, sizeof(*object_b), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, object_b);
 
 	KUNIT_EXPECT_EQ(test,
 			rk_rga_validate_task_import_aliases(&task, &imports),
@@ -15032,8 +15074,8 @@ static void rk_rga_task_import_alias_kunit(struct kunit *test)
 	/* Disjoint device bounces cannot prove distinct outputs won't alias. */
 	a.type = RK_RGA_IMPORT_DMABUF;
 	b.type = RK_RGA_IMPORT_DMABUF;
-	a.dmabuf = &object_a;
-	b.dmabuf = &object_b;
+	a.dmabuf = object_a;
+	b.dmabuf = object_b;
 	imports.src.yrgb = &c;
 	imports.src.uv = NULL;
 	imports.dst.yrgb = &a;
@@ -15857,24 +15899,26 @@ static void rk_rga_task_core_invalid_mask_kunit(struct kunit *test)
 	const u32 invalid_core = RK_RGA_CORE_MASK | BIT(4);
 	u32 type_mask;
 	struct rga_req task;
-	struct rk_rga_job job = {
-		.tasks = &task,
-		.task_count = 1,
-	};
+	struct rk_rga_job *job;
+
+	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+	job->tasks = &task;
+	job->task_count = 1;
 
 	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
 					 RK_RGA_FORMAT_BGRA_8888);
 	task.core = invalid_core;
-	job.import_count = 2;
+	job->import_count = 2;
 	type_mask = U32_MAX;
-	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask),
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(job, &type_mask),
 			-EINVAL);
 	KUNIT_EXPECT_EQ(test, type_mask, 0U);
 
 	task = rk_rga_fill_task(invalid_core);
-	job.import_count = 1;
+	job->import_count = 1;
 	type_mask = U32_MAX;
-	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask),
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(job, &type_mask),
 			-EINVAL);
 	KUNIT_EXPECT_EQ(test, type_mask, 0U);
 
@@ -15889,9 +15933,9 @@ static void rk_rga_task_core_invalid_mask_kunit(struct kunit *test)
 					16, 16),
 		.palette_mode = 3,
 	};
-	job.import_count = 3;
+	job->import_count = 3;
 	type_mask = U32_MAX;
-	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask),
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(job, &type_mask),
 			-EINVAL);
 	KUNIT_EXPECT_EQ(test, type_mask, 0U);
 
@@ -15902,9 +15946,9 @@ static void rk_rga_task_core_invalid_mask_kunit(struct kunit *test)
 					16, 16),
 		.palette_mode = 3,
 	};
-	job.import_count = 1;
+	job->import_count = 1;
 	type_mask = U32_MAX;
-	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask),
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(job, &type_mask),
 			-EINVAL);
 	KUNIT_EXPECT_EQ(test, type_mask, 0U);
 }
@@ -16161,28 +16205,31 @@ static void rk_rga_core_counter_kunit(struct kunit *test)
 
 static void rk_rga_core_slot_reprobe_kunit(struct kunit *test)
 {
-	struct rk_rga_hw rga3_0 = {
-		.type = RK_RGA_HW_RGA3,
-		.core_mask = BIT(0),
-	};
-	struct rk_rga_hw rga3_1 = {
-		.type = RK_RGA_HW_RGA3,
-		.core_mask = BIT(1),
-	};
-	struct rk_rga_hw rga2_0 = {
-		.type = RK_RGA_HW_RGA2,
-		.core_mask = BIT(2),
-	};
-	struct rk_rga_hw rga2_1 = {
-		.type = RK_RGA_HW_RGA2,
-		.core_mask = BIT(3),
-	};
+	struct rk_rga_hw *fixture;
+	struct rk_rga_hw *rga3_0;
+	struct rk_rga_hw *rga3_1;
+	struct rk_rga_hw *rga2_0;
+	struct rk_rga_hw *rga2_1;
 	LIST_HEAD(hw_list);
 
-	list_add_tail(&rga3_0.node, &hw_list);
-	list_add_tail(&rga3_1.node, &hw_list);
-	list_add_tail(&rga2_0.node, &hw_list);
-	list_add_tail(&rga2_1.node, &hw_list);
+	fixture = kunit_kcalloc(test, 4, sizeof(*fixture), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, fixture);
+	rga3_0 = &fixture[0];
+	rga3_1 = &fixture[1];
+	rga2_0 = &fixture[2];
+	rga2_1 = &fixture[3];
+	rga3_0->type = RK_RGA_HW_RGA3;
+	rga3_0->core_mask = BIT(0);
+	rga3_1->type = RK_RGA_HW_RGA3;
+	rga3_1->core_mask = BIT(1);
+	rga2_0->type = RK_RGA_HW_RGA2;
+	rga2_0->core_mask = BIT(2);
+	rga2_1->type = RK_RGA_HW_RGA2;
+	rga2_1->core_mask = BIT(3);
+	list_add_tail(&rga3_0->node, &hw_list);
+	list_add_tail(&rga3_1->node, &hw_list);
+	list_add_tail(&rga2_0->node, &hw_list);
+	list_add_tail(&rga2_1->node, &hw_list);
 
 	KUNIT_EXPECT_EQ(test,
 			rk_rga_find_free_core_mask(&hw_list,
@@ -16191,12 +16238,12 @@ static void rk_rga_core_slot_reprobe_kunit(struct kunit *test)
 			rk_rga_find_free_core_mask(&hw_list,
 						   RK_RGA_HW_RGA2), 0U);
 
-	list_del_init(&rga3_0.node);
+	list_del_init(&rga3_0->node);
 	KUNIT_EXPECT_EQ(test,
 			rk_rga_find_free_core_mask(&hw_list,
 						   RK_RGA_HW_RGA3),
 			BIT(0));
-	list_del_init(&rga2_0.node);
+	list_del_init(&rga2_0->node);
 	KUNIT_EXPECT_EQ(test,
 			rk_rga_find_free_core_mask(&hw_list,
 						   RK_RGA_HW_RGA2),
@@ -16206,36 +16253,46 @@ static void rk_rga_core_slot_reprobe_kunit(struct kunit *test)
 static void rk_rga_priority_enqueue_kunit(struct kunit *test)
 {
 	struct rk_rga_hw hw = { };
-	struct rk_rga_job low = { .priority = 1 };
-	struct rk_rga_job default_prio = { };
-	struct rk_rga_job high = { .priority = 3 };
-	struct rk_rga_job equal = { .priority = 2 };
+	struct rk_rga_job *fixture;
+	struct rk_rga_job *low;
+	struct rk_rga_job *default_prio;
+	struct rk_rga_job *high;
+	struct rk_rga_job *equal;
 	struct rk_rga_job *pos;
 
+	fixture = kunit_kcalloc(test, 4, sizeof(*fixture), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, fixture);
+	low = &fixture[0];
+	default_prio = &fixture[1];
+	high = &fixture[2];
+	equal = &fixture[3];
+	low->priority = 1;
+	high->priority = 3;
+	equal->priority = 2;
 	INIT_LIST_HEAD(&hw.job_queue);
-	INIT_LIST_HEAD(&low.node);
-	INIT_LIST_HEAD(&default_prio.node);
-	INIT_LIST_HEAD(&high.node);
-	INIT_LIST_HEAD(&equal.node);
+	INIT_LIST_HEAD(&low->node);
+	INIT_LIST_HEAD(&default_prio->node);
+	INIT_LIST_HEAD(&high->node);
+	INIT_LIST_HEAD(&equal->node);
 
-	rk_rga_hw_enqueue_job_locked(&hw, &low);
-	rk_rga_hw_enqueue_job_locked(&hw, &default_prio);
-	rk_rga_hw_enqueue_job_locked(&hw, &high);
-	rk_rga_hw_enqueue_job_locked(&hw, &equal);
+	rk_rga_hw_enqueue_job_locked(&hw, low);
+	rk_rga_hw_enqueue_job_locked(&hw, default_prio);
+	rk_rga_hw_enqueue_job_locked(&hw, high);
+	rk_rga_hw_enqueue_job_locked(&hw, equal);
 
 	KUNIT_EXPECT_EQ(test, hw.queued_jobs, 4U);
 	pos = list_first_entry(&hw.job_queue, struct rk_rga_job, node);
-	KUNIT_EXPECT_PTR_EQ(test, pos, &high);
+	KUNIT_EXPECT_PTR_EQ(test, pos, high);
 	pos = list_next_entry(pos, node);
-	KUNIT_EXPECT_PTR_EQ(test, pos, &low);
+	KUNIT_EXPECT_PTR_EQ(test, pos, low);
 	pos = list_next_entry(pos, node);
-	KUNIT_EXPECT_PTR_EQ(test, pos, &equal);
+	KUNIT_EXPECT_PTR_EQ(test, pos, equal);
 	pos = list_next_entry(pos, node);
-	KUNIT_EXPECT_PTR_EQ(test, pos, &default_prio);
+	KUNIT_EXPECT_PTR_EQ(test, pos, default_prio);
 
-	KUNIT_EXPECT_EQ(test, low.priority, 2);
-	KUNIT_EXPECT_EQ(test, default_prio.priority, 2);
-	KUNIT_EXPECT_EQ(test, equal.priority, 2);
+	KUNIT_EXPECT_EQ(test, low->priority, 2);
+	KUNIT_EXPECT_EQ(test, default_prio->priority, 2);
+	KUNIT_EXPECT_EQ(test, equal->priority, 2);
 }
 
 static void rk_rga_iommu_fault_generation_kunit(struct kunit *test)
@@ -16303,23 +16360,27 @@ static void rk_rga_iommu_fault_generation_kunit(struct kunit *test)
 
 static void rk_rga_reset_failure_retains_active_kunit(struct kunit *test)
 {
-	struct rk_rga_hw hw = {};
+	struct rk_rga_hw *hw;
 	struct rk_rga_job target = {};
 	struct rk_rga_job replacement = {};
 
-	spin_lock_init(&hw.job_lock);
-	hw.active_generation = 7;
+	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
+	spin_lock_init(&hw->job_lock);
+	hw->active_generation = 7;
 
 	KUNIT_EXPECT_TRUE(test,
-		rk_rga_hw_restore_active_after_reset_failure(&hw, &target,
-							      true));
-	KUNIT_EXPECT_PTR_EQ(test, hw.active_job, &target);
-	KUNIT_EXPECT_EQ(test, hw.iommu_fault_generation, 7ULL);
+			  rk_rga_hw_restore_active_after_reset_failure(hw,
+								       &target,
+								       true));
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, &target);
+	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 7ULL);
 
 	KUNIT_EXPECT_FALSE(test,
-		rk_rga_hw_restore_active_after_reset_failure(&hw, &replacement,
-							      false));
-	KUNIT_EXPECT_PTR_EQ(test, hw.active_job, &target);
+			   rk_rga_hw_restore_active_after_reset_failure(hw,
+									&replacement,
+									false));
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, &target);
 }
 
 static void rk_rga_abort_reset_failure_retains_dma_kunit(struct kunit *test)
@@ -17220,18 +17281,21 @@ static void rk_rga3_librga_drm_abgr_copy_emit_kunit(struct kunit *test)
 static void rk_rga3_librga_copy_splice_task_kunit(struct kunit *test)
 {
 	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
-	struct rga_req tasks[] = {
-		rk_rga_librga_splice_task(0x10000000, 0),
-		rk_rga_librga_splice_task(0x30000000, 1280),
-	};
+	struct rga_req *tasks;
 	struct rk_rga_job job = {
-		.tasks = tasks,
-		.task_count = ARRAY_SIZE(tasks),
+		.task_count = 2,
 		.import_count = 3,
 		.cmd_vaddr = cmd,
 		.cmd_size = sizeof(cmd),
 	};
 	enum rk_rga_hw_type type = 0;
+
+	tasks = kunit_kcalloc(test, job.task_count, sizeof(*tasks),
+			      GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, tasks);
+	tasks[0] = rk_rga_librga_splice_task(0x10000000, 0);
+	tasks[1] = rk_rga_librga_splice_task(0x30000000, 1280);
+	job.tasks = tasks;
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
@@ -17268,21 +17332,26 @@ static void rk_rga3_librga_copy_splice_task_kunit(struct kunit *test)
 static void rk_rga3_multitask_emit_clears_stale_regs_kunit(struct kunit *test)
 {
 	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
-	struct rk_rga_hw hw = {
-		.type = RK_RGA_HW_RGA3,
-	};
-	struct rga_req tasks[] = {
-		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
-					  RK_RGA_FORMAT_RGBA_8888),
-		rk_rga_librga_splice_task(0x40000000, 0),
-	};
+	struct rk_rga_hw *hw;
+	struct rga_req *tasks;
 	struct rk_rga_job job = {
-		.tasks = tasks,
-		.task_count = ARRAY_SIZE(tasks),
+		.task_count = 2,
 		.import_count = 3,
 		.cmd_vaddr = cmd,
 		.cmd_size = sizeof(cmd),
 	};
+
+	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
+	tasks = kunit_kcalloc(test, job.task_count, sizeof(*tasks),
+			      GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, tasks);
+	hw->type = RK_RGA_HW_RGA3;
+	tasks[0] =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_RGBA_8888);
+	tasks[1] = rk_rga_librga_splice_task(0x40000000, 0);
+	job.tasks = tasks;
 
 	tasks[0].src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
 					1280, 720);
@@ -17298,14 +17367,14 @@ static void rk_rga3_multitask_emit_clears_stale_regs_kunit(struct kunit *test)
 	tasks[0].bg_global_alpha = 0xff;
 	tasks[0].yuv2rgb_mode = 0;
 
-	KUNIT_EXPECT_EQ(test, rk_rga_job_emit_cmd(&hw, &job), 0);
+	KUNIT_EXPECT_EQ(test, rk_rga_job_emit_cmd(hw, &job), 0);
 	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
 	KUNIT_EXPECT_NE(test, cmd[RK_RGA3_OVLP_TOP_CTRL_OFFSET / 4], 0U);
 	KUNIT_EXPECT_NE(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4], 0U);
 
 	KUNIT_EXPECT_TRUE(test, rk_rga_job_advance_task(&job, 0));
 	job.cmd_ready = true;
-	KUNIT_EXPECT_EQ(test, rk_rga_job_emit_cmd(&hw, &job), 0);
+	KUNIT_EXPECT_EQ(test, rk_rga_job_emit_cmd(hw, &job), 0);
 	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_TOP_CTRL_OFFSET / 4], 0U);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4], 0U);
@@ -17691,13 +17760,17 @@ static void rk_rga3_librga_side_border_kunit(struct kunit *test)
 		.cmd_vaddr = rga3_cmd,
 		.cmd_size = sizeof(rga3_cmd),
 	};
-	struct rga_req task;
-	struct rk_rga_job single_job;
+	struct rga_req *task;
+	struct rk_rga_job *single_job;
 	enum rk_rga_hw_type type;
 
 	tasks = kunit_kcalloc(test, job.task_count, sizeof(*tasks),
 			      GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, tasks);
+	task = kunit_kzalloc(test, sizeof(*task), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, task);
+	single_job = kunit_kzalloc(test, sizeof(*single_job), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, single_job);
 	/*
 	 * Border strips are 80 px wide inside a 320 px row: narrower windows
 	 * are below RGA3's declared 68-pixel minimum and belong on RGA2.
@@ -17756,37 +17829,35 @@ static void rk_rga3_librga_side_border_kunit(struct kunit *test)
 									 0));
 	}
 
-	task = rk_rga_librga_side_border_task(80, 240, 80, true, BIT(2));
-	single_job = (struct rk_rga_job) {
-		.tasks = &task,
-		.task_count = 1,
-		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
-	};
+	*task = rk_rga_librga_side_border_task(80, 240, 80, true, BIT(2));
+	single_job->tasks = task;
+	single_job->task_count = 1;
+	single_job->import_count = 2;
+	single_job->cmd_vaddr = cmd;
+	single_job->cmd_size = sizeof(cmd);
 	type = 0;
-	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&single_job, &type), 0);
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(single_job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
-	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&single_job), 0);
-	KUNIT_EXPECT_TRUE(test, single_job.cmd_ready);
+	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(single_job), 0);
+	KUNIT_EXPECT_TRUE(test, single_job->cmd_ready);
 
-	task.core = BIT(0);
+	task->core = BIT(0);
 	type = 0;
-	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&single_job, &type), 0);
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(single_job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 
 	/* Overlapping in-place source and destination windows stay rejected. */
-	task = rk_rga_librga_side_border_task(80, 100, 80, true, 0);
-	single_job.cmd_ready = false;
-	task.dst.x_offset = 100;
+	*task = rk_rga_librga_side_border_task(80, 100, 80, true, 0);
+	single_job->cmd_ready = false;
+	task->dst.x_offset = 100;
 	type = 0;
-	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&single_job, &type),
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(single_job, &type),
 			-EOPNOTSUPP);
 
-	task = rk_rga_librga_side_border_task(80, 240, 80, true, 0);
-	task.dst.act_w = 40;
+	*task = rk_rga_librga_side_border_task(80, 240, 80, true, 0);
+	task->dst.act_w = 40;
 	type = 0;
-	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&single_job, &type),
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(single_job, &type),
 			-EOPNOTSUPP);
 }
 
