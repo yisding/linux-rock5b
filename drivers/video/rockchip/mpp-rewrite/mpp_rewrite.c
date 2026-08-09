@@ -175,6 +175,14 @@ enum rk_mpp_device_type {
 	RK_MPP_DEVICE_BUTT	= 30,
 };
 
+enum rk_mpp_reset_domain_state {
+	RK_MPP_RESET_DOMAIN_IDLE,
+	RK_MPP_RESET_DOMAIN_POWER_DEASSERT,
+	RK_MPP_RESET_DOMAIN_RESETTING,
+	RK_MPP_RESET_DOMAIN_FAILED,
+	RK_MPP_RESET_DOMAIN_QUARANTINED,
+};
+
 struct rk_mpp_msg_v1 {
 	__u32 cmd;
 	__u32 flags;
@@ -380,11 +388,13 @@ struct rk_mpp_dma_group {
 };
 
 struct rk_mpp_service;
+struct rk_mpp_reset_domain;
 
 struct rk_mpp_hw {
 	struct list_head link;
 	struct list_head fault_link;
 	struct list_head dma_group_link;
+	struct list_head reset_domain_link;
 	struct device *dev;
 	struct rk_mpp_service *srv;
 	const struct rk_mpp_hw_match *match;
@@ -398,27 +408,22 @@ struct rk_mpp_hw {
 	struct reset_control *resets;
 	/*
 	 * Nonzero while this core's reset line is being pulsed.  Set and
-	 * cleared inside reset_domain_lock, and read by rk_mpp_hw_power_on()
-	 * under that same lock, so with the lock doing its job it can never be
+	 * cleared inside the reset-domain transaction, and read by
+	 * rk_mpp_hw_power_on() under that same lock, so with the lock doing its
+	 * job it can never be
 	 * observed set: reset_deassert_contended_count staying at zero is the
 	 * regression signal that the serialization still holds.
 	 */
 	atomic_t reset_pulse_active;
 	/*
-	 * Serializes this core's reset-control operations against every other
-	 * writer of the same line.  Points into the service's domain table when
-	 * the core belongs to a CCU group.
-	 *
-	 * NULL, and the lock helpers then do nothing, when it does not: a core
-	 * outside a group is never reached by
-	 * rk_mpp_rkvdec2_power_on_ccu_cores(), which selects on ccu_node, so
-	 * the only contexts driving its reset line are its own submit and
-	 * recovery paths and those already serialize on its run_lock.  Also
-	 * NULL for a hw a KUnit fixture built without going through probe.
-	 * A pointer rather than an embedded mutex because rk_mpp_hw is built on
-	 * the stack by KUnit tests that already sit near the frame limit.
+	 * Stable reset-domain construction owner for this device. CCU members and their
+	 * coordinator share the domain keyed by the coordinator node; standalone
+	 * devices use their own node. Published before runtime PM/read-ID and
+	 * cleared only after remove has drained every operation.
+	 * Single-target power deassert and recovery pulse use its transaction
+	 * state now; the legacy multi-core force-stop joins in the cluster patch.
 	 */
-	struct mutex *reset_domain_lock;
+	struct rk_mpp_reset_domain *reset_domain;
 	struct delayed_work timeout_work;
 	struct work_struct iommu_fault_work;
 	struct mutex run_lock; /* serializes start, abort, timeout, and completion */
@@ -572,19 +577,29 @@ static bool rk_mpp_hw_restore_active_locked(struct rk_mpp_hw *hw,
 }
 
 /*
- * A core's reset line has two independent writers: its own recovery pulse and
- * the unconditional deassert every sibling submit issues through
- * rk_mpp_hw_power_on().  They serialize on this, keyed on the CCU node because
- * that is exactly the set of cores a submit can reach.
- *
- * The lock lives in the service, not in the coordinator's rk_mpp_hw, so that a
- * coordinator going away under rk_mpp_hw_remove() cannot free a mutex its cores
- * still point at.  Device nodes outlive the domains, so the table is never torn
- * down and entries are only ever added.
+ * One stable construction object per immutable reset topology identity. The
+ * service owns the table and its OF-node references; members join and leave
+ * under the domain lock, while slots are never compacted. Single-target reset
+ * operations own state/epoch here. The legacy multi-core force-stop remains
+ * outside this transaction model until the cluster pins its participant set.
+ * The reset mutex is the innermost sleepable leaf: no callback, allocation, PM
+ * operation, logging, or other lock may move under it.
  */
 struct rk_mpp_reset_domain {
 	struct device_node *node;
-	struct mutex lock; /* innermost leaf: reset controls only, no nesting */
+	struct mutex lock;
+	struct list_head members;
+	atomic_t reset_domain_operation_pending;
+	struct rk_mpp_hw *reset_domain_responsible;
+	enum rk_mpp_reset_domain_state reset_domain_state;
+	u64 reset_domain_epoch;
+	u64 reset_domain_pulse_count;
+	u64 reset_domain_deassert_count;
+	u64 reset_domain_refusal_count;
+	u64 reset_domain_overlap_count;
+	u32 reset_domain_member_count;
+	int reset_domain_last_core_id;
+	int reset_domain_last_error;
 };
 
 struct rk_mpp_service {
@@ -592,7 +607,7 @@ struct rk_mpp_service {
 	struct dentry *debugfs_root;
 	struct proc_dir_entry *procfs_root;
 	struct mutex hw_lock;
-	/* Reset domains, added under hw_lock at probe and never removed. */
+	/* Reset-domain slots are added under hw_lock and never compacted. */
 	struct rk_mpp_reset_domain reset_domains[RK_MPP_MAX_RESET_DOMAINS];
 	u32 reset_domain_count;
 	struct mutex dma_group_lock;
@@ -917,6 +932,20 @@ static void rk_mpp_hw_cancel_timeout_sync(struct rk_mpp_hw *hw);
 static void rk_mpp_hw_schedule_timeout(struct rk_mpp_hw *hw);
 static void rk_mpp_hw_deactivate_aux_irqs(struct rk_mpp_hw *hw);
 static void rk_mpp_hw_handle_reset_failure(struct rk_mpp_hw *hw, int error);
+static void
+rk_mpp_reset_domain_init(struct rk_mpp_reset_domain *domain,
+			 struct device_node *node);
+static struct rk_mpp_reset_domain *
+rk_mpp_reset_domain_get_locked(struct rk_mpp_service *srv,
+			       struct device_node *node, bool *added);
+static int
+rk_mpp_reset_domain_begin(struct rk_mpp_hw *hw,
+			  enum rk_mpp_reset_domain_state operation);
+static void rk_mpp_reset_domain_finish(struct rk_mpp_hw *hw, int error);
+static int
+rk_mpp_reset_domain_register_member(struct rk_mpp_reset_domain *domain,
+				    struct rk_mpp_hw *hw);
+static int rk_mpp_reset_domain_unregister_member(struct rk_mpp_hw *hw);
 static bool rk_mpp_hw_terminal_drain_power(struct rk_mpp_hw *hw);
 static int rk_mpp_hw_terminal_isolate(struct rk_mpp_hw *hw);
 static u32 rk_mpp_rkvdec2_stop_command(u32 core_work);
@@ -9969,6 +9998,144 @@ static void rk_mpp_debug_event_ring_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, srv->debug_events[1].job_id, 2U);
 }
 
+static void rk_mpp_reset_domain_registry_kunit(struct kunit *test)
+{
+	struct rk_mpp_reset_domain *domains[RK_MPP_MAX_RESET_DOMAINS];
+	struct device_node *identities[RK_MPP_MAX_RESET_DOMAINS + 1];
+	struct device_node *identity;
+	struct rk_mpp_reset_domain *domain;
+	struct rk_mpp_service *srv;
+	struct rk_mpp_hw *hw;
+	bool added;
+	int ret;
+	u32 i;
+
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
+	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
+	mutex_init(&srv->hw_lock);
+	INIT_LIST_HEAD(&hw->reset_domain_link);
+
+	for (i = 0; i < ARRAY_SIZE(identities); i++) {
+		identities[i] = kunit_kzalloc(test, 1, GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, identities[i]);
+	}
+
+	for (i = 0; i < ARRAY_SIZE(domains); i++) {
+		identity = identities[i];
+		mutex_lock(&srv->hw_lock);
+		domains[i] = rk_mpp_reset_domain_get_locked(srv, identity, &added);
+		mutex_unlock(&srv->hw_lock);
+		KUNIT_ASSERT_FALSE(test, IS_ERR(domains[i]));
+		KUNIT_EXPECT_TRUE(test, added);
+	}
+	KUNIT_EXPECT_EQ(test, srv->reset_domain_count,
+			(u32)RK_MPP_MAX_RESET_DOMAINS);
+
+	mutex_lock(&srv->hw_lock);
+	domain = rk_mpp_reset_domain_get_locked(srv, identities[0], &added);
+	mutex_unlock(&srv->hw_lock);
+	KUNIT_EXPECT_PTR_EQ(test, domain, domains[0]);
+	KUNIT_EXPECT_FALSE(test, added);
+
+	identity = identities[RK_MPP_MAX_RESET_DOMAINS];
+	mutex_lock(&srv->hw_lock);
+	domain = rk_mpp_reset_domain_get_locked(srv, identity, &added);
+	mutex_unlock(&srv->hw_lock);
+	KUNIT_EXPECT_TRUE(test, IS_ERR(domain));
+	KUNIT_EXPECT_EQ(test, PTR_ERR(domain), -ENOSPC);
+	KUNIT_EXPECT_EQ(test, srv->reset_domain_count,
+			(u32)RK_MPP_MAX_RESET_DOMAINS);
+	KUNIT_EXPECT_PTR_EQ(test, hw->reset_domain, NULL);
+
+	ret = rk_mpp_reset_domain_register_member(domains[0], hw);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, domains[0]->reset_domain_member_count, 1U);
+	KUNIT_EXPECT_EQ(test, rk_mpp_reset_domain_unregister_member(hw), 0);
+	ret = rk_mpp_reset_domain_register_member(domains[1], hw);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_PTR_EQ(test, hw->reset_domain, domains[1]);
+	KUNIT_EXPECT_EQ(test, domains[0]->reset_domain_member_count, 0U);
+	KUNIT_EXPECT_EQ(test, domains[1]->reset_domain_member_count, 1U);
+	KUNIT_EXPECT_EQ(test, rk_mpp_reset_domain_unregister_member(hw), 0);
+}
+
+static void rk_mpp_reset_domain_state_kunit(struct kunit *test)
+{
+	struct rk_mpp_reset_domain *domain;
+	struct rk_mpp_hw *owner;
+	struct rk_mpp_hw *peer;
+	u64 epoch;
+	int ret;
+
+	domain = kunit_kzalloc(test, sizeof(*domain), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, domain);
+	owner = kunit_kzalloc(test, sizeof(*owner), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, owner);
+	peer = kunit_kzalloc(test, sizeof(*peer), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, peer);
+
+	rk_mpp_reset_domain_init(domain, NULL);
+	INIT_LIST_HEAD(&owner->reset_domain_link);
+	INIT_LIST_HEAD(&peer->reset_domain_link);
+	owner->core_id = 2;
+	peer->core_id = 3;
+	owner->online = true;
+	peer->online = true;
+
+	ret = rk_mpp_reset_domain_register_member(domain, owner);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	ret = rk_mpp_reset_domain_register_member(domain, peer);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, domain->reset_domain_member_count, 2U);
+	KUNIT_EXPECT_PTR_EQ(test, owner->reset_domain, domain);
+	KUNIT_EXPECT_PTR_EQ(test, peer->reset_domain, domain);
+	ret = rk_mpp_reset_domain_register_member(domain, owner);
+	KUNIT_EXPECT_EQ(test, ret, -EEXIST);
+
+	ret = rk_mpp_reset_domain_begin(owner,
+					RK_MPP_RESET_DOMAIN_POWER_DEASSERT);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, domain->reset_domain_state,
+			(enum rk_mpp_reset_domain_state)
+			RK_MPP_RESET_DOMAIN_POWER_DEASSERT);
+	KUNIT_EXPECT_PTR_EQ(test, domain->reset_domain_responsible, owner);
+	KUNIT_EXPECT_EQ(test, domain->reset_domain_epoch, 0ULL);
+	rk_mpp_reset_domain_finish(owner, 0);
+	KUNIT_EXPECT_EQ(test, domain->reset_domain_state,
+			(enum rk_mpp_reset_domain_state)
+			RK_MPP_RESET_DOMAIN_IDLE);
+
+	ret = rk_mpp_reset_domain_begin(owner,
+					RK_MPP_RESET_DOMAIN_RESETTING);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	epoch = domain->reset_domain_epoch;
+	KUNIT_EXPECT_EQ(test, epoch, 1ULL);
+	KUNIT_EXPECT_EQ(test, domain->reset_domain_pulse_count, 1ULL);
+	rk_mpp_reset_domain_finish(owner, -EIO);
+	KUNIT_EXPECT_EQ(test, domain->reset_domain_state,
+			(enum rk_mpp_reset_domain_state)
+			RK_MPP_RESET_DOMAIN_FAILED);
+	KUNIT_EXPECT_EQ(test, domain->reset_domain_last_core_id, 2);
+	KUNIT_EXPECT_EQ(test, domain->reset_domain_last_error, -EIO);
+
+	/* FAILED records the last outcome; it does not refuse a safe retry. */
+	ret = rk_mpp_reset_domain_begin(peer,
+					RK_MPP_RESET_DOMAIN_RESETTING);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, domain->reset_domain_epoch, epoch + 1);
+	KUNIT_EXPECT_PTR_EQ(test, domain->reset_domain_responsible, peer);
+	rk_mpp_reset_domain_finish(peer, 0);
+
+	KUNIT_EXPECT_EQ(test, rk_mpp_reset_domain_unregister_member(peer), 0);
+	KUNIT_EXPECT_PTR_EQ(test, peer->reset_domain, NULL);
+	KUNIT_EXPECT_EQ(test, domain->reset_domain_member_count, 1U);
+	KUNIT_EXPECT_EQ(test, rk_mpp_reset_domain_unregister_member(owner), 0);
+	KUNIT_EXPECT_TRUE(test, list_empty(&domain->members));
+	KUNIT_EXPECT_EQ(test, domain->reset_domain_member_count, 0U);
+}
+
 static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_check_cmd_v1_kunit),
 	KUNIT_CASE(rk_mpp_check_msg_flags_kunit),
@@ -10064,6 +10231,8 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_reset_session_hw_active_import_kunit),
 	KUNIT_CASE(rk_mpp_file_release_public_cleanup_kunit),
 	KUNIT_CASE(rk_mpp_debug_event_ring_kunit),
+	KUNIT_CASE(rk_mpp_reset_domain_registry_kunit),
+	KUNIT_CASE(rk_mpp_reset_domain_state_kunit),
 	{}
 };
 
@@ -12427,30 +12596,183 @@ static struct clk *rk_mpp_hw_find_clk(struct rk_mpp_hw *hw, const char *id)
 	return NULL;
 }
 
-/*
- * Innermost leaf.  Everything under it is reset-control work and a udelay --
- * no allocation, no further locks, no callbacks -- so it cannot participate in
- * a cycle whatever else the caller already holds.  In particular
- * rk_mpp_hw_handle_reset_failure() takes srv->hw_lock and must stay outside.
- */
-static void rk_mpp_hw_reset_domain_lock(struct rk_mpp_hw *hw)
+static void
+rk_mpp_reset_domain_init(struct rk_mpp_reset_domain *domain,
+			 struct device_node *node)
 {
-	if (hw->reset_domain_lock)
-		mutex_lock(hw->reset_domain_lock);
+	domain->node = node;
+	mutex_init(&domain->lock);
+	INIT_LIST_HEAD(&domain->members);
+	atomic_set(&domain->reset_domain_operation_pending, 0);
+	domain->reset_domain_state = RK_MPP_RESET_DOMAIN_IDLE;
+	domain->reset_domain_last_core_id = -1;
 }
 
-static void rk_mpp_hw_reset_domain_unlock(struct rk_mpp_hw *hw)
+/* The caller transfers one OF-node reference only when a slot is added. */
+static struct rk_mpp_reset_domain *
+rk_mpp_reset_domain_get_locked(struct rk_mpp_service *srv,
+			       struct device_node *node, bool *added)
 {
-	if (hw->reset_domain_lock)
-		mutex_unlock(hw->reset_domain_lock);
+	struct rk_mpp_reset_domain *domain;
+	u32 i;
+
+	lockdep_assert_held(&srv->hw_lock);
+	*added = false;
+	for (i = 0; i < srv->reset_domain_count; i++) {
+		domain = &srv->reset_domains[i];
+		if (domain->node == node)
+			return domain;
+	}
+	if (srv->reset_domain_count >= ARRAY_SIZE(srv->reset_domains))
+		return ERR_PTR(-ENOSPC);
+
+	domain = &srv->reset_domains[srv->reset_domain_count++];
+	rk_mpp_reset_domain_init(domain, node);
+	*added = true;
+
+	return domain;
+}
+
+static int
+rk_mpp_reset_domain_register_member(struct rk_mpp_reset_domain *domain,
+				    struct rk_mpp_hw *hw)
+{
+	int ret = 0;
+
+	mutex_lock(&domain->lock);
+	if (READ_ONCE(hw->reset_domain) ||
+	    !list_empty(&hw->reset_domain_link)) {
+		ret = -EEXIST;
+		goto out_unlock;
+	}
+
+	list_add_tail(&hw->reset_domain_link, &domain->members);
+	domain->reset_domain_member_count++;
+	WRITE_ONCE(hw->reset_domain, domain);
+out_unlock:
+	mutex_unlock(&domain->lock);
+
+	return ret;
+}
+
+static int rk_mpp_reset_domain_unregister_member(struct rk_mpp_hw *hw)
+{
+	struct rk_mpp_reset_domain *domain = READ_ONCE(hw->reset_domain);
+	int ret = 0;
+
+	if (!domain)
+		return 0;
+
+	mutex_lock(&domain->lock);
+	if (WARN_ON_ONCE(domain->reset_domain_responsible == hw)) {
+		domain->reset_domain_responsible = NULL;
+		domain->reset_domain_last_error = -ENODEV;
+		WRITE_ONCE(domain->reset_domain_state,
+			   RK_MPP_RESET_DOMAIN_FAILED);
+	}
+	if (WARN_ON_ONCE(list_empty(&hw->reset_domain_link) ||
+			 !domain->reset_domain_member_count)) {
+		ret = -ENOENT;
+		goto out_unlock;
+	}
+
+	list_del_init(&hw->reset_domain_link);
+	domain->reset_domain_member_count--;
+	WRITE_ONCE(hw->reset_domain, NULL);
+out_unlock:
+	mutex_unlock(&domain->lock);
+
+	return ret;
+}
+
+static void rk_mpp_reset_domain_unregister_action(void *data)
+{
+	struct rk_mpp_hw *hw = data;
+
+	WARN_ON_ONCE(rk_mpp_reset_domain_unregister_member(hw));
 }
 
 /*
- * Phase-one reset write funnel. Locking, pulse timing, accounting and failure
- * handling deliberately remain with the existing callers until the reset
- * domain owns complete operations. No raw MPP reset write belongs outside
- * these helpers.
+ * Begin one complete reset-domain transaction and return with the innermost
+ * leaf mutex held. FAILED is an observed outcome, not a permanent admission
+ * bar yet: a later operation may retry. QUARANTINED is reserved for the
+ * cluster recovery migration and refuses all physical reset writes.
  */
+static int
+rk_mpp_reset_domain_begin(struct rk_mpp_hw *hw,
+			  enum rk_mpp_reset_domain_state operation)
+{
+	struct rk_mpp_reset_domain *domain = READ_ONCE(hw->reset_domain);
+	bool overlapped;
+	int ret = 0;
+
+	if (WARN_ON_ONCE(!domain))
+		return -ENODEV;
+	if (WARN_ON_ONCE(operation != RK_MPP_RESET_DOMAIN_POWER_DEASSERT &&
+			 operation != RK_MPP_RESET_DOMAIN_RESETTING))
+		return -EINVAL;
+
+	overlapped = atomic_inc_return(&domain->reset_domain_operation_pending) > 1;
+	mutex_lock(&domain->lock);
+	if (overlapped)
+		domain->reset_domain_overlap_count++;
+	if (READ_ONCE(hw->reset_domain) != domain ||
+	    list_empty(&hw->reset_domain_link)) {
+		domain->reset_domain_refusal_count++;
+		ret = -ENODEV;
+		goto out_unlock;
+	}
+
+	if (domain->reset_domain_state == RK_MPP_RESET_DOMAIN_QUARANTINED) {
+		domain->reset_domain_refusal_count++;
+		ret = -EIO;
+		goto out_unlock;
+	}
+	if (WARN_ON_ONCE(domain->reset_domain_responsible ||
+			 (domain->reset_domain_state != RK_MPP_RESET_DOMAIN_IDLE &&
+			  domain->reset_domain_state != RK_MPP_RESET_DOMAIN_FAILED))) {
+		domain->reset_domain_refusal_count++;
+		ret = -EBUSY;
+		goto out_unlock;
+	}
+
+	domain->reset_domain_responsible = hw;
+	domain->reset_domain_last_core_id =
+		READ_ONCE(hw->online) ? hw->core_id : -1;
+	domain->reset_domain_last_error = 0;
+	WRITE_ONCE(domain->reset_domain_state, operation);
+	if (operation == RK_MPP_RESET_DOMAIN_RESETTING) {
+		domain->reset_domain_epoch++;
+		if (!domain->reset_domain_epoch)
+			domain->reset_domain_epoch++;
+		domain->reset_domain_pulse_count++;
+	}
+
+	return 0;
+
+out_unlock:
+	atomic_dec(&domain->reset_domain_operation_pending);
+	mutex_unlock(&domain->lock);
+	return ret;
+}
+
+static void rk_mpp_reset_domain_finish(struct rk_mpp_hw *hw, int error)
+{
+	struct rk_mpp_reset_domain *domain = READ_ONCE(hw->reset_domain);
+
+	lockdep_assert_held(&domain->lock);
+	WARN_ON_ONCE(domain->reset_domain_responsible != hw);
+
+	domain->reset_domain_last_error = error;
+	WRITE_ONCE(domain->reset_domain_state,
+		   error ? RK_MPP_RESET_DOMAIN_FAILED :
+		   RK_MPP_RESET_DOMAIN_IDLE);
+	domain->reset_domain_responsible = NULL;
+	atomic_dec(&domain->reset_domain_operation_pending);
+	mutex_unlock(&domain->lock);
+}
+
+/* No raw MPP reset-control write belongs outside these two backend leaves. */
 static int rk_mpp_reset_domain_assert(struct rk_mpp_hw *hw)
 {
 	return reset_control_assert(hw->resets);
@@ -12462,47 +12784,108 @@ static int rk_mpp_reset_domain_deassert(struct rk_mpp_hw *hw)
 }
 
 /*
- * Bind a core to the reset domain of its CCU group.  Called once from probe,
- * before the core is reachable through the service list and before
- * rk_mpp_hw_read_id() first powers it on.  A core outside a group is left
- * unbound: nothing but its own run_lock-serialized paths drives its reset line.
+ * Complete single-target operations. Failure handling remains outside the
+ * domain mutex because rk_mpp_hw_handle_reset_failure() takes srv->hw_lock.
  */
-static void rk_mpp_hw_init_reset_domain(struct rk_mpp_hw *hw)
+static int rk_mpp_reset_domain_power_deassert(struct rk_mpp_hw *hw)
+{
+	struct rk_mpp_reset_domain *domain;
+	int ret;
+
+	ret = rk_mpp_reset_domain_begin(hw,
+					RK_MPP_RESET_DOMAIN_POWER_DEASSERT);
+	if (ret)
+		return ret;
+
+	domain = hw->reset_domain;
+	if (atomic_read(&hw->reset_pulse_active)) {
+		domain->reset_domain_overlap_count++;
+		atomic_inc(&hw->srv->reset_deassert_contended_count);
+	}
+	domain->reset_domain_deassert_count++;
+	ret = rk_mpp_reset_domain_deassert(hw);
+	rk_mpp_reset_domain_finish(hw, ret);
+
+	return ret;
+}
+
+static int rk_mpp_reset_domain_recovery_pulse(struct rk_mpp_hw *hw)
+{
+	struct rk_mpp_reset_domain *domain;
+	int ret;
+
+	ret = rk_mpp_reset_domain_begin(hw, RK_MPP_RESET_DOMAIN_RESETTING);
+	if (ret)
+		return ret;
+
+	domain = hw->reset_domain;
+	atomic_inc(&hw->reset_pulse_active);
+	ret = rk_mpp_reset_domain_assert(hw);
+	if (ret)
+		goto out_finish;
+
+	fsleep(10);
+	domain->reset_domain_deassert_count++;
+	ret = rk_mpp_reset_domain_deassert(hw);
+out_finish:
+	atomic_dec(&hw->reset_pulse_active);
+	rk_mpp_reset_domain_finish(hw, ret);
+
+	return ret;
+}
+
+/*
+ * Bind every device to a stable authority before runtime PM/read-ID. CCU
+ * members use their coordinator phandle; coordinators and standalone devices
+ * use their own node. Table publication and member publication deliberately
+ * use non-nested locks.
+ */
+static int rk_mpp_hw_init_reset_domain(struct rk_mpp_hw *hw)
 {
 	struct rk_mpp_service *srv = hw->srv;
-	struct rk_mpp_reset_domain *domain = NULL;
-	u32 i;
+	struct device_node *identity = hw->ccu_node ?: hw->dev->of_node;
+	struct device_node *identity_ref;
+	struct rk_mpp_reset_domain *domain;
+	bool added;
+	int ret;
 
-	hw->reset_domain_lock = NULL;
-
-	if (!srv || !hw->ccu_node)
-		return;
+	if (WARN_ON_ONCE(!srv || !identity))
+		return -EINVAL;
+	identity_ref = of_node_get(identity);
+	if (!identity_ref)
+		return -ENODEV;
 
 	mutex_lock(&srv->hw_lock);
-	for (i = 0; i < srv->reset_domain_count; i++) {
-		if (srv->reset_domains[i].node == hw->ccu_node) {
-			domain = &srv->reset_domains[i];
-			break;
-		}
-	}
-	if (!domain && srv->reset_domain_count < ARRAY_SIZE(srv->reset_domains)) {
-		domain = &srv->reset_domains[srv->reset_domain_count++];
-		domain->node = hw->ccu_node;
-		mutex_init(&domain->lock);
-	}
-	if (domain)
-		hw->reset_domain_lock = &domain->lock;
+	domain = rk_mpp_reset_domain_get_locked(srv, identity_ref, &added);
 	mutex_unlock(&srv->hw_lock);
+	if (IS_ERR(domain) || !added)
+		of_node_put(identity_ref);
 
-	/*
-	 * Out of domains: leave the core unbound, which is exactly as exposed
-	 * as it was before this fix rather than failing the probe.  Loud,
-	 * because the sibling race is silently back for it.
-	 */
-	if (!domain)
-		dev_warn(hw->dev,
-			 "no free reset domain for %pOF; sibling deasserts stay unserialized for this core\n",
-			 hw->ccu_node);
+	if (IS_ERR(domain))
+		return PTR_ERR(domain);
+
+	ret = rk_mpp_reset_domain_register_member(domain, hw);
+	if (ret)
+		return ret;
+
+	return devm_add_action_or_reset(hw->dev,
+					rk_mpp_reset_domain_unregister_action,
+					hw);
+}
+
+static void rk_mpp_reset_domains_destroy(struct rk_mpp_service *srv)
+{
+	u32 i;
+
+	for (i = 0; i < srv->reset_domain_count; i++) {
+		struct rk_mpp_reset_domain *domain = &srv->reset_domains[i];
+
+		WARN_ON_ONCE(domain->reset_domain_member_count ||
+			     !list_empty(&domain->members));
+		of_node_put(domain->node);
+		domain->node = NULL;
+	}
+	srv->reset_domain_count = 0;
 }
 
 static int rk_mpp_hw_power_on(struct rk_mpp_hw *hw)
@@ -12553,11 +12936,7 @@ static int rk_mpp_hw_power_on(struct rk_mpp_hw *hw)
 	atomic_inc(&hw->srv->reset_deassert_count);
 	rk_mpp_count_core(hw->srv->reset_deassert_core_count, hw);
 
-	rk_mpp_hw_reset_domain_lock(hw);
-	if (atomic_read(&hw->reset_pulse_active))
-		atomic_inc(&hw->srv->reset_deassert_contended_count);
-	ret = rk_mpp_reset_domain_deassert(hw);
-	rk_mpp_hw_reset_domain_unlock(hw);
+	ret = rk_mpp_reset_domain_power_deassert(hw);
 	if (ret) {
 		rk_mpp_hw_handle_reset_failure(hw, ret);
 		goto err_pm_put;
@@ -12738,33 +13117,10 @@ static int rk_mpp_hw_reset_active(struct rk_mpp_hw *hw)
 
 	atomic_inc(&hw->srv->reset_count);
 	rk_mpp_count_core(hw->srv->reset_core_count, hw);
-	/*
-	 * The whole pulse runs under the domain lock, so a sibling submit
-	 * cannot deassert this core partway through the udelay and end the
-	 * reset early.  The pulse flag is raised and cleared inside the lock
-	 * too: rk_mpp_hw_power_on() reads it while holding the same lock, so it
-	 * can never catch a pulse that is merely queued behind the lock and
-	 * mistake that for interference.
-	 */
-	rk_mpp_hw_reset_domain_lock(hw);
-	atomic_inc(&hw->reset_pulse_active);
-	ret = rk_mpp_reset_domain_assert(hw);
-	if (ret)
-		goto err_reset;
+	ret = rk_mpp_reset_domain_recovery_pulse(hw);
+	if (!ret)
+		return 0;
 
-	udelay(10);
-	ret = rk_mpp_reset_domain_deassert(hw);
-	if (ret)
-		goto err_reset;
-	atomic_dec(&hw->reset_pulse_active);
-	rk_mpp_hw_reset_domain_unlock(hw);
-
-	return 0;
-
-err_reset:
-	atomic_dec(&hw->reset_pulse_active);
-	/* Before handle_reset_failure(): it takes srv->hw_lock. */
-	rk_mpp_hw_reset_domain_unlock(hw);
 	dev_err_ratelimited(hw->dev, "hardware reset failed: %d\n", ret);
 	rk_mpp_hw_handle_reset_failure(hw, ret);
 	return ret;
@@ -18080,6 +18436,7 @@ static int rk_mpp_hw_probe(struct platform_device *pdev)
 	atomic_set(&hw->irq_disable_depth, 0);
 	atomic_set(&hw->power_count, 0);
 	INIT_LIST_HEAD(&hw->fault_link);
+	INIT_LIST_HEAD(&hw->reset_domain_link);
 	INIT_LIST_HEAD(&hw->rkvdec_ccu_jobs);
 	INIT_DELAYED_WORK(&hw->timeout_work, rk_mpp_hw_timeout_work);
 	INIT_WORK(&hw->iommu_fault_work, rk_mpp_hw_iommu_fault_work);
@@ -18116,14 +18473,6 @@ static int rk_mpp_hw_probe(struct platform_device *pdev)
 				     "%s references a disabled CCU\n",
 				     match->name);
 	rk_mpp_hw_read_rkvdec_ccu_mode(hw);
-	/*
-	 * The CCU node is settled and validated here, and this still runs
-	 * before rk_mpp_hw_read_id() first powers the core on and before the
-	 * core joins the service list, so no deassert can be issued for it
-	 * without a domain to serialize on.
-	 */
-	rk_mpp_hw_init_reset_domain(hw);
-
 	hw->iommu_node = of_parse_phandle(dev->of_node, "iommus", 0);
 	if (hw->iommu_node) {
 		ret = devm_add_action_or_reset(dev, rk_mpp_of_node_put,
@@ -18178,6 +18527,15 @@ static int rk_mpp_hw_probe(struct platform_device *pdev)
 	hw->resets = devm_reset_control_array_get_optional_exclusive(dev);
 	if (IS_ERR(hw->resets))
 		return PTR_ERR(hw->resets);
+
+	/*
+	 * Reset controls and the immutable topology identity are now complete.
+	 * Publish domain membership before runtime PM or read-ID can deassert.
+	 */
+	ret = rk_mpp_hw_init_reset_domain(hw);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "cannot register reset-domain authority\n");
 
 	ret = rk_mpp_hw_alloc_rcb(hw);
 	if (ret)
@@ -18760,6 +19118,7 @@ err_deregister_misc:
 	misc_deregister(&rk_mpp_srv.miscdev);
 err_unregister_hw:
 	platform_driver_unregister(&rk_mpp_hw_driver);
+	rk_mpp_reset_domains_destroy(&rk_mpp_srv);
 	rk_mpp_dma_groups_destroy();
 	WRITE_ONCE(rk_mpp_srv.debug_ready, false);
 	return ret;
@@ -18775,6 +19134,7 @@ static void rk_mpp_runtime_unregister(void)
 	debugfs_remove_recursive(rk_mpp_srv.debugfs_root);
 	misc_deregister(&rk_mpp_srv.miscdev);
 	platform_driver_unregister(&rk_mpp_hw_driver);
+	rk_mpp_reset_domains_destroy(&rk_mpp_srv);
 	rk_mpp_dma_groups_destroy();
 	flush_work(&rk_mpp_srv.sched_work);
 	WRITE_ONCE(rk_mpp_srv.debug_ready, false);
