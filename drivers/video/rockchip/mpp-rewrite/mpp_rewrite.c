@@ -520,6 +520,18 @@ struct rk_mpp_activation {
 	bool watchdog_deadline_valid;
 };
 
+static struct rk_mpp_job *
+rk_mpp_activation_job(const struct rk_mpp_activation *activation)
+{
+	return activation ? activation->job : NULL;
+}
+
+static u64
+rk_mpp_activation_generation(const struct rk_mpp_activation *activation)
+{
+	return activation ? activation->generation : 0;
+}
+
 struct rk_mpp_hw {
 	struct list_head link;
 	struct list_head fault_link;
@@ -563,8 +575,8 @@ struct rk_mpp_hw {
 	struct mutex ccu_recovery_lock; /* serializes shared-CCU recovery/admission */
 	spinlock_t lock;
 	raw_spinlock_t aux_lock; /* hard/thread IRQ auxiliary MMIO and state */
-	struct rk_mpp_job *active_job;
-	struct rk_mpp_job *timeout_job;
+	struct rk_mpp_activation *active_activation;
+	struct rk_mpp_activation *timeout_activation;
 	/*
 	 * Nonzero exactly while this core's clocks are running. The hard IRQ
 	 * dispatcher holds regs_lock across the whole backend handler, and
@@ -641,30 +653,39 @@ struct rk_mpp_hw {
 };
 
 /*
- * Phase-3A active-slot adapter. Callers retain the existing hw->lock,
- * run_lock, reference, timeout, IRQ-status, and fault-state ordering. Under
- * hw->lock these helpers own the job slot plus the embedded activation's
- * current generation and deadline reset; retained-attempt storage and slot
- * conversion remain later checkpoints.
+ * Phase-3D activation-slot owner. Callers retain the existing hw->lock,
+ * run_lock, job-reference, timeout, IRQ-status, and fault-state ordering.
+ * The active and timeout slots name exact embedded activation storage while
+ * each existing reference continues to pin the containing job; when both
+ * slots name the same activation, they own two independent job references.
+ * Retained attempt storage and terminal arbitration remain later checkpoints.
  */
-static struct rk_mpp_job *
-rk_mpp_hw_active_job_locked(const struct rk_mpp_hw *hw)
+static struct rk_mpp_activation *
+rk_mpp_hw_active_activation_locked(const struct rk_mpp_hw *hw)
 {
 	lockdep_assert_held(&hw->lock);
 
-	return hw->active_job;
+	return hw->active_activation;
 }
 
-static u64 rk_mpp_activation_generation(const struct rk_mpp_job *job);
+static struct rk_mpp_job *
+rk_mpp_hw_active_job_locked(const struct rk_mpp_hw *hw)
+{
+	return rk_mpp_activation_job(rk_mpp_hw_active_activation_locked(hw));
+}
+
 static void rk_mpp_activation_install_locked(struct rk_mpp_hw *hw,
 					     struct rk_mpp_job *job,
 					     u64 generation);
 
 static u64 rk_mpp_hw_active_generation_locked(const struct rk_mpp_hw *hw)
 {
-	lockdep_assert_held(&hw->lock);
+	struct rk_mpp_activation *activation;
 
-	return rk_mpp_activation_generation(hw->active_job);
+	lockdep_assert_held(&hw->lock);
+	activation = rk_mpp_hw_active_activation_locked(hw);
+
+	return rk_mpp_activation_generation(activation);
 }
 
 static u64 rk_mpp_hw_advance_active_generation_locked(struct rk_mpp_hw *hw)
@@ -679,44 +700,11 @@ static u64 rk_mpp_hw_advance_active_generation_locked(struct rk_mpp_hw *hw)
 }
 
 static u64 rk_mpp_hw_install_active_locked(struct rk_mpp_hw *hw,
-					   struct rk_mpp_job *job)
-{
-	u64 generation;
-
-	lockdep_assert_held(&hw->lock);
-
-	WARN_ON_ONCE(hw->active_job);
-	hw->active_job = job;
-	generation = rk_mpp_hw_advance_active_generation_locked(hw);
-	rk_mpp_activation_install_locked(hw, job, generation);
-
-	return generation;
-}
-
-static struct rk_mpp_job *rk_mpp_hw_take_active_locked(struct rk_mpp_hw *hw)
-{
-	struct rk_mpp_job *job;
-
-	lockdep_assert_held(&hw->lock);
-
-	job = hw->active_job;
-	hw->active_job = NULL;
-
-	return job;
-}
-
+					   struct rk_mpp_job *job);
+static struct rk_mpp_activation *
+rk_mpp_hw_take_active_locked(struct rk_mpp_hw *hw);
 static bool rk_mpp_hw_restore_active_locked(struct rk_mpp_hw *hw,
-					    struct rk_mpp_job *job)
-{
-	lockdep_assert_held(&hw->lock);
-
-	if (hw->active_job)
-		return false;
-
-	hw->active_job = job;
-
-	return true;
-}
+					    struct rk_mpp_activation *activation);
 
 /*
  * The raw register lease is published immediately before a START doorbell and
@@ -1195,17 +1183,12 @@ static void rk_mpp_activation_init(struct rk_mpp_job *job)
 	job->activation.selected_hw = NULL;
 }
 
-static u64 rk_mpp_activation_generation(const struct rk_mpp_job *job)
-{
-	return job ? job->activation.generation : 0;
-}
-
 static void rk_mpp_activation_install_locked(struct rk_mpp_hw *hw,
 					     struct rk_mpp_job *job,
 					     u64 generation)
 {
 	lockdep_assert_held(&hw->lock);
-	WARN_ON_ONCE(hw->active_job != job);
+	WARN_ON_ONCE(hw->active_activation != &job->activation);
 	WARN_ON_ONCE(job->activation.job && job->activation.job != job);
 	WARN_ON_ONCE(job->activation.selected_hw != hw);
 
@@ -1213,6 +1196,50 @@ static void rk_mpp_activation_install_locked(struct rk_mpp_hw *hw,
 	job->activation.generation = generation;
 	job->activation.watchdog_deadline = 0;
 	job->activation.watchdog_deadline_valid = false;
+}
+
+static u64 rk_mpp_hw_install_active_locked(struct rk_mpp_hw *hw,
+					   struct rk_mpp_job *job)
+{
+	u64 generation;
+
+	lockdep_assert_held(&hw->lock);
+
+	WARN_ON_ONCE(hw->active_activation);
+	WARN_ON_ONCE(job->activation.job != job);
+	hw->active_activation = &job->activation;
+	generation = rk_mpp_hw_advance_active_generation_locked(hw);
+	rk_mpp_activation_install_locked(hw, job, generation);
+
+	return generation;
+}
+
+static struct rk_mpp_activation *
+rk_mpp_hw_take_active_locked(struct rk_mpp_hw *hw)
+{
+	struct rk_mpp_activation *activation;
+
+	lockdep_assert_held(&hw->lock);
+
+	activation = hw->active_activation;
+	hw->active_activation = NULL;
+
+	return activation;
+}
+
+static bool rk_mpp_hw_restore_active_locked(struct rk_mpp_hw *hw,
+					    struct rk_mpp_activation *activation)
+{
+	lockdep_assert_held(&hw->lock);
+	WARN_ON_ONCE(activation &&
+		     (!activation->job || &activation->job->activation != activation));
+
+	if (hw->active_activation)
+		return false;
+
+	hw->active_activation = activation;
+
+	return true;
 }
 
 struct rk_mpp_batch_state {
@@ -7811,13 +7838,13 @@ static void rk_mpp_hw_take_active_if_kunit(struct kunit *test)
 
 	KUNIT_EXPECT_FALSE(test, rk_mpp_hw_take_active_if(&hw, job1,
 							  &irq_status));
-	KUNIT_EXPECT_PTR_EQ(test, hw.active_job, job0);
+	KUNIT_EXPECT_PTR_EQ(test, hw.active_activation, &job0->activation);
 	KUNIT_EXPECT_EQ(test, irq_status, 0U);
 	KUNIT_EXPECT_EQ(test, hw.irq_status, 0x1234U);
 
 	KUNIT_EXPECT_TRUE(test, rk_mpp_hw_take_active_if(&hw, job0,
 							 &irq_status));
-	KUNIT_EXPECT_PTR_EQ(test, hw.active_job, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, hw.active_activation, NULL);
 	KUNIT_EXPECT_EQ(test, irq_status, 0x1234U);
 	KUNIT_EXPECT_EQ(test, hw.irq_status, 0U);
 }
@@ -7853,8 +7880,8 @@ static void rk_mpp_irq_register_lease_kunit(struct kunit *test)
 	spin_lock_init(&hw->lock);
 	raw_spin_lock_init(&hw->regs_lock);
 	hw->regs_live_count = 1;
-	hw->active_job = job;
 	rk_mpp_activation_init(job);
+	hw->active_activation = &job->activation;
 	job->activation.generation = 7;
 
 	KUNIT_ASSERT_EQ(test, rk_mpp_hw_publish_register_lease(hw, 7), 0);
@@ -7925,10 +7952,10 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	hw->iommu_domain = &domain;
 	job0->session = &session;
 	job1->session = &session;
-	hw->active_job = job0;
 	hw->activation_generation_seq = 7;
 	rk_mpp_activation_init(job0);
 	rk_mpp_activation_init(job1);
+	hw->active_activation = &job0->activation;
 	job0->activation.selected_hw = hw;
 	job1->activation.selected_hw = hw;
 	job0->activation.generation = 7;
@@ -7940,7 +7967,7 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	hw->iommu_fault_generation = 7;
 
 	KUNIT_EXPECT_FALSE(test, rk_mpp_hw_prepare_active_retry(hw, job1));
-	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, job0);
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_activation, &job0->activation);
 	KUNIT_EXPECT_EQ(test, job0->activation.generation, 7ULL);
 	KUNIT_EXPECT_PTR_EQ(test, job0->activation.selected_hw, hw);
 	KUNIT_EXPECT_TRUE(test, job0->activation.watchdog_deadline_valid);
@@ -7952,7 +7979,7 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 			    &job0->activation);
 
 	KUNIT_EXPECT_TRUE(test, rk_mpp_hw_prepare_active_retry(hw, job0));
-	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, job0);
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_activation, &job0->activation);
 	KUNIT_EXPECT_EQ(test, job0->activation.generation, 8ULL);
 	KUNIT_EXPECT_PTR_EQ(test, job0->activation.selected_hw, hw);
 	KUNIT_EXPECT_EQ(test, hw->activation_generation_seq, 8ULL);
@@ -8005,8 +8032,8 @@ static void rk_mpp_iommu_fault_generation_kunit(struct kunit *test)
 					hw);
 	KUNIT_ASSERT_EQ(test, ret, 0);
 
-	hw->active_job = target;
 	rk_mpp_activation_init(target);
+	hw->active_activation = &target->activation;
 	target->activation.generation = 1;
 	hw->irq_status = 0x1234;
 	KUNIT_ASSERT_TRUE(test, rk_mpp_hw_mark_iommu_fault(hw));
@@ -8015,18 +8042,18 @@ static void rk_mpp_iommu_fault_generation_kunit(struct kunit *test)
 	taken = rk_mpp_hw_take_irq_job(hw, &irq_status, &fault_pending);
 	KUNIT_EXPECT_PTR_EQ(test, taken, NULL);
 	KUNIT_EXPECT_TRUE(test, fault_pending);
-	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, target);
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_activation, &target->activation);
 	KUNIT_EXPECT_EQ(test, hw->irq_status, 0x1234U);
 	KUNIT_EXPECT_FALSE(test, rk_mpp_hw_is_idle(hw));
 	taken = rk_mpp_hw_take_iommu_fault_job(hw, &consumed);
 	KUNIT_EXPECT_TRUE(test, consumed);
 	KUNIT_EXPECT_PTR_EQ(test, taken, target);
-	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_activation, NULL);
 	KUNIT_EXPECT_FALSE(test, hw->iommu_fault_pending);
 	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 0ULL);
 	KUNIT_ASSERT_TRUE(test,
 			  rk_mpp_hw_restore_iommu_fault_job(hw, target));
-	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, target);
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_activation, &target->activation);
 	KUNIT_EXPECT_TRUE(test, hw->iommu_fault_pending);
 	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 1ULL);
 	taken = rk_mpp_hw_take_irq_job(hw, &irq_status, &fault_pending);
@@ -8048,8 +8075,8 @@ static void rk_mpp_iommu_fault_generation_kunit(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, hw->iommu_fault_pending);
 	KUNIT_EXPECT_TRUE(test, rk_mpp_hw_is_idle(hw));
 
-	hw->active_job = replacement;
 	rk_mpp_activation_init(replacement);
+	hw->active_activation = &replacement->activation;
 	replacement->activation.generation = 2;
 	queued = schedule_delayed_work(&hw->timeout_work,
 				       msecs_to_jiffies(60000));
@@ -8057,7 +8084,8 @@ static void rk_mpp_iommu_fault_generation_kunit(struct kunit *test)
 
 	rk_mpp_hw_iommu_fault_work(&hw->iommu_fault_work);
 
-	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, replacement);
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_activation,
+			    &replacement->activation);
 	KUNIT_EXPECT_FALSE(test, hw->iommu_fault_pending);
 	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 0ULL);
 	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&hw->timeout_work));
@@ -8069,7 +8097,7 @@ static void rk_mpp_timeout_target_replacement_kunit(struct kunit *test)
 	struct rk_mpp_hw *hw;
 	struct rk_mpp_job *target;
 	struct rk_mpp_job *replacement;
-	struct rk_mpp_job *detached;
+	struct rk_mpp_activation *detached;
 	unsigned long deadline;
 	unsigned long flags;
 	u64 generation;
@@ -8092,38 +8120,41 @@ static void rk_mpp_timeout_target_replacement_kunit(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, ret, 0);
 	refcount_set(&target->refs, 1);
 	refcount_set(&replacement->refs, 1);
-	hw->active_job = replacement;
 	hw->activation_generation_seq = 2;
 	rk_mpp_activation_init(target);
 	rk_mpp_activation_init(replacement);
+	hw->active_activation = &replacement->activation;
 	target->activation.selected_hw = hw;
 	replacement->activation.selected_hw = hw;
 	replacement->activation.generation = 2;
-	hw->timeout_job = target;
+	hw->timeout_activation = &target->activation;
 	hw->timeout_generation = 1;
 	rk_mpp_job_get(target);
 
 	rk_mpp_hw_timeout_work(&hw->timeout_work.work);
 
-	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, replacement);
-	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_job, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_activation,
+			    &replacement->activation);
+	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_activation, NULL);
 	KUNIT_EXPECT_EQ(test, refcount_read(&target->refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&replacement->refs), 1);
 
 	/*
-	 * An old timeout for the same job pointer must not consume a freshly
-	 * restarted generation.
+	 * An old timeout for the same embedded activation must not consume a
+	 * freshly restarted generation.
 	 */
-	hw->timeout_job = replacement;
+	hw->timeout_activation = &replacement->activation;
 	hw->timeout_generation = 1;
 	rk_mpp_job_get(replacement);
 	rk_mpp_hw_timeout_work(&hw->timeout_work.work);
-	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, replacement);
-	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_job, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_activation,
+			    &replacement->activation);
+	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_activation, NULL);
 	KUNIT_EXPECT_EQ(test, refcount_read(&replacement->refs), 1);
 
 	rk_mpp_hw_schedule_timeout(hw);
-	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_job, replacement);
+	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_activation,
+			    &replacement->activation);
 	KUNIT_EXPECT_EQ(test, hw->timeout_generation, 2ULL);
 	KUNIT_EXPECT_EQ(test, refcount_read(&replacement->refs), 2);
 	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&hw->timeout_work));
@@ -8139,7 +8170,7 @@ static void rk_mpp_timeout_target_replacement_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test,
 			  replacement->activation.watchdog_deadline_valid);
 	rk_mpp_hw_cancel_timeout_sync(hw);
-	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_job, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_activation, NULL);
 	rk_mpp_hw_schedule_timeout(hw);
 	KUNIT_EXPECT_EQ(test, replacement->activation.watchdog_deadline,
 			deadline);
@@ -8147,13 +8178,13 @@ static void rk_mpp_timeout_target_replacement_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test,
 			  replacement->activation.watchdog_deadline_valid);
 
-	/* A new activation does start a new window. */
+	/* A reinstalled generation does start a new window. */
 	rk_mpp_hw_cancel_timeout_sync(hw);
 	spin_lock_irqsave(&hw->lock, flags);
 	detached = rk_mpp_hw_take_active_locked(hw);
 	generation = rk_mpp_hw_install_active_locked(hw, replacement);
 	spin_unlock_irqrestore(&hw->lock, flags);
-	KUNIT_ASSERT_PTR_EQ(test, detached, replacement);
+	KUNIT_ASSERT_PTR_EQ(test, detached, &replacement->activation);
 	KUNIT_EXPECT_EQ(test, generation, 3ULL);
 	KUNIT_EXPECT_FALSE(test,
 			   replacement->activation.watchdog_deadline_valid);
@@ -8163,7 +8194,7 @@ static void rk_mpp_timeout_target_replacement_kunit(struct kunit *test)
 			  replacement->activation.watchdog_deadline_valid);
 
 	rk_mpp_hw_cancel_timeout_sync(hw);
-	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_job, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_activation, NULL);
 	KUNIT_EXPECT_EQ(test, refcount_read(&replacement->refs), 1);
 	kunit_release_action(test, rk_mpp_kunit_cancel_hw_work, hw);
 }
@@ -8289,6 +8320,7 @@ static void rk_mpp_hw_abort_ccu_dependents_kunit(struct kunit *test)
 	list_add_tail(&core1->link, &srv->hw_list);
 
 	queued->session = session;
+	rk_mpp_activation_init(queued);
 	queued->activation.selected_hw = core0;
 	queued->state = RK_MPP_JOB_ACTIVE;
 	queued->result = -EINPROGRESS;
@@ -8302,6 +8334,7 @@ static void rk_mpp_hw_abort_ccu_dependents_kunit(struct kunit *test)
 	atomic_set(&core0->queued_job_count, 1);
 
 	active->session = session;
+	rk_mpp_activation_init(active);
 	active->activation.selected_hw = core1;
 	active->state = RK_MPP_JOB_ACTIVE;
 	active->result = -EINPROGRESS;
@@ -8311,7 +8344,7 @@ static void rk_mpp_hw_abort_ccu_dependents_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&active->sched_link);
 	INIT_LIST_HEAD(&active->rkvdec_ccu_node);
 	list_add_tail(&active->session_link, &session->active_jobs);
-	core1->active_job = active;
+	core1->active_activation = &active->activation;
 
 	core0->recovery_failed = true;
 	mutex_lock(&ccu->ccu_recovery_lock);
@@ -8322,7 +8355,7 @@ static void rk_mpp_hw_abort_ccu_dependents_kunit(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, list_empty(&queued->sched_link));
 	KUNIT_EXPECT_EQ(test, queued->result, -EINPROGRESS);
 	KUNIT_EXPECT_EQ(test, refcount_read(&core0->refs), 2);
-	KUNIT_EXPECT_PTR_EQ(test, core1->active_job, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, core1->active_activation, NULL);
 	KUNIT_EXPECT_EQ(test, active->result, -EIO);
 	KUNIT_EXPECT_PTR_EQ(test, active->activation.selected_hw, NULL);
 	KUNIT_EXPECT_EQ(test, refcount_read(&active->refs), 1);
@@ -8345,7 +8378,7 @@ static void rk_mpp_hw_abort_ccu_dependents_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&core0->queued_job_count), 0);
 	KUNIT_EXPECT_EQ(test, refcount_read(&core0->refs), 1);
 
-	KUNIT_EXPECT_PTR_EQ(test, core1->active_job, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, core1->active_activation, NULL);
 	KUNIT_EXPECT_TRUE(test, list_empty(&active->sched_link));
 	KUNIT_EXPECT_FALSE(test, list_empty(&active->session_link));
 	KUNIT_EXPECT_EQ(test, active->state,
@@ -8612,7 +8645,8 @@ static void rk_mpp_scheduler_session_start_order_kunit(struct kunit *test)
 	session_b->srv = srv;
 	session_b->client_type = RK_MPP_DEVICE_RKVDEC;
 	busy_hw->online = true;
-	busy_hw->active_job = active;
+	rk_mpp_activation_init(active);
+	busy_hw->active_activation = &active->activation;
 	idle_hw->online = true;
 	mutex_init(&srv->sched_lock);
 	INIT_LIST_HEAD(&srv->queued_jobs);
@@ -8665,7 +8699,7 @@ static void rk_mpp_scheduler_session_start_order_kunit(struct kunit *test)
 	 * overlap can corrupt references, so only another session may use the
 	 * second decoder core until job1 completes.
 	 */
-	busy_hw->active_job = NULL;
+	busy_hw->active_activation = NULL;
 	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_scheduler_take_job(srv), job1);
 	KUNIT_EXPECT_PTR_EQ(test, session_a->rkvdec_dispatch_owner,
 			    &job1->activation);
@@ -8675,7 +8709,7 @@ static void rk_mpp_scheduler_session_start_order_kunit(struct kunit *test)
 	rk_mpp_scheduler_release_session(job2);
 	KUNIT_EXPECT_PTR_EQ(test, session_a->rkvdec_dispatch_owner,
 			    &job1->activation);
-	busy_hw->active_job = job1;
+	busy_hw->active_activation = &job1->activation;
 	list_add_tail(&other->sched_link, &srv->queued_jobs);
 	atomic_inc(&idle_hw->queued_job_count);
 	atomic_inc(&srv->queued_job_count);
@@ -8686,7 +8720,7 @@ static void rk_mpp_scheduler_session_start_order_kunit(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, session_b->rkvdec_dispatch_owner, NULL);
 	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_scheduler_take_job(srv), NULL);
 
-	busy_hw->active_job = NULL;
+	busy_hw->active_activation = NULL;
 	rk_mpp_scheduler_release_session(job1);
 	KUNIT_EXPECT_PTR_EQ(test, session_a->rkvdec_dispatch_owner, NULL);
 	KUNIT_EXPECT_TRUE(test, rk_mpp_dispatch_lease_released(job1));
@@ -9131,13 +9165,16 @@ static void rk_mpp_iommu_hard_ccu_fault_target_kunit(struct kunit *test)
 
 	fixture->owner_job.rkvdec_ccu_started = true;
 	fixture->owner_job.rkvdec_link_iova = 0x2000;
-	owner->active_job = &fixture->owner_job;
+	rk_mpp_activation_init(&fixture->owner_job);
+	owner->active_activation = &fixture->owner_job.activation;
 	fixture->peer_job.rkvdec_ccu_started = true;
 	fixture->peer_job.rkvdec_link_iova = 0x3000;
-	peer->active_job = &fixture->peer_job;
+	rk_mpp_activation_init(&fixture->peer_job);
+	peer->active_activation = &fixture->peer_job.activation;
 	fixture->other_job.rkvdec_ccu_started = true;
 	fixture->other_job.rkvdec_link_iova = 0x4000;
-	other->active_job = &fixture->other_job;
+	rk_mpp_activation_init(&fixture->other_job);
+	other->active_activation = &fixture->other_job.activation;
 
 	target = rk_mpp_hard_fault_owner(&fault_hws, source, 0x3000, true);
 	KUNIT_EXPECT_PTR_EQ(test, target, peer);
@@ -9148,7 +9185,8 @@ static void rk_mpp_iommu_hard_ccu_fault_target_kunit(struct kunit *test)
 
 	fixture->source_job.rkvdec_ccu_started = true;
 	fixture->source_job.rkvdec_link_iova = 0x1000;
-	source->active_job = &fixture->source_job;
+	rk_mpp_activation_init(&fixture->source_job);
+	source->active_activation = &fixture->source_job.activation;
 	target = rk_mpp_hard_fault_owner(&fault_hws, source, 0x1000, true);
 	KUNIT_EXPECT_PTR_EQ(test, target, source);
 
@@ -10832,6 +10870,7 @@ static void rk_mpp_reset_session_hw_active_import_kunit(struct kunit *test)
 	list_add_tail(&import->link, &session->imports);
 
 	active->session = session;
+	rk_mpp_activation_init(active);
 	active->activation.selected_hw = hw;
 	/* Freed with the job by the production release path. */
 	active->imports = kcalloc(1, sizeof(*active->imports), GFP_KERNEL);
@@ -10850,7 +10889,7 @@ static void rk_mpp_reset_session_hw_active_import_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&active->sched_link);
 	INIT_LIST_HEAD(&active->rkvdec_ccu_node);
 	list_add_tail(&active->session_link, &session->active_jobs);
-	hw->active_job = active;
+	hw->active_activation = &active->activation;
 
 	kunit_remove_action(test, rk_mpp_kunit_kfree, active->imports);
 	kunit_remove_action(test, rk_mpp_kunit_kfree, active);
@@ -10861,7 +10900,7 @@ static void rk_mpp_reset_session_hw_active_import_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, list_empty(&session->imports));
 	KUNIT_EXPECT_TRUE(test, list_empty(&session->active_jobs));
 	KUNIT_EXPECT_EQ(test, session->active_job_count, 0U);
-	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_activation, NULL);
 	KUNIT_EXPECT_TRUE(test, completion_done(&hw->released));
 	KUNIT_EXPECT_EQ(test, refcount_read(&session->refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&import->refs), 1);
@@ -14939,7 +14978,7 @@ static bool rk_mpp_hw_clear_active_job(struct rk_mpp_hw *hw,
 	bool cleared = false;
 
 	spin_lock_irqsave(&hw->lock, flags);
-	if (rk_mpp_hw_active_job_locked(hw) == job) {
+	if (rk_mpp_hw_active_activation_locked(hw) == &job->activation) {
 		if (irq_status)
 			*irq_status = hw->irq_status;
 		rk_mpp_hw_take_active_locked(hw);
@@ -14959,26 +14998,24 @@ static bool rk_mpp_hw_clear_active_job(struct rk_mpp_hw *hw,
 static struct rk_mpp_job *rk_mpp_hw_take_active_job(struct rk_mpp_hw *hw,
 						    u32 *irq_status)
 {
-	struct rk_mpp_job *job;
+	struct rk_mpp_activation *activation;
 	unsigned long flags;
 
 	spin_lock_irqsave(&hw->lock, flags);
-	job = rk_mpp_hw_active_job_locked(hw);
 	if (irq_status)
 		*irq_status = hw->irq_status;
-	if (job)
-		rk_mpp_hw_take_active_locked(hw);
+	activation = rk_mpp_hw_take_active_locked(hw);
 	rk_mpp_hw_clear_irq_record_locked(hw);
 	spin_unlock_irqrestore(&hw->lock, flags);
 
-	return job;
+	return rk_mpp_activation_job(activation);
 }
 
 static struct rk_mpp_job *
 rk_mpp_hw_take_irq_job(struct rk_mpp_hw *hw, u32 *irq_status,
 		       bool *fault_pending)
 {
-	struct rk_mpp_job *job = NULL;
+	struct rk_mpp_activation *activation = NULL;
 	unsigned long regs_flags;
 	unsigned long flags;
 	bool lease_current;
@@ -14989,12 +15026,10 @@ rk_mpp_hw_take_irq_job(struct rk_mpp_hw *hw, u32 *irq_status,
 	pending = hw->iommu_fault_pending;
 	if (!pending) {
 		lease_current = rk_mpp_hw_irq_record_current_locked(hw);
-		if (lease_current)
-			job = rk_mpp_hw_active_job_locked(hw);
 		if (irq_status)
 			*irq_status = lease_current ? hw->irq_status : 0;
-		if (job)
-			rk_mpp_hw_take_active_locked(hw);
+		if (lease_current)
+			activation = rk_mpp_hw_take_active_locked(hw);
 		rk_mpp_hw_clear_irq_record_locked(hw);
 	}
 	spin_unlock_irqrestore(&hw->lock, flags);
@@ -15003,7 +15038,7 @@ rk_mpp_hw_take_irq_job(struct rk_mpp_hw *hw, u32 *irq_status,
 	if (fault_pending)
 		*fault_pending = pending;
 
-	return job;
+	return rk_mpp_activation_job(activation);
 }
 
 static struct rk_mpp_job *
@@ -15041,7 +15076,7 @@ static bool rk_mpp_hw_take_active_if(struct rk_mpp_hw *hw,
 	bool taken = false;
 
 	spin_lock_irqsave(&hw->lock, flags);
-	if (rk_mpp_hw_active_job_locked(hw) == match &&
+	if (rk_mpp_hw_active_activation_locked(hw) == &match->activation &&
 	    !hw->iommu_fault_pending) {
 		if (irq_status)
 			*irq_status = hw->irq_status;
@@ -15056,14 +15091,15 @@ static bool rk_mpp_hw_take_active_if(struct rk_mpp_hw *hw,
 
 static bool
 rk_mpp_hw_take_active_if_generation(struct rk_mpp_hw *hw,
-				    struct rk_mpp_job *match, u64 generation,
+				    struct rk_mpp_activation *match,
+				    u64 generation,
 				    u32 *irq_status)
 {
 	unsigned long flags;
 	bool taken = false;
 
 	spin_lock_irqsave(&hw->lock, flags);
-	if (generation && rk_mpp_hw_active_job_locked(hw) == match &&
+	if (generation && rk_mpp_hw_active_activation_locked(hw) == match &&
 	    rk_mpp_hw_active_generation_locked(hw) == generation &&
 	    !hw->iommu_fault_pending) {
 		if (irq_status)
@@ -15085,7 +15121,7 @@ static bool __rk_mpp_hw_restore_active_job(struct rk_mpp_hw *hw,
 	bool restored = false;
 
 	spin_lock_irqsave(&hw->lock, flags);
-	if (rk_mpp_hw_restore_active_locked(hw, job)) {
+	if (rk_mpp_hw_restore_active_locked(hw, &job->activation)) {
 		rk_mpp_hw_clear_irq_record_locked(hw);
 		if (force_iommu_fault)
 			hw->iommu_fault_pending = true;
@@ -15111,39 +15147,39 @@ static bool rk_mpp_hw_restore_iommu_fault_job(struct rk_mpp_hw *hw,
 	return __rk_mpp_hw_restore_active_job(hw, job, true);
 }
 
-static struct rk_mpp_job *
-rk_mpp_hw_take_timeout_job(struct rk_mpp_hw *hw, u64 *generation)
+static struct rk_mpp_activation *
+rk_mpp_hw_take_timeout_activation(struct rk_mpp_hw *hw, u64 *generation)
 {
-	struct rk_mpp_job *job;
+	struct rk_mpp_activation *activation;
 	unsigned long flags;
 
 	spin_lock_irqsave(&hw->lock, flags);
-	job = hw->timeout_job;
-	hw->timeout_job = NULL;
+	activation = hw->timeout_activation;
+	hw->timeout_activation = NULL;
 	if (generation)
 		*generation = hw->timeout_generation;
 	hw->timeout_generation = 0;
 	spin_unlock_irqrestore(&hw->lock, flags);
 
-	return job;
+	return activation;
 }
 
 static void rk_mpp_hw_cancel_timeout(struct rk_mpp_hw *hw)
 {
-	struct rk_mpp_job *job;
+	struct rk_mpp_activation *activation;
 
 	cancel_delayed_work(&hw->timeout_work);
-	job = rk_mpp_hw_take_timeout_job(hw, NULL);
-	rk_mpp_job_put(job);
+	activation = rk_mpp_hw_take_timeout_activation(hw, NULL);
+	rk_mpp_job_put(rk_mpp_activation_job(activation));
 }
 
 static void rk_mpp_hw_cancel_timeout_sync(struct rk_mpp_hw *hw)
 {
-	struct rk_mpp_job *job;
+	struct rk_mpp_activation *activation;
 
 	cancel_delayed_work_sync(&hw->timeout_work);
-	job = rk_mpp_hw_take_timeout_job(hw, NULL);
-	rk_mpp_job_put(job);
+	activation = rk_mpp_hw_take_timeout_activation(hw, NULL);
+	rk_mpp_job_put(rk_mpp_activation_job(activation));
 }
 
 static bool rk_mpp_hw_mark_iommu_fault(struct rk_mpp_hw *hw)
@@ -15172,7 +15208,7 @@ static bool rk_mpp_hw_mark_iommu_fault(struct rk_mpp_hw *hw)
 static struct rk_mpp_job *
 rk_mpp_hw_take_iommu_fault_job(struct rk_mpp_hw *hw, bool *consumed)
 {
-	struct rk_mpp_job *job = NULL;
+	struct rk_mpp_activation *activation = NULL;
 	unsigned long flags;
 	u64 generation;
 
@@ -15184,12 +15220,12 @@ rk_mpp_hw_take_iommu_fault_job(struct rk_mpp_hw *hw, bool *consumed)
 	hw->iommu_fault_generation = 0;
 	if (generation && rk_mpp_hw_active_job_locked(hw) &&
 	    generation == rk_mpp_hw_active_generation_locked(hw)) {
-		job = rk_mpp_hw_take_active_locked(hw);
+		activation = rk_mpp_hw_take_active_locked(hw);
 		rk_mpp_hw_clear_irq_record_locked(hw);
 	}
 	spin_unlock_irqrestore(&hw->lock, flags);
 
-	return job;
+	return rk_mpp_activation_job(activation);
 }
 
 static bool rk_mpp_hw_prepare_active_retry(struct rk_mpp_hw *hw,
@@ -15200,7 +15236,7 @@ static bool rk_mpp_hw_prepare_active_retry(struct rk_mpp_hw *hw,
 	bool active = false;
 
 	spin_lock_irqsave(&hw->lock, flags);
-	if (rk_mpp_hw_active_job_locked(hw) == match) {
+	if (rk_mpp_hw_active_activation_locked(hw) == &match->activation) {
 		generation = rk_mpp_hw_advance_active_generation_locked(hw);
 		rk_mpp_activation_install_locked(hw, match, generation);
 		rk_mpp_hw_clear_irq_record_locked(hw);
@@ -15444,7 +15480,7 @@ rk_mpp_hw_active_job_is(struct rk_mpp_hw *hw, const struct rk_mpp_job *match)
 	bool active;
 
 	spin_lock_irqsave(&hw->lock, flags);
-	active = rk_mpp_hw_active_job_locked(hw) == match;
+	active = rk_mpp_hw_active_activation_locked(hw) == &match->activation;
 	spin_unlock_irqrestore(&hw->lock, flags);
 
 	return active;
@@ -15452,15 +15488,18 @@ rk_mpp_hw_active_job_is(struct rk_mpp_hw *hw, const struct rk_mpp_job *match)
 
 static struct rk_mpp_hw *
 rk_mpp_hw_get_active_ccu_if(struct rk_mpp_hw *hw,
-			    const struct rk_mpp_job *match, u64 generation)
+			    const struct rk_mpp_activation *match,
+			    u64 generation)
 {
+	struct rk_mpp_activation *activation;
 	struct rk_mpp_hw *ccu = NULL;
 	struct rk_mpp_job *job;
 	unsigned long flags;
 
 	spin_lock_irqsave(&hw->lock, flags);
-	job = rk_mpp_hw_active_job_locked(hw);
-	if (job && (!match || job == match) &&
+	activation = rk_mpp_hw_active_activation_locked(hw);
+	job = rk_mpp_activation_job(activation);
+	if (job && (!match || activation == match) &&
 	    (!generation ||
 	     rk_mpp_hw_active_generation_locked(hw) == generation) &&
 	    job->rkvdec_ccu) {
@@ -15497,7 +15536,7 @@ static bool rk_mpp_hw_abort_job(struct rk_mpp_job *job)
 	rk_mpp_hw_cancel_timeout_sync(hw);
 	irq_disabled = rk_mpp_hw_disable_irq(hw);
 	rk_mpp_hw_synchronize_hardirq(hw);
-	ccu = rk_mpp_hw_get_active_ccu_if(hw, job, 0);
+	ccu = rk_mpp_hw_get_active_ccu_if(hw, &job->activation, 0);
 	if (ccu)
 		mutex_lock(&ccu->ccu_recovery_lock);
 	mutex_lock(&hw->run_lock);
@@ -15566,7 +15605,7 @@ static bool rk_mpp_hw_abort_job(struct rk_mpp_job *job)
 		/*
 		 * The active owner is the only path allowed to tear down the
 		 * descriptor. Submit failures and IRQ completion retain their
-		 * own cleanup ownership after clearing active_job.
+		 * own cleanup ownership after clearing the active activation.
 		 */
 		rk_mpp_rkvdec2_release_link_table(job);
 		/*
@@ -15611,25 +15650,28 @@ out_unlock_core:
 
 static void rk_mpp_hw_schedule_timeout(struct rk_mpp_hw *hw)
 {
+	struct rk_mpp_activation *activation;
+	struct rk_mpp_activation *old = NULL;
 	struct rk_mpp_job *job;
-	struct rk_mpp_job *old = NULL;
 	unsigned long deadline;
 	unsigned long flags;
 	unsigned long now;
 	u64 generation;
 
 	spin_lock_irqsave(&hw->lock, flags);
-	job = rk_mpp_hw_active_job_locked(hw);
-	generation = rk_mpp_hw_active_generation_locked(hw);
-	if (job != hw->timeout_job) {
+	activation = rk_mpp_hw_active_activation_locked(hw);
+	job = rk_mpp_activation_job(activation);
+	generation = rk_mpp_activation_generation(activation);
+	if (activation != hw->timeout_activation) {
 		if (job)
 			rk_mpp_job_get(job);
-		old = hw->timeout_job;
-		hw->timeout_job = job;
+		old = hw->timeout_activation;
+		hw->timeout_activation = activation;
 	}
 	hw->timeout_generation = job ? generation : 0;
 	/*
-	 * Only a new activation starts a new window. rk_mpp_hw_abort_job()
+	 * Only a newly installed generation starts a new window.
+	 * rk_mpp_hw_abort_job()
 	 * must drain the watchdog before it can take run_lock, so it clears
 	 * the slot for whatever job owns the core and restores it here -- and
 	 * an unrelated session can drive that path as fast as it likes via
@@ -15637,14 +15679,14 @@ static void rk_mpp_hw_schedule_timeout(struct rk_mpp_hw *hw)
 	 * let it postpone another session's watchdog indefinitely, which on a
 	 * wedged core is the only recovery there is.
 	 */
-	if (job && !job->activation.watchdog_deadline_valid) {
-		job->activation.watchdog_deadline = jiffies +
+	if (activation && !activation->watchdog_deadline_valid) {
+		activation->watchdog_deadline = jiffies +
 			msecs_to_jiffies(RK_MPP_WORK_TIMEOUT_MS);
-		job->activation.watchdog_deadline_valid = true;
+		activation->watchdog_deadline_valid = true;
 	}
-	deadline = job ? job->activation.watchdog_deadline : 0;
+	deadline = activation ? activation->watchdog_deadline : 0;
 	spin_unlock_irqrestore(&hw->lock, flags);
-	rk_mpp_job_put(old);
+	rk_mpp_job_put(rk_mpp_activation_job(old));
 
 	if (job) {
 		/*
@@ -16023,9 +16065,11 @@ static u32 rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu)
 }
 
 static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
-				     struct rk_mpp_job *timeout_job,
+				     struct rk_mpp_activation *timeout_activation,
 				     u64 timeout_generation)
 {
+	struct rk_mpp_job *timeout_job =
+		rk_mpp_activation_job(timeout_activation);
 	struct rk_mpp_job *job;
 	struct rk_mpp_hw *ccu = NULL;
 	struct rk_mpp_cluster_recovery_result ccu_recovery = {
@@ -16048,12 +16092,13 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 
 	/*
 	 * Synchronize this core's threaded IRQ before taking recovery_lock:
-	 * a hard-CCU IRQ thread takes that lock before it drains active_job.
+	 * a hard-CCU IRQ thread takes that lock before it drains the active
+	 * activation.
 	 */
 	irq_disabled = rk_mpp_hw_disable_irq(hw);
 	rk_mpp_hw_synchronize_hardirq(hw);
 	ccu = rk_mpp_hw_get_active_ccu_if(hw,
-					  iommu_fault ? NULL : timeout_job,
+					  iommu_fault ? NULL : timeout_activation,
 					  iommu_fault ? 0 : timeout_generation);
 	if (ccu)
 		mutex_lock(&ccu->ccu_recovery_lock);
@@ -16061,8 +16106,8 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 	if (iommu_fault)
 		job = rk_mpp_hw_take_iommu_fault_job(hw, &fault_consumed);
 	else if (timeout_job &&
-		 rk_mpp_hw_take_active_if_generation(hw, timeout_job,
-						      timeout_generation, NULL))
+		 rk_mpp_hw_take_active_if_generation(hw, timeout_activation,
+						     timeout_generation, NULL))
 		job = timeout_job;
 	else
 		job = NULL;
@@ -16231,14 +16276,14 @@ static void rk_mpp_hw_timeout_work(struct work_struct *work)
 	struct rk_mpp_hw *hw =
 		container_of(to_delayed_work(work), struct rk_mpp_hw,
 			     timeout_work);
-	struct rk_mpp_job *job;
+	struct rk_mpp_activation *activation;
 	u64 generation = 0;
 
-	job = rk_mpp_hw_take_timeout_job(hw, &generation);
-	if (!job)
+	activation = rk_mpp_hw_take_timeout_activation(hw, &generation);
+	if (!activation)
 		return;
-	rk_mpp_hw_recover_active(hw, false, job, generation);
-	rk_mpp_job_put(job);
+	rk_mpp_hw_recover_active(hw, false, activation, generation);
+	rk_mpp_job_put(rk_mpp_activation_job(activation));
 }
 
 static void rk_mpp_hw_iommu_fault_work(struct work_struct *work)
@@ -18018,7 +18063,7 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 	if (hard_ccu) {
 		/*
 		 * Keep one coordinator reference in the job and one in this
-		 * submit transaction. Publish active_job only after its
+		 * submit transaction. Publish the active activation only after its
 		 * coordinator association exists, so abort/fault recovery can
 		 * never observe a hard job without the serialization target.
 		 */
@@ -18151,7 +18196,7 @@ err_clear_active:
 	rk_mpp_hw_clear_active_job(hw, job, NULL);
 err_unlock:
 	/*
-	 * Resolve descriptor/CCU ownership before active_job becomes
+	 * Resolve descriptor/CCU ownership before the active activation becomes
 	 * externally absent. Later job completion and abort cleanup are then
 	 * harmless idempotent calls instead of concurrent teardown owners.
 	 */
