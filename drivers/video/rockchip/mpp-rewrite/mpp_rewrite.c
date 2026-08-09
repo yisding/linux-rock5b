@@ -391,6 +391,39 @@ struct rk_mpp_dma_group {
 struct rk_mpp_service;
 struct rk_mpp_reset_domain;
 struct rk_mpp_hw;
+struct rk_mpp_cluster;
+
+struct rk_mpp_reset_backend_ops {
+	int (*assert)(struct rk_mpp_reset_domain *domain,
+		      struct rk_mpp_hw *hw);
+	int (*deassert)(struct rk_mpp_reset_domain *domain,
+			struct rk_mpp_hw *hw);
+};
+
+struct rk_mpp_rkvdec2_stop_core {
+	struct rk_mpp_hw *hw;
+	int bus_ret;
+	int reset_assert_ret;
+	int reset_deassert_ret;
+	bool irq_disabled;
+	bool reset_attempted;
+	bool reset_asserted;
+	bool reset_pulse_active;
+};
+
+struct rk_mpp_cluster_reset_request {
+	struct rk_mpp_cluster *cluster;
+	struct rk_mpp_hw *ccu;
+	struct rk_mpp_rkvdec2_stop_core *cores;
+	u32 count;
+};
+
+struct rk_mpp_cluster_reset_result {
+	u64 epoch;
+	int ccu_assert_ret;
+	int ccu_deassert_ret;
+	bool ccu_reset_asserted;
+};
 
 /*
  * Stable construction-time view of one explicit CCU topology. The service
@@ -447,7 +480,8 @@ struct rk_mpp_hw {
 	 * devices use their own node. Published before runtime PM/read-ID and
 	 * cleared only after remove has drained every operation.
 	 * Single-target power deassert and recovery pulse use its transaction
-	 * state now; the legacy multi-core force-stop joins in the cluster patch.
+	 * state; hard-CCU force-stop validates its pinned participants through
+	 * the cluster and records the whole physical pulse as one epoch.
 	 */
 	struct rk_mpp_reset_domain *reset_domain;
 	struct delayed_work timeout_work;
@@ -606,13 +640,14 @@ static bool rk_mpp_hw_restore_active_locked(struct rk_mpp_hw *hw,
  * One stable construction object per immutable reset topology identity. The
  * service owns the table and its OF-node references; members join and leave
  * under the domain lock, while slots are never compacted. Single-target reset
- * operations own state/epoch here. The legacy multi-core force-stop remains
- * outside this transaction model until the cluster pins its participant set.
- * The reset mutex is the innermost sleepable leaf: no callback, allocation, PM
- * operation, logging, or other lock may move under it.
+ * operations and cluster-validated hard-CCU group pulses own state/epoch here.
+ * The reset mutex is the innermost sleepable leaf: no callback, allocation,
+ * PM operation, logging, or other lock may move under it.
  */
 struct rk_mpp_reset_domain {
 	struct device_node *node;
+	const struct rk_mpp_reset_backend_ops *backend_ops;
+	void *backend_data;
 	struct mutex lock;
 	struct list_head members;
 	atomic_t reset_domain_operation_pending;
@@ -964,12 +999,18 @@ static void rk_mpp_hw_handle_reset_failure(struct rk_mpp_hw *hw, int error);
 static void
 rk_mpp_reset_domain_init(struct rk_mpp_reset_domain *domain,
 			 struct device_node *node);
+static const struct rk_mpp_reset_backend_ops
+	rk_mpp_reset_control_backend_ops;
 static struct rk_mpp_reset_domain *
 rk_mpp_reset_domain_get_locked(struct rk_mpp_service *srv,
 			       struct device_node *node, bool *added);
 static int
+rk_mpp_cluster_reset_valid_locked(struct rk_mpp_reset_domain *domain,
+				  const struct rk_mpp_cluster_reset_request *request);
+static int
 rk_mpp_reset_domain_begin(struct rk_mpp_hw *hw,
-			  enum rk_mpp_reset_domain_state operation);
+			  enum rk_mpp_reset_domain_state operation,
+			  const struct rk_mpp_cluster_reset_request *request);
 static void rk_mpp_reset_domain_finish(struct rk_mpp_hw *hw, int error);
 static int
 rk_mpp_reset_domain_register_member(struct rk_mpp_reset_domain *domain,
@@ -979,6 +1020,9 @@ static bool rk_mpp_hw_terminal_drain_power(struct rk_mpp_hw *hw);
 static int rk_mpp_hw_terminal_isolate(struct rk_mpp_hw *hw);
 static u32 rk_mpp_rkvdec2_stop_command(u32 core_work);
 static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu);
+static int
+rk_mpp_cluster_reset_group(struct rk_mpp_cluster_reset_request *request,
+			   struct rk_mpp_cluster_reset_result *result);
 static int
 rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(struct rk_mpp_hw *ccu);
 static u32 rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu);
@@ -1929,8 +1973,8 @@ static void rk_mpp_cluster_rebuild_locked(struct rk_mpp_cluster *cluster)
 {
 	struct rk_mpp_hw *member;
 
-	cluster->coordinator = NULL;
-	cluster->reset_domain = NULL;
+	WRITE_ONCE(cluster->coordinator, NULL);
+	WRITE_ONCE(cluster->reset_domain, NULL);
 	cluster->member_type = RK_MPP_DEVICE_BUTT;
 	cluster->member_count = 0;
 	cluster->core_count = 0;
@@ -1949,7 +1993,7 @@ static void rk_mpp_cluster_rebuild_locked(struct rk_mpp_cluster *cluster)
 				      !list_empty(&cluster->coordinator->link)) &&
 				     (READ_ONCE(member->online) ||
 				      !list_empty(&member->link)));
-			cluster->coordinator = member;
+			WRITE_ONCE(cluster->coordinator, member);
 		} else {
 			if (cluster->core_count)
 				WARN_ON_ONCE(cluster->member_type !=
@@ -1963,7 +2007,7 @@ static void rk_mpp_cluster_rebuild_locked(struct rk_mpp_cluster *cluster)
 			WARN_ON_ONCE(cluster->reset_domain !=
 				     member->reset_domain);
 		else
-			cluster->reset_domain = member->reset_domain;
+			WRITE_ONCE(cluster->reset_domain, member->reset_domain);
 	}
 }
 
@@ -1991,7 +2035,7 @@ rk_mpp_cluster_register_member_locked(struct rk_mpp_cluster *cluster,
 		return -EXDEV;
 
 	list_add_tail(&hw->cluster_link, &cluster->members);
-	hw->cluster = cluster;
+	WRITE_ONCE(hw->cluster, cluster);
 	rk_mpp_cluster_rebuild_locked(cluster);
 
 	return 0;
@@ -2008,7 +2052,7 @@ static int rk_mpp_cluster_unregister_member_locked(struct rk_mpp_hw *hw)
 		return -ENOENT;
 
 	list_del_init(&hw->cluster_link);
-	hw->cluster = NULL;
+	WRITE_ONCE(hw->cluster, NULL);
 	rk_mpp_cluster_rebuild_locked(cluster);
 
 	return 0;
@@ -10492,6 +10536,206 @@ static void rk_mpp_cluster_membership_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, list_empty(&cluster->members));
 }
 
+struct rk_mpp_kunit_reset_trace {
+	struct rk_mpp_hw *targets[2 * (RK_MPP_RKVDEC_MAX_CCU_CORES + 1)];
+	bool deassert[2 * (RK_MPP_RKVDEC_MAX_CCU_CORES + 1)];
+	u32 count;
+	u32 fail_at;
+	int fail_error;
+};
+
+static int
+rk_mpp_kunit_reset_record(struct rk_mpp_reset_domain *domain,
+			  struct rk_mpp_hw *hw, bool deassert)
+{
+	struct rk_mpp_kunit_reset_trace *trace = domain->backend_data;
+	u32 index = trace->count++;
+
+	if (WARN_ON_ONCE(index >= ARRAY_SIZE(trace->targets)))
+		return -EOVERFLOW;
+	trace->targets[index] = hw;
+	trace->deassert[index] = deassert;
+	if (index == trace->fail_at)
+		return trace->fail_error;
+
+	return 0;
+}
+
+static int
+rk_mpp_kunit_reset_assert(struct rk_mpp_reset_domain *domain,
+			  struct rk_mpp_hw *hw)
+{
+	return rk_mpp_kunit_reset_record(domain, hw, false);
+}
+
+static int
+rk_mpp_kunit_reset_deassert(struct rk_mpp_reset_domain *domain,
+			    struct rk_mpp_hw *hw)
+{
+	return rk_mpp_kunit_reset_record(domain, hw, true);
+}
+
+static const struct rk_mpp_reset_backend_ops rk_mpp_kunit_reset_ops = {
+	.assert = rk_mpp_kunit_reset_assert,
+	.deassert = rk_mpp_kunit_reset_deassert,
+};
+
+static void rk_mpp_cluster_reset_group_kunit(struct kunit *test)
+{
+	struct rk_mpp_rkvdec2_stop_core cores[2] = {};
+	struct rk_mpp_cluster_reset_request request;
+	struct rk_mpp_cluster_reset_result result;
+	struct rk_mpp_kunit_reset_trace *trace;
+	struct rk_mpp_reset_domain *domain;
+	struct rk_mpp_cluster *cluster;
+	struct rk_mpp_service *srv;
+	struct rk_mpp_hw *core0;
+	struct rk_mpp_hw *core1;
+	struct rk_mpp_hw *ccu;
+	struct device_node *identity;
+	struct device *ccu_dev;
+	int ret;
+
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
+	domain = kunit_kzalloc(test, sizeof(*domain), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, domain);
+	cluster = kunit_kzalloc(test, sizeof(*cluster), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, cluster);
+	trace = kunit_kzalloc(test, sizeof(*trace), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, trace);
+	core0 = kunit_kzalloc(test, sizeof(*core0), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, core0);
+	core1 = kunit_kzalloc(test, sizeof(*core1), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, core1);
+	ccu = kunit_kzalloc(test, sizeof(*ccu), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ccu);
+	identity = kunit_kzalloc(test, sizeof(*identity), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, identity);
+	ccu_dev = kunit_kzalloc(test, sizeof(*ccu_dev), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ccu_dev);
+
+	mutex_init(&srv->hw_lock);
+	rk_mpp_reset_domain_init(domain, identity);
+	domain->backend_ops = &rk_mpp_kunit_reset_ops;
+	domain->backend_data = trace;
+	rk_mpp_cluster_init(cluster, identity);
+	ccu_dev->of_node = identity;
+
+	core0->srv = srv;
+	core0->match = &rk_mpp_rkvdec2_core;
+	core0->ccu_node = identity;
+	core0->resets = (struct reset_control *)&core0->reset_pulse_active;
+	INIT_LIST_HEAD(&core0->link);
+	INIT_LIST_HEAD(&core0->reset_domain_link);
+	INIT_LIST_HEAD(&core0->cluster_link);
+	core1->srv = srv;
+	core1->match = &rk_mpp_rkvdec2_core;
+	core1->ccu_node = identity;
+	core1->resets = (struct reset_control *)&core1->reset_pulse_active;
+	INIT_LIST_HEAD(&core1->link);
+	INIT_LIST_HEAD(&core1->reset_domain_link);
+	INIT_LIST_HEAD(&core1->cluster_link);
+	ccu->srv = srv;
+	ccu->dev = ccu_dev;
+	ccu->match = &rk_mpp_rkvdec2_ccu;
+	ccu->resets = (struct reset_control *)&ccu->reset_pulse_active;
+	INIT_LIST_HEAD(&ccu->link);
+	INIT_LIST_HEAD(&ccu->reset_domain_link);
+	INIT_LIST_HEAD(&ccu->cluster_link);
+	mutex_init(&ccu->ccu_recovery_lock);
+	mutex_init(&ccu->run_lock);
+
+	KUNIT_ASSERT_EQ(test,
+			rk_mpp_reset_domain_register_member(domain, core0), 0);
+	KUNIT_ASSERT_EQ(test,
+			rk_mpp_reset_domain_register_member(domain, core1), 0);
+	KUNIT_ASSERT_EQ(test,
+			rk_mpp_reset_domain_register_member(domain, ccu), 0);
+	mutex_lock(&srv->hw_lock);
+	ret = rk_mpp_cluster_register_member_locked(cluster, core0);
+	if (!ret)
+		ret = rk_mpp_cluster_register_member_locked(cluster, core1);
+	if (!ret)
+		ret = rk_mpp_cluster_register_member_locked(cluster, ccu);
+	mutex_unlock(&srv->hw_lock);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	cores[0].hw = core0;
+	cores[1].hw = core1;
+	request.cluster = cluster;
+	request.ccu = ccu;
+	request.cores = cores;
+	request.count = ARRAY_SIZE(cores);
+	trace->fail_at = U32_MAX;
+	mutex_lock(&ccu->ccu_recovery_lock);
+	mutex_lock(&ccu->run_lock);
+	ret = rk_mpp_cluster_reset_group(&request, &result);
+	mutex_unlock(&ccu->run_lock);
+	mutex_unlock(&ccu->ccu_recovery_lock);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, result.epoch, 1ULL);
+	KUNIT_EXPECT_EQ(test, domain->reset_domain_epoch, 1ULL);
+	KUNIT_EXPECT_EQ(test, domain->reset_domain_pulse_count, 1ULL);
+	KUNIT_EXPECT_EQ(test, domain->reset_domain_deassert_count, 3ULL);
+	KUNIT_EXPECT_EQ(test, trace->count, 6U);
+	KUNIT_EXPECT_PTR_EQ(test, trace->targets[0], core0);
+	KUNIT_EXPECT_PTR_EQ(test, trace->targets[1], core1);
+	KUNIT_EXPECT_PTR_EQ(test, trace->targets[2], ccu);
+	KUNIT_EXPECT_PTR_EQ(test, trace->targets[3], core0);
+	KUNIT_EXPECT_PTR_EQ(test, trace->targets[4], core1);
+	KUNIT_EXPECT_PTR_EQ(test, trace->targets[5], ccu);
+	KUNIT_EXPECT_FALSE(test, trace->deassert[0]);
+	KUNIT_EXPECT_FALSE(test, trace->deassert[1]);
+	KUNIT_EXPECT_FALSE(test, trace->deassert[2]);
+	KUNIT_EXPECT_TRUE(test, trace->deassert[3]);
+	KUNIT_EXPECT_TRUE(test, trace->deassert[4]);
+	KUNIT_EXPECT_TRUE(test, trace->deassert[5]);
+	KUNIT_EXPECT_EQ(test, atomic_read(&core0->reset_pulse_active), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&core1->reset_pulse_active), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&ccu->reset_pulse_active), 0);
+
+	memset(cores, 0, sizeof(cores));
+	cores[0].hw = core0;
+	cores[1].hw = core1;
+	memset(trace, 0, sizeof(*trace));
+	trace->fail_at = 1;
+	trace->fail_error = -EIO;
+	mutex_lock(&ccu->ccu_recovery_lock);
+	mutex_lock(&ccu->run_lock);
+	ret = rk_mpp_cluster_reset_group(&request, &result);
+	mutex_unlock(&ccu->run_lock);
+	mutex_unlock(&ccu->ccu_recovery_lock);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, result.epoch, 2ULL);
+	KUNIT_EXPECT_EQ(test, domain->reset_domain_state,
+			(enum rk_mpp_reset_domain_state)
+			RK_MPP_RESET_DOMAIN_FAILED);
+	KUNIT_EXPECT_EQ(test, domain->reset_domain_last_error, -EIO);
+	KUNIT_EXPECT_EQ(test, trace->count, 5U);
+	KUNIT_EXPECT_PTR_EQ(test, trace->targets[0], core0);
+	KUNIT_EXPECT_PTR_EQ(test, trace->targets[1], core1);
+	KUNIT_EXPECT_PTR_EQ(test, trace->targets[2], ccu);
+	KUNIT_EXPECT_PTR_EQ(test, trace->targets[3], core0);
+	KUNIT_EXPECT_PTR_EQ(test, trace->targets[4], ccu);
+	KUNIT_EXPECT_EQ(test, atomic_read(&core0->reset_pulse_active), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&core1->reset_pulse_active), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&ccu->reset_pulse_active), 0);
+
+	WRITE_ONCE(core1->cluster, NULL);
+	memset(trace, 0, sizeof(*trace));
+	trace->fail_at = U32_MAX;
+	mutex_lock(&ccu->ccu_recovery_lock);
+	mutex_lock(&ccu->run_lock);
+	ret = rk_mpp_cluster_reset_group(&request, &result);
+	mutex_unlock(&ccu->run_lock);
+	mutex_unlock(&ccu->ccu_recovery_lock);
+	KUNIT_EXPECT_EQ(test, ret, -EXDEV);
+	KUNIT_EXPECT_EQ(test, domain->reset_domain_epoch, 2ULL);
+	KUNIT_EXPECT_EQ(test, trace->count, 0U);
+	WRITE_ONCE(core1->cluster, cluster);
+}
+
 static void rk_mpp_reset_domain_registry_kunit(struct kunit *test)
 {
 	struct rk_mpp_reset_domain *domains[RK_MPP_MAX_RESET_DOMAINS];
@@ -10589,7 +10833,8 @@ static void rk_mpp_reset_domain_state_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ret, -EEXIST);
 
 	ret = rk_mpp_reset_domain_begin(owner,
-					RK_MPP_RESET_DOMAIN_POWER_DEASSERT);
+					RK_MPP_RESET_DOMAIN_POWER_DEASSERT,
+					NULL);
 	KUNIT_ASSERT_EQ(test, ret, 0);
 	KUNIT_EXPECT_EQ(test, domain->reset_domain_state,
 			(enum rk_mpp_reset_domain_state)
@@ -10602,7 +10847,8 @@ static void rk_mpp_reset_domain_state_kunit(struct kunit *test)
 			RK_MPP_RESET_DOMAIN_IDLE);
 
 	ret = rk_mpp_reset_domain_begin(owner,
-					RK_MPP_RESET_DOMAIN_RESETTING);
+					RK_MPP_RESET_DOMAIN_RESETTING,
+					NULL);
 	KUNIT_ASSERT_EQ(test, ret, 0);
 	epoch = domain->reset_domain_epoch;
 	KUNIT_EXPECT_EQ(test, epoch, 1ULL);
@@ -10616,7 +10862,8 @@ static void rk_mpp_reset_domain_state_kunit(struct kunit *test)
 
 	/* FAILED records the last outcome; it does not refuse a safe retry. */
 	ret = rk_mpp_reset_domain_begin(peer,
-					RK_MPP_RESET_DOMAIN_RESETTING);
+					RK_MPP_RESET_DOMAIN_RESETTING,
+					NULL);
 	KUNIT_ASSERT_EQ(test, ret, 0);
 	KUNIT_EXPECT_EQ(test, domain->reset_domain_epoch, epoch + 1);
 	KUNIT_EXPECT_PTR_EQ(test, domain->reset_domain_responsible, peer);
@@ -10727,6 +10974,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_debug_event_ring_kunit),
 	KUNIT_CASE(rk_mpp_cluster_registry_kunit),
 	KUNIT_CASE(rk_mpp_cluster_membership_kunit),
+	KUNIT_CASE(rk_mpp_cluster_reset_group_kunit),
 	KUNIT_CASE(rk_mpp_reset_domain_registry_kunit),
 	KUNIT_CASE(rk_mpp_reset_domain_state_kunit),
 	{}
@@ -13097,6 +13345,7 @@ rk_mpp_reset_domain_init(struct rk_mpp_reset_domain *domain,
 			 struct device_node *node)
 {
 	domain->node = node;
+	domain->backend_ops = &rk_mpp_reset_control_backend_ops;
 	mutex_init(&domain->lock);
 	INIT_LIST_HEAD(&domain->members);
 	atomic_set(&domain->reset_domain_operation_pending, 0);
@@ -13196,7 +13445,8 @@ static void rk_mpp_reset_domain_unregister_action(void *data)
  */
 static int
 rk_mpp_reset_domain_begin(struct rk_mpp_hw *hw,
-			  enum rk_mpp_reset_domain_state operation)
+			  enum rk_mpp_reset_domain_state operation,
+			  const struct rk_mpp_cluster_reset_request *request)
 {
 	struct rk_mpp_reset_domain *domain = READ_ONCE(hw->reset_domain);
 	bool overlapped;
@@ -13230,6 +13480,13 @@ rk_mpp_reset_domain_begin(struct rk_mpp_hw *hw,
 		domain->reset_domain_refusal_count++;
 		ret = -EBUSY;
 		goto out_unlock;
+	}
+	if (request) {
+		ret = rk_mpp_cluster_reset_valid_locked(domain, request);
+		if (ret) {
+			domain->reset_domain_refusal_count++;
+			goto out_unlock;
+		}
 	}
 
 	domain->reset_domain_responsible = hw;
@@ -13269,14 +13526,42 @@ static void rk_mpp_reset_domain_finish(struct rk_mpp_hw *hw, int error)
 }
 
 /* No raw MPP reset-control write belongs outside these two backend leaves. */
+static int
+rk_mpp_reset_control_backend_assert(struct rk_mpp_reset_domain *domain,
+				    struct rk_mpp_hw *hw)
+{
+	lockdep_assert_held(&domain->lock);
+	return reset_control_assert(hw->resets);
+}
+
+static int
+rk_mpp_reset_control_backend_deassert(struct rk_mpp_reset_domain *domain,
+				      struct rk_mpp_hw *hw)
+{
+	lockdep_assert_held(&domain->lock);
+	return reset_control_deassert(hw->resets);
+}
+
+static const struct rk_mpp_reset_backend_ops
+rk_mpp_reset_control_backend_ops = {
+	.assert = rk_mpp_reset_control_backend_assert,
+	.deassert = rk_mpp_reset_control_backend_deassert,
+};
+
 static int rk_mpp_reset_domain_assert(struct rk_mpp_hw *hw)
 {
-	return reset_control_assert(hw->resets);
+	struct rk_mpp_reset_domain *domain = READ_ONCE(hw->reset_domain);
+
+	lockdep_assert_held(&domain->lock);
+	return domain->backend_ops->assert(domain, hw);
 }
 
 static int rk_mpp_reset_domain_deassert(struct rk_mpp_hw *hw)
 {
-	return reset_control_deassert(hw->resets);
+	struct rk_mpp_reset_domain *domain = READ_ONCE(hw->reset_domain);
+
+	lockdep_assert_held(&domain->lock);
+	return domain->backend_ops->deassert(domain, hw);
 }
 
 /*
@@ -13289,7 +13574,8 @@ static int rk_mpp_reset_domain_power_deassert(struct rk_mpp_hw *hw)
 	int ret;
 
 	ret = rk_mpp_reset_domain_begin(hw,
-					RK_MPP_RESET_DOMAIN_POWER_DEASSERT);
+					RK_MPP_RESET_DOMAIN_POWER_DEASSERT,
+					NULL);
 	if (ret)
 		return ret;
 
@@ -13310,7 +13596,8 @@ static int rk_mpp_reset_domain_recovery_pulse(struct rk_mpp_hw *hw)
 	struct rk_mpp_reset_domain *domain;
 	int ret;
 
-	ret = rk_mpp_reset_domain_begin(hw, RK_MPP_RESET_DOMAIN_RESETTING);
+	ret = rk_mpp_reset_domain_begin(hw, RK_MPP_RESET_DOMAIN_RESETTING,
+					NULL);
 	if (ret)
 		return ret;
 
@@ -14947,12 +15234,6 @@ out_unlock:
 	return stop_ret;
 }
 
-struct rk_mpp_rkvdec2_stop_core {
-	struct rk_mpp_hw *hw;
-	bool irq_disabled;
-	bool reset_asserted;
-};
-
 static u32 rk_mpp_rkvdec2_stop_command(u32 core_work)
 {
 	u32 low = core_work & RK_MPP_RKVDEC_CCU_CORE_LOW_MASK;
@@ -15008,9 +15289,156 @@ rk_mpp_rkvdec2_collect_stop_cores(
 	return complete;
 }
 
+static int rk_mpp_rkvdec2_poll_reset_bus_idle(struct rk_mpp_hw *hw)
+{
+	void __iomem *debug;
+	u32 value;
+
+	if (atomic_read(&hw->power_count) <= 0 ||
+	    !rk_mpp_hw_reg_range_valid(hw, 0,
+				       RK_MPP_RKVDEC_DEBUG_INT_BASE,
+				       sizeof(u32)))
+		return -ENODEV;
+
+	debug = hw->regs[0] + RK_MPP_RKVDEC_DEBUG_INT_BASE;
+	return readl_poll_timeout(debug, value,
+				  value & RK_MPP_RKVDEC_DEBUG_BUS_IDLE, 1,
+				  RK_MPP_CCU_STOP_TIMEOUT_US);
+}
+
+static int
+rk_mpp_cluster_reset_valid_locked(struct rk_mpp_reset_domain *domain,
+				  const struct rk_mpp_cluster_reset_request *request)
+{
+	struct rk_mpp_cluster *cluster;
+	u32 i;
+
+	lockdep_assert_held(&domain->lock);
+	if (!request || !request->ccu || !request->cluster ||
+	    !request->cores ||
+	    request->count > RK_MPP_RKVDEC_MAX_CCU_CORES)
+		return -EINVAL;
+
+	lockdep_assert_held(&request->ccu->ccu_recovery_lock);
+	lockdep_assert_held(&request->ccu->run_lock);
+	cluster = READ_ONCE(request->ccu->cluster);
+	if (cluster != request->cluster ||
+	    READ_ONCE(cluster->coordinator) != request->ccu ||
+	    READ_ONCE(cluster->reset_domain) != domain ||
+	    READ_ONCE(request->ccu->reset_domain) != domain ||
+	    list_empty(&request->ccu->reset_domain_link))
+		return -EXDEV;
+
+	for (i = 0; i < request->count; i++) {
+		struct rk_mpp_hw *hw = request->cores[i].hw;
+
+		if (!hw || READ_ONCE(hw->cluster) != cluster ||
+		    READ_ONCE(hw->reset_domain) != domain ||
+		    list_empty(&hw->reset_domain_link))
+			return -EXDEV;
+	}
+
+	return 0;
+}
+
+/*
+ * Own one physical HARD-CCU reset pulse. The caller keeps the existing
+ * reference-pinned participant subset and order; the cluster only validates
+ * those participants and the common reset authority. The domain mutex spans
+ * reset writes and the single 10us delay, while logging, failure publication,
+ * IOMMU isolation, and every other lock remain outside this innermost leaf.
+ */
+static int
+rk_mpp_cluster_reset_group(struct rk_mpp_cluster_reset_request *request,
+			   struct rk_mpp_cluster_reset_result *result)
+{
+	struct rk_mpp_reset_domain *domain;
+	struct rk_mpp_hw *ccu = request->ccu;
+	bool ccu_pulse_active = false;
+	int transaction_error = 0;
+	u32 i;
+	int ret;
+
+	memset(result, 0, sizeof(*result));
+	result->ccu_assert_ret = -ENODEV;
+	ret = rk_mpp_reset_domain_begin(ccu, RK_MPP_RESET_DOMAIN_RESETTING,
+					request);
+	if (ret)
+		return ret;
+
+	domain = READ_ONCE(ccu->reset_domain);
+	result->epoch = domain->reset_domain_epoch;
+	for (i = 0; i < request->count; i++) {
+		struct rk_mpp_rkvdec2_stop_core *core = &request->cores[i];
+		struct rk_mpp_hw *hw = core->hw;
+
+		core->reset_assert_ret = -ENODEV;
+		core->reset_attempted = !READ_ONCE(hw->terminally_stopped);
+		if (!core->reset_attempted)
+			continue;
+		if (hw->resets) {
+			atomic_inc(&hw->srv->reset_count);
+			atomic_inc(&hw->reset_pulse_active);
+			core->reset_pulse_active = true;
+			core->reset_assert_ret = rk_mpp_reset_domain_assert(hw);
+			core->reset_asserted = !core->reset_assert_ret;
+		}
+		if (core->reset_assert_ret && !transaction_error)
+			transaction_error = core->reset_assert_ret;
+	}
+
+	if (ccu->resets) {
+		atomic_inc(&ccu->srv->reset_count);
+		atomic_inc(&ccu->reset_pulse_active);
+		ccu_pulse_active = true;
+		result->ccu_assert_ret = rk_mpp_reset_domain_assert(ccu);
+		result->ccu_reset_asserted = !result->ccu_assert_ret;
+	}
+	if (result->ccu_assert_ret && !transaction_error)
+		transaction_error = result->ccu_assert_ret;
+
+	fsleep(10);
+	for (i = 0; i < request->count; i++) {
+		struct rk_mpp_rkvdec2_stop_core *core = &request->cores[i];
+		struct rk_mpp_hw *hw = core->hw;
+
+		if (!core->reset_asserted ||
+		    READ_ONCE(hw->terminally_stopped))
+			continue;
+		domain->reset_domain_deassert_count++;
+		core->reset_deassert_ret = rk_mpp_reset_domain_deassert(hw);
+		if (core->reset_deassert_ret && !transaction_error)
+			transaction_error = core->reset_deassert_ret;
+	}
+	if (result->ccu_reset_asserted &&
+	    !READ_ONCE(ccu->terminally_stopped)) {
+		domain->reset_domain_deassert_count++;
+		result->ccu_deassert_ret = rk_mpp_reset_domain_deassert(ccu);
+		if (result->ccu_deassert_ret && !transaction_error)
+			transaction_error = result->ccu_deassert_ret;
+	}
+
+	for (i = 0; i < request->count; i++) {
+		struct rk_mpp_rkvdec2_stop_core *core = &request->cores[i];
+
+		if (core->reset_pulse_active) {
+			atomic_dec(&core->hw->reset_pulse_active);
+			core->reset_pulse_active = false;
+		}
+	}
+	if (ccu_pulse_active)
+		atomic_dec(&ccu->reset_pulse_active);
+	rk_mpp_reset_domain_finish(ccu, transaction_error);
+
+	return 0;
+}
+
 static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu)
 {
 	struct rk_mpp_rkvdec2_stop_core cores[RK_MPP_RKVDEC_MAX_CCU_CORES] = {};
+	struct rk_mpp_cluster_reset_request reset_request;
+	struct rk_mpp_cluster_reset_result reset_result;
+	struct rk_mpp_cluster *cluster;
 	void __iomem *regs;
 	u32 core_command;
 	u32 covered = 0;
@@ -15025,6 +15453,7 @@ static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu)
 	bool terminal = false;
 	int ccu_assert_ret = -ENODEV;
 	int ccu_deassert_ret = 0;
+	int group_reset_ret;
 	int status_ret = -ENODEV;
 	int terminal_ret = 0;
 	int work_ret = -ENODEV;
@@ -15111,30 +15540,46 @@ static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu)
 	/*
 	 * The coordinator reset does not reset decoder cores. Assert every
 	 * involved core reset independently; BUS_IDLE is an additional proof,
-	 * not a substitute for resetting a core that should be reusable.
+	 * not a substitute for resetting a core that should be reusable. Poll
+	 * every participant before beginning the indivisible physical pulse.
 	 */
 	for (i = 0; i < count; i++) {
 		struct rk_mpp_hw *hw = cores[i].hw;
-		int bus_ret = -ENODEV;
-		int reset_ret = -ENODEV;
 
 		if (READ_ONCE(hw->terminally_stopped))
 			continue;
-		if (atomic_read(&hw->power_count) > 0 &&
-		    rk_mpp_hw_reg_range_valid(hw, 0,
-					      RK_MPP_RKVDEC_DEBUG_INT_BASE,
-					      sizeof(u32))) {
-			bus_ret = readl_poll_timeout(
-				hw->regs[0] + RK_MPP_RKVDEC_DEBUG_INT_BASE,
-				value, value & RK_MPP_RKVDEC_DEBUG_BUS_IDLE,
-				1, RK_MPP_CCU_STOP_TIMEOUT_US);
+		cores[i].bus_ret = rk_mpp_rkvdec2_poll_reset_bus_idle(hw);
+	}
+
+	cluster = READ_ONCE(ccu->cluster);
+	reset_request.cluster = cluster;
+	reset_request.ccu = ccu;
+	reset_request.cores = cores;
+	reset_request.count = count;
+	group_reset_ret =
+		rk_mpp_cluster_reset_group(&reset_request, &reset_result);
+	if (group_reset_ret) {
+		ccu_assert_ret = group_reset_ret;
+		error = group_reset_ret;
+		for (i = 0; i < count; i++) {
+			struct rk_mpp_hw *hw = cores[i].hw;
+
+			if (!READ_ONCE(hw->terminally_stopped))
+				rk_mpp_hw_handle_reset_failure(hw, group_reset_ret);
 		}
-		if (hw->resets) {
-			atomic_inc(&hw->srv->reset_count);
-			reset_ret = rk_mpp_reset_domain_assert(hw);
-			cores[i].reset_asserted = !reset_ret;
-		}
-		if (reset_ret) {
+		rk_mpp_hw_handle_reset_failure(ccu, group_reset_ret);
+		terminal = true;
+	} else {
+		ccu_assert_ret = reset_result.ccu_assert_ret;
+		ccu_deassert_ret = reset_result.ccu_deassert_ret;
+		ccu_reset_asserted = reset_result.ccu_reset_asserted;
+	}
+
+	for (i = 0; !group_reset_ret && i < count; i++) {
+		struct rk_mpp_hw *hw = cores[i].hw;
+		int reset_ret = cores[i].reset_assert_ret;
+
+		if (cores[i].reset_attempted && reset_ret) {
 			/*
 			 * BUS_IDLE can prove current quiescence, but without a
 			 * successful reset future reuse is unsafe. Poison the
@@ -15142,44 +15587,31 @@ static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu)
 			 * DMA proof.
 			 */
 			error = reset_ret != -ENODEV ? reset_ret :
-				bus_ret ?: -EOPNOTSUPP;
+				cores[i].bus_ret ?: -EOPNOTSUPP;
 			rk_mpp_hw_handle_reset_failure(hw, error);
 			terminal = true;
 		}
 	}
 
-	if (ccu->resets) {
-		atomic_inc(&ccu->srv->reset_count);
-		ccu_assert_ret = rk_mpp_reset_domain_assert(ccu);
-		ccu_reset_asserted = !ccu_assert_ret;
-	}
-	if (ccu_assert_ret) {
+	if (!group_reset_ret && ccu_assert_ret) {
 		error = ccu_assert_ret != -ENODEV ? ccu_assert_ret :
 			work_ret ?: status_ret ?: -EOPNOTSUPP;
 		rk_mpp_hw_handle_reset_failure(ccu, error);
 		terminal = true;
 	}
 
-	udelay(10);
-	for (i = 0; i < count; i++) {
+	for (i = 0; !group_reset_ret && i < count; i++) {
 		struct rk_mpp_hw *hw = cores[i].hw;
-		int ret;
+		int ret = cores[i].reset_deassert_ret;
 
-		if (!cores[i].reset_asserted ||
-		    READ_ONCE(hw->terminally_stopped))
-			continue;
-		ret = rk_mpp_reset_domain_deassert(hw);
 		if (ret) {
 			rk_mpp_hw_handle_reset_failure(hw, ret);
 			terminal = true;
 		}
 	}
-	if (ccu_reset_asserted && !READ_ONCE(ccu->terminally_stopped)) {
-		ccu_deassert_ret = rk_mpp_reset_domain_deassert(ccu);
-		if (ccu_deassert_ret) {
-			rk_mpp_hw_handle_reset_failure(ccu, ccu_deassert_ret);
-			terminal = true;
-		}
+	if (!group_reset_ret && ccu_deassert_ret) {
+		rk_mpp_hw_handle_reset_failure(ccu, ccu_deassert_ret);
+		terminal = true;
 	}
 
 	if (terminal) {
