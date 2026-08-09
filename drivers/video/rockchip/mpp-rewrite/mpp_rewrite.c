@@ -303,6 +303,12 @@ struct rk_mpp_backend_ops;
 struct rk_mpp_job;
 struct rk_mpp_hw;
 
+/* Bounded hard-IRQ view; all fields are owned by hw->regs_lock. */
+struct rk_mpp_irq_register_lease {
+	u64 register_epoch;
+	u64 register_generation;
+};
+
 struct rk_mpp_aux_irq_desc {
 	const char *name;
 	u8 index;
@@ -556,7 +562,14 @@ struct rk_mpp_hw {
 	 */
 	raw_spinlock_t regs_lock; /* regs_live_count vs. hard-IRQ MMIO */
 	unsigned int regs_live_count;
+	bool register_lease_live;
+	u64 register_reset_epoch;
+	u64 register_lease_epoch;
+	u64 register_lease_generation;
 	u64 active_generation;
+	bool irq_lease_recorded;
+	u64 irq_reset_epoch;
+	u64 irq_generation;
 	u64 timeout_generation;
 	/*
 	 * Absolute expiry of the current activation's watchdog, and the
@@ -688,12 +701,169 @@ static bool rk_mpp_hw_restore_active_locked(struct rk_mpp_hw *hw,
 }
 
 /*
+ * The raw register lease is published immediately before a START doorbell and
+ * invalidated before any reset write or final clock gate. Hard IRQ may only
+ * touch MMIO while this snapshot is live; a nonzero generation additionally
+ * binds a direct-core interrupt to the active slot that published it. HARD CCU
+ * members use generation zero because descriptor ownership belongs to the
+ * coordinator chain rather than to the physical core that raises the IRQ.
+ */
+static void
+rk_mpp_hw_invalidate_register_lease_locked(struct rk_mpp_hw *hw, u64 epoch)
+{
+	lockdep_assert_held(&hw->regs_lock);
+
+	if (epoch)
+		hw->register_reset_epoch = epoch;
+	hw->register_lease_live = false;
+	hw->register_lease_epoch = hw->register_reset_epoch;
+	hw->register_lease_generation = 0;
+}
+
+static void rk_mpp_hw_invalidate_register_lease(struct rk_mpp_hw *hw,
+						u64 epoch)
+{
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&hw->regs_lock, flags);
+	rk_mpp_hw_invalidate_register_lease_locked(hw, epoch);
+	raw_spin_unlock_irqrestore(&hw->regs_lock, flags);
+}
+
+static int
+rk_mpp_hw_publish_register_lease_locked(struct rk_mpp_hw *hw, u64 generation)
+{
+	lockdep_assert_held(&hw->regs_lock);
+
+	if (!hw->regs_live_count)
+		return -ENODEV;
+
+	hw->register_lease_epoch = hw->register_reset_epoch;
+	hw->register_lease_generation = generation;
+	hw->register_lease_live = true;
+
+	return 0;
+}
+
+static int
+rk_mpp_hw_publish_register_lease(struct rk_mpp_hw *hw, u64 generation)
+{
+	unsigned long flags;
+	int ret;
+
+	raw_spin_lock_irqsave(&hw->regs_lock, flags);
+	ret = rk_mpp_hw_publish_register_lease_locked(hw, generation);
+	raw_spin_unlock_irqrestore(&hw->regs_lock, flags);
+
+	return ret;
+}
+
+static bool
+rk_mpp_hw_irq_register_lease_snapshot_locked(struct rk_mpp_hw *hw,
+					     struct rk_mpp_irq_register_lease *lease)
+{
+	unsigned long flags;
+	bool lease_current = true;
+
+	lockdep_assert_held(&hw->regs_lock);
+	if (!hw->regs_live_count || !hw->register_lease_live)
+		return false;
+
+	lease->register_epoch = hw->register_lease_epoch;
+	lease->register_generation = hw->register_lease_generation;
+	if (!lease->register_generation)
+		return true;
+
+	spin_lock_irqsave(&hw->lock, flags);
+	if (!rk_mpp_hw_active_job_locked(hw) ||
+	    rk_mpp_hw_active_generation_locked(hw) !=
+		    lease->register_generation)
+		lease_current = false;
+	spin_unlock_irqrestore(&hw->lock, flags);
+
+	return lease_current;
+}
+
+static void rk_mpp_hw_clear_irq_record_locked(struct rk_mpp_hw *hw)
+{
+	lockdep_assert_held(&hw->lock);
+
+	hw->irq_status = 0;
+	hw->irq_lease_recorded = false;
+	hw->irq_reset_epoch = 0;
+	hw->irq_generation = 0;
+}
+
+static bool
+rk_mpp_hw_irq_record_current_locked(const struct rk_mpp_hw *hw)
+{
+	lockdep_assert_held(&hw->regs_lock);
+	lockdep_assert_held(&hw->lock);
+
+	if (!hw->irq_lease_recorded)
+		return false;
+	if (!hw->regs_live_count || !hw->register_lease_live ||
+	    hw->irq_reset_epoch != hw->register_lease_epoch ||
+	    hw->irq_generation != hw->register_lease_generation)
+		return false;
+	if (hw->irq_generation &&
+	    (!rk_mpp_hw_active_job_locked(hw) ||
+	     rk_mpp_hw_active_generation_locked(hw) != hw->irq_generation))
+		return false;
+
+	return true;
+}
+
+static void
+rk_mpp_hw_record_irq_status(struct rk_mpp_hw *hw,
+			    const struct rk_mpp_irq_register_lease *lease,
+			    u32 status)
+{
+	unsigned long flags;
+
+	lockdep_assert_held(&hw->regs_lock);
+	if (!status)
+		return;
+
+	spin_lock_irqsave(&hw->lock, flags);
+	if (hw->irq_status && hw->irq_lease_recorded &&
+	    (hw->irq_reset_epoch != lease->register_epoch ||
+	     hw->irq_generation != lease->register_generation))
+		rk_mpp_hw_clear_irq_record_locked(hw);
+	hw->irq_status |= status;
+	hw->irq_lease_recorded = true;
+	hw->irq_reset_epoch = lease->register_epoch;
+	hw->irq_generation = lease->register_generation;
+	spin_unlock_irqrestore(&hw->lock, flags);
+}
+
+static bool rk_mpp_hw_take_irq_status(struct rk_mpp_hw *hw, u32 *irq_status)
+{
+	unsigned long regs_flags;
+	unsigned long flags;
+	bool lease_current;
+
+	raw_spin_lock_irqsave(&hw->regs_lock, regs_flags);
+	spin_lock_irqsave(&hw->lock, flags);
+	lease_current = rk_mpp_hw_irq_record_current_locked(hw);
+	if (irq_status)
+		*irq_status = lease_current ? hw->irq_status : 0;
+	rk_mpp_hw_clear_irq_record_locked(hw);
+	spin_unlock_irqrestore(&hw->lock, flags);
+	raw_spin_unlock_irqrestore(&hw->regs_lock, regs_flags);
+
+	return lease_current;
+}
+
+/*
  * One stable construction object per immutable reset topology identity. The
  * service owns the table and its OF-node references; members join and leave
  * under the domain lock, while slots are never compacted. Single-target reset
  * operations and cluster-validated hard-CCU group pulses own state/epoch here.
  * The reset mutex is the innermost sleepable leaf: no callback, allocation,
- * PM operation, logging, or other lock may move under it.
+ * PM operation, or logging may move under it. The sole nested lock is the
+ * hard-IRQ-safe register lease lock, held briefly to revoke register access
+ * before the first reset write; no path acquires a reset mutex under it.
  */
 struct rk_mpp_reset_domain {
 	struct device_node *node;
@@ -928,7 +1098,8 @@ struct rk_mpp_trans_table {
 struct rk_mpp_backend_ops {
 	int (*validate)(struct rk_mpp_job *job);
 	int (*submit)(struct rk_mpp_job *job);
-	irqreturn_t (*irq)(struct rk_mpp_hw *hw);
+	irqreturn_t (*irq)(struct rk_mpp_hw *hw,
+			   const struct rk_mpp_irq_register_lease *lease);
 	irqreturn_t (*thread)(struct rk_mpp_hw *hw);
 	void (*quiesce_aux_irqs)(struct rk_mpp_hw *hw);
 };
@@ -1098,6 +1269,7 @@ static int
 rk_mpp_rkvdec2_reset_soft_ccu_job(struct rk_mpp_job *job,
 				  struct rk_mpp_cluster_recovery_result *result);
 static int rk_mpp_rkvdec2_publish_and_start_core(struct rk_mpp_job *job,
+						 u64 generation,
 						 u32 start_value);
 static int rk_mpp_hw_abort_ccu_dependents(struct rk_mpp_hw *ccu);
 static void
@@ -3775,6 +3947,40 @@ rk_mpp_cluster_power_lease_core(const struct rk_mpp_job *job, u32 index)
 	return lease->power_lease_cores[index];
 }
 
+static int rk_mpp_cluster_publish_register_leases(struct rk_mpp_job *job)
+{
+	u32 count = rk_mpp_cluster_power_lease_core_count(job);
+	u32 i;
+	int ret;
+
+	if (!count)
+		return -ENODEV;
+
+	for (i = 0; i < count; i++) {
+		struct rk_mpp_hw *hw = rk_mpp_cluster_power_lease_core(job, i);
+
+		if (!hw) {
+			ret = -ENODEV;
+			goto err_invalidate;
+		}
+		ret = rk_mpp_hw_publish_register_lease(hw, 0);
+		if (ret)
+			goto err_invalidate;
+	}
+
+	return 0;
+
+err_invalidate:
+	while (i--) {
+		struct rk_mpp_hw *hw =
+			rk_mpp_cluster_power_lease_core(job, i);
+
+		rk_mpp_hw_invalidate_register_lease(hw, 0);
+	}
+
+	return ret;
+}
+
 static int rk_mpp_rkvdec2_acquire_ccu_power(struct rk_mpp_job *job,
 					    struct rk_mpp_hw *ccu,
 					    bool *acquired_now)
@@ -5732,6 +5938,8 @@ static void rk_mpp_av1_afbc_status_observation_kunit(struct kunit *test)
 	hw.reg_size[RK_MPP_AV1_AFBC_REGION] =
 		RK_MPP_AV1_AFBC_MIN_REG_SIZE;
 	raw_spin_lock_init(&hw.aux_lock);
+	raw_spin_lock_init(&hw.regs_lock);
+	hw.regs_live_count = 1;
 	mutex_init(&hw.run_lock);
 
 	writel(RK_MPP_AV1_AFBC_CONTROL_STREAMS,
@@ -6395,8 +6603,9 @@ static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
 	ccu->online = true;
 	spin_lock_init(&hw->lock);
 	raw_spin_lock_init(&hw->regs_lock);
+	hw->regs_live_count = 1;
 	KUNIT_EXPECT_EQ(test,
-			rk_mpp_rkvdec2_publish_and_start_core(job, 0x100), 0);
+			rk_mpp_rkvdec2_publish_and_start_core(job, 1, 0x100), 0);
 	KUNIT_EXPECT_EQ(test,
 			ccu_regs[RK_MPP_RKVDEC_CCU_CORE_STA_BASE / sizeof(*ccu_regs)],
 			hw->core_mask);
@@ -7570,6 +7779,64 @@ static void rk_mpp_hw_take_spurious_irq_kunit(struct kunit *test)
 			    rk_mpp_hw_take_active_job(&hw, &irq_status), NULL);
 	KUNIT_EXPECT_EQ(test, irq_status, 0x1234U);
 	KUNIT_EXPECT_EQ(test, hw.irq_status, 0U);
+}
+
+static void rk_mpp_irq_register_lease_kunit(struct kunit *test)
+{
+	struct rk_mpp_irq_register_lease lease = {};
+	struct rk_mpp_hw *hw;
+	struct rk_mpp_job *job;
+	unsigned long flags;
+	bool lease_current;
+	u32 irq_status = 0;
+
+	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
+	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+	spin_lock_init(&hw->lock);
+	raw_spin_lock_init(&hw->regs_lock);
+	hw->regs_live_count = 1;
+	hw->active_job = job;
+	hw->active_generation = 7;
+
+	KUNIT_ASSERT_EQ(test, rk_mpp_hw_publish_register_lease(hw, 7), 0);
+	raw_spin_lock_irqsave(&hw->regs_lock, flags);
+	lease_current =
+		rk_mpp_hw_irq_register_lease_snapshot_locked(hw, &lease);
+	KUNIT_EXPECT_TRUE(test, lease_current);
+	KUNIT_EXPECT_EQ(test, lease.register_epoch, 0ULL);
+	KUNIT_EXPECT_EQ(test, lease.register_generation, 7ULL);
+	rk_mpp_hw_record_irq_status(hw, &lease, 0x1234);
+	raw_spin_unlock_irqrestore(&hw->regs_lock, flags);
+	KUNIT_EXPECT_TRUE(test, rk_mpp_hw_take_irq_status(hw, &irq_status));
+	KUNIT_EXPECT_EQ(test, irq_status, 0x1234U);
+	KUNIT_EXPECT_FALSE(test, rk_mpp_hw_take_irq_status(hw, &irq_status));
+
+	raw_spin_lock_irqsave(&hw->regs_lock, flags);
+	rk_mpp_hw_record_irq_status(hw, &lease, 0x5678);
+	raw_spin_unlock_irqrestore(&hw->regs_lock, flags);
+	rk_mpp_hw_invalidate_register_lease(hw, 3);
+	irq_status = U32_MAX;
+	KUNIT_EXPECT_FALSE(test, rk_mpp_hw_take_irq_status(hw, &irq_status));
+	KUNIT_EXPECT_EQ(test, irq_status, 0U);
+	KUNIT_EXPECT_EQ(test, hw->register_reset_epoch, 3ULL);
+
+	KUNIT_ASSERT_EQ(test, rk_mpp_hw_publish_register_lease(hw, 8), 0);
+	raw_spin_lock_irqsave(&hw->regs_lock, flags);
+	lease_current =
+		rk_mpp_hw_irq_register_lease_snapshot_locked(hw, &lease);
+	KUNIT_EXPECT_FALSE(test, lease_current);
+	raw_spin_unlock_irqrestore(&hw->regs_lock, flags);
+
+	KUNIT_ASSERT_EQ(test, rk_mpp_hw_publish_register_lease(hw, 0), 0);
+	raw_spin_lock_irqsave(&hw->regs_lock, flags);
+	lease_current =
+		rk_mpp_hw_irq_register_lease_snapshot_locked(hw, &lease);
+	KUNIT_EXPECT_TRUE(test, lease_current);
+	KUNIT_EXPECT_EQ(test, lease.register_epoch, 3ULL);
+	KUNIT_EXPECT_EQ(test, lease.register_generation, 0ULL);
+	raw_spin_unlock_irqrestore(&hw->regs_lock, flags);
 }
 
 static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
@@ -11360,6 +11627,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_rkvdec2_cache_config_kunit),
 	KUNIT_CASE(rk_mpp_hw_take_active_if_kunit),
 	KUNIT_CASE(rk_mpp_hw_take_spurious_irq_kunit),
+	KUNIT_CASE(rk_mpp_irq_register_lease_kunit),
 	KUNIT_CASE(rk_mpp_hw_prepare_active_retry_kunit),
 	KUNIT_CASE(rk_mpp_iommu_fault_generation_kunit),
 	KUNIT_CASE(rk_mpp_timeout_target_replacement_kunit),
@@ -13588,7 +13856,8 @@ static int rk_mpp_cluster_arm_soft_ccu(struct rk_mpp_job *job)
  * before rk_mpp_cluster_arm_soft_ccu() until this helper returns.
  */
 static int
-rk_mpp_cluster_publish_soft_ccu_job(struct rk_mpp_job *job, u32 start_value)
+rk_mpp_cluster_publish_soft_ccu_job(struct rk_mpp_job *job, u64 generation,
+				    u32 start_value)
 {
 	struct rk_mpp_hw *hw = job->hw;
 	struct rk_mpp_hw *ccu = job->rkvdec_ccu;
@@ -13610,6 +13879,8 @@ rk_mpp_cluster_publish_soft_ccu_job(struct rk_mpp_job *job, u32 start_value)
 	writel_relaxed(hw->core_mask,
 		       ccu->regs[0] + RK_MPP_RKVDEC_CCU_CORE_STA_BASE);
 	rk_mpp_hw_schedule_timeout(hw);
+	if (rk_mpp_hw_publish_register_lease(hw, generation))
+		return -ENODEV;
 	/* Publish the register image and watchdog generation before START. */
 	wmb();
 	writel(start_value | RK_MPP_RKVDEC_START_EN,
@@ -13619,16 +13890,20 @@ rk_mpp_cluster_publish_soft_ccu_job(struct rk_mpp_job *job, u32 start_value)
 }
 
 static int rk_mpp_rkvdec2_publish_and_start_core(struct rk_mpp_job *job,
+						 u64 generation,
 						 u32 start_value)
 {
 	struct rk_mpp_hw *hw = job->hw;
 
 	lockdep_assert_held(&hw->run_lock);
 	if (job->rkvdec_ccu)
-		return rk_mpp_cluster_publish_soft_ccu_job(job, start_value);
+		return rk_mpp_cluster_publish_soft_ccu_job(job, generation,
+							   start_value);
 
 	rk_mpp_hw_assert_powered(hw);
 	rk_mpp_hw_schedule_timeout(hw);
+	if (rk_mpp_hw_publish_register_lease(hw, generation))
+		return -ENODEV;
 	/* Publish the register image and watchdog generation before START. */
 	wmb();
 	writel(start_value | RK_MPP_RKVDEC_START_EN,
@@ -14055,6 +14330,7 @@ rk_mpp_reset_domain_recovery_pulse(struct rk_mpp_hw *hw, u64 *epoch)
 	domain = hw->reset_domain;
 	if (epoch)
 		*epoch = domain->reset_domain_epoch;
+	rk_mpp_hw_invalidate_register_lease(hw, domain->reset_domain_epoch);
 	atomic_inc(&hw->reset_pulse_active);
 	ret = rk_mpp_reset_domain_assert(hw);
 	if (ret)
@@ -14214,6 +14490,8 @@ static void rk_mpp_hw_power_off(struct rk_mpp_hw *hw)
 		hw->regs_live_count = 0;
 	else
 		hw->regs_live_count--;
+	if (!hw->regs_live_count)
+		rk_mpp_hw_invalidate_register_lease_locked(hw, hw->register_reset_epoch);
 	raw_spin_unlock_irqrestore(&hw->regs_lock, flags);
 
 	clk_bulk_disable_unprepare(hw->num_clks, hw->clks);
@@ -14254,6 +14532,8 @@ static bool rk_mpp_hw_terminal_drain_power(struct rk_mpp_hw *hw)
 			hw->regs_live_count = 0;
 		else
 			hw->regs_live_count--;
+		if (!hw->regs_live_count)
+			rk_mpp_hw_invalidate_register_lease_locked(hw, hw->register_reset_epoch);
 		raw_spin_unlock_irqrestore(&hw->regs_lock, flags);
 		clk_bulk_disable_unprepare(hw->num_clks, hw->clks);
 		ret = pm_runtime_put_sync_suspend(hw->dev);
@@ -14513,7 +14793,7 @@ static int rk_mpp_hw_begin_active_job(struct rk_mpp_hw *hw,
 			rk_mpp_hw_install_active_locked(hw, job);
 		hw->iommu_fault_pending = false;
 		hw->iommu_fault_generation = 0;
-		hw->irq_status = 0;
+		rk_mpp_hw_clear_irq_record_locked(hw);
 	}
 	spin_unlock_irqrestore(&hw->lock, flags);
 	if (generation)
@@ -14533,7 +14813,7 @@ static bool rk_mpp_hw_clear_active_job(struct rk_mpp_hw *hw,
 		if (irq_status)
 			*irq_status = hw->irq_status;
 		rk_mpp_hw_take_active_locked(hw);
-		hw->irq_status = 0;
+		rk_mpp_hw_clear_irq_record_locked(hw);
 		cleared = true;
 	}
 	spin_unlock_irqrestore(&hw->lock, flags);
@@ -14558,7 +14838,7 @@ static struct rk_mpp_job *rk_mpp_hw_take_active_job(struct rk_mpp_hw *hw,
 		*irq_status = hw->irq_status;
 	if (job)
 		rk_mpp_hw_take_active_locked(hw);
-	hw->irq_status = 0;
+	rk_mpp_hw_clear_irq_record_locked(hw);
 	spin_unlock_irqrestore(&hw->lock, flags);
 
 	return job;
@@ -14569,20 +14849,26 @@ rk_mpp_hw_take_irq_job(struct rk_mpp_hw *hw, u32 *irq_status,
 		       bool *fault_pending)
 {
 	struct rk_mpp_job *job = NULL;
+	unsigned long regs_flags;
 	unsigned long flags;
+	bool lease_current;
 	bool pending;
 
+	raw_spin_lock_irqsave(&hw->regs_lock, regs_flags);
 	spin_lock_irqsave(&hw->lock, flags);
 	pending = hw->iommu_fault_pending;
 	if (!pending) {
-		job = rk_mpp_hw_active_job_locked(hw);
+		lease_current = rk_mpp_hw_irq_record_current_locked(hw);
+		if (lease_current)
+			job = rk_mpp_hw_active_job_locked(hw);
 		if (irq_status)
-			*irq_status = hw->irq_status;
+			*irq_status = lease_current ? hw->irq_status : 0;
 		if (job)
 			rk_mpp_hw_take_active_locked(hw);
-		hw->irq_status = 0;
+		rk_mpp_hw_clear_irq_record_locked(hw);
 	}
 	spin_unlock_irqrestore(&hw->lock, flags);
+	raw_spin_unlock_irqrestore(&hw->regs_lock, regs_flags);
 
 	if (fault_pending)
 		*fault_pending = pending;
@@ -14595,19 +14881,24 @@ rk_mpp_hw_peek_irq_job(struct rk_mpp_hw *hw, u32 *irq_status,
 		       u64 *generation, bool *fault_pending)
 {
 	struct rk_mpp_job *job = NULL;
+	unsigned long regs_flags;
 	unsigned long flags;
+	bool lease_current;
 
 	lockdep_assert_held(&hw->run_lock);
+	raw_spin_lock_irqsave(&hw->regs_lock, regs_flags);
 	spin_lock_irqsave(&hw->lock, flags);
+	lease_current = rk_mpp_hw_irq_record_current_locked(hw);
 	if (irq_status)
-		*irq_status = hw->irq_status;
+		*irq_status = lease_current ? hw->irq_status : 0;
 	if (generation)
 		*generation = rk_mpp_hw_active_generation_locked(hw);
 	if (fault_pending)
 		*fault_pending = hw->iommu_fault_pending;
-	if (!hw->iommu_fault_pending)
+	if (lease_current && !hw->iommu_fault_pending)
 		job = rk_mpp_hw_active_job_locked(hw);
 	spin_unlock_irqrestore(&hw->lock, flags);
+	raw_spin_unlock_irqrestore(&hw->regs_lock, regs_flags);
 
 	return job;
 }
@@ -14625,7 +14916,7 @@ static bool rk_mpp_hw_take_active_if(struct rk_mpp_hw *hw,
 		if (irq_status)
 			*irq_status = hw->irq_status;
 		rk_mpp_hw_take_active_locked(hw);
-		hw->irq_status = 0;
+		rk_mpp_hw_clear_irq_record_locked(hw);
 		taken = true;
 	}
 	spin_unlock_irqrestore(&hw->lock, flags);
@@ -14648,7 +14939,7 @@ rk_mpp_hw_take_active_if_generation(struct rk_mpp_hw *hw,
 		if (irq_status)
 			*irq_status = hw->irq_status;
 		rk_mpp_hw_take_active_locked(hw);
-		hw->irq_status = 0;
+		rk_mpp_hw_clear_irq_record_locked(hw);
 		taken = true;
 	}
 	spin_unlock_irqrestore(&hw->lock, flags);
@@ -14665,7 +14956,7 @@ static bool __rk_mpp_hw_restore_active_job(struct rk_mpp_hw *hw,
 
 	spin_lock_irqsave(&hw->lock, flags);
 	if (rk_mpp_hw_restore_active_locked(hw, job)) {
-		hw->irq_status = 0;
+		rk_mpp_hw_clear_irq_record_locked(hw);
 		if (force_iommu_fault)
 			hw->iommu_fault_pending = true;
 		if (hw->iommu_fault_pending)
@@ -14764,7 +15055,7 @@ rk_mpp_hw_take_iommu_fault_job(struct rk_mpp_hw *hw, bool *consumed)
 	if (generation && rk_mpp_hw_active_job_locked(hw) &&
 	    generation == rk_mpp_hw_active_generation_locked(hw)) {
 		job = rk_mpp_hw_take_active_locked(hw);
-		hw->irq_status = 0;
+		rk_mpp_hw_clear_irq_record_locked(hw);
 	}
 	spin_unlock_irqrestore(&hw->lock, flags);
 
@@ -14780,7 +15071,7 @@ static bool rk_mpp_hw_prepare_active_retry(struct rk_mpp_hw *hw,
 	spin_lock_irqsave(&hw->lock, flags);
 	if (rk_mpp_hw_active_job_locked(hw) == match) {
 		rk_mpp_hw_advance_active_generation_locked(hw);
-		hw->irq_status = 0;
+		rk_mpp_hw_clear_irq_record_locked(hw);
 		hw->iommu_fault_pending = false;
 		hw->iommu_fault_generation = 0;
 		active = true;
@@ -15012,20 +15303,6 @@ rk_mpp_hw_recover_iommu_fault(struct rk_mpp_hw *hw,
 	result->quiesced = true;
 
 	return rk_mpp_hw_finish_recovery(hw, NULL, result);
-}
-
-static struct rk_mpp_job *rk_mpp_hw_get_active_job(struct rk_mpp_hw *hw)
-{
-	struct rk_mpp_job *job;
-	unsigned long flags;
-
-	spin_lock_irqsave(&hw->lock, flags);
-	job = rk_mpp_hw_active_job_locked(hw);
-	if (job)
-		rk_mpp_job_get(job);
-	spin_unlock_irqrestore(&hw->lock, flags);
-
-	return job;
 }
 
 static bool
@@ -15349,6 +15626,11 @@ static int rk_mpp_cluster_start_ccu_job(struct rk_mpp_job *job)
 	 */
 	if (hw->iommu_domain && hw->iommu_domain->ops)
 		iommu_flush_iotlb_all(hw->iommu_domain);
+	if (!add_mode) {
+		ret = rk_mpp_cluster_publish_register_leases(job);
+		if (ret)
+			goto err_unlock_ccu;
+	}
 
 	ret = rk_mpp_cluster_publish_ccu_job(cluster, job, ccu_regs);
 	if (ret)
@@ -16070,8 +16352,10 @@ rk_mpp_cluster_reset_valid_locked(struct rk_mpp_reset_domain *domain,
  * Own one physical HARD-CCU reset pulse. The caller keeps the existing
  * reference-pinned participant subset and order; the cluster only validates
  * those participants and the common reset authority. The domain mutex spans
- * reset writes and the single 10us delay, while logging, failure publication,
- * IOMMU isolation, and every other lock remain outside this innermost leaf.
+ * reset writes and the single 10us delay. Register leases are revoked under
+ * their raw spinlocks before the first reset write; logging, failure
+ * publication, IOMMU isolation, and every other lock remain outside this
+ * innermost sleepable leaf.
  */
 static int
 rk_mpp_cluster_reset_group(struct rk_mpp_cluster_reset_request *request,
@@ -16093,6 +16377,12 @@ rk_mpp_cluster_reset_group(struct rk_mpp_cluster_reset_request *request,
 
 	domain = READ_ONCE(ccu->reset_domain);
 	result->epoch = domain->reset_domain_epoch;
+	for (i = 0; i < request->count; i++) {
+		struct rk_mpp_hw *hw = request->cores[i].hw;
+
+		rk_mpp_hw_invalidate_register_lease(hw, result->epoch);
+	}
+	rk_mpp_hw_invalidate_register_lease(ccu, result->epoch);
 	for (i = 0; i < request->count; i++) {
 		struct rk_mpp_rkvdec2_stop_core *core = &request->cores[i];
 		struct rk_mpp_hw *hw = core->hw;
@@ -17130,16 +17420,23 @@ static int rk_mpp_rkvenc2_validate(struct rk_mpp_job *job)
 	return rk_mpp_job_validate_write_regs(job, RK_MPP_RKVENC_START_BASE);
 }
 
-static void rk_mpp_rkvenc2_publish_and_start(struct rk_mpp_job *job,
-					     u32 start_value)
+static int rk_mpp_rkvenc2_publish_and_start(struct rk_mpp_job *job,
+					    u64 generation,
+					    u32 start_value)
 {
 	struct rk_mpp_hw *hw = job->hw;
+	int ret;
 
 	lockdep_assert_held(&hw->run_lock);
 	rk_mpp_hw_schedule_timeout(hw);
+	ret = rk_mpp_hw_publish_register_lease(hw, generation);
+	if (ret)
+		return ret;
 	/* Publish the register image and watchdog generation before START. */
 	wmb();
 	writel(start_value, hw->regs[0] + RK_MPP_RKVENC_START_BASE);
+
+	return 0;
 }
 
 static int rk_mpp_rkvenc2_submit(struct rk_mpp_job *job)
@@ -17149,6 +17446,7 @@ static int rk_mpp_rkvenc2_submit(struct rk_mpp_job *job)
 	bool dchs_lifecycle_locked = false;
 	bool start_seen;
 	bool irq_disabled;
+	u64 generation;
 	int ret;
 
 	if (hw->irq < 0 || !hw->regs[0])
@@ -17162,7 +17460,7 @@ static int rk_mpp_rkvenc2_submit(struct rk_mpp_job *job)
 		return ret;
 
 	mutex_lock(&hw->run_lock);
-	ret = rk_mpp_hw_begin_active_job(hw, job, NULL);
+	ret = rk_mpp_hw_begin_active_job(hw, job, &generation);
 	if (ret)
 		goto err_unlock;
 
@@ -17235,7 +17533,9 @@ static int rk_mpp_rkvenc2_submit(struct rk_mpp_job *job)
 		goto err_power_off;
 	}
 
-	rk_mpp_rkvenc2_publish_and_start(job, start_value);
+	ret = rk_mpp_rkvenc2_publish_and_start(job, generation, start_value);
+	if (ret)
+		goto err_power_off;
 	rk_mpp_count_started_core(job);
 	rk_mpp_rkvenc2_dchs_lifecycle_unlock(job, dchs_lifecycle_locked);
 	mutex_unlock(&hw->run_lock);
@@ -17398,12 +17698,11 @@ rk_mpp_rkvenc2_handle_bs_overflow(struct rk_mpp_hw *hw,
 	return true;
 }
 
-static irqreturn_t rk_mpp_rkvenc2_irq(struct rk_mpp_hw *hw)
+static irqreturn_t
+rk_mpp_rkvenc2_irq(struct rk_mpp_hw *hw,
+		   const struct rk_mpp_irq_register_lease *lease)
 {
-	struct rk_mpp_job *job;
-	unsigned long flags;
 	u32 status;
-	bool slice_ready = false;
 
 	if (!rk_mpp_hw_reg_range_valid(hw, 0, RK_MPP_RKVENC_INT_STA_BASE,
 				       sizeof(u32)))
@@ -17423,26 +17722,10 @@ static irqreturn_t rk_mpp_rkvenc2_irq(struct rk_mpp_hw *hw)
 		writel(RK_MPP_RKVENC_INT_WATCHDOG,
 		       hw->regs[0] + RK_MPP_RKVENC_INT_MASK_BASE);
 
-	job = rk_mpp_hw_get_active_job(hw);
-	if (job) {
-		if (status & (RK_MPP_RKVENC_INT_SLICE_DONE |
-			      RK_MPP_RKVENC_INT_DONE))
-			slice_ready = rk_mpp_rkvenc2_read_slice_len(hw, job,
-								   &status);
-		if (status & RK_MPP_RKVENC_INT_BS_OVERFLOW)
-			rk_mpp_rkvenc2_handle_bs_overflow(hw, job);
-		if (slice_ready)
-			rk_mpp_session_poll_notify(job->session);
-		rk_mpp_job_put(job);
-	}
+	rk_mpp_hw_record_irq_status(hw, lease, status);
 
-	spin_lock_irqsave(&hw->lock, flags);
-	hw->irq_status |= status;
-	spin_unlock_irqrestore(&hw->lock, flags);
-	if (status & (RK_MPP_RKVENC_INT_DONE | RK_MPP_RKVENC_INT_ERROR))
-		return IRQ_WAKE_THREAD;
-
-	return IRQ_HANDLED;
+	/* Slice/overflow processing may notify or log, so it belongs in thread. */
+	return IRQ_WAKE_THREAD;
 }
 
 /*
@@ -17483,12 +17766,14 @@ static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 	struct rk_mpp_cluster_recovery_result recovery;
 	bool dchs_lifecycle_locked;
 	bool fault_pending = false;
+	bool slice_ready = false;
 	u32 irq_status = 0;
 	int reset_ret;
 	int ret;
 
 	mutex_lock(&hw->run_lock);
-	job = rk_mpp_hw_take_irq_job(hw, &irq_status, &fault_pending);
+	job = rk_mpp_hw_peek_irq_job(hw, &irq_status, NULL,
+				     &fault_pending);
 	if (!job) {
 		if (fault_pending) {
 			mutex_unlock(&hw->run_lock);
@@ -17499,6 +17784,35 @@ static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 					   RK_MPP_DEBUG_SPURIOUS_IRQ,
 					   0, 0, RK_MPP_DEVICE_RKVENC,
 					   -ENOENT, irq_status, 0);
+		mutex_unlock(&hw->run_lock);
+		return IRQ_HANDLED;
+	}
+
+	if (irq_status & (RK_MPP_RKVENC_INT_SLICE_DONE |
+			  RK_MPP_RKVENC_INT_DONE))
+		slice_ready = rk_mpp_rkvenc2_read_slice_len(hw, job, &irq_status);
+	if (irq_status & RK_MPP_RKVENC_INT_BS_OVERFLOW)
+		rk_mpp_rkvenc2_handle_bs_overflow(hw, job);
+	if (slice_ready)
+		rk_mpp_session_poll_notify(job->session);
+
+	if (!(irq_status & (RK_MPP_RKVENC_INT_DONE |
+			    RK_MPP_RKVENC_INT_ERROR))) {
+		rk_mpp_hw_take_irq_status(hw, NULL);
+		mutex_unlock(&hw->run_lock);
+		return IRQ_HANDLED;
+	}
+
+	job = rk_mpp_hw_take_irq_job(hw, NULL, &fault_pending);
+	if (!job) {
+		if (!fault_pending) {
+			atomic_inc(&hw->srv->spurious_irq_count);
+			rk_mpp_debug_record_values(hw->srv, hw,
+						   RK_MPP_DEBUG_SPURIOUS_IRQ,
+						   0, 0,
+						   RK_MPP_DEVICE_RKVENC,
+						   -ENOENT, irq_status, 0);
+		}
 		mutex_unlock(&hw->run_lock);
 		return IRQ_HANDLED;
 	}
@@ -17541,6 +17855,7 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 	u32 start_value = 0;
 	bool start_seen;
 	bool hard_ccu;
+	u64 generation;
 	int ret;
 
 	if (hw->irq < 0 || !hw->regs[0])
@@ -17578,7 +17893,7 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 		rk_mpp_hw_get(ccu);
 		job->rkvdec_ccu = ccu;
 	}
-	ret = rk_mpp_hw_begin_active_job(hw, job, NULL);
+	ret = rk_mpp_hw_begin_active_job(hw, job, &generation);
 	if (ret)
 		goto err_unlock;
 
@@ -17664,7 +17979,7 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 		goto err_deregister_soft_ccu;
 	}
 
-	ret = rk_mpp_rkvdec2_publish_and_start_core(job, start_value);
+	ret = rk_mpp_rkvdec2_publish_and_start_core(job, generation, start_value);
 	if (ret)
 		goto err_deregister_soft_ccu;
 	if (soft_ccu)
@@ -17736,11 +18051,12 @@ static int rk_mpp_rkvdec2_validate(struct rk_mpp_job *job)
 	return rk_mpp_job_validate_write_regs(job, RK_MPP_RKVDEC_START_BASE);
 }
 
-static irqreturn_t rk_mpp_rkvdec2_irq(struct rk_mpp_hw *hw)
+static irqreturn_t
+rk_mpp_rkvdec2_irq(struct rk_mpp_hw *hw,
+		   const struct rk_mpp_irq_register_lease *lease)
 {
 	const struct rk_mpp_rkvdec2_link_info *link_info =
 		&rk_mpp_rkvdec2_vdpu381_link_info;
-	unsigned long flags;
 	u32 status;
 
 	if (rk_mpp_rkvdec2_hard_ccu_enabled(hw) &&
@@ -17757,9 +18073,7 @@ static irqreturn_t rk_mpp_rkvdec2_irq(struct rk_mpp_hw *hw)
 			atomic_inc(&hw->srv->irq_count);
 			writel(rk_mpp_rkvdec2_link_irq_ack(irq_val),
 			       link + link_info->irq_base);
-			spin_lock_irqsave(&hw->lock, flags);
-			hw->irq_status |= status;
-			spin_unlock_irqrestore(&hw->lock, flags);
+			rk_mpp_hw_record_irq_status(hw, lease, status);
 
 			return IRQ_WAKE_THREAD;
 		}
@@ -17775,9 +18089,7 @@ static irqreturn_t rk_mpp_rkvdec2_irq(struct rk_mpp_hw *hw)
 	atomic_inc(&hw->srv->irq_count);
 
 	writel(0, hw->regs[0] + RK_MPP_RKVDEC_INT_STA_BASE);
-	spin_lock_irqsave(&hw->lock, flags);
-	hw->irq_status |= status;
-	spin_unlock_irqrestore(&hw->lock, flags);
+	rk_mpp_hw_record_irq_status(hw, lease, status);
 
 	return IRQ_WAKE_THREAD;
 }
@@ -17785,14 +18097,17 @@ static irqreturn_t rk_mpp_rkvdec2_irq(struct rk_mpp_hw *hw)
 static irqreturn_t rk_mpp_rkvdec2_hard_ccu_thread(struct rk_mpp_hw *hw)
 {
 	struct rk_mpp_hw *ccu;
-	unsigned long flags;
 	u32 completed = 0;
-	u32 irq_status;
+	u32 irq_status = 0;
 
-	spin_lock_irqsave(&hw->lock, flags);
-	irq_status = hw->irq_status;
-	hw->irq_status = 0;
-	spin_unlock_irqrestore(&hw->lock, flags);
+	if (!rk_mpp_hw_take_irq_status(hw, &irq_status) || !irq_status) {
+		atomic_inc(&hw->srv->spurious_irq_count);
+		rk_mpp_debug_record_values(hw->srv, hw,
+					   RK_MPP_DEBUG_SPURIOUS_IRQ,
+					   0, 0, RK_MPP_DEVICE_RKVDEC,
+					   -ESTALE, 0, 0);
+		return IRQ_HANDLED;
+	}
 
 	ccu = rk_mpp_hw_get_ccu_for_core(hw->srv, hw);
 	if (!ccu) {
@@ -18292,13 +18607,17 @@ static int rk_mpp_av1_publish_and_start(struct rk_mpp_hw *hw, u64 generation,
 	lockdep_assert_held(&hw->run_lock);
 
 	if (!afbc_enabled) {
+		ret = rk_mpp_hw_publish_register_lease(hw, generation);
+		if (ret)
+			return ret;
 		/* Publish every decoder register before the START doorbell. */
 		wmb();
 		writel(start_value, hw->regs[0] + RK_MPP_AV1_IRQ_BASE);
 		return 0;
 	}
 
-	raw_spin_lock_irqsave(&hw->aux_lock, flags);
+	raw_spin_lock_irqsave(&hw->regs_lock, flags);
+	raw_spin_lock(&hw->aux_lock);
 	/*
 	 * Keep the dedicated AFBC source masked while stale UPDATE status is
 	 * drained and this generation is published.  START and unmask are in
@@ -18310,7 +18629,8 @@ static int rk_mpp_av1_publish_and_start(struct rk_mpp_hw *hw, u64 generation,
 	ret = readl_poll_timeout_atomic(afbc + RK_MPP_AV1_AFBC_ACKNOWLEDGE,
 					status, !(status & BIT(0)), 1, 100);
 	if (ret) {
-		raw_spin_unlock_irqrestore(&hw->aux_lock, flags);
+		raw_spin_unlock(&hw->aux_lock);
+		raw_spin_unlock_irqrestore(&hw->regs_lock, flags);
 		atomic_inc(&hw->srv->av1_afbc_stale_status_timeout_count);
 		dev_err_ratelimited(hw->dev,
 				    "AFBC status did not deassert before START: %d (status %#x)\n",
@@ -18321,12 +18641,21 @@ static int rk_mpp_av1_publish_and_start(struct rk_mpp_hw *hw, u64 generation,
 	hw->av1_afbc_status_generation = 0;
 	hw->av1_start_ns = ktime_get_mono_fast_ns();
 	WRITE_ONCE(hw->aux_irqs_active, true);
+	ret = rk_mpp_hw_publish_register_lease_locked(hw, generation);
+	if (ret) {
+		WRITE_ONCE(hw->aux_irqs_active, false);
+		hw->av1_afbc_armed_generation = 0;
+		raw_spin_unlock(&hw->aux_lock);
+		raw_spin_unlock_irqrestore(&hw->regs_lock, flags);
+		return ret;
+	}
 	/* Publish all decoder/AFBC registers and the owner before START. */
 	wmb();
 	writel(start_value, hw->regs[0] + RK_MPP_AV1_IRQ_BASE);
 	writel(1, afbc + RK_MPP_AV1_AFBC_INT_ENABLE);
 	readl(afbc + RK_MPP_AV1_AFBC_INT_ENABLE);
-	raw_spin_unlock_irqrestore(&hw->aux_lock, flags);
+	raw_spin_unlock(&hw->aux_lock);
+	raw_spin_unlock_irqrestore(&hw->regs_lock, flags);
 
 	return 0;
 }
@@ -18512,7 +18841,9 @@ err_unlock:
 	return ret;
 }
 
-static irqreturn_t rk_mpp_av1_irq(struct rk_mpp_hw *hw)
+static irqreturn_t
+rk_mpp_av1_irq(struct rk_mpp_hw *hw,
+	       const struct rk_mpp_irq_register_lease *lease)
 {
 	unsigned long flags;
 	u32 status;
@@ -18530,9 +18861,7 @@ static irqreturn_t rk_mpp_av1_irq(struct rk_mpp_hw *hw)
 	raw_spin_lock_irqsave(&hw->aux_lock, flags);
 	hw->av1_vcd_irq_ns = ktime_get_mono_fast_ns();
 	raw_spin_unlock_irqrestore(&hw->aux_lock, flags);
-	spin_lock_irqsave(&hw->lock, flags);
-	hw->irq_status |= status;
-	spin_unlock_irqrestore(&hw->lock, flags);
+	rk_mpp_hw_record_irq_status(hw, lease, status);
 
 	return IRQ_WAKE_THREAD;
 }
@@ -18645,6 +18974,9 @@ static irqreturn_t rk_mpp_hw_aux_irq(int irq, void *data)
 {
 	struct rk_mpp_aux_irq *aux = data;
 	struct rk_mpp_hw *hw = aux->hw;
+	struct rk_mpp_irq_register_lease lease;
+	unsigned long flags;
+	irqreturn_t ret;
 
 	if (!READ_ONCE(hw->aux_irqs_active) ||
 	    unlikely(READ_ONCE(hw->recovery_failed)))
@@ -18652,12 +18984,21 @@ static irqreturn_t rk_mpp_hw_aux_irq(int irq, void *data)
 	if (!aux->desc || !aux->desc->handler)
 		return IRQ_NONE;
 
-	return aux->desc->handler(hw);
+	raw_spin_lock_irqsave(&hw->regs_lock, flags);
+	if (!rk_mpp_hw_irq_register_lease_snapshot_locked(hw, &lease)) {
+		raw_spin_unlock_irqrestore(&hw->regs_lock, flags);
+		return IRQ_HANDLED;
+	}
+	ret = aux->desc->handler(hw);
+	raw_spin_unlock_irqrestore(&hw->regs_lock, flags);
+
+	return ret;
 }
 
 static irqreturn_t rk_mpp_hw_irq(int irq, void *data)
 {
 	struct rk_mpp_hw *hw = data;
+	struct rk_mpp_irq_register_lease lease;
 	unsigned long flags;
 	irqreturn_t ret;
 
@@ -18682,11 +19023,12 @@ static irqreturn_t rk_mpp_hw_irq(int irq, void *data)
 	 * only one of the two drivers.
 	 */
 	raw_spin_lock_irqsave(&hw->regs_lock, flags);
-	if (unlikely(!hw->regs_live_count)) {
+	if (unlikely(!rk_mpp_hw_irq_register_lease_snapshot_locked(hw,
+								   &lease))) {
 		raw_spin_unlock_irqrestore(&hw->regs_lock, flags);
 		return IRQ_NONE;
 	}
-	ret = hw->match->ops->irq(hw);
+	ret = hw->match->ops->irq(hw, &lease);
 	raw_spin_unlock_irqrestore(&hw->regs_lock, flags);
 
 	return ret;
