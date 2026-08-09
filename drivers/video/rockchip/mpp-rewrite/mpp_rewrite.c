@@ -593,6 +593,7 @@ struct rk_mpp_activation {
 	struct list_head job_link;
 	struct list_head quarantine_link;
 	u32 quarantine_ref_count;
+	u64 quarantine_generation;
 	struct rk_mpp_job *job;
 	struct rk_mpp_hw *selected_hw;
 	enum rk_mpp_activation_slot_state slot_state;
@@ -1279,6 +1280,7 @@ rk_mpp_activation_storage_init(struct rk_mpp_activation *activation,
 	INIT_LIST_HEAD(&activation->job_link);
 	INIT_LIST_HEAD(&activation->quarantine_link);
 	activation->quarantine_ref_count = 0;
+	activation->quarantine_generation = 0;
 	activation->job = job;
 	activation->selected_hw = NULL;
 	activation->slot_state = RK_MPP_ACTIVATION_UNINSTALLED;
@@ -5217,8 +5219,14 @@ static bool
 rk_mpp_hw_restore_or_quarantine(struct rk_mpp_hw *hw,
 				struct rk_mpp_hw *ccu,
 				struct rk_mpp_activation_claim_token *token,
-	bool force_iommu_fault, int status,
-	const struct rk_mpp_cluster_recovery_result *result);
+				bool force_iommu_fault, int core_status,
+				const struct rk_mpp_cluster_recovery_result *core,
+				int group_status,
+				const struct rk_mpp_cluster_recovery_result *group);
+static bool
+rk_mpp_service_has_quarantined_activation(struct rk_mpp_service *srv);
+static bool rk_mpp_hw_job_is_quarantined(struct rk_mpp_hw *hw,
+					 const struct rk_mpp_job *job);
 static bool
 rk_mpp_activation_claim_put(struct rk_mpp_activation_claim_token *token);
 static u32 rk_mpp_rkvenc2_advance_bs_write(u32 write, u32 top, u32 bottom);
@@ -8377,6 +8385,7 @@ static void rk_mpp_activation_recovered_terminal_kunit(struct kunit *test)
 	bool restored;
 	int ret;
 	u64 generation;
+	u64 quarantine_generation;
 
 	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, srv);
@@ -8416,7 +8425,7 @@ static void rk_mpp_activation_recovered_terminal_kunit(struct kunit *test)
 	session->srv = srv;
 	mutex_init(&session->lock);
 	hw->srv = srv;
-	hw->match = &rk_mpp_rkvenc2_core;
+	hw->match = &rk_mpp_rkvdec2_core;
 	hw->dev = hw_dev;
 	hw->online = true;
 	spin_lock_init(&hw->lock);
@@ -8426,6 +8435,8 @@ static void rk_mpp_activation_recovered_terminal_kunit(struct kunit *test)
 	ccu->dev = ccu_dev;
 	ccu->online = true;
 	mutex_init(&ccu->ccu_recovery_lock);
+	cluster->coordinator = ccu;
+	cluster->member_type = RK_MPP_DEVICE_RKVDEC;
 	WRITE_ONCE(hw->cluster, cluster);
 	WRITE_ONCE(ccu->cluster, cluster);
 
@@ -8504,10 +8515,13 @@ static void rk_mpp_activation_recovered_terminal_kunit(struct kunit *test)
 	KUNIT_ASSERT_NE(test, generation, 0ULL);
 	rk_mpp_job_get(quarantined_job);
 	quarantined_activation = quarantined_job->current_activation;
+	mutex_lock(&srv->sched_lock);
 	session->rkvdec_dispatch_owner = quarantined_activation;
+	mutex_unlock(&srv->sched_lock);
 	claimed_job = rk_mpp_hw_take_active_job(hw, RK_MPP_TRANSITION_SHUTDOWN,
 						NULL, &quarantine_claim);
 	KUNIT_ASSERT_PTR_EQ(test, claimed_job, quarantined_job);
+	quarantine_generation = quarantine_claim.generation;
 	occupant->session = session;
 	refcount_set(&occupant->refs, 2);
 	rk_mpp_activation_init(occupant);
@@ -8522,8 +8536,11 @@ static void rk_mpp_activation_recovered_terminal_kunit(struct kunit *test)
 	quarantined_activation->generation++;
 	quarantined_activation->slot_state = RK_MPP_ACTIVATION_UNINSTALLED;
 	quarantined_activation->transition_reason = RK_MPP_TRANSITION_NONE;
+	mutex_lock(&ccu->ccu_recovery_lock);
 	restored = rk_mpp_hw_restore_or_quarantine(hw, ccu, &quarantine_claim,
-						   false, -EIO, &bad_group);
+						   false, -EIO, &unproved,
+						   0, &bad_group);
+	mutex_unlock(&ccu->ccu_recovery_lock);
 	KUNIT_EXPECT_FALSE(test, restored);
 	KUNIT_EXPECT_PTR_EQ(test, quarantine_claim.activation, NULL);
 	KUNIT_EXPECT_EQ(test, quarantined_activation->slot_state,
@@ -8533,10 +8550,15 @@ static void rk_mpp_activation_recovered_terminal_kunit(struct kunit *test)
 		!list_empty(&quarantined_activation->quarantine_link);
 	KUNIT_EXPECT_TRUE(test, quarantine_linked);
 	KUNIT_EXPECT_EQ(test, quarantined_activation->quarantine_ref_count, 1U);
+	KUNIT_EXPECT_EQ(test, quarantined_activation->quarantine_generation,
+			quarantine_generation);
 	KUNIT_EXPECT_EQ(test, quarantined_activation->closure.terminal_scope,
 			(enum rk_mpp_activation_retirement_scope)
 			RK_MPP_ACTIVATION_RETIREMENT_CCU_GROUP);
 	KUNIT_EXPECT_TRUE(test, quarantined_activation->closure.group.valid);
+	KUNIT_EXPECT_EQ(test, quarantined_activation->closure.group.status, 0);
+	KUNIT_EXPECT_TRUE(test, quarantined_activation->closure.core.valid);
+	KUNIT_EXPECT_EQ(test, quarantined_activation->closure.core.status, -EIO);
 	storage_released =
 		rk_mpp_activation_storage_released(quarantined_activation);
 	KUNIT_EXPECT_FALSE(test, storage_released);
@@ -8545,6 +8567,10 @@ static void rk_mpp_activation_recovered_terminal_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, hw->recovery_failed);
 	KUNIT_EXPECT_TRUE(test, ccu->recovery_failed);
 	KUNIT_EXPECT_FALSE(test, rk_mpp_hw_usable(hw));
+	KUNIT_EXPECT_TRUE(test, rk_mpp_hw_job_is_quarantined(hw,
+							     quarantined_job));
+	KUNIT_EXPECT_TRUE(test,
+			  rk_mpp_service_has_quarantined_activation(srv));
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->quarantine_count), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&quarantined_job->refs), 2);
 	claimed_job = rk_mpp_hw_take_active_job(hw,
@@ -16179,8 +16205,10 @@ static bool
 rk_mpp_activation_claim_quarantine(struct rk_mpp_hw *hw,
 				   struct rk_mpp_hw *ccu,
 				   struct rk_mpp_activation_claim_token *token,
-				   int status,
-				   const struct rk_mpp_cluster_recovery_result *result)
+				   int core_status,
+				   const struct rk_mpp_cluster_recovery_result *core,
+				   int group_status,
+				   const struct rk_mpp_cluster_recovery_result *group)
 {
 	struct rk_mpp_activation *activation;
 	struct rk_mpp_job *job;
@@ -16188,6 +16216,7 @@ rk_mpp_activation_claim_quarantine(struct rk_mpp_hw *hw,
 	struct rk_mpp_service *srv = hw->srv;
 	unsigned long flags;
 	bool group_scope;
+	int error;
 
 	lockdep_assert_held(&hw->run_lock);
 	if (!token || !token->owns_job_ref || !token->activation ||
@@ -16201,19 +16230,29 @@ rk_mpp_activation_claim_quarantine(struct rk_mpp_hw *hw,
 	owned_ccu = job->rkvdec_ccu;
 	group_scope = ccu && ccu == owned_ccu &&
 		READ_ONCE(hw->cluster) == READ_ONCE(ccu->cluster);
+	if (group_scope)
+		lockdep_assert_held(&ccu->ccu_recovery_lock);
+	error = core_status ?: group_status ?: -EUCLEAN;
 
 	mutex_lock(&srv->quarantine_lock);
 	spin_lock_irqsave(&hw->lock, flags);
-	if (rk_mpp_activation_closure_pristine(activation) && result) {
+	if (rk_mpp_activation_closure_pristine(activation)) {
 		if (group_scope) {
-			activation->closure.group.result = *result;
-			activation->closure.group.status = status;
-			activation->closure.group.valid = true;
+			if (group) {
+				activation->closure.group.result = *group;
+				activation->closure.group.status = group_status;
+				activation->closure.group.valid = true;
+			}
+			if (core) {
+				activation->closure.core.result = *core;
+				activation->closure.core.status = core_status;
+				activation->closure.core.valid = true;
+			}
 			activation->closure.terminal_scope =
 				RK_MPP_ACTIVATION_RETIREMENT_CCU_GROUP;
-		} else {
-			activation->closure.terminal.result = *result;
-			activation->closure.terminal.status = status;
+		} else if (core) {
+			activation->closure.terminal.result = *core;
+			activation->closure.terminal.status = core_status;
 			activation->closure.terminal.valid = true;
 			activation->closure.terminal_scope =
 				RK_MPP_ACTIVATION_RETIREMENT_CORE;
@@ -16222,6 +16261,7 @@ rk_mpp_activation_claim_quarantine(struct rk_mpp_hw *hw,
 	activation->closure.state = RK_MPP_ACTIVATION_CLOSURE_QUARANTINED;
 	activation->slot_state = RK_MPP_ACTIVATION_QUARANTINED;
 	activation->transition_reason = token->reason;
+	activation->quarantine_generation = token->generation;
 	if (list_empty(&activation->quarantine_link)) {
 		list_add_tail(&activation->quarantine_link,
 			      &srv->quarantined_activations);
@@ -16232,10 +16272,9 @@ rk_mpp_activation_claim_quarantine(struct rk_mpp_hw *hw,
 	spin_unlock_irqrestore(&hw->lock, flags);
 	mutex_unlock(&srv->quarantine_lock);
 
-	rk_mpp_hw_handle_reset_failure(hw, status ?: -EUCLEAN);
+	rk_mpp_hw_handle_reset_failure(hw, error);
 	if (owned_ccu && owned_ccu != hw)
-		rk_mpp_hw_handle_reset_failure(owned_ccu,
-					       status ?: -EUCLEAN);
+		rk_mpp_hw_handle_reset_failure(owned_ccu, error);
 
 	return true;
 }
@@ -16244,8 +16283,10 @@ static bool
 rk_mpp_hw_restore_or_quarantine(struct rk_mpp_hw *hw,
 				struct rk_mpp_hw *ccu,
 				struct rk_mpp_activation_claim_token *token,
-				bool force_iommu_fault, int status,
-				const struct rk_mpp_cluster_recovery_result *result)
+				bool force_iommu_fault, int core_status,
+				const struct rk_mpp_cluster_recovery_result *core,
+				int group_status,
+				const struct rk_mpp_cluster_recovery_result *group)
 {
 	unsigned long flags;
 	bool restored;
@@ -16265,8 +16306,9 @@ rk_mpp_hw_restore_or_quarantine(struct rk_mpp_hw *hw,
 	if (restored)
 		return true;
 
-	WARN_ON_ONCE(!rk_mpp_activation_claim_quarantine(hw, ccu, token, status,
-							 result));
+	WARN_ON_ONCE(!rk_mpp_activation_claim_quarantine(hw, ccu, token,
+							 core_status, core,
+							 group_status, group));
 	return false;
 }
 
@@ -17088,8 +17130,9 @@ rk_mpp_hw_abort_job(struct rk_mpp_job *job,
 			rk_mpp_hw_restore_or_quarantine(hw,
 							hard_ccu_abort ? ccu : NULL,
 							&claim, false,
-					reset_ret, hard_ccu_abort ? &ccu_recovery :
-									 &recovery);
+					reset_ret, &recovery,
+					hard_ccu_abort ? ccu_stop_ret : 0,
+					hard_ccu_abort ? &ccu_recovery : NULL);
 			goto out_unlock_core;
 		}
 		if (hard_ccu_abort) {
@@ -17099,9 +17142,10 @@ rk_mpp_hw_abort_job(struct rk_mpp_job *job,
 									 &recovery,
 									 ccu_stop_ret,
 									 &ccu_recovery))) {
-				rk_mpp_hw_restore_or_quarantine(hw, ccu, &claim,
-								false, -EUCLEAN,
-							     &ccu_recovery);
+				rk_mpp_hw_restore_or_quarantine(hw, ccu, &claim, false,
+								-EUCLEAN, &recovery,
+								ccu_stop_ret,
+								&ccu_recovery);
 				reset_ret = -EUCLEAN;
 				goto out_unlock_core;
 			}
@@ -17111,7 +17155,8 @@ rk_mpp_hw_abort_job(struct rk_mpp_job *job,
 								      &recovery, 0,
 								      NULL))) {
 			rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, false,
-							-EUCLEAN, &recovery);
+							-EUCLEAN, &recovery, 0,
+							NULL);
 			reset_ret = -EUCLEAN;
 			goto out_unlock_core;
 		}
@@ -17579,7 +17624,8 @@ static u32 rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu)
 			 * every resource that makes that descriptor valid.
 			 */
 			rk_mpp_hw_restore_or_quarantine(hw, ccu, &claim, false,
-							stop_ret, &ccu_recovery);
+							0, NULL, stop_ret,
+							&ccu_recovery);
 			mutex_unlock(&hw->run_lock);
 			rk_mpp_job_put(job);
 			rk_mpp_hw_put(hw);
@@ -17599,7 +17645,8 @@ static u32 rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu)
 								       stop_ret,
 								       &ccu_recovery))) {
 			rk_mpp_hw_restore_or_quarantine(hw, ccu, &claim, false,
-							-EUCLEAN, &ccu_recovery);
+							-EUCLEAN, &recovery,
+							stop_ret, &ccu_recovery);
 			mutex_unlock(&hw->run_lock);
 			rk_mpp_job_put(job);
 			rk_mpp_hw_put(hw);
@@ -17721,8 +17768,9 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 			 * that the shared engine is quiescent.
 			 */
 			rk_mpp_hw_restore_or_quarantine(hw, ccu, &claim,
-							iommu_fault, ccu_stop_ret,
-						     &ccu_recovery);
+							iommu_fault, 0, NULL,
+							ccu_stop_ret,
+							&ccu_recovery);
 			rk_mpp_hw_handle_reset_failure(ccu, ccu_stop_ret);
 			rk_mpp_hw_enable_irq(hw, irq_disabled);
 			mutex_unlock(&hw->run_lock);
@@ -17773,7 +17821,7 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 		reset_ret = rk_mpp_hw_stop_and_recover(hw, job, &recovery);
 	if (reset_ret && !hard_ccu_recovery) {
 		rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, iommu_fault,
-						reset_ret, &recovery);
+						reset_ret, &recovery, 0, NULL);
 		rk_mpp_hw_handle_reset_failure(hw, reset_ret);
 		rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
 						     dchs_lifecycle_locked);
@@ -17799,7 +17847,8 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 								       &ccu_recovery))) {
 			rk_mpp_hw_restore_or_quarantine(hw, ccu, &claim,
 							iommu_fault, -EUCLEAN,
-						     &ccu_recovery);
+							&recovery, ccu_stop_ret,
+							&ccu_recovery);
 			rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
 							     dchs_lifecycle_locked);
 			rk_mpp_hw_enable_irq(hw, irq_disabled);
@@ -17811,7 +17860,7 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 	} else if (WARN_ON_ONCE(!rk_mpp_activation_finish_terminal(hw, NULL,
 			   &claim, reset_ret, &recovery, 0, NULL))) {
 		rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, iommu_fault,
-						-EUCLEAN, &recovery);
+						-EUCLEAN, &recovery, 0, NULL);
 		rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
 						     dchs_lifecycle_locked);
 		rk_mpp_hw_enable_irq(hw, irq_disabled);
@@ -17900,7 +17949,7 @@ rk_mpp_hw_abort_active(struct rk_mpp_hw *hw, int result,
 	stop_ret = rk_mpp_hw_stop_and_recover(hw, job, &recovery);
 	if (stop_ret) {
 		rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, false, stop_ret,
-						&recovery);
+						&recovery, 0, NULL);
 		rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
 						     dchs_lifecycle_locked);
 		rk_mpp_hw_enable_irq(hw, irq_disabled);
@@ -17911,7 +17960,7 @@ rk_mpp_hw_abort_active(struct rk_mpp_hw *hw, int result,
 							    stop_ret, &recovery,
 							      0, NULL))) {
 		rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, false, -EUCLEAN,
-						&recovery);
+						&recovery, 0, NULL);
 		rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
 						     dchs_lifecycle_locked);
 		rk_mpp_hw_enable_irq(hw, irq_disabled);
@@ -17981,7 +18030,7 @@ rk_mpp_hw_abort_active_recovery_locked(struct rk_mpp_hw *hw,
 		if (stop_ret) {
 			rk_mpp_hw_restore_or_quarantine(hw, group ? ccu : NULL,
 							&claim, false, stop_ret,
-						     group ? group : &recovery);
+							&recovery, 0, group);
 			job = NULL;
 			goto out_unlock;
 		}
@@ -17991,7 +18040,7 @@ rk_mpp_hw_abort_active_recovery_locked(struct rk_mpp_hw *hw,
 							 &recovery, 0, group))) {
 			rk_mpp_hw_restore_or_quarantine(hw, group ? ccu : NULL,
 							&claim, false, -EUCLEAN,
-						     group ? group : &recovery);
+							&recovery, 0, group);
 			job = NULL;
 			stop_ret = -EUCLEAN;
 			goto out_unlock;
@@ -19612,7 +19661,8 @@ static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 		reset_ret = rk_mpp_hw_stop_and_recover(hw, job, &recovery);
 		if (reset_ret) {
 			rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, false,
-							reset_ret, &recovery);
+							reset_ret, &recovery, 0,
+							NULL);
 			rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
 							     dchs_lifecycle_locked);
 			mutex_unlock(&hw->run_lock);
@@ -19624,7 +19674,8 @@ static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 								       &recovery, 0,
 								       NULL))) {
 			rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, false,
-							-EUCLEAN, &recovery);
+							-EUCLEAN, &recovery, 0,
+							NULL);
 			rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
 							     dchs_lifecycle_locked);
 			mutex_unlock(&hw->run_lock);
@@ -19987,7 +20038,8 @@ static irqreturn_t rk_mpp_rkvdec2_thread(struct rk_mpp_hw *hw)
 		reset_ret = rk_mpp_rkvdec2_reset_soft_ccu_job(job, &recovery);
 		if (reset_ret) {
 			rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, false,
-							reset_ret, &recovery);
+							reset_ret, &recovery, 0,
+							NULL);
 			mutex_unlock(&hw->run_lock);
 			return IRQ_HANDLED;
 		}
@@ -19997,7 +20049,8 @@ static irqreturn_t rk_mpp_rkvdec2_thread(struct rk_mpp_hw *hw)
 								       &recovery, 0,
 								       NULL))) {
 			rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, false,
-							-EUCLEAN, &recovery);
+							-EUCLEAN, &recovery, 0,
+							NULL);
 			mutex_unlock(&hw->run_lock);
 			return IRQ_HANDLED;
 		}
@@ -20652,7 +20705,8 @@ err_power_off:
 									 &recovery, 0,
 									 NULL))) {
 				rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, false,
-								-EUCLEAN, &recovery);
+								-EUCLEAN, &recovery,
+								0, NULL);
 				rk_mpp_hw_enable_irq(hw, irq_disabled);
 				mutex_unlock(&hw->run_lock);
 				return 0;
@@ -20747,7 +20801,8 @@ static irqreturn_t rk_mpp_av1_thread(struct rk_mpp_hw *hw)
 		reset_ret = rk_mpp_hw_stop_and_recover(hw, job, &recovery);
 		if (reset_ret) {
 			rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, false,
-							reset_ret, &recovery);
+							reset_ret, &recovery, 0,
+							NULL);
 			mutex_unlock(&hw->run_lock);
 			return IRQ_HANDLED;
 		}
@@ -20757,7 +20812,8 @@ static irqreturn_t rk_mpp_av1_thread(struct rk_mpp_hw *hw)
 								       &recovery, 0,
 								       NULL))) {
 			rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, false,
-							-EUCLEAN, &recovery);
+							-EUCLEAN, &recovery, 0,
+							NULL);
 			mutex_unlock(&hw->run_lock);
 			return IRQ_HANDLED;
 		}
