@@ -5411,9 +5411,8 @@ static void rk_mpp_core_identity_kunit(struct kunit *test)
 static void rk_mpp_init_trans_table_kunit(struct kunit *test)
 {
 	u16 entries[] = { 7, 1024, U16_MAX };
-	struct rk_mpp_service srv = {};
+	struct rk_mpp_service *srv;
 	struct rk_mpp_session session = {
-		.srv = &srv,
 		.trans_count = 9,
 	};
 	struct mpp_request req = {
@@ -5425,6 +5424,9 @@ static void rk_mpp_init_trans_table_kunit(struct kunit *test)
 	};
 	int ret;
 
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
+	session.srv = srv;
 	memset(session.trans_table, 0xa5, sizeof(session.trans_table));
 	mutex_init(&session.lock);
 	req.data = rk_mpp_kunit_user_payload(test, entries, sizeof(entries));
@@ -5977,9 +5979,8 @@ static void rk_mpp_rkvdec2_link_info_kunit(struct kunit *test)
 
 static void rk_mpp_rkvdec2_vp9_translate_validate_kunit(struct kunit *test)
 {
-	struct rk_mpp_service srv = {};
+	struct rk_mpp_service *srv;
 	struct rk_mpp_session session = {
-		.srv = &srv,
 		.client_type = RK_MPP_DEVICE_RKVDEC,
 	};
 	struct rk_mpp_hw *hw;
@@ -5994,6 +5995,9 @@ static void rk_mpp_rkvdec2_vp9_translate_validate_kunit(struct kunit *test)
 	int fd;
 	int ret;
 
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
+	session.srv = srv;
 	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, dev);
 	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
@@ -6033,12 +6037,12 @@ static void rk_mpp_rkvdec2_vp9_translate_validate_kunit(struct kunit *test)
 	hw->reg_size[0] = RK_MPP_RKVDEC_INT_STA_BASE + sizeof(u32);
 
 	import->fd = fd;
-	import->srv = &srv;
+	import->srv = srv;
 	import->dev = get_device(dev);
 	import->dmabuf = dmabuf;
 	import->iova = 0x80000000;
 	refcount_set(&import->refs, 1);
-	atomic_set(&srv.import_count, 1);
+	atomic_set(&srv->import_count, 1);
 	INIT_LIST_HEAD(&import->link);
 	cleanup->job = job;
 	cleanup->import = import;
@@ -6088,7 +6092,7 @@ static void rk_mpp_rkvdec2_vp9_translate_validate_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_translate_reg_image(job), -EINVAL);
 
 	kunit_release_action(test, rk_mpp_kunit_vp9_cleanup, cleanup);
-	KUNIT_EXPECT_EQ(test, atomic_read(&srv.import_count), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&srv->import_count), 0);
 }
 
 static void rk_mpp_rkvdec2_link_irq_decode_kunit(struct kunit *test)
@@ -6682,10 +6686,12 @@ static void rk_mpp_rkvdec2_ccu_collect_unfinished_kunit(struct kunit *test)
 
 static void rk_mpp_rkvdec2_ccu_descriptor_kunit(struct kunit *test)
 {
-	struct rk_mpp_hw ccu = {};
+	struct rk_mpp_hw *ccu;
 	struct rk_mpp_job *job;
 	u32 *ccu_regs;
 
+	ccu = kunit_kzalloc(test, sizeof(*ccu), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ccu);
 	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, job);
 	ccu_regs = kunit_kcalloc(test,
@@ -6694,7 +6700,7 @@ static void rk_mpp_rkvdec2_ccu_descriptor_kunit(struct kunit *test)
 				 sizeof(*ccu_regs), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, ccu_regs);
 
-	job->rkvdec_ccu = &ccu;
+	job->rkvdec_ccu = ccu;
 	job->rkvdec_link_iova = 0x12345000;
 	job->rkvdec_link_active = true;
 
@@ -6967,54 +6973,56 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	struct iommu_domain domain = {
 		.ops = &iommu_ops,
 	};
-	struct rk_mpp_hw hw = {};
+	struct rk_mpp_hw *hw;
 	struct rk_mpp_job *job0;
 	struct rk_mpp_job *job1;
 
 	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, srv);
+	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
 	session.srv = srv;
 	job0 = kunit_kzalloc(test, sizeof(*job0), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, job0);
 	job1 = kunit_kzalloc(test, sizeof(*job1), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, job1);
 
-	spin_lock_init(&hw.lock);
-	raw_spin_lock_init(&hw.regs_lock);
-	mutex_init(&hw.run_lock);
-	hw.iommu_domain = &domain;
+	spin_lock_init(&hw->lock);
+	raw_spin_lock_init(&hw->regs_lock);
+	mutex_init(&hw->run_lock);
+	hw->iommu_domain = &domain;
 	job0->session = &session;
 	job1->session = &session;
-	hw.active_job = job0;
-	hw.active_generation = 7;
-	hw.irq_status = 0x1234;
-	hw.iommu_fault_pending = true;
-	hw.iommu_fault_generation = 7;
+	hw->active_job = job0;
+	hw->active_generation = 7;
+	hw->irq_status = 0x1234;
+	hw->iommu_fault_pending = true;
+	hw->iommu_fault_generation = 7;
 
-	KUNIT_EXPECT_FALSE(test, rk_mpp_hw_prepare_active_retry(&hw, job1));
-	KUNIT_EXPECT_PTR_EQ(test, hw.active_job, job0);
-	KUNIT_EXPECT_EQ(test, hw.irq_status, 0x1234U);
-	KUNIT_EXPECT_TRUE(test, hw.iommu_fault_pending);
-	KUNIT_EXPECT_EQ(test, hw.iommu_fault_generation, 7ULL);
+	KUNIT_EXPECT_FALSE(test, rk_mpp_hw_prepare_active_retry(hw, job1));
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, job0);
+	KUNIT_EXPECT_EQ(test, hw->irq_status, 0x1234U);
+	KUNIT_EXPECT_TRUE(test, hw->iommu_fault_pending);
+	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 7ULL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->iommu_refresh_count), 0);
 
-	KUNIT_EXPECT_TRUE(test, rk_mpp_hw_prepare_active_retry(&hw, job0));
-	KUNIT_EXPECT_PTR_EQ(test, hw.active_job, job0);
-	KUNIT_EXPECT_EQ(test, hw.active_generation, 8ULL);
-	KUNIT_EXPECT_EQ(test, hw.irq_status, 0U);
-	KUNIT_EXPECT_FALSE(test, hw.iommu_fault_pending);
-	KUNIT_EXPECT_EQ(test, hw.iommu_fault_generation, 0ULL);
+	KUNIT_EXPECT_TRUE(test, rk_mpp_hw_prepare_active_retry(hw, job0));
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, job0);
+	KUNIT_EXPECT_EQ(test, hw->active_generation, 8ULL);
+	KUNIT_EXPECT_EQ(test, hw->irq_status, 0U);
+	KUNIT_EXPECT_FALSE(test, hw->iommu_fault_pending);
+	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 0ULL);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->iommu_refresh_count), 0);
 
-	mutex_lock(&hw.run_lock);
-	rk_mpp_hw_refresh_iommu(&hw, job0);
-	mutex_unlock(&hw.run_lock);
+	mutex_lock(&hw->run_lock);
+	rk_mpp_hw_refresh_iommu(hw, job0);
+	mutex_unlock(&hw->run_lock);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->iommu_refresh_count), 1);
 
-	hw.iommu_domain = NULL;
-	mutex_lock(&hw.run_lock);
-	rk_mpp_hw_refresh_iommu(&hw, job0);
-	mutex_unlock(&hw.run_lock);
+	hw->iommu_domain = NULL;
+	mutex_lock(&hw->run_lock);
+	rk_mpp_hw_refresh_iommu(hw, job0);
+	mutex_unlock(&hw->run_lock);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->iommu_refresh_count), 1);
 }
 
@@ -7393,13 +7401,14 @@ static void rk_mpp_core_counter_kunit(struct kunit *test)
 			      [RK_MPP_CORE_COUNTER_COUNT];
 	atomic64_t max_ns[RK_MPP_DEBUG_CLIENT_COUNT]
 			 [RK_MPP_CORE_COUNTER_COUNT];
-	struct rk_mpp_hw hw = {
-		.match = &rk_mpp_rkvenc2_core,
-		.core_id = 1,
-	};
+	struct rk_mpp_hw *hw;
 	u32 client;
 	u32 i;
 
+	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
+	hw->match = &rk_mpp_rkvenc2_core;
+	hw->core_id = 1;
 	for (client = 0; client < RK_MPP_DEBUG_CLIENT_COUNT; client++) {
 		for (i = 0; i < RK_MPP_CORE_COUNTER_COUNT; i++) {
 			atomic_set(&counters[client][i], 0);
@@ -7408,11 +7417,11 @@ static void rk_mpp_core_counter_kunit(struct kunit *test)
 		}
 	}
 
-	KUNIT_EXPECT_EQ(test, rk_mpp_core_counter_index(&hw), 1);
-	rk_mpp_count_core(counters, &hw);
-	rk_mpp_count_core_ns(counters_ns, &hw, 100, false);
-	rk_mpp_count_core_ns(max_ns, &hw, 7, true);
-	rk_mpp_count_core_ns(max_ns, &hw, 3, true);
+	KUNIT_EXPECT_EQ(test, rk_mpp_core_counter_index(hw), 1);
+	rk_mpp_count_core(counters, hw);
+	rk_mpp_count_core_ns(counters_ns, hw, 100, false);
+	rk_mpp_count_core_ns(max_ns, hw, 7, true);
+	rk_mpp_count_core_ns(max_ns, hw, 3, true);
 	KUNIT_EXPECT_EQ(test,
 			atomic_read(&counters[RK_MPP_DEBUG_CLIENT_RKVENC][1]),
 			1);
@@ -7424,12 +7433,12 @@ static void rk_mpp_core_counter_kunit(struct kunit *test)
 			atomic64_read(&max_ns[RK_MPP_DEBUG_CLIENT_RKVENC][1]),
 			7LL);
 
-	hw.match = &rk_mpp_rkvdec2_core;
-	hw.core_id = 2;
-	KUNIT_EXPECT_EQ(test, rk_mpp_core_counter_index(&hw), 2);
-	rk_mpp_count_core(counters, &hw);
-	rk_mpp_count_core_ns(counters_ns, &hw, 50, false);
-	rk_mpp_count_core_ns(max_ns, &hw, 9, true);
+	hw->match = &rk_mpp_rkvdec2_core;
+	hw->core_id = 2;
+	KUNIT_EXPECT_EQ(test, rk_mpp_core_counter_index(hw), 2);
+	rk_mpp_count_core(counters, hw);
+	rk_mpp_count_core_ns(counters_ns, hw, 50, false);
+	rk_mpp_count_core_ns(max_ns, hw, 9, true);
 	KUNIT_EXPECT_EQ(test,
 			atomic_read(&counters[RK_MPP_DEBUG_CLIENT_RKVDEC][2]),
 			1);
@@ -7441,11 +7450,11 @@ static void rk_mpp_core_counter_kunit(struct kunit *test)
 			atomic64_read(&max_ns[RK_MPP_DEBUG_CLIENT_RKVDEC][2]),
 			9LL);
 
-	hw.match = &rk_mpp_av1_core;
-	hw.core_id = 0;
-	KUNIT_EXPECT_EQ(test, rk_mpp_core_counter_index(&hw), 0);
-	rk_mpp_count_core(counters, &hw);
-	rk_mpp_count_core_ns(counters_ns, &hw, 25, false);
+	hw->match = &rk_mpp_av1_core;
+	hw->core_id = 0;
+	KUNIT_EXPECT_EQ(test, rk_mpp_core_counter_index(hw), 0);
+	rk_mpp_count_core(counters, hw);
+	rk_mpp_count_core_ns(counters_ns, hw, 25, false);
 	KUNIT_EXPECT_EQ(test,
 			atomic_read(&counters[RK_MPP_DEBUG_CLIENT_AV1][0]), 1);
 	KUNIT_EXPECT_EQ(test,
@@ -7453,28 +7462,27 @@ static void rk_mpp_core_counter_kunit(struct kunit *test)
 				      [RK_MPP_DEBUG_CLIENT_AV1][0]),
 			25LL);
 
-	hw.core_id = RK_MPP_CORE_COUNTER_COUNT;
-	KUNIT_EXPECT_EQ(test, rk_mpp_core_counter_index(&hw), -EINVAL);
-	rk_mpp_count_core(counters, &hw);
-	rk_mpp_count_core_ns(counters_ns, &hw, 1000, false);
+	hw->core_id = RK_MPP_CORE_COUNTER_COUNT;
+	KUNIT_EXPECT_EQ(test, rk_mpp_core_counter_index(hw), -EINVAL);
+	rk_mpp_count_core(counters, hw);
+	rk_mpp_count_core_ns(counters_ns, hw, 1000, false);
 
-	hw.core_id = -1;
-	KUNIT_EXPECT_EQ(test, rk_mpp_core_counter_index(&hw), -EINVAL);
-	rk_mpp_count_core(counters, &hw);
-	rk_mpp_count_core_ns(counters_ns, &hw, 1000, false);
+	hw->core_id = -1;
+	KUNIT_EXPECT_EQ(test, rk_mpp_core_counter_index(hw), -EINVAL);
+	rk_mpp_count_core(counters, hw);
+	rk_mpp_count_core_ns(counters_ns, hw, 1000, false);
 
-	hw.match = &rk_mpp_rkvenc2_ccu;
-	hw.core_id = 0;
-	KUNIT_EXPECT_EQ(test, rk_mpp_core_counter_index(&hw), -EINVAL);
-	rk_mpp_count_core(counters, &hw);
-	rk_mpp_count_core_ns(counters_ns, &hw, 1000, false);
+	hw->match = &rk_mpp_rkvenc2_ccu;
+	hw->core_id = 0;
+	KUNIT_EXPECT_EQ(test, rk_mpp_core_counter_index(hw), -EINVAL);
+	rk_mpp_count_core(counters, hw);
+	rk_mpp_count_core_ns(counters_ns, hw, 1000, false);
 }
 
 static void rk_mpp_hw_select_rotation_kunit(struct kunit *test)
 {
-	struct rk_mpp_service srv = {};
+	struct rk_mpp_service *srv;
 	struct rk_mpp_session session = {
-		.srv = &srv,
 		.client_type = RK_MPP_DEVICE_RKVENC,
 	};
 	struct rk_mpp_hw *hw0;
@@ -7482,8 +7490,11 @@ static void rk_mpp_hw_select_rotation_kunit(struct kunit *test)
 	struct rk_mpp_hw *hw2;
 	struct rk_mpp_hw *selected;
 
-	mutex_init(&srv.hw_lock);
-	INIT_LIST_HEAD(&srv.hw_list);
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
+	session.srv = srv;
+	mutex_init(&srv->hw_lock);
+	INIT_LIST_HEAD(&srv->hw_list);
 	hw0 = kunit_kzalloc(test, sizeof(*hw0), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, hw0);
 	hw1 = kunit_kzalloc(test, sizeof(*hw1), GFP_KERNEL);
@@ -7509,44 +7520,44 @@ static void rk_mpp_hw_select_rotation_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&hw0->link);
 	INIT_LIST_HEAD(&hw1->link);
 	INIT_LIST_HEAD(&hw2->link);
-	list_add_tail(&hw0->link, &srv.hw_list);
-	list_add_tail(&hw1->link, &srv.hw_list);
-	list_add_tail(&hw2->link, &srv.hw_list);
+	list_add_tail(&hw0->link, &srv->hw_list);
+	list_add_tail(&hw1->link, &srv->hw_list);
+	list_add_tail(&hw2->link, &srv->hw_list);
 
 	selected = rk_mpp_hw_get_for_session(&session, true);
 	KUNIT_EXPECT_PTR_EQ(test, selected, hw0);
-	KUNIT_EXPECT_EQ(test, srv.core_select_seq, 1U);
+	KUNIT_EXPECT_EQ(test, srv->core_select_seq, 1U);
 	rk_mpp_hw_put(selected);
 
 	selected = rk_mpp_hw_get_for_session(&session, true);
 	KUNIT_EXPECT_PTR_EQ(test, selected, hw1);
-	KUNIT_EXPECT_EQ(test, srv.core_select_seq, 2U);
+	KUNIT_EXPECT_EQ(test, srv->core_select_seq, 2U);
 	rk_mpp_hw_put(selected);
 
 	selected = rk_mpp_hw_get_for_session(&session, true);
 	KUNIT_EXPECT_PTR_EQ(test, selected, hw2);
-	KUNIT_EXPECT_EQ(test, srv.core_select_seq, 3U);
+	KUNIT_EXPECT_EQ(test, srv->core_select_seq, 3U);
 	rk_mpp_hw_put(selected);
 
-	srv.core_select_seq = 2;
+	srv->core_select_seq = 2;
 	atomic_set(&hw2->queued_job_count, 1);
 	selected = rk_mpp_hw_get_for_session(&session, true);
 	KUNIT_EXPECT_PTR_EQ(test, selected, hw0);
-	KUNIT_EXPECT_EQ(test, srv.core_select_seq, 1U);
+	KUNIT_EXPECT_EQ(test, srv->core_select_seq, 1U);
 	rk_mpp_hw_put(selected);
 	atomic_set(&hw2->queued_job_count, 0);
 
-	srv.core_select_seq = 2;
+	srv->core_select_seq = 2;
 	selected = rk_mpp_hw_get_for_session(&session, false);
 	KUNIT_EXPECT_PTR_EQ(test, selected, hw0);
-	KUNIT_EXPECT_EQ(test, srv.core_select_seq, 2U);
+	KUNIT_EXPECT_EQ(test, srv->core_select_seq, 2U);
 	rk_mpp_hw_put(selected);
 
-	srv.core_select_seq = 0;
+	srv->core_select_seq = 0;
 	hw0->recovery_failed = true;
 	selected = rk_mpp_hw_get_for_session(&session, true);
 	KUNIT_EXPECT_PTR_EQ(test, selected, hw1);
-	KUNIT_EXPECT_EQ(test, srv.core_select_seq, 2U);
+	KUNIT_EXPECT_EQ(test, srv->core_select_seq, 2U);
 	rk_mpp_hw_put(selected);
 }
 
@@ -7741,7 +7752,7 @@ static void rk_mpp_rkvdec2_wait_bus_idle_kunit(struct kunit *test)
 
 static void rk_mpp_explicit_iova_affinity_kunit(struct kunit *test)
 {
-	struct rk_mpp_service srv = {};
+	struct rk_mpp_service *srv;
 	struct rk_mpp_session *session;
 	struct rk_mpp_job *job;
 	struct rk_mpp_hw *other;
@@ -7750,6 +7761,8 @@ static void rk_mpp_explicit_iova_affinity_kunit(struct kunit *test)
 	struct device *map_dev;
 	struct device *other_dev;
 
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
 	session = kunit_kzalloc(test, sizeof(*session), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, session);
 	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
@@ -7769,9 +7782,9 @@ static void rk_mpp_explicit_iova_affinity_kunit(struct kunit *test)
 	map_dev->release = rk_mpp_kunit_device_release;
 	device_initialize(other_dev);
 	other_dev->release = rk_mpp_kunit_device_release;
-	mutex_init(&srv.hw_lock);
-	INIT_LIST_HEAD(&srv.hw_list);
-	session->srv = &srv;
+	mutex_init(&srv->hw_lock);
+	INIT_LIST_HEAD(&srv->hw_list);
+	session->srv = srv;
 	session->client_type = RK_MPP_DEVICE_RKVENC;
 	mutex_init(&session->lock);
 	mutex_init(&session->explicit_map_lock);
@@ -7786,7 +7799,7 @@ static void rk_mpp_explicit_iova_affinity_kunit(struct kunit *test)
 	spin_lock_init(&other->lock);
 	refcount_set(&other->refs, 1);
 	INIT_LIST_HEAD(&other->link);
-	list_add_tail(&other->link, &srv.hw_list);
+	list_add_tail(&other->link, &srv->hw_list);
 
 	original->dev = map_dev;
 	original->match = &rk_mpp_rkvenc2_core;
@@ -7795,7 +7808,7 @@ static void rk_mpp_explicit_iova_affinity_kunit(struct kunit *test)
 	spin_lock_init(&original->lock);
 	refcount_set(&original->refs, 1);
 	INIT_LIST_HEAD(&original->link);
-	list_add_tail(&original->link, &srv.hw_list);
+	list_add_tail(&original->link, &srv->hw_list);
 
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_select_hw(job), -ENODEV);
 	KUNIT_EXPECT_PTR_EQ(test, job->hw, NULL);
@@ -7817,7 +7830,7 @@ static void rk_mpp_explicit_iova_affinity_kunit(struct kunit *test)
 	spin_lock_init(&rebound->lock);
 	refcount_set(&rebound->refs, 1);
 	INIT_LIST_HEAD(&rebound->link);
-	list_add_tail(&rebound->link, &srv.hw_list);
+	list_add_tail(&rebound->link, &srv->hw_list);
 
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_select_hw(job), 0);
 	KUNIT_EXPECT_PTR_EQ(test, job->hw, rebound);
@@ -8629,26 +8642,27 @@ static void rk_mpp_rcb_invalid_index_kunit(struct kunit *test)
 	struct rk_mpp_session session = {
 		.client_type = RK_MPP_DEVICE_RKVENC,
 	};
-	struct rk_mpp_hw hw = {
-		.rcb_iova = 0x80000000,
-		.rcb_size = 0x300,
-		.rcb_count = 2,
-	};
+	struct rk_mpp_hw *hw;
 	u32 max_words = RK_MPP_MAX_REG_IMAGE_BYTES / sizeof(u32);
 	struct rk_mpp_job *job;
 
 	mutex_init(&session.lock);
 
+	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
+	hw->rcb_iova = 0x80000000;
+	hw->rcb_size = 0x300;
+	hw->rcb_count = 2;
 	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, job);
 
 	job->session = &session;
 	job->client_type = RK_MPP_DEVICE_RKVENC;
-	job->hw = &hw;
-	hw.rcb_descs[0].index = 2;
-	hw.rcb_descs[0].size = 0x100;
-	hw.rcb_descs[1].index = 4;
-	hw.rcb_descs[1].size = 0x100;
+	job->hw = hw;
+	hw->rcb_descs[0].index = 2;
+	hw->rcb_descs[0].size = 0x100;
+	hw->rcb_descs[1].index = 4;
+	hw->rcb_descs[1].size = 0x100;
 	job->reg_image.rcb_count = 3;
 	job->reg_image.rcb_descs[0].index = 2;
 	job->reg_image.rcb_descs[0].size = 0x100;
@@ -8668,7 +8682,7 @@ static void rk_mpp_rcb_invalid_index_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_hold_explicit_iova(job, 4), -ERANGE);
 	job->reg_image.regs[4] = 0x80000100U;
 
-	hw.rcb_iova = 0;
+	hw->rcb_iova = 0;
 	job->reg_image.rcb_count = 1;
 	job->reg_image.rcb_descs[0].index = 4;
 	job->reg_image.rcb_descs[0].size = 0x100;
@@ -8683,7 +8697,7 @@ static void rk_mpp_rcb_invalid_index_kunit(struct kunit *test)
 	 * rcb_descs are sticky, so returning an error here killed every later
 	 * job on the session rather than just ignoring one bad entry.
 	 */
-	hw.rcb_iova = 0x80000000;
+	hw->rcb_iova = 0x80000000;
 	job->reg_image.rcb_count = 2;
 	job->reg_image.rcb_descs[0].index =
 		RK_MPP_RKVENC2_MIN_REG_SIZE / sizeof(u32);
@@ -8957,10 +8971,8 @@ static void rk_mpp_batch_server_wait_collect_reject_kunit(struct kunit *test)
 
 static void rk_mpp_collect_msg_limit_kunit(struct kunit *test)
 {
-	struct rk_mpp_service srv = {};
-	struct rk_mpp_session session = {
-		.srv = &srv,
-	};
+	struct rk_mpp_service *srv;
+	struct rk_mpp_session session = {};
 	struct {
 		struct rk_mpp_msg_v1 reqs[RK_MPP_MAX_BATCH_MSGS + 1];
 		struct mpp_bat_msg bat;
@@ -8969,6 +8981,9 @@ static void rk_mpp_collect_msg_limit_kunit(struct kunit *test)
 	uintptr_t bat_user;
 	u32 i;
 
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
+	session.srv = srv;
 	layout = kunit_kzalloc(test, sizeof(*layout), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, layout);
 	layout->bat.flag = MPP_BAT_MSG_DONE;
@@ -9119,7 +9134,7 @@ static void rk_mpp_batch_session_snapshot_kunit(struct kunit *test)
 
 static void rk_mpp_reset_session_staged_cancel_kunit(struct kunit *test)
 {
-	struct rk_mpp_service srv = {};
+	struct rk_mpp_service *srv;
 	struct rk_mpp_session *session0;
 	struct rk_mpp_session *session1;
 	struct rk_mpp_batch_state *batch;
@@ -9132,21 +9147,23 @@ static void rk_mpp_reset_session_staged_cancel_kunit(struct kunit *test)
 	struct rk_mpp_job *new_job0;
 	int ret;
 
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
 	session0 = kunit_kzalloc(test, sizeof(*session0), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, session0);
 	session1 = kunit_kzalloc(test, sizeof(*session1), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, session1);
 	batch = kunit_kzalloc(test, sizeof(*batch), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, batch);
-	session0->srv = &srv;
+	session0->srv = srv;
 	session0->client_type = RK_MPP_DEVICE_RKVDEC;
 	session0->initialized = true;
 	session0->state_seq = 10;
-	session1->srv = &srv;
+	session1->srv = srv;
 	session1->client_type = RK_MPP_DEVICE_RKVENC;
 	session1->initialized = true;
-	mutex_init(&srv.sched_lock);
-	INIT_LIST_HEAD(&srv.queued_jobs);
+	mutex_init(&srv->sched_lock);
+	INIT_LIST_HEAD(&srv->queued_jobs);
 	mutex_init(&session0->lock);
 	mutex_init(&session0->explicit_map_lock);
 	mutex_init(&session1->lock);
@@ -9195,12 +9212,8 @@ static void rk_mpp_reset_session_staged_cancel_kunit(struct kunit *test)
 
 static void rk_mpp_session_reinit_kunit(struct kunit *test)
 {
-	struct rk_mpp_service srv = {
-		.hw_support = BIT(RK_MPP_DEVICE_RKVDEC) |
-			      BIT(RK_MPP_DEVICE_RKVENC),
-	};
+	struct rk_mpp_service *srv;
 	struct rk_mpp_session session = {
-		.srv = &srv,
 		.client_type = RK_MPP_DEVICE_BUTT,
 	};
 	struct rk_mpp_batch_state batch = {};
@@ -9211,7 +9224,12 @@ static void rk_mpp_session_reinit_kunit(struct kunit *test)
 	struct rk_mpp_job *sentinel = (struct rk_mpp_job *)0x1;
 	u32 client_type = RK_MPP_DEVICE_RKVDEC;
 
-	mutex_init(&srv.hw_lock);
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
+	srv->hw_support = BIT(RK_MPP_DEVICE_RKVDEC) |
+			  BIT(RK_MPP_DEVICE_RKVENC);
+	session.srv = srv;
+	mutex_init(&srv->hw_lock);
 	mutex_init(&session.lock);
 	req.data = rk_mpp_kunit_user_payload(test, &client_type,
 					     sizeof(client_type));
@@ -9301,30 +9319,32 @@ static void rk_mpp_job_queue_current_kunit(struct kunit *test)
 static void rk_mpp_job_hw_pin_kunit(struct kunit *test)
 {
 	struct rk_mpp_session session = {};
-	struct rk_mpp_hw hw = {};
+	struct rk_mpp_hw *hw;
 	struct rk_mpp_job *job;
 	struct rk_mpp_hw *pinned;
 
 	mutex_init(&session.lock);
-	refcount_set(&hw.refs, 1);
-	init_completion(&hw.released);
+	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
+	refcount_set(&hw->refs, 1);
+	init_completion(&hw->released);
 	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, job);
 	job->session = &session;
-	job->hw = &hw;
+	job->hw = hw;
 
 	pinned = rk_mpp_job_get_hw(job);
-	KUNIT_ASSERT_PTR_EQ(test, pinned, &hw);
-	KUNIT_EXPECT_EQ(test, refcount_read(&hw.refs), 2);
+	KUNIT_ASSERT_PTR_EQ(test, pinned, hw);
+	KUNIT_EXPECT_EQ(test, refcount_read(&hw->refs), 2);
 
 	rk_mpp_job_drop_hw(job);
 	KUNIT_EXPECT_PTR_EQ(test, job->hw, NULL);
-	KUNIT_EXPECT_EQ(test, refcount_read(&hw.refs), 1);
-	KUNIT_EXPECT_FALSE(test, completion_done(&hw.released));
+	KUNIT_EXPECT_EQ(test, refcount_read(&hw->refs), 1);
+	KUNIT_EXPECT_FALSE(test, completion_done(&hw->released));
 	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_job_get_hw(job), NULL);
 
 	rk_mpp_hw_put(pinned);
-	KUNIT_EXPECT_TRUE(test, completion_done(&hw.released));
+	KUNIT_EXPECT_TRUE(test, completion_done(&hw->released));
 }
 
 static void rk_mpp_import_cache_identity_kunit(struct kunit *test)
@@ -9574,24 +9594,26 @@ static void rk_mpp_session_poll_irq_nonslice_kunit(struct kunit *test)
 
 static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 {
-	struct rk_mpp_service srv = {};
+	struct rk_mpp_service *srv;
 	struct rk_mpp_session session = {
-		.srv = &srv,
 		.active_job_count = 2,
 	};
 	struct rk_mpp_hw *hw;
 	struct rk_mpp_job *queued;
 	struct rk_mpp_job *active;
 
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
+	session.srv = srv;
 	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, hw);
-	mutex_init(&srv.sched_lock);
-	INIT_LIST_HEAD(&srv.queued_jobs);
+	mutex_init(&srv->sched_lock);
+	INIT_LIST_HEAD(&srv->queued_jobs);
 	mutex_init(&session.lock);
 	INIT_LIST_HEAD(&session.imports);
 	INIT_LIST_HEAD(&session.active_jobs);
 	init_waitqueue_head(&session.wait);
-	hw->srv = &srv;
+	hw->srv = srv;
 	spin_lock_init(&hw->lock);
 	raw_spin_lock_init(&hw->regs_lock);
 	mutex_init(&hw->run_lock);
@@ -9614,9 +9636,9 @@ static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&queued->sched_link);
 	INIT_LIST_HEAD(&queued->rkvdec_ccu_node);
 	list_add_tail(&queued->session_link, &session.active_jobs);
-	list_add_tail(&queued->sched_link, &srv.queued_jobs);
+	list_add_tail(&queued->sched_link, &srv->queued_jobs);
 	atomic_set(&hw->queued_job_count, 1);
-	atomic_set(&srv.queued_job_count, 1);
+	atomic_set(&srv->queued_job_count, 1);
 
 	active->session = &session;
 	active->client_type = RK_MPP_DEVICE_RKVDEC;
@@ -9635,7 +9657,7 @@ static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 
 	KUNIT_EXPECT_TRUE(test, list_empty(&session.active_jobs));
 	KUNIT_EXPECT_EQ(test, session.active_job_count, 0U);
-	KUNIT_EXPECT_TRUE(test, list_empty(&srv.queued_jobs));
+	KUNIT_EXPECT_TRUE(test, list_empty(&srv->queued_jobs));
 	KUNIT_EXPECT_TRUE(test, list_empty(&queued->session_link));
 	KUNIT_EXPECT_TRUE(test, list_empty(&queued->sched_link));
 	KUNIT_EXPECT_TRUE(test, list_empty(&active->session_link));
@@ -9649,8 +9671,8 @@ static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&queued->refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&active->refs), 1);
 	KUNIT_EXPECT_EQ(test, atomic_read(&hw->queued_job_count), 0);
-	KUNIT_EXPECT_EQ(test, atomic_read(&srv.queued_job_count), 0);
-	KUNIT_EXPECT_EQ(test, atomic_read(&srv.aborted_job_count), 2);
+	KUNIT_EXPECT_EQ(test, atomic_read(&srv->queued_job_count), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&srv->aborted_job_count), 2);
 	KUNIT_EXPECT_FALSE(test, session.rkvdec_dispatch_active);
 	KUNIT_EXPECT_FALSE(test, active->rkvdec_session_dispatch);
 	KUNIT_EXPECT_EQ(test,
@@ -9671,12 +9693,14 @@ static void rk_mpp_reset_session_public_cleanup_kunit(struct kunit *test)
 		.cmd = MPP_CMD_RESET_SESSION,
 	};
 	struct rk_mpp_import *import;
-	struct rk_mpp_hw hw = {};
+	struct rk_mpp_hw *hw;
 	struct rk_mpp_job *queued;
 	struct rk_mpp_job *active;
 
 	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, srv);
+	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
 	session.srv = srv;
 	mutex_init(&srv->sched_lock);
 	INIT_LIST_HEAD(&srv->queued_jobs);
@@ -9686,13 +9710,13 @@ static void rk_mpp_reset_session_public_cleanup_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&session.active_jobs);
 	init_waitqueue_head(&session.wait);
 	INIT_LIST_HEAD(&batch.jobs);
-	hw.srv = srv;
-	spin_lock_init(&hw.lock);
-	raw_spin_lock_init(&hw.regs_lock);
-	mutex_init(&hw.run_lock);
-	INIT_DELAYED_WORK_ONSTACK(&hw.timeout_work, rk_mpp_hw_timeout_work);
-	refcount_set(&hw.refs, 1);
-	init_completion(&hw.released);
+	hw->srv = srv;
+	spin_lock_init(&hw->lock);
+	raw_spin_lock_init(&hw->regs_lock);
+	mutex_init(&hw->run_lock);
+	INIT_DELAYED_WORK(&hw->timeout_work, rk_mpp_hw_timeout_work);
+	refcount_set(&hw->refs, 1);
+	init_completion(&hw->released);
 
 	import = kzalloc(sizeof(*import), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, import);
@@ -9707,7 +9731,7 @@ static void rk_mpp_reset_session_public_cleanup_kunit(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, active);
 
 	queued->session = &session;
-	queued->hw = &hw;
+	queued->hw = hw;
 	queued->state = RK_MPP_JOB_ACTIVE;
 	queued->result = -EINPROGRESS;
 	refcount_set(&queued->refs, 3);
@@ -9717,7 +9741,7 @@ static void rk_mpp_reset_session_public_cleanup_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&queued->rkvdec_ccu_node);
 	list_add_tail(&queued->session_link, &session.active_jobs);
 	list_add_tail(&queued->sched_link, &srv->queued_jobs);
-	atomic_set(&hw.queued_job_count, 1);
+	atomic_set(&hw->queued_job_count, 1);
 	atomic_set(&srv->queued_job_count, 1);
 
 	active->session = &session;
@@ -9745,12 +9769,11 @@ static void rk_mpp_reset_session_public_cleanup_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, active->result, -ECANCELED);
 	KUNIT_EXPECT_EQ(test, refcount_read(&queued->refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&active->refs), 1);
-	KUNIT_EXPECT_EQ(test, atomic_read(&hw.queued_job_count), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&hw->queued_job_count), 0);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->queued_job_count), 0);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->aborted_job_count), 2);
 
 	rk_mpp_import_put(import);
-	destroy_delayed_work_on_stack(&hw.timeout_work);
 }
 
 static void rk_mpp_reset_session_hw_active_import_kunit(struct kunit *test)
@@ -9758,7 +9781,7 @@ static void rk_mpp_reset_session_hw_active_import_kunit(struct kunit *test)
 	struct rk_mpp_service *srv;
 	struct rk_mpp_session *session;
 	struct device *dev;
-	struct rk_mpp_hw hw = {};
+	struct rk_mpp_hw *hw;
 	struct rk_mpp_batch_state batch = {};
 	struct mpp_request req = {
 		.cmd = MPP_CMD_RESET_SESSION,
@@ -9773,6 +9796,8 @@ static void rk_mpp_reset_session_hw_active_import_kunit(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, session);
 	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, dev);
+	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
 	import = kzalloc(sizeof(*import), GFP_KERNEL);
 	ret = kunit_add_action_or_reset(test, rk_mpp_kunit_kfree, import);
 	KUNIT_ASSERT_EQ(test, ret, 0);
@@ -9803,16 +9828,16 @@ static void rk_mpp_reset_session_hw_active_import_kunit(struct kunit *test)
 	refcount_set(&session->refs, 2);
 	INIT_LIST_HEAD(&batch.jobs);
 
-	hw.dev = dev;
-	hw.srv = srv;
-	hw.terminally_stopped = true;
-	refcount_set(&hw.refs, 1);
-	init_completion(&hw.released);
-	spin_lock_init(&hw.lock);
-	raw_spin_lock_init(&hw.regs_lock);
-	mutex_init(&hw.run_lock);
-	INIT_LIST_HEAD(&hw.rkvdec_ccu_jobs);
-	INIT_DELAYED_WORK_ONSTACK(&hw.timeout_work, rk_mpp_hw_timeout_work);
+	hw->dev = dev;
+	hw->srv = srv;
+	hw->terminally_stopped = true;
+	refcount_set(&hw->refs, 1);
+	init_completion(&hw->released);
+	spin_lock_init(&hw->lock);
+	raw_spin_lock_init(&hw->regs_lock);
+	mutex_init(&hw->run_lock);
+	INIT_LIST_HEAD(&hw->rkvdec_ccu_jobs);
+	INIT_DELAYED_WORK(&hw->timeout_work, rk_mpp_hw_timeout_work);
 
 	import->fd = 9;
 	refcount_set(&import->refs, 3);
@@ -9820,7 +9845,7 @@ static void rk_mpp_reset_session_hw_active_import_kunit(struct kunit *test)
 	list_add_tail(&import->link, &session->imports);
 
 	active->session = session;
-	active->hw = &hw;
+	active->hw = hw;
 	/* Freed with the job by the production release path. */
 	active->imports = kcalloc(1, sizeof(*active->imports), GFP_KERNEL);
 	ret = kunit_add_action_or_reset(test, rk_mpp_kunit_kfree,
@@ -9838,7 +9863,7 @@ static void rk_mpp_reset_session_hw_active_import_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&active->sched_link);
 	INIT_LIST_HEAD(&active->rkvdec_ccu_node);
 	list_add_tail(&active->session_link, &session->active_jobs);
-	hw.active_job = active;
+	hw->active_job = active;
 
 	kunit_remove_action(test, rk_mpp_kunit_kfree, active->imports);
 	kunit_remove_action(test, rk_mpp_kunit_kfree, active);
@@ -9849,31 +9874,32 @@ static void rk_mpp_reset_session_hw_active_import_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, list_empty(&session->imports));
 	KUNIT_EXPECT_TRUE(test, list_empty(&session->active_jobs));
 	KUNIT_EXPECT_EQ(test, session->active_job_count, 0U);
-	KUNIT_EXPECT_PTR_EQ(test, hw.active_job, NULL);
-	KUNIT_EXPECT_TRUE(test, completion_done(&hw.released));
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, NULL);
+	KUNIT_EXPECT_TRUE(test, completion_done(&hw->released));
 	KUNIT_EXPECT_EQ(test, refcount_read(&session->refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&import->refs), 1);
 
 	rk_mpp_import_put(import);
-	destroy_delayed_work_on_stack(&hw.timeout_work);
 	pm_runtime_disable(dev);
 	put_device(dev);
 }
 
 static void rk_mpp_file_release_public_cleanup_kunit(struct kunit *test)
 {
-	struct rk_mpp_service srv = {};
+	struct rk_mpp_service *srv;
 	struct rk_mpp_session *session;
 	struct rk_mpp_import *import;
 	struct rk_mpp_job *active;
 	struct file file = {};
 
-	mutex_init(&srv.sched_lock);
-	INIT_LIST_HEAD(&srv.queued_jobs);
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
+	mutex_init(&srv->sched_lock);
+	INIT_LIST_HEAD(&srv->queued_jobs);
 
 	session = kzalloc(sizeof(*session), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, session);
-	session->srv = &srv;
+	session->srv = srv;
 	session->active_job_count = 1;
 	mutex_init(&session->lock);
 	mutex_init(&session->explicit_map_lock);
@@ -9916,29 +9942,31 @@ static void rk_mpp_file_release_public_cleanup_kunit(struct kunit *test)
 
 static void rk_mpp_debug_event_ring_kunit(struct kunit *test)
 {
-	struct rk_mpp_service srv = {};
+	struct rk_mpp_service *srv;
 	struct rk_mpp_debug_event event = {
 		.type = RK_MPP_DEBUG_QUEUED,
 	};
 	u32 i;
 
-	srv.debug_events = kunit_kcalloc(test, RK_MPP_DEBUG_EVENT_COUNT,
-					 sizeof(*srv.debug_events), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, srv.debug_events);
-	raw_spin_lock_init(&srv.debug_lock);
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
+	srv->debug_events = kunit_kcalloc(test, RK_MPP_DEBUG_EVENT_COUNT,
+					  sizeof(*srv->debug_events), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv->debug_events);
+	raw_spin_lock_init(&srv->debug_lock);
 	for (i = 0; i < RK_MPP_DEBUG_EVENT_COUNT + 1; i++) {
 		event.job_id = i + 1;
-		rk_mpp_debug_ring_push(&srv, &event);
+		rk_mpp_debug_ring_push(srv, &event);
 	}
 
-	KUNIT_EXPECT_EQ(test, srv.debug_event_count,
+	KUNIT_EXPECT_EQ(test, srv->debug_event_count,
 			(u32)RK_MPP_DEBUG_EVENT_COUNT);
-	KUNIT_EXPECT_EQ(test, srv.debug_event_head, 1U);
-	KUNIT_EXPECT_EQ(test, srv.debug_event_next_seq,
+	KUNIT_EXPECT_EQ(test, srv->debug_event_head, 1U);
+	KUNIT_EXPECT_EQ(test, srv->debug_event_next_seq,
 			(u64)RK_MPP_DEBUG_EVENT_COUNT + 1);
-	KUNIT_EXPECT_EQ(test, srv.debug_events[0].job_id,
+	KUNIT_EXPECT_EQ(test, srv->debug_events[0].job_id,
 			(u32)RK_MPP_DEBUG_EVENT_COUNT + 1);
-	KUNIT_EXPECT_EQ(test, srv.debug_events[1].job_id, 2U);
+	KUNIT_EXPECT_EQ(test, srv->debug_events[1].job_id, 2U);
 }
 
 static struct kunit_case rk_mpp_rewrite_test_cases[] = {
