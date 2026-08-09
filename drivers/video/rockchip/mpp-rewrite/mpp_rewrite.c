@@ -254,12 +254,21 @@ enum rk_mpp_activation_slot_state {
 	RK_MPP_ACTIVATION_SLOTTED,
 	RK_MPP_ACTIVATION_CLAIMED,
 	RK_MPP_ACTIVATION_SUPERSEDED,
+	RK_MPP_ACTIVATION_RETIRED,
+	RK_MPP_ACTIVATION_QUARANTINED,
 };
 
 enum rk_mpp_activation_closure_state {
 	RK_MPP_ACTIVATION_CLOSURE_NONE,
 	RK_MPP_ACTIVATION_CLOSURE_PENDING,
 	RK_MPP_ACTIVATION_CLOSURE_RETIRED,
+	RK_MPP_ACTIVATION_CLOSURE_QUARANTINED,
+};
+
+enum rk_mpp_activation_retirement_scope {
+	RK_MPP_ACTIVATION_RETIREMENT_NONE,
+	RK_MPP_ACTIVATION_RETIREMENT_CORE,
+	RK_MPP_ACTIVATION_RETIREMENT_CCU_GROUP,
 };
 
 enum rk_mpp_activation_transition_reason {
@@ -508,12 +517,28 @@ struct rk_mpp_activation_closure {
 	enum rk_mpp_activation_closure_state state;
 	struct rk_mpp_activation_recovery_record group;
 	struct rk_mpp_activation_recovery_record core;
+	struct rk_mpp_activation_recovery_record terminal;
+	enum rk_mpp_activation_retirement_scope terminal_scope;
 };
 
 /* Stack-local exact identity carried from retry publication to closure. */
 struct rk_mpp_activation_retry_token {
 	struct rk_mpp_activation *activation;
 	u64 generation;
+};
+
+/*
+ * Exact active-slot reference ownership. A nonempty token owns the one
+ * containing-job reference transferred out of hw->active_activation. It may
+ * only restore that reference, release it after cleanup, or transfer it to the
+ * service quarantine list. Retry predecessor tokens deliberately use the
+ * separate non-refholding type above.
+ */
+struct rk_mpp_activation_claim_token {
+	struct rk_mpp_activation *activation;
+	u64 generation;
+	enum rk_mpp_activation_transition_reason reason;
+	bool owns_job_ref;
 };
 
 /*
@@ -566,6 +591,8 @@ struct rk_mpp_cluster_power_lease {
  */
 struct rk_mpp_activation {
 	struct list_head job_link;
+	struct list_head quarantine_link;
+	u32 quarantine_ref_count;
 	struct rk_mpp_job *job;
 	struct rk_mpp_hw *selected_hw;
 	enum rk_mpp_activation_slot_state slot_state;
@@ -715,9 +742,10 @@ struct rk_mpp_hw {
  * existing reference continues to pin the containing job; when both slots
  * name the same record, they own two independent job references. Hard-CCU
  * retry publishes a fresh record and retains every predecessor until final
- * job release, so a detached timeout never observes reused storage. CLAIMED
- * is still restorable rather than final, and terminal arbitration remains a
- * later checkpoint.
+ * job release, so a detached timeout never observes reused storage. A claim
+ * token owns the active slot's transferred job reference until exact restore,
+ * proof-backed retirement, or fail-closed quarantine. Clean completion and
+ * public result arbitration remain later checkpoints.
  */
 static struct rk_mpp_activation *
 rk_mpp_hw_active_activation_locked(const struct rk_mpp_hw *hw)
@@ -763,9 +791,10 @@ static struct rk_mpp_activation *
 rk_mpp_hw_claim_active_locked(struct rk_mpp_hw *hw,
 			      struct rk_mpp_activation *match,
 			      u64 generation,
-			      enum rk_mpp_activation_transition_reason reason);
+			      enum rk_mpp_activation_transition_reason reason,
+			      struct rk_mpp_activation_claim_token *token);
 static bool rk_mpp_hw_restore_active_locked(struct rk_mpp_hw *hw,
-					    struct rk_mpp_activation *activation);
+					    struct rk_mpp_activation_claim_token *token);
 
 /*
  * The raw register lease is published immediately before a START doorbell and
@@ -964,6 +993,7 @@ struct rk_mpp_service {
 	u32 cluster_count;
 	struct mutex dma_group_lock;
 	struct mutex sched_lock; /* protects queued_jobs and dispatch stamps */
+	struct mutex quarantine_lock; /* protects quarantined_activations */
 	/*
 	 * Lock order: core run_lock -> rkvenc_dchs_lifecycle_lock ->
 	 * rkvenc_dchs_lock. Serializes a consumer's DCHS patch-through-START
@@ -983,6 +1013,7 @@ struct rk_mpp_service {
 	struct list_head dma_groups;
 	struct list_head fault_hws;
 	struct list_head queued_jobs;
+	struct list_head quarantined_activations;
 	/*
 	 * Bumped at the start of every scheduler scan, under sched_lock.
 	 * Compared against each session's sched_defer_stamp so one scan can
@@ -1010,6 +1041,7 @@ struct rk_mpp_service {
 	atomic_t reset_core_count[RK_MPP_DEBUG_CLIENT_COUNT]
 					 [RK_MPP_CORE_COUNTER_COUNT];
 	atomic_t recovery_failure_count;
+	atomic_t quarantine_count;
 	atomic_t reset_deassert_contended_count;
 	atomic_t reset_deassert_count;
 	atomic_t reset_deassert_core_count[RK_MPP_DEBUG_CLIENT_COUNT]
@@ -1245,6 +1277,8 @@ rk_mpp_activation_storage_init(struct rk_mpp_activation *activation,
 			       struct rk_mpp_job *job)
 {
 	INIT_LIST_HEAD(&activation->job_link);
+	INIT_LIST_HEAD(&activation->quarantine_link);
+	activation->quarantine_ref_count = 0;
 	activation->job = job;
 	activation->selected_hw = NULL;
 	activation->slot_state = RK_MPP_ACTIVATION_UNINSTALLED;
@@ -1288,12 +1322,32 @@ rk_mpp_activation_storage_released(const struct rk_mpp_activation *activation)
 		       !activation->closure.group.status &&
 		       activation->closure.group.result.quiesced &&
 		       activation->closure.core.valid;
+	if (activation->slot_state == RK_MPP_ACTIVATION_RETIRED)
+		return activation->transition_reason >
+			       RK_MPP_TRANSITION_NONE &&
+		       activation->transition_reason <
+			       RK_MPP_TRANSITION_RETRY_REPLACED &&
+		       activation->closure.state ==
+			       RK_MPP_ACTIVATION_CLOSURE_RETIRED &&
+		       ((activation->closure.terminal_scope ==
+			 RK_MPP_ACTIVATION_RETIREMENT_CORE &&
+			 activation->closure.terminal.valid &&
+			 !activation->closure.terminal.status &&
+			 activation->closure.terminal.result.quiesced) ||
+			(activation->closure.terminal_scope ==
+			 RK_MPP_ACTIVATION_RETIREMENT_CCU_GROUP &&
+			 activation->closure.group.valid &&
+			 !activation->closure.group.status &&
+			 activation->closure.group.result.quiesced &&
+			 activation->closure.core.valid));
 
+	/* Clean IRQ and pre-doorbell paths retain the Phase-3G legacy boundary. */
 	return rk_mpp_activation_closure_pristine(activation) &&
 	       activation->slot_state == RK_MPP_ACTIVATION_CLAIMED &&
-	       activation->transition_reason > RK_MPP_TRANSITION_NONE &&
-	       activation->transition_reason <
-		       RK_MPP_TRANSITION_RETRY_REPLACED;
+	       (activation->transition_reason ==
+			RK_MPP_TRANSITION_START_FAILURE ||
+		activation->transition_reason == RK_MPP_TRANSITION_IRQ ||
+		activation->transition_reason == RK_MPP_TRANSITION_CCU_DONE);
 }
 
 static bool rk_mpp_job_activation_storage_released(struct rk_mpp_job *job)
@@ -1378,11 +1432,15 @@ static struct rk_mpp_activation *
 rk_mpp_hw_claim_active_locked(struct rk_mpp_hw *hw,
 			      struct rk_mpp_activation *match,
 			      u64 generation,
-			      enum rk_mpp_activation_transition_reason reason)
+			      enum rk_mpp_activation_transition_reason reason,
+			      struct rk_mpp_activation_claim_token *token)
 {
 	struct rk_mpp_activation *activation;
 
 	lockdep_assert_held(&hw->lock);
+	if (!token || token->activation || token->generation || token->reason ||
+	    token->owns_job_ref)
+		return NULL;
 	if (reason <= RK_MPP_TRANSITION_NONE ||
 	    reason >= RK_MPP_TRANSITION_COUNT ||
 	    reason == RK_MPP_TRANSITION_RETRY_REPLACED)
@@ -1405,14 +1463,23 @@ rk_mpp_hw_claim_active_locked(struct rk_mpp_hw *hw,
 	activation->slot_state = RK_MPP_ACTIVATION_CLAIMED;
 	activation->transition_reason = reason;
 	hw->active_activation = NULL;
+	token->activation = activation;
+	token->generation = activation->generation;
+	token->reason = reason;
+	token->owns_job_ref = true;
 
 	return activation;
 }
 
 static bool rk_mpp_hw_restore_active_locked(struct rk_mpp_hw *hw,
-					    struct rk_mpp_activation *activation)
+					    struct rk_mpp_activation_claim_token *token)
 {
+	struct rk_mpp_activation *activation;
+
 	lockdep_assert_held(&hw->lock);
+	if (!token || !token->owns_job_ref)
+		return false;
+	activation = token->activation;
 	if (WARN_ON_ONCE(activation &&
 			 (!activation->job ||
 			  activation->job->current_activation != activation ||
@@ -1423,13 +1490,15 @@ static bool rk_mpp_hw_restore_active_locked(struct rk_mpp_hw *hw,
 		return false;
 	if (WARN_ON_ONCE(!activation || activation->slot_state !=
 			 RK_MPP_ACTIVATION_CLAIMED ||
-			 activation->transition_reason ==
-			 RK_MPP_TRANSITION_NONE))
+			 activation->transition_reason != token->reason ||
+			 activation->generation != token->generation ||
+			 token->reason == RK_MPP_TRANSITION_NONE))
 		return false;
 
 	activation->slot_state = RK_MPP_ACTIVATION_SLOTTED;
 	activation->transition_reason = RK_MPP_TRANSITION_NONE;
 	hw->active_activation = activation;
+	memset(token, 0, sizeof(*token));
 
 	return true;
 }
@@ -1462,20 +1531,22 @@ static int rk_mpp_job_queue_current_locked(struct rk_mpp_job *job);
 static struct rk_mpp_job *
 rk_mpp_hw_take_active_job(struct rk_mpp_hw *hw,
 			  enum rk_mpp_activation_transition_reason reason,
-			  u32 *irq_status);
+			  u32 *irq_status,
+			  struct rk_mpp_activation_claim_token *token);
 static struct rk_mpp_job *
 rk_mpp_hw_take_irq_job(struct rk_mpp_hw *hw, u32 *irq_status,
-		       bool *fault_pending);
+		       bool *fault_pending,
+		       struct rk_mpp_activation_claim_token *token);
 static bool rk_mpp_hw_take_active_if(struct rk_mpp_hw *hw,
 				     struct rk_mpp_job *match,
-				     u32 *irq_status);
+				     u32 *irq_status,
+				     struct rk_mpp_activation_claim_token *token);
 static void rk_mpp_hw_timeout_work(struct work_struct *work);
 static void rk_mpp_hw_iommu_fault_work(struct work_struct *work);
 static bool rk_mpp_hw_mark_iommu_fault(struct rk_mpp_hw *hw);
 static struct rk_mpp_job *
-rk_mpp_hw_take_iommu_fault_job(struct rk_mpp_hw *hw, bool *consumed);
-static bool rk_mpp_hw_restore_iommu_fault_job(struct rk_mpp_hw *hw,
-					      struct rk_mpp_job *job);
+rk_mpp_hw_take_iommu_fault_job(struct rk_mpp_hw *hw, bool *consumed,
+			       struct rk_mpp_activation_claim_token *token);
 static void rk_mpp_hw_cancel_timeout(struct rk_mpp_hw *hw);
 static void rk_mpp_hw_cancel_timeout_sync(struct rk_mpp_hw *hw);
 static void rk_mpp_hw_schedule_timeout(struct rk_mpp_hw *hw);
@@ -1536,10 +1607,13 @@ rk_mpp_rkvdec2_reset_soft_ccu_job(struct rk_mpp_job *job,
 static int rk_mpp_rkvdec2_publish_and_start_core(struct rk_mpp_job *job,
 						 u64 generation,
 						 u32 start_value);
-static int rk_mpp_hw_abort_ccu_dependents(struct rk_mpp_hw *ccu);
+static int
+rk_mpp_hw_abort_ccu_dependents(struct rk_mpp_hw *ccu,
+			       const struct rk_mpp_cluster_recovery_result *group);
 static void
 rk_mpp_hw_abort_ccu_active_dependents(struct rk_mpp_hw *ccu,
-				      struct rk_mpp_hw *skip, int result);
+				      struct rk_mpp_hw *skip, int result,
+				      const struct rk_mpp_cluster_recovery_result *group);
 static bool rk_mpp_job_rkvenc_slice_mode(struct rk_mpp_job *job);
 static void rk_mpp_job_rkvenc_fixup_slice_flush(struct rk_mpp_job *job);
 static bool rk_mpp_job_rkvenc_slice_ready(struct rk_mpp_job *job);
@@ -1583,6 +1657,7 @@ static void rk_mpp_service_state_init(struct rk_mpp_service *srv)
 	mutex_init(&srv->hw_lock);
 	mutex_init(&srv->dma_group_lock);
 	mutex_init(&srv->sched_lock);
+	mutex_init(&srv->quarantine_lock);
 	mutex_init(&srv->rkvenc_dchs_lifecycle_lock);
 	spin_lock_init(&srv->fault_lock);
 	spin_lock_init(&srv->rkvenc_dchs_lock);
@@ -1596,6 +1671,7 @@ static void rk_mpp_service_state_init(struct rk_mpp_service *srv)
 	INIT_LIST_HEAD(&srv->dma_groups);
 	INIT_LIST_HEAD(&srv->fault_hws);
 	INIT_LIST_HEAD(&srv->queued_jobs);
+	INIT_LIST_HEAD(&srv->quarantined_activations);
 	INIT_WORK(&srv->sched_work, rk_mpp_scheduler_work);
 }
 
@@ -5127,7 +5203,24 @@ static bool
 rk_mpp_hw_take_active_if_generation(struct rk_mpp_hw *hw,
 				    struct rk_mpp_activation *match,
 				    u64 generation,
-				    u32 *irq_status);
+				    u32 *irq_status,
+				    struct rk_mpp_activation_claim_token *token);
+static bool
+rk_mpp_activation_finish_terminal(struct rk_mpp_hw *hw,
+				  struct rk_mpp_hw *ccu,
+				  struct rk_mpp_activation_claim_token *token,
+				  int core_status,
+				  const struct rk_mpp_cluster_recovery_result *core,
+				  int group_status,
+				  const struct rk_mpp_cluster_recovery_result *group);
+static bool
+rk_mpp_hw_restore_or_quarantine(struct rk_mpp_hw *hw,
+				struct rk_mpp_hw *ccu,
+				struct rk_mpp_activation_claim_token *token,
+	bool force_iommu_fault, int status,
+	const struct rk_mpp_cluster_recovery_result *result);
+static bool
+rk_mpp_activation_claim_put(struct rk_mpp_activation_claim_token *token);
 static u32 rk_mpp_rkvenc2_advance_bs_write(u32 write, u32 top, u32 bottom);
 static bool rk_mpp_rkvenc2_irq_needs_reset(u32 irq_status);
 static u32 rk_mpp_rkvdec2_decoded_length(u32 dec_get, u32 stream_addr);
@@ -8083,6 +8176,8 @@ static void rk_mpp_hw_take_active_if_kunit(struct kunit *test)
 	struct rk_mpp_job *job1;
 	struct rk_mpp_activation *active;
 	struct rk_mpp_activation *claimed;
+	struct rk_mpp_activation_claim_token claim = {};
+	struct rk_mpp_activation_claim_token other_claim = {};
 	unsigned long flags;
 	bool collision_restored;
 	bool restored;
@@ -8129,7 +8224,7 @@ static void rk_mpp_hw_take_active_if_kunit(struct kunit *test)
 	hw.irq_status = 0x1234;
 
 	KUNIT_EXPECT_FALSE(test, rk_mpp_hw_take_active_if(&hw, job1,
-							  &irq_status));
+							  &irq_status, &claim));
 	KUNIT_EXPECT_PTR_EQ(test, hw.active_activation, job0->current_activation);
 	KUNIT_EXPECT_EQ(test, irq_status, 0U);
 	KUNIT_EXPECT_EQ(test, hw.irq_status, 0x1234U);
@@ -8141,12 +8236,12 @@ static void rk_mpp_hw_take_active_if_kunit(struct kunit *test)
 			RK_MPP_TRANSITION_NONE);
 	spin_lock_irqsave(&hw.lock, flags);
 	claimed = rk_mpp_hw_claim_active_locked(&hw, active, generation,
-						RK_MPP_TRANSITION_NONE);
+						RK_MPP_TRANSITION_NONE, &claim);
 	spin_unlock_irqrestore(&hw.lock, flags);
 	KUNIT_EXPECT_PTR_EQ(test, claimed, NULL);
 	spin_lock_irqsave(&hw.lock, flags);
 	claimed = rk_mpp_hw_claim_active_locked(&hw, active, generation,
-						RK_MPP_TRANSITION_COUNT);
+						RK_MPP_TRANSITION_COUNT, &claim);
 	spin_unlock_irqrestore(&hw.lock, flags);
 	KUNIT_EXPECT_PTR_EQ(test, claimed, NULL);
 	KUNIT_EXPECT_PTR_EQ(test, hw.active_activation, active);
@@ -8160,7 +8255,8 @@ static void rk_mpp_hw_take_active_if_kunit(struct kunit *test)
 	hw.iommu_fault_pending = true;
 	for (i = 0; i < ARRAY_SIZE(blocked); i++) {
 		spin_lock_irqsave(&hw.lock, flags);
-		claimed = rk_mpp_hw_claim_active_locked(&hw, active, generation, blocked[i]);
+		claimed = rk_mpp_hw_claim_active_locked(&hw, active, generation,
+							blocked[i], &claim);
 		spin_unlock_irqrestore(&hw.lock, flags);
 		KUNIT_EXPECT_PTR_EQ(test, claimed, NULL);
 		KUNIT_EXPECT_PTR_EQ(test, hw.active_activation,
@@ -8174,7 +8270,8 @@ static void rk_mpp_hw_take_active_if_kunit(struct kunit *test)
 	}
 	for (i = 0; i < ARRAY_SIZE(allowed); i++) {
 		spin_lock_irqsave(&hw.lock, flags);
-		claimed = rk_mpp_hw_claim_active_locked(&hw, active, generation, allowed[i]);
+		claimed = rk_mpp_hw_claim_active_locked(&hw, active, generation,
+							allowed[i], &claim);
 		spin_unlock_irqrestore(&hw.lock, flags);
 		KUNIT_ASSERT_PTR_EQ(test, claimed, job0->current_activation);
 		KUNIT_EXPECT_EQ(test, job0->current_activation->slot_state,
@@ -8183,14 +8280,14 @@ static void rk_mpp_hw_take_active_if_kunit(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, job0->current_activation->transition_reason,
 				(enum rk_mpp_activation_transition_reason)allowed[i]);
 		spin_lock_irqsave(&hw.lock, flags);
-		restored = rk_mpp_hw_restore_active_locked(&hw, active);
+		restored = rk_mpp_hw_restore_active_locked(&hw, &claim);
 		spin_unlock_irqrestore(&hw.lock, flags);
 		KUNIT_ASSERT_TRUE(test, restored);
 	}
 	hw.iommu_fault_pending = false;
 
 	KUNIT_EXPECT_TRUE(test, rk_mpp_hw_take_active_if(&hw, job0,
-							 &irq_status));
+							 &irq_status, &claim));
 	KUNIT_EXPECT_PTR_EQ(test, hw.active_activation, NULL);
 	KUNIT_EXPECT_EQ(test, irq_status, 0x1234U);
 	KUNIT_EXPECT_EQ(test, hw.irq_status, 0U);
@@ -8203,14 +8300,17 @@ static void rk_mpp_hw_take_active_if_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test,
 			  rk_mpp_activation_storage_released(job0->current_activation));
 
+	refcount_set(&job1->refs, 1);
+	rk_mpp_job_get(job1);
 	spin_lock_irqsave(&hw.lock, flags);
 	refused_generation = rk_mpp_hw_install_active_locked(&hw, job0);
 	refused_sequence = hw.activation_generation_seq;
 	rk_mpp_hw_install_active_locked(&hw, job1);
 	collision_restored =
-		rk_mpp_hw_restore_active_locked(&hw, job0->current_activation);
+		rk_mpp_hw_restore_active_locked(&hw, &claim);
 	claimed = rk_mpp_hw_claim_active_locked(&hw, job1->current_activation, 0,
-						RK_MPP_TRANSITION_REMOVE);
+						RK_MPP_TRANSITION_START_FAILURE,
+						&other_claim);
 	spin_unlock_irqrestore(&hw.lock, flags);
 	KUNIT_EXPECT_EQ(test, refused_generation, 0ULL);
 	KUNIT_EXPECT_EQ(test, refused_sequence, 1ULL);
@@ -8224,7 +8324,7 @@ static void rk_mpp_hw_take_active_if_kunit(struct kunit *test)
 			RK_MPP_TRANSITION_CCU_DONE);
 
 	spin_lock_irqsave(&hw.lock, flags);
-	restored = rk_mpp_hw_restore_active_locked(&hw, job0->current_activation);
+	restored = rk_mpp_hw_restore_active_locked(&hw, &claim);
 	spin_unlock_irqrestore(&hw.lock, flags);
 	KUNIT_ASSERT_TRUE(test, restored);
 	KUNIT_EXPECT_PTR_EQ(test, hw.active_activation, job0->current_activation);
@@ -8237,10 +8337,237 @@ static void rk_mpp_hw_take_active_if_kunit(struct kunit *test)
 			RK_MPP_TRANSITION_NONE);
 	KUNIT_EXPECT_FALSE(test,
 			   rk_mpp_activation_storage_released(job0->current_activation));
+	KUNIT_EXPECT_TRUE(test, rk_mpp_activation_claim_put(&other_claim));
+	KUNIT_EXPECT_EQ(test, refcount_read(&job1->refs), 1);
+}
+
+static void rk_mpp_activation_recovered_terminal_kunit(struct kunit *test)
+{
+	struct rk_mpp_activation_claim_token claim = {};
+	struct rk_mpp_activation_claim_token cleanup_claim = {};
+	struct rk_mpp_activation_claim_token group_claim = {};
+	struct rk_mpp_activation_claim_token quarantine_claim = {};
+	struct rk_mpp_cluster_recovery_result core = {
+		.reset_effect = RK_MPP_RESET_TERMINALLY_ISOLATED,
+		.quiesced = true,
+	};
+	struct rk_mpp_cluster_recovery_result group = {
+		.reset_effect = RK_MPP_RESET_TERMINALLY_ISOLATED,
+		.quiesced = true,
+	};
+	struct rk_mpp_cluster_recovery_result bad_group = {};
+	struct rk_mpp_cluster_recovery_result unproved = {};
+	struct rk_mpp_cluster *cluster;
+	struct rk_mpp_service *srv;
+	struct rk_mpp_session *session;
+	struct rk_mpp_hw *ccu;
+	struct rk_mpp_hw *hw;
+	struct device *ccu_dev;
+	struct device *hw_dev;
+	struct rk_mpp_job *job;
+	struct rk_mpp_job *group_job;
+	struct rk_mpp_job *quarantined_job;
+	struct rk_mpp_job *occupant;
+	struct rk_mpp_job *claimed_job;
+	struct rk_mpp_activation *quarantined_activation;
+	unsigned long flags;
+	bool finished;
+	bool quarantine_linked;
+	bool storage_released;
+	bool restored;
+	int ret;
+	u64 generation;
+
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
+	session = kunit_kzalloc(test, sizeof(*session), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, session);
+	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
+	ccu = kunit_kzalloc(test, sizeof(*ccu), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ccu);
+	ccu_dev = kunit_kzalloc(test, sizeof(*ccu_dev), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ccu_dev);
+	hw_dev = kunit_kzalloc(test, sizeof(*hw_dev), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw_dev);
+	cluster = kunit_kzalloc(test, sizeof(*cluster), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, cluster);
+	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+	group_job = kunit_kzalloc(test, sizeof(*group_job), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, group_job);
+	quarantined_job = kunit_kzalloc(test, sizeof(*quarantined_job),
+					GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, quarantined_job);
+	occupant = kunit_kzalloc(test, sizeof(*occupant), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, occupant);
+
+	device_initialize(hw_dev);
+	hw_dev->init_name = "kunit-phase3h-core";
+	hw_dev->release = rk_mpp_kunit_device_release;
+	ret = kunit_add_action_or_reset(test, rk_mpp_kunit_put_device, hw_dev);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	device_initialize(ccu_dev);
+	ccu_dev->init_name = "kunit-phase3h-ccu";
+	ccu_dev->release = rk_mpp_kunit_device_release;
+	ret = kunit_add_action_or_reset(test, rk_mpp_kunit_put_device, ccu_dev);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	rk_mpp_service_state_init(srv);
+	session->srv = srv;
+	mutex_init(&session->lock);
+	hw->srv = srv;
+	hw->match = &rk_mpp_rkvenc2_core;
+	hw->dev = hw_dev;
+	hw->online = true;
+	spin_lock_init(&hw->lock);
+	mutex_init(&hw->run_lock);
+	ccu->srv = srv;
+	ccu->match = &rk_mpp_rkvdec2_ccu;
+	ccu->dev = ccu_dev;
+	ccu->online = true;
+	mutex_init(&ccu->ccu_recovery_lock);
+	WRITE_ONCE(hw->cluster, cluster);
+	WRITE_ONCE(ccu->cluster, cluster);
+
+	job->session = session;
+	refcount_set(&job->refs, 1);
+	rk_mpp_activation_init(job);
+	job->current_activation->selected_hw = hw;
+	spin_lock_irqsave(&hw->lock, flags);
+	generation = rk_mpp_hw_install_active_locked(hw, job);
+	spin_unlock_irqrestore(&hw->lock, flags);
+	KUNIT_ASSERT_NE(test, generation, 0ULL);
+	rk_mpp_job_get(job);
+	mutex_lock(&hw->run_lock);
+	claimed_job = rk_mpp_hw_take_active_job(hw, RK_MPP_TRANSITION_TIMEOUT,
+						NULL, &claim);
+	KUNIT_ASSERT_PTR_EQ(test, claimed_job, job);
+	KUNIT_EXPECT_PTR_EQ(test, claim.activation, job->current_activation);
+	KUNIT_EXPECT_EQ(test, claim.generation, generation);
+	KUNIT_EXPECT_TRUE(test, claim.owns_job_ref);
+	KUNIT_EXPECT_EQ(test, refcount_read(&job->refs), 2);
+	finished = rk_mpp_activation_finish_terminal(hw, NULL, &claim, 0,
+						     &core, 0, NULL);
+	KUNIT_ASSERT_TRUE(test, finished);
+	KUNIT_EXPECT_EQ(test, job->current_activation->slot_state,
+			(enum rk_mpp_activation_slot_state)
+			RK_MPP_ACTIVATION_RETIRED);
+	KUNIT_EXPECT_EQ(test, job->current_activation->closure.terminal_scope,
+			(enum rk_mpp_activation_retirement_scope)
+			RK_MPP_ACTIVATION_RETIREMENT_CORE);
+	KUNIT_ASSERT_TRUE(test, rk_mpp_activation_claim_put(&claim));
+	KUNIT_EXPECT_EQ(test, refcount_read(&job->refs), 1);
+
+	group_job->session = session;
+	group_job->rkvdec_ccu = ccu;
+	refcount_set(&group_job->refs, 1);
+	rk_mpp_activation_init(group_job);
+	group_job->current_activation->selected_hw = hw;
+	spin_lock_irqsave(&hw->lock, flags);
+	generation = rk_mpp_hw_install_active_locked(hw, group_job);
+	spin_unlock_irqrestore(&hw->lock, flags);
+	KUNIT_ASSERT_NE(test, generation, 0ULL);
+	rk_mpp_job_get(group_job);
+	claimed_job = rk_mpp_hw_take_active_job(hw, RK_MPP_TRANSITION_REMOVE,
+						NULL, &group_claim);
+	KUNIT_ASSERT_PTR_EQ(test, claimed_job, group_job);
+	mutex_lock(&ccu->ccu_recovery_lock);
+	finished = rk_mpp_activation_finish_terminal(hw, ccu, &group_claim, 0,
+						     &core, 0, &bad_group);
+	KUNIT_EXPECT_FALSE(test, finished);
+	KUNIT_EXPECT_EQ(test, group_job->current_activation->slot_state,
+			(enum rk_mpp_activation_slot_state)
+			RK_MPP_ACTIVATION_CLAIMED);
+	finished = rk_mpp_activation_finish_terminal(hw, ccu, &group_claim,
+						     -EIO, &unproved, 0,
+						     &group);
+	KUNIT_ASSERT_TRUE(test, finished);
+	mutex_unlock(&ccu->ccu_recovery_lock);
+	KUNIT_EXPECT_EQ(test, group_job->current_activation->closure.terminal_scope,
+			(enum rk_mpp_activation_retirement_scope)
+			RK_MPP_ACTIVATION_RETIREMENT_CCU_GROUP);
+	KUNIT_EXPECT_TRUE(test,
+			  group_job->current_activation->closure.group.valid);
+	KUNIT_EXPECT_TRUE(test,
+			  group_job->current_activation->closure.core.valid);
+	KUNIT_ASSERT_TRUE(test, rk_mpp_activation_claim_put(&group_claim));
+	KUNIT_EXPECT_EQ(test, refcount_read(&group_job->refs), 1);
+
+	quarantined_job->session = session;
+	quarantined_job->rkvdec_ccu = ccu;
+	refcount_set(&quarantined_job->refs, 1);
+	rk_mpp_activation_init(quarantined_job);
+	quarantined_job->current_activation->selected_hw = hw;
+	spin_lock_irqsave(&hw->lock, flags);
+	generation = rk_mpp_hw_install_active_locked(hw, quarantined_job);
+	spin_unlock_irqrestore(&hw->lock, flags);
+	KUNIT_ASSERT_NE(test, generation, 0ULL);
+	rk_mpp_job_get(quarantined_job);
+	quarantined_activation = quarantined_job->current_activation;
+	session->rkvdec_dispatch_owner = quarantined_activation;
+	claimed_job = rk_mpp_hw_take_active_job(hw, RK_MPP_TRANSITION_SHUTDOWN,
+						NULL, &quarantine_claim);
+	KUNIT_ASSERT_PTR_EQ(test, claimed_job, quarantined_job);
+	occupant->session = session;
+	refcount_set(&occupant->refs, 2);
+	rk_mpp_activation_init(occupant);
+	occupant->current_activation->selected_hw = hw;
+	spin_lock_irqsave(&hw->lock, flags);
+	generation = rk_mpp_hw_install_active_locked(hw, occupant);
+	spin_unlock_irqrestore(&hw->lock, flags);
+	KUNIT_ASSERT_NE(test, generation, 0ULL);
+	finished = rk_mpp_activation_finish_terminal(hw, NULL, &quarantine_claim,
+						     0, &core, 0, NULL);
+	KUNIT_EXPECT_FALSE(test, finished);
+	quarantined_activation->generation++;
+	quarantined_activation->slot_state = RK_MPP_ACTIVATION_UNINSTALLED;
+	quarantined_activation->transition_reason = RK_MPP_TRANSITION_NONE;
+	restored = rk_mpp_hw_restore_or_quarantine(hw, ccu, &quarantine_claim,
+						   false, -EIO, &bad_group);
+	KUNIT_EXPECT_FALSE(test, restored);
+	KUNIT_EXPECT_PTR_EQ(test, quarantine_claim.activation, NULL);
+	KUNIT_EXPECT_EQ(test, quarantined_activation->slot_state,
+			(enum rk_mpp_activation_slot_state)
+			RK_MPP_ACTIVATION_QUARANTINED);
+	quarantine_linked =
+		!list_empty(&quarantined_activation->quarantine_link);
+	KUNIT_EXPECT_TRUE(test, quarantine_linked);
+	KUNIT_EXPECT_EQ(test, quarantined_activation->quarantine_ref_count, 1U);
+	KUNIT_EXPECT_EQ(test, quarantined_activation->closure.terminal_scope,
+			(enum rk_mpp_activation_retirement_scope)
+			RK_MPP_ACTIVATION_RETIREMENT_CCU_GROUP);
+	KUNIT_EXPECT_TRUE(test, quarantined_activation->closure.group.valid);
+	storage_released =
+		rk_mpp_activation_storage_released(quarantined_activation);
+	KUNIT_EXPECT_FALSE(test, storage_released);
+	KUNIT_EXPECT_PTR_EQ(test, session->rkvdec_dispatch_owner,
+			    quarantined_activation);
+	KUNIT_EXPECT_TRUE(test, hw->recovery_failed);
+	KUNIT_EXPECT_TRUE(test, ccu->recovery_failed);
+	KUNIT_EXPECT_FALSE(test, rk_mpp_hw_usable(hw));
+	KUNIT_EXPECT_EQ(test, atomic_read(&srv->quarantine_count), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&quarantined_job->refs), 2);
+	claimed_job = rk_mpp_hw_take_active_job(hw,
+						RK_MPP_TRANSITION_START_FAILURE,
+						NULL, &cleanup_claim);
+	KUNIT_EXPECT_PTR_EQ(test, claimed_job, occupant);
+	mutex_unlock(&hw->run_lock);
+	KUNIT_ASSERT_TRUE(test, rk_mpp_activation_claim_put(&cleanup_claim));
+	KUNIT_EXPECT_EQ(test, refcount_read(&occupant->refs), 1);
+
+	mutex_lock(&srv->quarantine_lock);
+	list_del_init(&quarantined_activation->quarantine_link);
+	quarantined_activation->quarantine_ref_count--;
+	atomic_dec(&srv->quarantine_count);
+	mutex_unlock(&srv->quarantine_lock);
+	rk_mpp_job_put(quarantined_job);
+	KUNIT_EXPECT_EQ(test, refcount_read(&quarantined_job->refs), 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&srv->quarantine_count), 0);
 }
 
 static void rk_mpp_hw_take_spurious_irq_kunit(struct kunit *test)
 {
+	struct rk_mpp_activation_claim_token claim = {};
 	struct rk_mpp_hw hw = {};
 	u32 irq_status = 0;
 
@@ -8251,7 +8578,7 @@ static void rk_mpp_hw_take_spurious_irq_kunit(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test,
 			    rk_mpp_hw_take_active_job(&hw,
 						      RK_MPP_TRANSITION_REMOVE,
-						      &irq_status),
+						      &irq_status, &claim),
 			    NULL);
 	KUNIT_EXPECT_EQ(test, irq_status, 0x1234U);
 	KUNIT_EXPECT_EQ(test, hw.irq_status, 0U);
@@ -8333,6 +8660,8 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	struct rk_mpp_activation *successor2;
 	struct rk_mpp_activation_retry_token token = {};
 	struct rk_mpp_activation_retry_token token2 = {};
+	struct rk_mpp_activation_claim_token fault_claim = {};
+	struct rk_mpp_activation_claim_token timeout_claim = {};
 	struct rk_mpp_cluster_recovery_result *group;
 	struct rk_mpp_cluster_recovery_result *bad_group;
 	struct rk_mpp_cluster_recovery_result *core;
@@ -8513,16 +8842,25 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, hw->irq_status, 0U);
 	KUNIT_EXPECT_FALSE(test, hw->iommu_fault_pending);
 	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 0ULL);
-	taken = rk_mpp_hw_take_active_if_generation(hw, initial, 7, NULL);
+	taken = rk_mpp_hw_take_active_if_generation(hw, initial, 7, NULL,
+						    &timeout_claim);
 	KUNIT_EXPECT_FALSE(test, taken);
 	KUNIT_EXPECT_PTR_EQ(test, hw->active_activation, successor);
 	marked = rk_mpp_hw_mark_iommu_fault(hw);
 	KUNIT_EXPECT_TRUE(test, marked);
 	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 8ULL);
-	fault_job = rk_mpp_hw_take_iommu_fault_job(hw, &consumed);
+	fault_job = rk_mpp_hw_take_iommu_fault_job(hw, &consumed,
+						   &fault_claim);
 	KUNIT_EXPECT_TRUE(test, consumed);
 	KUNIT_EXPECT_PTR_EQ(test, fault_job, job0);
-	restored = rk_mpp_hw_restore_iommu_fault_job(hw, job0);
+	spin_lock_irqsave(&hw->lock, flags);
+	restored = rk_mpp_hw_restore_active_locked(hw, &fault_claim);
+	if (restored) {
+		hw->iommu_fault_pending = true;
+		hw->iommu_fault_generation =
+			rk_mpp_hw_active_generation_locked(hw);
+	}
+	spin_unlock_irqrestore(&hw->lock, flags);
 	KUNIT_EXPECT_TRUE(test, restored);
 	token.generation = 6;
 	finished = rk_mpp_activation_finish_retry(hw, &token, 0, core);
@@ -8603,13 +8941,21 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 
 static void rk_mpp_iommu_fault_generation_kunit(struct kunit *test)
 {
+	struct rk_mpp_activation_claim_token fault_claim = {};
+	struct rk_mpp_activation_claim_token irq_claim = {};
+	struct rk_mpp_cluster_recovery_result recovery = {
+		.reset_effect = RK_MPP_RESET_TERMINALLY_ISOLATED,
+		.quiesced = true,
+	};
 	struct rk_mpp_hw *hw;
 	struct rk_mpp_job *target;
 	struct rk_mpp_job *replacement;
 	struct rk_mpp_job *taken;
 	bool consumed = false;
 	bool fault_pending = false;
+	bool finished;
 	bool queued;
+	bool restored;
 	u32 irq_status = 0;
 	int ret;
 
@@ -8630,6 +8976,8 @@ static void rk_mpp_iommu_fault_generation_kunit(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, ret, 0);
 
 	rk_mpp_activation_init(target);
+	refcount_set(&target->refs, 2);
+	target->current_activation->selected_hw = hw;
 	hw->active_activation = target->current_activation;
 	target->current_activation->slot_state = RK_MPP_ACTIVATION_SLOTTED;
 	target->current_activation->generation = 1;
@@ -8637,13 +8985,14 @@ static void rk_mpp_iommu_fault_generation_kunit(struct kunit *test)
 	KUNIT_ASSERT_TRUE(test, rk_mpp_hw_mark_iommu_fault(hw));
 	KUNIT_EXPECT_TRUE(test, hw->iommu_fault_pending);
 	KUNIT_EXPECT_FALSE(test, rk_mpp_hw_mark_iommu_fault(hw));
-	taken = rk_mpp_hw_take_irq_job(hw, &irq_status, &fault_pending);
+	taken = rk_mpp_hw_take_irq_job(hw, &irq_status, &fault_pending,
+				       &irq_claim);
 	KUNIT_EXPECT_PTR_EQ(test, taken, NULL);
 	KUNIT_EXPECT_TRUE(test, fault_pending);
 	KUNIT_EXPECT_PTR_EQ(test, hw->active_activation, target->current_activation);
 	KUNIT_EXPECT_EQ(test, hw->irq_status, 0x1234U);
 	KUNIT_EXPECT_FALSE(test, rk_mpp_hw_is_idle(hw));
-	taken = rk_mpp_hw_take_iommu_fault_job(hw, &consumed);
+	taken = rk_mpp_hw_take_iommu_fault_job(hw, &consumed, &fault_claim);
 	KUNIT_EXPECT_TRUE(test, consumed);
 	KUNIT_EXPECT_PTR_EQ(test, taken, target);
 	KUNIT_EXPECT_PTR_EQ(test, hw->active_activation, NULL);
@@ -8655,8 +9004,15 @@ static void rk_mpp_iommu_fault_generation_kunit(struct kunit *test)
 			RK_MPP_TRANSITION_IOMMU_FAULT);
 	KUNIT_EXPECT_FALSE(test, hw->iommu_fault_pending);
 	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 0ULL);
-	KUNIT_ASSERT_TRUE(test,
-			  rk_mpp_hw_restore_iommu_fault_job(hw, target));
+	spin_lock_irq(&hw->lock);
+	restored = rk_mpp_hw_restore_active_locked(hw, &fault_claim);
+	if (restored) {
+		hw->iommu_fault_pending = true;
+		hw->iommu_fault_generation =
+			rk_mpp_hw_active_generation_locked(hw);
+	}
+	spin_unlock_irq(&hw->lock);
+	KUNIT_ASSERT_TRUE(test, restored);
 	KUNIT_EXPECT_PTR_EQ(test, hw->active_activation, target->current_activation);
 	KUNIT_EXPECT_EQ(test, target->current_activation->slot_state,
 			(enum rk_mpp_activation_slot_state)
@@ -8666,12 +9022,20 @@ static void rk_mpp_iommu_fault_generation_kunit(struct kunit *test)
 			RK_MPP_TRANSITION_NONE);
 	KUNIT_EXPECT_TRUE(test, hw->iommu_fault_pending);
 	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 1ULL);
-	taken = rk_mpp_hw_take_irq_job(hw, &irq_status, &fault_pending);
+	taken = rk_mpp_hw_take_irq_job(hw, &irq_status, &fault_pending,
+				       &irq_claim);
 	KUNIT_EXPECT_PTR_EQ(test, taken, NULL);
 	KUNIT_EXPECT_TRUE(test, fault_pending);
-	taken = rk_mpp_hw_take_iommu_fault_job(hw, &consumed);
+	taken = rk_mpp_hw_take_iommu_fault_job(hw, &consumed, &fault_claim);
 	KUNIT_EXPECT_TRUE(test, consumed);
 	KUNIT_EXPECT_PTR_EQ(test, taken, target);
+	mutex_lock(&hw->run_lock);
+	finished = rk_mpp_activation_finish_terminal(hw, NULL, &fault_claim, 0,
+						     &recovery, 0, NULL);
+	KUNIT_ASSERT_TRUE(test, finished);
+	mutex_unlock(&hw->run_lock);
+	KUNIT_ASSERT_TRUE(test, rk_mpp_activation_claim_put(&fault_claim));
+	KUNIT_EXPECT_EQ(test, refcount_read(&target->refs), 1);
 
 	hw->iommu_provider = RK_MPP_IOMMU_VSI;
 	KUNIT_ASSERT_TRUE(test, rk_mpp_hw_mark_iommu_fault(hw));
@@ -8679,7 +9043,7 @@ static void rk_mpp_iommu_fault_generation_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 0ULL);
 	KUNIT_EXPECT_FALSE(test, rk_mpp_hw_is_idle(hw));
 	KUNIT_EXPECT_FALSE(test, rk_mpp_hw_mark_iommu_fault(hw));
-	taken = rk_mpp_hw_take_iommu_fault_job(hw, &consumed);
+	taken = rk_mpp_hw_take_iommu_fault_job(hw, &consumed, &irq_claim);
 	KUNIT_EXPECT_TRUE(test, consumed);
 	KUNIT_EXPECT_PTR_EQ(test, taken, NULL);
 	KUNIT_EXPECT_FALSE(test, hw->iommu_fault_pending);
@@ -8966,7 +9330,7 @@ static void rk_mpp_hw_abort_ccu_dependents_kunit(struct kunit *test)
 
 	core0->recovery_failed = true;
 	mutex_lock(&ccu->ccu_recovery_lock);
-	rk_mpp_hw_abort_ccu_active_dependents(ccu, core0, -EIO);
+	rk_mpp_hw_abort_ccu_active_dependents(ccu, core0, -EIO, NULL);
 	cancel_work_sync(&srv->sched_work);
 	core0->recovery_failed = false;
 
@@ -8979,7 +9343,7 @@ static void rk_mpp_hw_abort_ccu_dependents_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&active->refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&core1->refs), 1);
 
-	ret = rk_mpp_hw_abort_ccu_dependents(ccu);
+	ret = rk_mpp_hw_abort_ccu_dependents(ccu, NULL);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 	mutex_unlock(&ccu->ccu_recovery_lock);
 	flush_work(&srv->sched_work);
@@ -9230,6 +9594,8 @@ static void rk_mpp_scheduler_skips_recovery_failed_kunit(struct kunit *test)
 
 static void rk_mpp_scheduler_session_start_order_kunit(struct kunit *test)
 {
+	struct rk_mpp_activation_claim_token active_claim = {};
+	struct rk_mpp_activation_claim_token job1_claim = {};
 	struct rk_mpp_service *srv;
 	struct rk_mpp_session *session_a;
 	struct rk_mpp_session *session_b;
@@ -9267,6 +9633,7 @@ static void rk_mpp_scheduler_session_start_order_kunit(struct kunit *test)
 	session_b->client_type = RK_MPP_DEVICE_RKVDEC;
 	busy_hw->online = true;
 	rk_mpp_activation_init(active);
+	refcount_set(&active->refs, 2);
 	busy_hw->active_activation = active->current_activation;
 	active->current_activation->slot_state = RK_MPP_ACTIVATION_SLOTTED;
 	idle_hw->online = true;
@@ -9323,9 +9690,12 @@ static void rk_mpp_scheduler_session_start_order_kunit(struct kunit *test)
 	 */
 	spin_lock_irqsave(&busy_hw->lock, flags);
 	claimed = rk_mpp_hw_claim_active_locked(busy_hw, active->current_activation,
-						0, RK_MPP_TRANSITION_REMOVE);
+						0, RK_MPP_TRANSITION_START_FAILURE,
+						&active_claim);
 	spin_unlock_irqrestore(&busy_hw->lock, flags);
 	KUNIT_ASSERT_PTR_EQ(test, claimed, active->current_activation);
+	KUNIT_ASSERT_TRUE(test, rk_mpp_activation_claim_put(&active_claim));
+	KUNIT_EXPECT_EQ(test, refcount_read(&active->refs), 1);
 	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_scheduler_take_job(srv), job1);
 	KUNIT_EXPECT_PTR_EQ(test, session_a->rkvdec_dispatch_owner,
 			    job1->current_activation);
@@ -9337,6 +9707,7 @@ static void rk_mpp_scheduler_session_start_order_kunit(struct kunit *test)
 			    job1->current_activation);
 	busy_hw->active_activation = job1->current_activation;
 	job1->current_activation->slot_state = RK_MPP_ACTIVATION_SLOTTED;
+	refcount_set(&job1->refs, 2);
 	list_add_tail(&other->sched_link, &srv->queued_jobs);
 	atomic_inc(&idle_hw->queued_job_count);
 	atomic_inc(&srv->queued_job_count);
@@ -9349,9 +9720,12 @@ static void rk_mpp_scheduler_session_start_order_kunit(struct kunit *test)
 
 	spin_lock_irqsave(&busy_hw->lock, flags);
 	claimed = rk_mpp_hw_claim_active_locked(busy_hw, job1->current_activation,
-						0, RK_MPP_TRANSITION_IRQ);
+						0, RK_MPP_TRANSITION_IRQ,
+						&job1_claim);
 	spin_unlock_irqrestore(&busy_hw->lock, flags);
 	KUNIT_ASSERT_PTR_EQ(test, claimed, job1->current_activation);
+	KUNIT_ASSERT_TRUE(test, rk_mpp_activation_claim_put(&job1_claim));
+	KUNIT_EXPECT_EQ(test, refcount_read(&job1->refs), 1);
 	rk_mpp_scheduler_release_session(job1);
 	KUNIT_EXPECT_PTR_EQ(test, session_a->rkvdec_dispatch_owner, NULL);
 	KUNIT_EXPECT_TRUE(test, rk_mpp_dispatch_lease_released(job1));
@@ -12428,6 +12802,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_rkvdec2_fixed_rcb_link_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_cache_config_kunit),
 	KUNIT_CASE(rk_mpp_hw_take_active_if_kunit),
+	KUNIT_CASE(rk_mpp_activation_recovered_terminal_kunit),
 	KUNIT_CASE(rk_mpp_hw_take_spurious_irq_kunit),
 	KUNIT_CASE(rk_mpp_irq_register_lease_kunit),
 	KUNIT_CASE(rk_mpp_hw_prepare_active_retry_kunit),
@@ -15694,18 +16069,234 @@ static int rk_mpp_hw_begin_active_job(struct rk_mpp_hw *hw,
 	return ret;
 }
 
+static struct rk_mpp_job *
+rk_mpp_activation_claim_job(const struct rk_mpp_activation_claim_token *token)
+{
+	if (!token || !token->owns_job_ref || !token->activation)
+		return NULL;
+
+	return token->activation->job;
+}
+
+static bool
+rk_mpp_activation_claim_put(struct rk_mpp_activation_claim_token *token)
+{
+	struct rk_mpp_activation *activation;
+	struct rk_mpp_job *job;
+
+	if (!token || !token->owns_job_ref)
+		return false;
+	activation = token->activation;
+	job = rk_mpp_activation_claim_job(token);
+	if (!job || activation->generation != token->generation ||
+	    activation->transition_reason != token->reason ||
+	    !rk_mpp_activation_storage_released(activation))
+		return false;
+
+	memset(token, 0, sizeof(*token));
+	rk_mpp_job_put(job);
+
+	return true;
+}
+
+static bool
+rk_mpp_activation_finish_terminal_locked(struct rk_mpp_hw *hw,
+					 struct rk_mpp_hw *ccu,
+	struct rk_mpp_activation_claim_token *token, int core_status,
+	const struct rk_mpp_cluster_recovery_result *core, int group_status,
+	const struct rk_mpp_cluster_recovery_result *group)
+{
+	struct rk_mpp_activation *activation;
+	struct rk_mpp_job *job;
+	bool group_scope = !!group;
+
+	lockdep_assert_held(&hw->run_lock);
+	lockdep_assert_held(&hw->lock);
+	if (!token || !token->owns_job_ref || !token->activation || !core)
+		return false;
+	activation = token->activation;
+	job = activation->job;
+	if (!job || activation != READ_ONCE(job->current_activation) ||
+	    activation->selected_hw != hw || list_empty(&activation->job_link) ||
+	    activation->generation != token->generation ||
+	    activation->transition_reason != token->reason ||
+	    activation->slot_state != RK_MPP_ACTIVATION_CLAIMED ||
+	    !rk_mpp_activation_closure_pristine(activation) ||
+	    hw->active_activation)
+		return false;
+	if (group_scope) {
+		if (!ccu || group_status || !group->quiesced ||
+		    job->rkvdec_ccu != ccu || READ_ONCE(hw->cluster) !=
+						 READ_ONCE(ccu->cluster))
+			return false;
+		lockdep_assert_held(&ccu->ccu_recovery_lock);
+		activation->closure.group.result = *group;
+		activation->closure.group.status = group_status;
+		activation->closure.group.valid = true;
+		activation->closure.core.result = *core;
+		activation->closure.core.status = core_status;
+		activation->closure.core.valid = true;
+		activation->closure.terminal_scope =
+			RK_MPP_ACTIVATION_RETIREMENT_CCU_GROUP;
+	} else {
+		if (core_status || !core->quiesced)
+			return false;
+		activation->closure.terminal.result = *core;
+		activation->closure.terminal.status = core_status;
+		activation->closure.terminal.valid = true;
+		activation->closure.terminal_scope =
+			RK_MPP_ACTIVATION_RETIREMENT_CORE;
+	}
+	activation->closure.state = RK_MPP_ACTIVATION_CLOSURE_RETIRED;
+	activation->slot_state = RK_MPP_ACTIVATION_RETIRED;
+
+	return true;
+}
+
+static bool
+rk_mpp_activation_finish_terminal(struct rk_mpp_hw *hw,
+				  struct rk_mpp_hw *ccu,
+				  struct rk_mpp_activation_claim_token *token,
+				  int core_status,
+				  const struct rk_mpp_cluster_recovery_result *core,
+				  int group_status,
+				  const struct rk_mpp_cluster_recovery_result *group)
+{
+	unsigned long flags;
+	bool finished;
+
+	lockdep_assert_held(&hw->run_lock);
+	spin_lock_irqsave(&hw->lock, flags);
+	finished = rk_mpp_activation_finish_terminal_locked(hw, ccu, token,
+							    core_status, core,
+							    group_status, group);
+	spin_unlock_irqrestore(&hw->lock, flags);
+
+	return finished;
+}
+
+static bool
+rk_mpp_activation_claim_quarantine(struct rk_mpp_hw *hw,
+				   struct rk_mpp_hw *ccu,
+				   struct rk_mpp_activation_claim_token *token,
+				   int status,
+				   const struct rk_mpp_cluster_recovery_result *result)
+{
+	struct rk_mpp_activation *activation;
+	struct rk_mpp_job *job;
+	struct rk_mpp_hw *owned_ccu;
+	struct rk_mpp_service *srv = hw->srv;
+	unsigned long flags;
+	bool group_scope;
+
+	lockdep_assert_held(&hw->run_lock);
+	if (!token || !token->owns_job_ref || !token->activation ||
+	    !token->generation || token->reason <= RK_MPP_TRANSITION_NONE ||
+	    token->reason >= RK_MPP_TRANSITION_RETRY_REPLACED)
+		return false;
+	activation = token->activation;
+	job = activation->job;
+	if (!job || list_empty(&activation->job_link))
+		return false;
+	owned_ccu = job->rkvdec_ccu;
+	group_scope = ccu && ccu == owned_ccu &&
+		READ_ONCE(hw->cluster) == READ_ONCE(ccu->cluster);
+
+	mutex_lock(&srv->quarantine_lock);
+	spin_lock_irqsave(&hw->lock, flags);
+	if (rk_mpp_activation_closure_pristine(activation) && result) {
+		if (group_scope) {
+			activation->closure.group.result = *result;
+			activation->closure.group.status = status;
+			activation->closure.group.valid = true;
+			activation->closure.terminal_scope =
+				RK_MPP_ACTIVATION_RETIREMENT_CCU_GROUP;
+		} else {
+			activation->closure.terminal.result = *result;
+			activation->closure.terminal.status = status;
+			activation->closure.terminal.valid = true;
+			activation->closure.terminal_scope =
+				RK_MPP_ACTIVATION_RETIREMENT_CORE;
+		}
+	}
+	activation->closure.state = RK_MPP_ACTIVATION_CLOSURE_QUARANTINED;
+	activation->slot_state = RK_MPP_ACTIVATION_QUARANTINED;
+	activation->transition_reason = token->reason;
+	if (list_empty(&activation->quarantine_link)) {
+		list_add_tail(&activation->quarantine_link,
+			      &srv->quarantined_activations);
+		atomic_inc(&srv->quarantine_count);
+	}
+	activation->quarantine_ref_count++;
+	memset(token, 0, sizeof(*token));
+	spin_unlock_irqrestore(&hw->lock, flags);
+	mutex_unlock(&srv->quarantine_lock);
+
+	rk_mpp_hw_handle_reset_failure(hw, status ?: -EUCLEAN);
+	if (owned_ccu && owned_ccu != hw)
+		rk_mpp_hw_handle_reset_failure(owned_ccu,
+					       status ?: -EUCLEAN);
+
+	return true;
+}
+
+static bool
+rk_mpp_hw_restore_or_quarantine(struct rk_mpp_hw *hw,
+				struct rk_mpp_hw *ccu,
+				struct rk_mpp_activation_claim_token *token,
+				bool force_iommu_fault, int status,
+				const struct rk_mpp_cluster_recovery_result *result)
+{
+	unsigned long flags;
+	bool restored;
+
+	lockdep_assert_held(&hw->run_lock);
+	spin_lock_irqsave(&hw->lock, flags);
+	restored = rk_mpp_hw_restore_active_locked(hw, token);
+	if (restored) {
+		rk_mpp_hw_clear_irq_record_locked(hw);
+		if (force_iommu_fault)
+			hw->iommu_fault_pending = true;
+		if (hw->iommu_fault_pending)
+			hw->iommu_fault_generation =
+				rk_mpp_hw_active_generation_locked(hw);
+	}
+	spin_unlock_irqrestore(&hw->lock, flags);
+	if (restored)
+		return true;
+
+	WARN_ON_ONCE(!rk_mpp_activation_claim_quarantine(hw, ccu, token, status,
+							 result));
+	return false;
+}
+
+static bool
+rk_mpp_service_has_quarantined_activation(struct rk_mpp_service *srv)
+{
+	bool found;
+
+	mutex_lock(&srv->quarantine_lock);
+	found = !list_empty(&srv->quarantined_activations);
+	mutex_unlock(&srv->quarantine_lock);
+
+	return found;
+}
+
 static bool rk_mpp_hw_clear_active_job(struct rk_mpp_hw *hw,
 				       struct rk_mpp_job *job,
 				       enum rk_mpp_activation_transition_reason reason,
-				       u32 *irq_status)
+				       u32 *irq_status,
+				       struct rk_mpp_activation_claim_token *token)
 {
 	struct rk_mpp_activation *activation;
+	struct rk_mpp_activation_claim_token local = {};
+	struct rk_mpp_activation_claim_token *claim = token ?: &local;
 	unsigned long flags;
 	bool cleared = false;
 
 	spin_lock_irqsave(&hw->lock, flags);
 	activation = rk_mpp_hw_claim_active_locked(hw, job->current_activation, 0,
-						   reason);
+						   reason, claim);
 	if (activation) {
 		if (irq_status)
 			*irq_status = hw->irq_status;
@@ -15716,7 +16307,8 @@ static bool rk_mpp_hw_clear_active_job(struct rk_mpp_hw *hw,
 
 	if (cleared) {
 		rk_mpp_hw_cancel_timeout(hw);
-		rk_mpp_job_put(job);
+		if (!token)
+			WARN_ON_ONCE(!rk_mpp_activation_claim_put(claim));
 	}
 
 	return cleared;
@@ -15725,7 +16317,8 @@ static bool rk_mpp_hw_clear_active_job(struct rk_mpp_hw *hw,
 static struct rk_mpp_job *
 rk_mpp_hw_take_active_job(struct rk_mpp_hw *hw,
 			  enum rk_mpp_activation_transition_reason reason,
-			  u32 *irq_status)
+			  u32 *irq_status,
+			  struct rk_mpp_activation_claim_token *token)
 {
 	struct rk_mpp_activation *activation;
 	unsigned long flags;
@@ -15733,7 +16326,7 @@ rk_mpp_hw_take_active_job(struct rk_mpp_hw *hw,
 	spin_lock_irqsave(&hw->lock, flags);
 	if (irq_status)
 		*irq_status = hw->irq_status;
-	activation = rk_mpp_hw_claim_active_locked(hw, NULL, 0, reason);
+	activation = rk_mpp_hw_claim_active_locked(hw, NULL, 0, reason, token);
 	rk_mpp_hw_clear_irq_record_locked(hw);
 	spin_unlock_irqrestore(&hw->lock, flags);
 
@@ -15742,7 +16335,8 @@ rk_mpp_hw_take_active_job(struct rk_mpp_hw *hw,
 
 static struct rk_mpp_job *
 rk_mpp_hw_take_irq_job(struct rk_mpp_hw *hw, u32 *irq_status,
-		       bool *fault_pending)
+		       bool *fault_pending,
+		       struct rk_mpp_activation_claim_token *token)
 {
 	struct rk_mpp_activation *activation = NULL;
 	unsigned long regs_flags;
@@ -15759,7 +16353,8 @@ rk_mpp_hw_take_irq_job(struct rk_mpp_hw *hw, u32 *irq_status,
 			*irq_status = lease_current ? hw->irq_status : 0;
 		if (lease_current)
 			activation = rk_mpp_hw_claim_active_locked(hw, NULL, 0,
-								   RK_MPP_TRANSITION_IRQ);
+								   RK_MPP_TRANSITION_IRQ,
+								   token);
 		rk_mpp_hw_clear_irq_record_locked(hw);
 	}
 	spin_unlock_irqrestore(&hw->lock, flags);
@@ -15800,14 +16395,15 @@ rk_mpp_hw_peek_irq_job(struct rk_mpp_hw *hw, u32 *irq_status,
 
 static bool rk_mpp_hw_take_active_if(struct rk_mpp_hw *hw,
 				     struct rk_mpp_job *match,
-				     u32 *irq_status)
+				     u32 *irq_status,
+				     struct rk_mpp_activation_claim_token *token)
 {
 	unsigned long flags;
 	bool taken = false;
 
 	spin_lock_irqsave(&hw->lock, flags);
 	if (rk_mpp_hw_claim_active_locked(hw, match->current_activation, 0,
-					  RK_MPP_TRANSITION_CCU_DONE)) {
+					  RK_MPP_TRANSITION_CCU_DONE, token)) {
 		if (irq_status)
 			*irq_status = hw->irq_status;
 		rk_mpp_hw_clear_irq_record_locked(hw);
@@ -15822,7 +16418,8 @@ static bool
 rk_mpp_hw_take_active_if_generation(struct rk_mpp_hw *hw,
 				    struct rk_mpp_activation *match,
 				    u64 generation,
-				    u32 *irq_status)
+				    u32 *irq_status,
+				    struct rk_mpp_activation_claim_token *token)
 {
 	struct rk_mpp_activation *activation;
 	unsigned long flags;
@@ -15831,7 +16428,8 @@ rk_mpp_hw_take_active_if_generation(struct rk_mpp_hw *hw,
 	spin_lock_irqsave(&hw->lock, flags);
 	activation = generation ?
 		rk_mpp_hw_claim_active_locked(hw, match, generation,
-					      RK_MPP_TRANSITION_TIMEOUT) : NULL;
+					      RK_MPP_TRANSITION_TIMEOUT,
+					      token) : NULL;
 	if (generation && activation) {
 		if (irq_status)
 			*irq_status = hw->irq_status;
@@ -15841,40 +16439,6 @@ rk_mpp_hw_take_active_if_generation(struct rk_mpp_hw *hw,
 	spin_unlock_irqrestore(&hw->lock, flags);
 
 	return taken;
-}
-
-static bool __rk_mpp_hw_restore_active_job(struct rk_mpp_hw *hw,
-					   struct rk_mpp_job *job,
-					   bool force_iommu_fault)
-{
-	unsigned long flags;
-	bool restored = false;
-
-	spin_lock_irqsave(&hw->lock, flags);
-	if (rk_mpp_hw_restore_active_locked(hw, job->current_activation)) {
-		rk_mpp_hw_clear_irq_record_locked(hw);
-		if (force_iommu_fault)
-			hw->iommu_fault_pending = true;
-		if (hw->iommu_fault_pending)
-			hw->iommu_fault_generation =
-				rk_mpp_hw_active_generation_locked(hw);
-		restored = true;
-	}
-	spin_unlock_irqrestore(&hw->lock, flags);
-
-	return restored;
-}
-
-static bool rk_mpp_hw_restore_active_job(struct rk_mpp_hw *hw,
-					 struct rk_mpp_job *job)
-{
-	return __rk_mpp_hw_restore_active_job(hw, job, false);
-}
-
-static bool rk_mpp_hw_restore_iommu_fault_job(struct rk_mpp_hw *hw,
-					      struct rk_mpp_job *job)
-{
-	return __rk_mpp_hw_restore_active_job(hw, job, true);
 }
 
 static struct rk_mpp_activation *
@@ -15936,7 +16500,8 @@ static bool rk_mpp_hw_mark_iommu_fault(struct rk_mpp_hw *hw)
 }
 
 static struct rk_mpp_job *
-rk_mpp_hw_take_iommu_fault_job(struct rk_mpp_hw *hw, bool *consumed)
+rk_mpp_hw_take_iommu_fault_job(struct rk_mpp_hw *hw, bool *consumed,
+			       struct rk_mpp_activation_claim_token *token)
 {
 	struct rk_mpp_activation *activation = NULL;
 	unsigned long flags;
@@ -15950,7 +16515,8 @@ rk_mpp_hw_take_iommu_fault_job(struct rk_mpp_hw *hw, bool *consumed)
 	hw->iommu_fault_generation = 0;
 	if (generation)
 		activation = rk_mpp_hw_claim_active_locked(hw, NULL, generation,
-							   RK_MPP_TRANSITION_IOMMU_FAULT);
+							   RK_MPP_TRANSITION_IOMMU_FAULT,
+							   token);
 	if (activation)
 		rk_mpp_hw_clear_irq_record_locked(hw);
 	spin_unlock_irqrestore(&hw->lock, flags);
@@ -16369,6 +16935,23 @@ rk_mpp_hw_active_job_is(struct rk_mpp_hw *hw, const struct rk_mpp_job *match)
 	return active;
 }
 
+static bool
+rk_mpp_hw_job_is_quarantined(struct rk_mpp_hw *hw,
+			     const struct rk_mpp_job *job)
+{
+	struct rk_mpp_activation *activation;
+	unsigned long flags;
+	bool quarantined;
+
+	spin_lock_irqsave(&hw->lock, flags);
+	activation = READ_ONCE(job->current_activation);
+	quarantined = activation && activation->selected_hw == hw &&
+		activation->slot_state == RK_MPP_ACTIVATION_QUARANTINED;
+	spin_unlock_irqrestore(&hw->lock, flags);
+
+	return quarantined;
+}
+
 static struct rk_mpp_hw *
 rk_mpp_hw_get_active_ccu_if(struct rk_mpp_hw *hw,
 			    const struct rk_mpp_activation *match,
@@ -16425,6 +17008,7 @@ rk_mpp_hw_abort_job(struct rk_mpp_job *job,
 	struct rk_mpp_cluster_recovery_result recovery = {
 		.reusable = true,
 	};
+	struct rk_mpp_activation_claim_token claim = {};
 	struct rk_mpp_hw *ccu;
 	bool active_owned;
 	bool dchs_lifecycle_locked = false;
@@ -16446,6 +17030,8 @@ rk_mpp_hw_abort_job(struct rk_mpp_job *job,
 	mutex_lock(&hw->run_lock);
 	active_owned = rk_mpp_hw_active_job_is(hw, job);
 	if (!active_owned) {
+		if (rk_mpp_hw_job_is_quarantined(hw, job))
+			goto out_unlock_core;
 		dispatch_retired = true;
 		/*
 		 * The synchronous drain above had to run before run_lock (the
@@ -16472,7 +17058,8 @@ rk_mpp_hw_abort_job(struct rk_mpp_job *job,
 		if (ccu_stop_ret)
 			goto out_unlock_core;
 	}
-	if (active_owned && rk_mpp_hw_clear_active_job(hw, job, reason, NULL)) {
+	if (active_owned && rk_mpp_hw_clear_active_job(hw, job, reason, NULL,
+						       &claim)) {
 		dchs_lifecycle_locked =
 			rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
 		/*
@@ -16498,9 +17085,34 @@ rk_mpp_hw_abort_job(struct rk_mpp_job *job,
 			reset_ret =
 				rk_mpp_hw_stop_and_recover(hw, job, &recovery);
 		if (reset_ret) {
-			rk_mpp_job_get(job);
-			if (WARN_ON_ONCE(!rk_mpp_hw_restore_active_job(hw, job)))
-				rk_mpp_job_put(job);
+			rk_mpp_hw_restore_or_quarantine(hw,
+							hard_ccu_abort ? ccu : NULL,
+							&claim, false,
+					reset_ret, hard_ccu_abort ? &ccu_recovery :
+									 &recovery);
+			goto out_unlock_core;
+		}
+		if (hard_ccu_abort) {
+			if (WARN_ON_ONCE(!rk_mpp_activation_finish_terminal(hw,
+									    ccu, &claim,
+									 reset_ret,
+									 &recovery,
+									 ccu_stop_ret,
+									 &ccu_recovery))) {
+				rk_mpp_hw_restore_or_quarantine(hw, ccu, &claim,
+								false, -EUCLEAN,
+							     &ccu_recovery);
+				reset_ret = -EUCLEAN;
+				goto out_unlock_core;
+			}
+		} else if (WARN_ON_ONCE(!rk_mpp_activation_finish_terminal(hw,
+								      NULL, &claim,
+								      reset_ret,
+								      &recovery, 0,
+								      NULL))) {
+			rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, false,
+							-EUCLEAN, &recovery);
+			reset_ret = -EUCLEAN;
 			goto out_unlock_core;
 		}
 		dispatch_retired = true;
@@ -16512,6 +17124,7 @@ rk_mpp_hw_abort_job(struct rk_mpp_job *job,
 		 * own cleanup ownership after clearing the active activation.
 		 */
 		rk_mpp_rkvdec2_release_link_table(job);
+		WARN_ON_ONCE(!rk_mpp_activation_claim_put(&claim));
 		/*
 		 * Unlike IRQ completion, abort idles the core without going
 		 * through rk_mpp_job_complete(), so other sessions' queued
@@ -16541,7 +17154,7 @@ out_unlock_core:
 			ccu_stop_ret = rk_mpp_rkvdec2_force_stop_ccu(ccu, &ccu_recovery);
 			if (!ccu_stop_ret)
 				rk_mpp_hw_abort_ccu_active_dependents(
-					ccu, hw, -ECANCELED);
+					ccu, hw, -ECANCELED, &ccu_recovery);
 		}
 	}
 	if (ccu)
@@ -16922,6 +17535,7 @@ static u32 rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu)
 
 	while ((job = rk_mpp_cluster_first_done_job(cluster, ccu))) {
 		struct rk_mpp_hw *hw = rk_mpp_job_get_hw(job);
+		struct rk_mpp_activation_claim_token claim = {};
 		struct rk_mpp_cluster_recovery_result ccu_recovery;
 		struct rk_mpp_cluster_recovery_result recovery;
 		bool ccu_error;
@@ -16938,7 +17552,7 @@ static u32 rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu)
 		}
 		mutex_lock(&hw->run_lock);
 
-		if (!rk_mpp_hw_take_active_if(hw, job, &irq_status)) {
+		if (!rk_mpp_hw_take_active_if(hw, job, &irq_status, &claim)) {
 			mutex_unlock(&hw->run_lock);
 			rk_mpp_hw_put(hw);
 			rk_mpp_job_put(job);
@@ -16964,21 +17578,8 @@ static u32 rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu)
 			 * detached active reference back to the slot and retain
 			 * every resource that makes that descriptor valid.
 			 */
-			if (WARN_ON_ONCE(!rk_mpp_hw_restore_active_job(hw, job))) {
-				mutex_unlock(&hw->run_lock);
-				rk_mpp_hw_put(hw);
-				/*
-				 * The slot refused the reference, so this
-				 * iteration still owns both of them: the one
-				 * the done list handed over and the one
-				 * detached from the active slot. The path
-				 * below drops only one because a successful
-				 * restore takes the other back.
-				 */
-				rk_mpp_job_put(job);
-				rk_mpp_job_put(job);
-				break;
-			}
+			rk_mpp_hw_restore_or_quarantine(hw, ccu, &claim, false,
+							stop_ret, &ccu_recovery);
 			mutex_unlock(&hw->run_lock);
 			rk_mpp_job_put(job);
 			rk_mpp_hw_put(hw);
@@ -16990,6 +17591,20 @@ static u32 rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu)
 				rk_mpp_hw_stop_and_recover(hw, job, &recovery);
 		if (!ret)
 			ret = stop_ret ?: reset_ret;
+		if (ccu_error &&
+		    WARN_ON_ONCE(!rk_mpp_activation_finish_terminal(hw, ccu,
+								    &claim,
+								       reset_ret,
+								       &recovery,
+								       stop_ret,
+								       &ccu_recovery))) {
+			rk_mpp_hw_restore_or_quarantine(hw, ccu, &claim, false,
+							-EUCLEAN, &ccu_recovery);
+			mutex_unlock(&hw->run_lock);
+			rk_mpp_job_put(job);
+			rk_mpp_hw_put(hw);
+			break;
+		}
 		/*
 		 * The CCU can run a descriptor on a core other than its
 		 * software owner, so this proves the owner core drained; a
@@ -16999,11 +17614,12 @@ static u32 rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu)
 		rk_mpp_hw_power_off(hw);
 		rk_mpp_job_complete(job, ret);
 		mutex_unlock(&hw->run_lock);
-		rk_mpp_job_put(job);
+		WARN_ON_ONCE(!rk_mpp_activation_claim_put(&claim));
 		rk_mpp_job_put(job);
 		completed++;
 		if (ccu_error)
-			rk_mpp_hw_abort_ccu_active_dependents(ccu, hw, -EIO);
+			rk_mpp_hw_abort_ccu_active_dependents(ccu, hw, -EIO,
+							      &ccu_recovery);
 		rk_mpp_hw_put(hw);
 		if (ccu_error)
 			break;
@@ -17018,6 +17634,7 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 {
 	struct rk_mpp_job *timeout_job =
 		rk_mpp_activation_job(timeout_activation);
+	struct rk_mpp_activation_claim_token claim = {};
 	struct rk_mpp_job *job;
 	struct rk_mpp_hw *ccu = NULL;
 	struct rk_mpp_cluster_recovery_result ccu_recovery = {
@@ -17029,7 +17646,6 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 	bool hard_ccu_recovery;
 	bool dchs_lifecycle_locked = false;
 	bool fault_consumed = true;
-	bool restored;
 	bool ccu_done = false;
 	bool ccu_error = false;
 	int ccu_stop_ret = 0;
@@ -17052,10 +17668,12 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 		mutex_lock(&ccu->ccu_recovery_lock);
 	mutex_lock(&hw->run_lock);
 	if (iommu_fault)
-		job = rk_mpp_hw_take_iommu_fault_job(hw, &fault_consumed);
+		job = rk_mpp_hw_take_iommu_fault_job(hw, &fault_consumed,
+						     &claim);
 	else if (timeout_job &&
 		 rk_mpp_hw_take_active_if_generation(hw, timeout_activation,
-						     timeout_generation, NULL))
+						     timeout_generation, NULL,
+						     &claim))
 		job = timeout_job;
 	else
 		job = NULL;
@@ -17102,16 +17720,9 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 			 * storage if neither register polling nor reset asserted
 			 * that the shared engine is quiescent.
 			 */
-			restored = iommu_fault ?
-				rk_mpp_hw_restore_iommu_fault_job(hw, job) :
-				rk_mpp_hw_restore_active_job(hw, job);
-			if (WARN_ON_ONCE(!restored)) {
-				rk_mpp_hw_enable_irq(hw, irq_disabled);
-				mutex_unlock(&hw->run_lock);
-				mutex_unlock(&ccu->ccu_recovery_lock);
-				rk_mpp_hw_put(ccu);
-				return;
-			}
+			rk_mpp_hw_restore_or_quarantine(hw, ccu, &claim,
+							iommu_fault, ccu_stop_ret,
+						     &ccu_recovery);
 			rk_mpp_hw_handle_reset_failure(ccu, ccu_stop_ret);
 			rk_mpp_hw_enable_irq(hw, irq_disabled);
 			mutex_unlock(&hw->run_lock);
@@ -17161,19 +17772,8 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 	else
 		reset_ret = rk_mpp_hw_stop_and_recover(hw, job, &recovery);
 	if (reset_ret && !hard_ccu_recovery) {
-		restored = iommu_fault ?
-			rk_mpp_hw_restore_iommu_fault_job(hw, job) :
-			rk_mpp_hw_restore_active_job(hw, job);
-		if (WARN_ON_ONCE(!restored)) {
-			rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
-							     dchs_lifecycle_locked);
-			rk_mpp_hw_enable_irq(hw, irq_disabled);
-			mutex_unlock(&hw->run_lock);
-			if (ccu)
-				mutex_unlock(&ccu->ccu_recovery_lock);
-			rk_mpp_hw_put(ccu);
-			return;
-		}
+		rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, iommu_fault,
+						reset_ret, &recovery);
 		rk_mpp_hw_handle_reset_failure(hw, reset_ret);
 		rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
 						     dchs_lifecycle_locked);
@@ -17190,12 +17790,43 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 		dev_err_ratelimited(hw->dev,
 				    "IOMMU refresh failed after fault: %d\n",
 				    recovery.refresh_error);
+	if (hard_ccu_recovery) {
+		if (WARN_ON_ONCE(!rk_mpp_activation_finish_terminal(hw, ccu,
+								    &claim,
+								       reset_ret,
+								       &recovery,
+								       ccu_stop_ret,
+								       &ccu_recovery))) {
+			rk_mpp_hw_restore_or_quarantine(hw, ccu, &claim,
+							iommu_fault, -EUCLEAN,
+						     &ccu_recovery);
+			rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
+							     dchs_lifecycle_locked);
+			rk_mpp_hw_enable_irq(hw, irq_disabled);
+			mutex_unlock(&hw->run_lock);
+			mutex_unlock(&ccu->ccu_recovery_lock);
+			rk_mpp_hw_put(ccu);
+			return;
+		}
+	} else if (WARN_ON_ONCE(!rk_mpp_activation_finish_terminal(hw, NULL,
+			   &claim, reset_ret, &recovery, 0, NULL))) {
+		rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, iommu_fault,
+						-EUCLEAN, &recovery);
+		rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
+						     dchs_lifecycle_locked);
+		rk_mpp_hw_enable_irq(hw, irq_disabled);
+		mutex_unlock(&hw->run_lock);
+		if (ccu)
+			mutex_unlock(&ccu->ccu_recovery_lock);
+		rk_mpp_hw_put(ccu);
+		return;
+	}
 	rk_mpp_hw_power_off(hw);
 	rk_mpp_job_complete(job, result);
 	rk_mpp_rkvenc2_dchs_lifecycle_unlock(job, dchs_lifecycle_locked);
 	rk_mpp_hw_enable_irq(hw, irq_disabled);
 	mutex_unlock(&hw->run_lock);
-	rk_mpp_job_put(job);
+	WARN_ON_ONCE(!rk_mpp_activation_claim_put(&claim));
 	if (hard_ccu_recovery) {
 		int restart_ret = -EIO;
 
@@ -17211,7 +17842,7 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 			ccu_stop_ret = rk_mpp_rkvdec2_force_stop_ccu(ccu, &ccu_recovery);
 			if (!ccu_stop_ret)
 				rk_mpp_hw_abort_ccu_active_dependents(
-					ccu, hw, recovery_result);
+					ccu, hw, recovery_result, &ccu_recovery);
 		}
 	}
 	if (ccu)
@@ -17246,6 +17877,7 @@ static int
 rk_mpp_hw_abort_active(struct rk_mpp_hw *hw, int result,
 		       enum rk_mpp_activation_transition_reason reason)
 {
+	struct rk_mpp_activation_claim_token claim = {};
 	struct rk_mpp_job *job;
 	struct rk_mpp_cluster_recovery_result recovery;
 	bool dchs_lifecycle_locked;
@@ -17257,7 +17889,7 @@ rk_mpp_hw_abort_active(struct rk_mpp_hw *hw, int result,
 	rk_mpp_hw_synchronize_hardirq(hw);
 
 	mutex_lock(&hw->run_lock);
-	job = rk_mpp_hw_take_active_job(hw, reason, NULL);
+	job = rk_mpp_hw_take_active_job(hw, reason, NULL, &claim);
 	if (!job) {
 		rk_mpp_hw_enable_irq(hw, irq_disabled);
 		mutex_unlock(&hw->run_lock);
@@ -17267,30 +17899,31 @@ rk_mpp_hw_abort_active(struct rk_mpp_hw *hw, int result,
 	dchs_lifecycle_locked = rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
 	stop_ret = rk_mpp_hw_stop_and_recover(hw, job, &recovery);
 	if (stop_ret) {
-		bool restored = rk_mpp_hw_restore_active_job(hw, job);
-
-		WARN_ON_ONCE(!restored);
+		rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, false, stop_ret,
+						&recovery);
 		rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
 						     dchs_lifecycle_locked);
 		rk_mpp_hw_enable_irq(hw, irq_disabled);
 		mutex_unlock(&hw->run_lock);
-		/*
-		 * The slot takes the reference back on a successful restore.
-		 * When it refuses, this function still owns it, and a leaked
-		 * job pins its session, its hardware reference and every one
-		 * of its dma-buf attachments -- which then blocks remove()'s
-		 * wait_for_completion(&hw->released) forever.
-		 */
-		if (!restored)
-			rk_mpp_job_put(job);
 		return stop_ret;
+	}
+	if (WARN_ON_ONCE(!rk_mpp_activation_finish_terminal(hw, NULL, &claim,
+							    stop_ret, &recovery,
+							      0, NULL))) {
+		rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, false, -EUCLEAN,
+						&recovery);
+		rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
+						     dchs_lifecycle_locked);
+		rk_mpp_hw_enable_irq(hw, irq_disabled);
+		mutex_unlock(&hw->run_lock);
+		return -EUCLEAN;
 	}
 	rk_mpp_hw_power_off(hw);
 	rk_mpp_job_complete(job, result);
 	rk_mpp_rkvenc2_dchs_lifecycle_unlock(job, dchs_lifecycle_locked);
 	rk_mpp_hw_enable_irq(hw, irq_disabled);
 	mutex_unlock(&hw->run_lock);
-	rk_mpp_job_put(job);
+	WARN_ON_ONCE(!rk_mpp_activation_claim_put(&claim));
 
 	return 0;
 }
@@ -17303,9 +17936,12 @@ rk_mpp_hw_abort_active(struct rk_mpp_hw *hw, int result,
  */
 static int
 rk_mpp_hw_abort_active_recovery_locked(struct rk_mpp_hw *hw,
+				       struct rk_mpp_hw *ccu,
 				       int result,
-				       enum rk_mpp_activation_transition_reason reason)
+				       enum rk_mpp_activation_transition_reason reason,
+				       const struct rk_mpp_cluster_recovery_result *group)
 {
+	struct rk_mpp_activation_claim_token claim = {};
 	struct rk_mpp_job *job;
 	struct rk_mpp_cluster_recovery_result recovery;
 	/*
@@ -17330,7 +17966,7 @@ rk_mpp_hw_abort_active_recovery_locked(struct rk_mpp_hw *hw,
 	irq_disabled = rk_mpp_hw_disable_irq_nosync(hw);
 	rk_mpp_hw_synchronize_hardirq(hw);
 	mutex_lock(&hw->run_lock);
-	job = rk_mpp_hw_take_active_job(hw, reason, NULL);
+	job = rk_mpp_hw_take_active_job(hw, reason, NULL, &claim);
 	if (job) {
 		/*
 		 * Reset, power-off and completion are exactly the three
@@ -17343,16 +17979,21 @@ rk_mpp_hw_abort_active_recovery_locked(struct rk_mpp_hw *hw,
 		dchs_job = job;
 		stop_ret = rk_mpp_hw_stop_and_recover(hw, job, &recovery);
 		if (stop_ret) {
-			bool restored = rk_mpp_hw_restore_active_job(hw, job);
-
-			/*
-			 * A successful restore hands the reference back to the
-			 * slot; a failed one leaves us owning it, so it must
-			 * not be dropped on the floor.
-			 */
-			WARN_ON_ONCE(!restored);
-			if (restored)
-				job = NULL;
+			rk_mpp_hw_restore_or_quarantine(hw, group ? ccu : NULL,
+							&claim, false, stop_ret,
+						     group ? group : &recovery);
+			job = NULL;
+			goto out_unlock;
+		}
+		if (WARN_ON_ONCE(!rk_mpp_activation_finish_terminal(hw,
+								    group ? ccu : NULL,
+							 &claim, stop_ret,
+							 &recovery, 0, group))) {
+			rk_mpp_hw_restore_or_quarantine(hw, group ? ccu : NULL,
+							&claim, false, -EUCLEAN,
+						     group ? group : &recovery);
+			job = NULL;
+			stop_ret = -EUCLEAN;
 			goto out_unlock;
 		}
 		rk_mpp_hw_power_off(hw);
@@ -17362,7 +18003,8 @@ out_unlock:
 	rk_mpp_rkvenc2_dchs_lifecycle_unlock(dchs_job, dchs_lifecycle_locked);
 	rk_mpp_hw_enable_irq(hw, irq_disabled);
 	mutex_unlock(&hw->run_lock);
-	rk_mpp_job_put(job);
+	if (job)
+		WARN_ON_ONCE(!rk_mpp_activation_claim_put(&claim));
 
 	return stop_ret;
 }
@@ -17933,7 +18575,9 @@ rk_mpp_hw_collect_ccu_dependents(struct rk_mpp_hw *ccu,
 	return count;
 }
 
-static int rk_mpp_hw_abort_ccu_dependents(struct rk_mpp_hw *ccu)
+static int
+rk_mpp_hw_abort_ccu_dependents(struct rk_mpp_hw *ccu,
+			       const struct rk_mpp_cluster_recovery_result *group)
 {
 	struct rk_mpp_hw *deps[RK_MPP_CORE_COUNTER_COUNT];
 	u32 count;
@@ -17950,8 +18594,10 @@ static int rk_mpp_hw_abort_ccu_dependents(struct rk_mpp_hw *ccu)
 		rk_mpp_hw_abort_queued(deps[i], -ENODEV);
 		abort_ret =
 			rk_mpp_hw_abort_active_recovery_locked(deps[i],
+							       ccu,
 							       -ENODEV,
-							       RK_MPP_TRANSITION_REMOVE);
+							       RK_MPP_TRANSITION_REMOVE,
+							       group);
 		if (abort_ret && !ret)
 			ret = abort_ret;
 		rk_mpp_hw_put(deps[i]);
@@ -17962,7 +18608,8 @@ static int rk_mpp_hw_abort_ccu_dependents(struct rk_mpp_hw *ccu)
 
 static void
 rk_mpp_hw_abort_ccu_active_dependents(struct rk_mpp_hw *ccu,
-				      struct rk_mpp_hw *skip, int result)
+				      struct rk_mpp_hw *skip, int result,
+				      const struct rk_mpp_cluster_recovery_result *group)
 {
 	const enum rk_mpp_activation_transition_reason reason =
 		RK_MPP_TRANSITION_CCU_DEPENDENT_ABORT;
@@ -17976,7 +18623,8 @@ rk_mpp_hw_abort_ccu_active_dependents(struct rk_mpp_hw *ccu,
 
 	for (i = 0; i < count; i++) {
 		if (deps[i] != skip)
-			rk_mpp_hw_abort_active_recovery_locked(deps[i], result, reason);
+			rk_mpp_hw_abort_active_recovery_locked(deps[i], ccu,
+							       result, reason, group);
 		rk_mpp_hw_put(deps[i]);
 	}
 }
@@ -18689,7 +19337,7 @@ err_power_off:
 	rk_mpp_hw_synchronize_hardirq(hw);
 	rk_mpp_hw_power_off(hw);
 	rk_mpp_hw_clear_active_job(hw, job,
-				   RK_MPP_TRANSITION_START_FAILURE, NULL);
+				   RK_MPP_TRANSITION_START_FAILURE, NULL, NULL);
 	rk_mpp_hw_enable_irq(hw, irq_disabled);
 	rk_mpp_rkvenc2_dchs_lifecycle_unlock(job, dchs_lifecycle_locked);
 	mutex_unlock(&hw->run_lock);
@@ -18698,7 +19346,7 @@ err_clear_active:
 	irq_disabled = rk_mpp_hw_disable_irq_nosync(hw);
 	rk_mpp_hw_synchronize_hardirq(hw);
 	rk_mpp_hw_clear_active_job(hw, job,
-				   RK_MPP_TRANSITION_START_FAILURE, NULL);
+				   RK_MPP_TRANSITION_START_FAILURE, NULL, NULL);
 	rk_mpp_hw_enable_irq(hw, irq_disabled);
 err_unlock:
 	mutex_unlock(&hw->run_lock);
@@ -18896,6 +19544,7 @@ static void rk_mpp_rkvenc2_drain_int_status(struct rk_mpp_hw *hw)
 
 static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 {
+	struct rk_mpp_activation_claim_token claim = {};
 	struct rk_mpp_job *job;
 	struct rk_mpp_cluster_recovery_result recovery;
 	bool dchs_lifecycle_locked;
@@ -18937,7 +19586,7 @@ static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 		return IRQ_HANDLED;
 	}
 
-	job = rk_mpp_hw_take_irq_job(hw, NULL, &fault_pending);
+	job = rk_mpp_hw_take_irq_job(hw, NULL, &fault_pending, &claim);
 	if (!job) {
 		if (!fault_pending) {
 			atomic_inc(&hw->srv->spurious_irq_count);
@@ -18962,7 +19611,20 @@ static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 	if (rk_mpp_rkvenc2_irq_needs_reset(irq_status)) {
 		reset_ret = rk_mpp_hw_stop_and_recover(hw, job, &recovery);
 		if (reset_ret) {
-			WARN_ON_ONCE(!rk_mpp_hw_restore_active_job(hw, job));
+			rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, false,
+							reset_ret, &recovery);
+			rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
+							     dchs_lifecycle_locked);
+			mutex_unlock(&hw->run_lock);
+			return IRQ_HANDLED;
+		}
+		if (WARN_ON_ONCE(!rk_mpp_activation_finish_terminal(hw, NULL,
+								    &claim,
+								       reset_ret,
+								       &recovery, 0,
+								       NULL))) {
+			rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, false,
+							-EUCLEAN, &recovery);
 			rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
 							     dchs_lifecycle_locked);
 			mutex_unlock(&hw->run_lock);
@@ -18976,7 +19638,7 @@ static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 	rk_mpp_job_complete(job, ret);
 	rk_mpp_rkvenc2_dchs_lifecycle_unlock(job, dchs_lifecycle_locked);
 	mutex_unlock(&hw->run_lock);
-	rk_mpp_job_put(job);
+	WARN_ON_ONCE(!rk_mpp_activation_claim_put(&claim));
 
 	return IRQ_HANDLED;
 }
@@ -19151,7 +19813,7 @@ err_power_off:
 	rk_mpp_hw_power_off(hw);
 err_clear_active:
 	rk_mpp_hw_clear_active_job(hw, job,
-				   RK_MPP_TRANSITION_START_FAILURE, NULL);
+				   RK_MPP_TRANSITION_START_FAILURE, NULL, NULL);
 err_unlock:
 	/*
 	 * Resolve descriptor/CCU ownership before the active activation becomes
@@ -19280,6 +19942,7 @@ static irqreturn_t rk_mpp_rkvdec2_thread(struct rk_mpp_hw *hw)
 	const struct rk_mpp_rkvdec2_link_info *link_info =
 		&rk_mpp_rkvdec2_vdpu381_link_info;
 	struct rk_mpp_job *job;
+	struct rk_mpp_activation_claim_token claim = {};
 	struct rk_mpp_cluster_recovery_result recovery;
 	bool fault_pending = false;
 	u32 irq_status = 0;
@@ -19290,7 +19953,7 @@ static irqreturn_t rk_mpp_rkvdec2_thread(struct rk_mpp_hw *hw)
 		return rk_mpp_rkvdec2_hard_ccu_thread(hw);
 
 	mutex_lock(&hw->run_lock);
-	job = rk_mpp_hw_take_irq_job(hw, &irq_status, &fault_pending);
+	job = rk_mpp_hw_take_irq_job(hw, &irq_status, &fault_pending, &claim);
 	if (!job) {
 		if (fault_pending) {
 			mutex_unlock(&hw->run_lock);
@@ -19323,7 +19986,18 @@ static irqreturn_t rk_mpp_rkvdec2_thread(struct rk_mpp_hw *hw)
 	if (irq_status & link_info->err_mask) {
 		reset_ret = rk_mpp_rkvdec2_reset_soft_ccu_job(job, &recovery);
 		if (reset_ret) {
-			WARN_ON_ONCE(!rk_mpp_hw_restore_active_job(hw, job));
+			rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, false,
+							reset_ret, &recovery);
+			mutex_unlock(&hw->run_lock);
+			return IRQ_HANDLED;
+		}
+		if (WARN_ON_ONCE(!rk_mpp_activation_finish_terminal(hw, NULL,
+								    &claim,
+								       reset_ret,
+								       &recovery, 0,
+								       NULL))) {
+			rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, false,
+							-EUCLEAN, &recovery);
 			mutex_unlock(&hw->run_lock);
 			return IRQ_HANDLED;
 		}
@@ -19334,7 +20008,7 @@ static irqreturn_t rk_mpp_rkvdec2_thread(struct rk_mpp_hw *hw)
 	rk_mpp_hw_power_off(hw);
 	rk_mpp_job_complete(job, ret);
 	mutex_unlock(&hw->run_lock);
-	rk_mpp_job_put(job);
+	WARN_ON_ONCE(!rk_mpp_activation_claim_put(&claim));
 
 	return IRQ_HANDLED;
 }
@@ -19859,6 +20533,7 @@ static int rk_mpp_av1_validate(struct rk_mpp_job *job)
 
 static int rk_mpp_av1_submit(struct rk_mpp_job *job)
 {
+	struct rk_mpp_activation_claim_token claim = {};
 	struct rk_mpp_av1_afbc_config config;
 	struct rk_mpp_hw *hw = job->current_activation->selected_hw;
 	struct rk_mpp_cluster_recovery_result recovery;
@@ -19966,11 +20641,27 @@ err_power_off:
 			return 0;
 		}
 	}
-	rk_mpp_hw_power_off(hw);
-	if (active_owned)
+	if (active_owned) {
 		rk_mpp_hw_clear_active_job(hw, job,
 					   RK_MPP_TRANSITION_START_FAILURE,
-					   NULL);
+					   NULL, &claim);
+		if (start_failed_untrusted) {
+			if (WARN_ON_ONCE(!rk_mpp_activation_finish_terminal(hw, NULL,
+									    &claim,
+									 stop_ret,
+									 &recovery, 0,
+									 NULL))) {
+				rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, false,
+								-EUCLEAN, &recovery);
+				rk_mpp_hw_enable_irq(hw, irq_disabled);
+				mutex_unlock(&hw->run_lock);
+				return 0;
+			}
+		}
+	}
+	rk_mpp_hw_power_off(hw);
+	if (active_owned)
+		WARN_ON_ONCE(!rk_mpp_activation_claim_put(&claim));
 	rk_mpp_hw_enable_irq(hw, irq_disabled);
 	mutex_unlock(&hw->run_lock);
 	return ret;
@@ -20007,6 +20698,7 @@ rk_mpp_av1_irq(struct rk_mpp_hw *hw,
 static irqreturn_t rk_mpp_av1_thread(struct rk_mpp_hw *hw)
 {
 	struct rk_mpp_job *job;
+	struct rk_mpp_activation_claim_token claim = {};
 	struct rk_mpp_cluster_recovery_result recovery;
 	bool fault_pending = false;
 	u64 generation = 0;
@@ -20021,7 +20713,7 @@ static irqreturn_t rk_mpp_av1_thread(struct rk_mpp_hw *hw)
 	if (job && job->av1_afbc_enabled &&
 	    !(irq_status & RK_MPP_AV1_ERR_MASK))
 		rk_mpp_av1_observe_afbc_at_vcd(hw, generation);
-	job = rk_mpp_hw_take_irq_job(hw, &irq_status, &fault_pending);
+	job = rk_mpp_hw_take_irq_job(hw, &irq_status, &fault_pending, &claim);
 	if (!job) {
 		if (fault_pending) {
 			mutex_unlock(&hw->run_lock);
@@ -20054,7 +20746,18 @@ static irqreturn_t rk_mpp_av1_thread(struct rk_mpp_hw *hw)
 	if (irq_status & RK_MPP_AV1_ERR_MASK) {
 		reset_ret = rk_mpp_hw_stop_and_recover(hw, job, &recovery);
 		if (reset_ret) {
-			WARN_ON_ONCE(!rk_mpp_hw_restore_active_job(hw, job));
+			rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, false,
+							reset_ret, &recovery);
+			mutex_unlock(&hw->run_lock);
+			return IRQ_HANDLED;
+		}
+		if (WARN_ON_ONCE(!rk_mpp_activation_finish_terminal(hw, NULL,
+								    &claim,
+								       reset_ret,
+								       &recovery, 0,
+								       NULL))) {
+			rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, false,
+							-EUCLEAN, &recovery);
 			mutex_unlock(&hw->run_lock);
 			return IRQ_HANDLED;
 		}
@@ -20064,7 +20767,7 @@ static irqreturn_t rk_mpp_av1_thread(struct rk_mpp_hw *hw)
 	rk_mpp_hw_power_off(hw);
 	rk_mpp_job_complete(job, ret);
 	mutex_unlock(&hw->run_lock);
-	rk_mpp_job_put(job);
+	WARN_ON_ONCE(!rk_mpp_activation_claim_put(&claim));
 
 	return IRQ_HANDLED;
 }
@@ -21916,6 +22619,7 @@ static void rk_mpp_hw_remove(struct platform_device *pdev)
 	struct rk_mpp_cluster_recovery_result ccu_recovery;
 	bool ccu_was_online = false;
 	bool dma_unquiesced = false;
+	bool hard_ccu = false;
 	unsigned int stop_attempt = 0;
 	int stop_ret = 0;
 
@@ -21934,6 +22638,7 @@ static void rk_mpp_hw_remove(struct platform_device *pdev)
 		if (!ccu)
 			ccu = rk_mpp_hw_get_ccu_for_core(hw->srv, hw);
 	}
+	hard_ccu = ccu && rk_mpp_rkvdec2_hard_ccu_enabled(hw);
 retry_stop:
 	dma_unquiesced = false;
 	stop_ret = 0;
@@ -21949,10 +22654,12 @@ retry_stop:
 
 	if (ccu) {
 		mutex_lock(&ccu->ccu_recovery_lock);
-		if (rk_mpp_rkvdec2_hard_ccu_enabled(hw))
+		if (hard_ccu)
 			stop_ret = rk_mpp_rkvdec2_force_stop_ccu(ccu, &ccu_recovery);
 		if (!stop_ret)
-			stop_ret = rk_mpp_hw_abort_ccu_dependents(ccu);
+			stop_ret = rk_mpp_hw_abort_ccu_dependents(ccu,
+								  hard_ccu ? &ccu_recovery :
+								  NULL);
 		if (stop_ret) {
 			dma_unquiesced = true;
 			rk_mpp_hw_handle_reset_failure(hw, stop_ret);
@@ -21963,7 +22670,8 @@ retry_stop:
 		stop_ret =
 			rk_mpp_rkvdec2_force_stop_ccu(hw, &ccu_recovery);
 		if (!stop_ret)
-			stop_ret = rk_mpp_hw_abort_ccu_dependents(hw);
+			stop_ret = rk_mpp_hw_abort_ccu_dependents(hw,
+								  &ccu_recovery);
 		if (stop_ret)
 			dma_unquiesced = true;
 		mutex_unlock(&hw->ccu_recovery_lock);
@@ -21981,6 +22689,11 @@ retry_stop:
 	 * With online already false, no new submit can pass after this drain.
 	 */
 	rk_mpp_hw_cancel_timeout_sync(hw);
+	if (rk_mpp_service_has_quarantined_activation(hw->srv)) {
+		dma_unquiesced = true;
+		if (!stop_ret)
+			stop_ret = -EUCLEAN;
+	}
 	if (dma_unquiesced) {
 		if (!(stop_attempt++ % 10))
 			dev_crit(hw->dev,
@@ -22196,6 +22909,12 @@ retry_stop:
 	stop_ret = rk_mpp_hw_abort_active(hw, -ESHUTDOWN,
 					  RK_MPP_TRANSITION_SHUTDOWN);
 	rk_mpp_hw_cancel_timeout_sync(hw);
+	if (rk_mpp_service_has_quarantined_activation(hw->srv)) {
+		dev_crit(hw->dev,
+			 "shutdown retaining quarantined DMA ownership until reboot\n");
+		rk_mpp_hw_disable_irq(hw);
+		return;
+	}
 	if (stop_ret) {
 		if (!(stop_attempt++ % 10))
 			dev_crit(hw->dev,
@@ -22308,6 +23027,9 @@ static int rk_mpp_runtime_register(void)
 	debugfs_create_atomic_t("recovery_failure_count", 0444,
 				rk_mpp_srv.debugfs_root,
 				&rk_mpp_srv.recovery_failure_count);
+	debugfs_create_atomic_t("quarantine_count", 0444,
+				rk_mpp_srv.debugfs_root,
+				&rk_mpp_srv.quarantine_count);
 	debugfs_create_atomic_t("reset_deassert_contended_count", 0444,
 				rk_mpp_srv.debugfs_root,
 				&rk_mpp_srv.reset_deassert_contended_count);
