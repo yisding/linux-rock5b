@@ -256,6 +256,12 @@ enum rk_mpp_activation_slot_state {
 	RK_MPP_ACTIVATION_SUPERSEDED,
 };
 
+enum rk_mpp_activation_closure_state {
+	RK_MPP_ACTIVATION_CLOSURE_NONE,
+	RK_MPP_ACTIVATION_CLOSURE_PENDING,
+	RK_MPP_ACTIVATION_CLOSURE_RETIRED,
+};
+
 enum rk_mpp_activation_transition_reason {
 	RK_MPP_TRANSITION_NONE,
 	RK_MPP_TRANSITION_START_FAILURE,
@@ -486,6 +492,30 @@ struct rk_mpp_cluster_recovery_result {
 	bool reusable;
 };
 
+struct rk_mpp_activation_recovery_record {
+	struct rk_mpp_cluster_recovery_result result;
+	int status;
+	bool valid;
+};
+
+/*
+ * Immutable proof for a retry predecessor. The group record proves that the
+ * old HARD-CCU descriptor chain and its DMA translations are retired. The
+ * later per-core record decides whether the already-published successor may
+ * restart; its failure does not invalidate the earlier retirement proof.
+ */
+struct rk_mpp_activation_closure {
+	enum rk_mpp_activation_closure_state state;
+	struct rk_mpp_activation_recovery_record group;
+	struct rk_mpp_activation_recovery_record core;
+};
+
+/* Stack-local exact identity carried from retry publication to closure. */
+struct rk_mpp_activation_retry_token {
+	struct rk_mpp_activation *activation;
+	u64 generation;
+};
+
 /*
  * Stable construction-time view of one explicit CCU topology. The service
  * owns these slots and their OF-node references; hardware members only borrow
@@ -543,6 +573,7 @@ struct rk_mpp_activation {
 	u64 generation;
 	unsigned long watchdog_deadline;
 	bool watchdog_deadline_valid;
+	struct rk_mpp_activation_closure closure;
 };
 
 static struct rk_mpp_job *
@@ -1221,6 +1252,15 @@ rk_mpp_activation_storage_init(struct rk_mpp_activation *activation,
 	activation->generation = 0;
 	activation->watchdog_deadline = 0;
 	activation->watchdog_deadline_valid = false;
+	memset(&activation->closure, 0, sizeof(activation->closure));
+}
+
+static bool
+rk_mpp_activation_closure_pristine(const struct rk_mpp_activation *activation)
+{
+	return activation &&
+	       !memchr_inv(&activation->closure, 0,
+			    sizeof(activation->closure));
 }
 
 static void rk_mpp_activation_init(struct rk_mpp_job *job)
@@ -1237,12 +1277,20 @@ static bool
 rk_mpp_activation_storage_released(const struct rk_mpp_activation *activation)
 {
 	if (activation->slot_state == RK_MPP_ACTIVATION_UNINSTALLED)
-		return activation->transition_reason == RK_MPP_TRANSITION_NONE;
+		return activation->transition_reason == RK_MPP_TRANSITION_NONE &&
+		       rk_mpp_activation_closure_pristine(activation);
 	if (activation->slot_state == RK_MPP_ACTIVATION_SUPERSEDED)
 		return activation->transition_reason ==
-		       RK_MPP_TRANSITION_RETRY_REPLACED;
+			       RK_MPP_TRANSITION_RETRY_REPLACED &&
+		       activation->closure.state ==
+			       RK_MPP_ACTIVATION_CLOSURE_RETIRED &&
+		       activation->closure.group.valid &&
+		       !activation->closure.group.status &&
+		       activation->closure.group.result.quiesced &&
+		       activation->closure.core.valid;
 
-	return activation->slot_state == RK_MPP_ACTIVATION_CLAIMED &&
+	return rk_mpp_activation_closure_pristine(activation) &&
+	       activation->slot_state == RK_MPP_ACTIVATION_CLAIMED &&
 	       activation->transition_reason > RK_MPP_TRANSITION_NONE &&
 	       activation->transition_reason <
 		       RK_MPP_TRANSITION_RETRY_REPLACED;
@@ -1284,7 +1332,8 @@ rk_mpp_activation_install_locked(struct rk_mpp_hw *hw,
 	    activation->slot_state != RK_MPP_ACTIVATION_UNINSTALLED ||
 	    activation->transition_reason != RK_MPP_TRANSITION_NONE ||
 	    activation->generation || activation->watchdog_deadline ||
-	    activation->watchdog_deadline_valid)
+	    activation->watchdog_deadline_valid ||
+	    !rk_mpp_activation_closure_pristine(activation))
 		return 0;
 
 	generation = rk_mpp_hw_advance_active_generation_locked(hw);
@@ -1477,7 +1526,8 @@ static int
 rk_mpp_cluster_reset_group(struct rk_mpp_cluster_reset_request *request,
 			   struct rk_mpp_cluster_reset_result *result);
 static int
-rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(struct rk_mpp_hw *ccu);
+rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(struct rk_mpp_hw *ccu,
+					   const struct rk_mpp_cluster_recovery_result *group);
 static u32 rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu);
 static void rk_mpp_rkvdec2_wait_bus_idle(struct rk_mpp_hw *hw);
 static int
@@ -2796,6 +2846,7 @@ rk_mpp_activation_free_unpublished(struct rk_mpp_activation *activation)
 		     RK_MPP_ACTIVATION_UNINSTALLED);
 	WARN_ON_ONCE(activation->transition_reason !=
 		     RK_MPP_TRANSITION_NONE);
+	WARN_ON_ONCE(!rk_mpp_activation_closure_pristine(activation));
 	kfree(activation);
 }
 
@@ -5064,7 +5115,14 @@ static bool
 rk_mpp_hw_commit_active_retry(struct rk_mpp_hw *hw,
 			      struct rk_mpp_job *job,
 			      struct rk_mpp_activation *old,
-			      struct rk_mpp_activation *successor);
+			      struct rk_mpp_activation *successor,
+			      const struct rk_mpp_cluster_recovery_result *group,
+			      struct rk_mpp_activation_retry_token *token);
+static bool
+rk_mpp_activation_finish_retry(struct rk_mpp_hw *hw,
+			       struct rk_mpp_activation_retry_token *token,
+			       int status,
+			       const struct rk_mpp_cluster_recovery_result *core);
 static bool
 rk_mpp_hw_take_active_if_generation(struct rk_mpp_hw *hw,
 				    struct rk_mpp_activation *match,
@@ -8273,13 +8331,23 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	struct rk_mpp_activation *initial;
 	struct rk_mpp_activation *successor;
 	struct rk_mpp_activation *successor2;
+	struct rk_mpp_activation_retry_token token = {};
+	struct rk_mpp_activation_retry_token token2 = {};
+	struct rk_mpp_cluster_recovery_result *group;
+	struct rk_mpp_cluster_recovery_result *bad_group;
+	struct rk_mpp_cluster_recovery_result *core;
+	struct rk_mpp_cluster_recovery_result *core2;
 	struct rk_mpp_job *fault_job;
 	bool committed;
 	bool consumed;
+	bool finished;
 	bool marked;
 	bool ready;
+	bool released;
 	bool restored;
 	bool taken;
+	unsigned long flags;
+	u64 installed;
 
 	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, srv);
@@ -8291,6 +8359,29 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, job0);
 	job1 = kunit_kzalloc(test, sizeof(*job1), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, job1);
+	group = kunit_kzalloc(test, sizeof(*group), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, group);
+	bad_group = kunit_kzalloc(test, sizeof(*bad_group), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, bad_group);
+	core = kunit_kzalloc(test, sizeof(*core), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, core);
+	core2 = kunit_kzalloc(test, sizeof(*core2), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, core2);
+	group->reset_effect = RK_MPP_RESET_TRANSLATIONS_LOST;
+	group->reset_epoch = 41;
+	group->dma_group_count = 2;
+	group->dma_group_refresh_count = 2;
+	group->quiesced = true;
+	group->reusable = true;
+	*bad_group = *group;
+	bad_group->quiesced = false;
+	core->reset_effect = RK_MPP_RESET_TRANSLATIONS_LOST;
+	core->reset_epoch = 42;
+	core->quiesced = true;
+	core->reusable = true;
+	core2->reset_effect = RK_MPP_RESET_TERMINALLY_ISOLATED;
+	core2->reset_epoch = 43;
+	core2->quiesced = true;
 
 	spin_lock_init(&hw->lock);
 	raw_spin_lock_init(&hw->regs_lock);
@@ -8323,6 +8414,23 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	hw->irq_status = 0x1234;
 	hw->iommu_fault_pending = true;
 	hw->iommu_fault_generation = 7;
+	job1->current_activation->closure.state =
+		RK_MPP_ACTIVATION_CLOSURE_PENDING;
+	released = rk_mpp_activation_storage_released(job1->current_activation);
+	KUNIT_EXPECT_FALSE(test, released);
+	spin_lock_irqsave(&hw->lock, flags);
+	installed = rk_mpp_activation_install_locked(hw, job1->current_activation);
+	spin_unlock_irqrestore(&hw->lock, flags);
+	KUNIT_EXPECT_EQ(test, installed, 0ULL);
+	KUNIT_EXPECT_EQ(test, hw->activation_generation_seq, 7ULL);
+	job1->current_activation->slot_state = RK_MPP_ACTIVATION_CLAIMED;
+	job1->current_activation->transition_reason = RK_MPP_TRANSITION_IRQ;
+	released = rk_mpp_activation_storage_released(job1->current_activation);
+	KUNIT_EXPECT_FALSE(test, released);
+	job1->current_activation->slot_state = RK_MPP_ACTIVATION_UNINSTALLED;
+	job1->current_activation->transition_reason = RK_MPP_TRANSITION_NONE;
+	memset(&job1->current_activation->closure, 0,
+	       sizeof(job1->current_activation->closure));
 
 	mutex_lock(&hw->run_lock);
 	ready = rk_mpp_hw_active_retry_ready(hw, job1, job1->current_activation);
@@ -8346,7 +8454,29 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, job0->current_activation, initial);
 
 	committed = rk_mpp_hw_commit_active_retry(hw, job0, initial,
-						  successor);
+						  successor, bad_group,
+						  &token);
+	KUNIT_EXPECT_FALSE(test, committed);
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_activation, initial);
+	KUNIT_EXPECT_PTR_EQ(test, job0->current_activation, initial);
+	KUNIT_EXPECT_PTR_EQ(test, session.rkvdec_dispatch_owner, initial);
+	KUNIT_EXPECT_EQ(test, hw->activation_generation_seq, 7ULL);
+	KUNIT_EXPECT_PTR_EQ(test, token.activation, NULL);
+	KUNIT_EXPECT_EQ(test, token.generation, 0ULL);
+	bad_group->quiesced = true;
+	bad_group->reusable = false;
+	committed = rk_mpp_hw_commit_active_retry(hw, job0, initial,
+						  successor, bad_group,
+						  &token);
+	KUNIT_EXPECT_FALSE(test, committed);
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_activation, initial);
+	KUNIT_EXPECT_PTR_EQ(test, job0->current_activation, initial);
+	KUNIT_EXPECT_EQ(test, hw->activation_generation_seq, 7ULL);
+	KUNIT_EXPECT_PTR_EQ(test, token.activation, NULL);
+	KUNIT_EXPECT_EQ(test, token.generation, 0ULL);
+
+	committed = rk_mpp_hw_commit_active_retry(hw, job0, initial,
+						  successor, group, &token);
 	KUNIT_EXPECT_TRUE(test, committed);
 	KUNIT_EXPECT_PTR_EQ(test, hw->active_activation, successor);
 	KUNIT_EXPECT_PTR_EQ(test, job0->current_activation, successor);
@@ -8360,6 +8490,15 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, initial->transition_reason,
 			(enum rk_mpp_activation_transition_reason)
 			RK_MPP_TRANSITION_RETRY_REPLACED);
+	KUNIT_EXPECT_EQ(test, initial->closure.state,
+			(enum rk_mpp_activation_closure_state)
+			RK_MPP_ACTIVATION_CLOSURE_PENDING);
+	KUNIT_EXPECT_TRUE(test, initial->closure.group.valid);
+	KUNIT_EXPECT_EQ(test, initial->closure.group.result.reset_epoch, 41ULL);
+	KUNIT_EXPECT_PTR_EQ(test, token.activation, initial);
+	KUNIT_EXPECT_EQ(test, token.generation, 7ULL);
+	released = rk_mpp_activation_storage_released(initial);
+	KUNIT_EXPECT_FALSE(test, released);
 	KUNIT_EXPECT_EQ(test, successor->generation, 8ULL);
 	KUNIT_EXPECT_EQ(test, successor->slot_state,
 			(enum rk_mpp_activation_slot_state)
@@ -8385,10 +8524,37 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, fault_job, job0);
 	restored = rk_mpp_hw_restore_iommu_fault_job(hw, job0);
 	KUNIT_EXPECT_TRUE(test, restored);
+	token.generation = 6;
+	finished = rk_mpp_activation_finish_retry(hw, &token, 0, core);
+	KUNIT_EXPECT_FALSE(test, finished);
+	KUNIT_EXPECT_PTR_EQ(test, token.activation, initial);
+	KUNIT_EXPECT_EQ(test, token.generation, 6ULL);
+	KUNIT_EXPECT_EQ(test, initial->closure.state,
+			(enum rk_mpp_activation_closure_state)
+			RK_MPP_ACTIVATION_CLOSURE_PENDING);
+	KUNIT_EXPECT_FALSE(test, initial->closure.core.valid);
+	token.generation = 7;
+	finished = rk_mpp_activation_finish_retry(hw, &token, 0, core);
+	KUNIT_EXPECT_TRUE(test, finished);
+	KUNIT_EXPECT_PTR_EQ(test, token.activation, NULL);
+	KUNIT_EXPECT_EQ(test, token.generation, 0ULL);
+	KUNIT_EXPECT_EQ(test, initial->closure.state,
+			(enum rk_mpp_activation_closure_state)
+			RK_MPP_ACTIVATION_CLOSURE_RETIRED);
+	KUNIT_EXPECT_TRUE(test, initial->closure.core.valid);
+	KUNIT_EXPECT_EQ(test, initial->closure.core.result.reset_epoch, 42ULL);
+	released = rk_mpp_activation_storage_released(initial);
+	KUNIT_EXPECT_TRUE(test, released);
+	finished = rk_mpp_activation_finish_retry(hw, &token, -EIO, core2);
+	KUNIT_EXPECT_FALSE(test, finished);
+	KUNIT_EXPECT_EQ(test, initial->closure.core.status, 0);
+	KUNIT_EXPECT_EQ(test, initial->closure.core.result.reset_epoch, 42ULL);
 
 	committed = rk_mpp_hw_commit_active_retry(hw, job0, successor,
-						  successor2);
+						  successor2, group, &token2);
 	KUNIT_EXPECT_TRUE(test, committed);
+	finished = rk_mpp_activation_finish_retry(hw, &token2, -EIO, core2);
+	KUNIT_EXPECT_TRUE(test, finished);
 	mutex_unlock(&hw->run_lock);
 	KUNIT_EXPECT_PTR_NE(test, successor2, initial);
 	KUNIT_EXPECT_PTR_NE(test, successor2, successor);
@@ -8400,6 +8566,17 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, successor->transition_reason,
 			(enum rk_mpp_activation_transition_reason)
 			RK_MPP_TRANSITION_RETRY_REPLACED);
+	KUNIT_EXPECT_EQ(test, successor->closure.state,
+			(enum rk_mpp_activation_closure_state)
+			RK_MPP_ACTIVATION_CLOSURE_RETIRED);
+	KUNIT_EXPECT_EQ(test, successor->closure.group.result.reset_epoch,
+			41ULL);
+	KUNIT_EXPECT_TRUE(test, successor->closure.core.valid);
+	KUNIT_EXPECT_EQ(test, successor->closure.core.status, -EIO);
+	KUNIT_EXPECT_EQ(test, successor->closure.core.result.reset_epoch, 43ULL);
+	KUNIT_EXPECT_FALSE(test, successor->closure.core.result.reusable);
+	released = rk_mpp_activation_storage_released(successor);
+	KUNIT_EXPECT_TRUE(test, released);
 	KUNIT_EXPECT_EQ(test, successor2->generation, 9ULL);
 	KUNIT_EXPECT_FALSE(test, hw->iommu_fault_pending);
 	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 0ULL);
@@ -15825,7 +16002,9 @@ static bool
 rk_mpp_hw_commit_active_retry(struct rk_mpp_hw *hw,
 			      struct rk_mpp_job *job,
 			      struct rk_mpp_activation *old,
-			      struct rk_mpp_activation *successor)
+			      struct rk_mpp_activation *successor,
+			      const struct rk_mpp_cluster_recovery_result *group,
+			      struct rk_mpp_activation_retry_token *token)
 {
 	struct rk_mpp_session *session = job->session;
 	struct rk_mpp_service *srv = session->srv;
@@ -15840,13 +16019,17 @@ rk_mpp_hw_commit_active_retry(struct rk_mpp_hw *hw,
 	mutex_lock(&srv->sched_lock);
 	spin_lock_irqsave(&hw->lock, flags);
 	if (!rk_mpp_hw_active_retry_matches_locked(hw, job, old) ||
-	    !successor || successor->job != job ||
+	    !successor || successor->job != job || !group || !token ||
+	    token->activation || token->generation || !group->quiesced ||
+	    !group->reusable ||
 	    successor->selected_hw ||
 	    !list_empty(&successor->job_link) ||
 	    successor->slot_state != RK_MPP_ACTIVATION_UNINSTALLED ||
 	    successor->transition_reason != RK_MPP_TRANSITION_NONE ||
 	    successor->generation || successor->watchdog_deadline ||
-	    successor->watchdog_deadline_valid)
+	    successor->watchdog_deadline_valid ||
+	    !rk_mpp_activation_closure_pristine(old) ||
+	    !rk_mpp_activation_closure_pristine(successor))
 		goto unlock;
 
 	rk_mpp_hw_get(hw);
@@ -15859,11 +16042,17 @@ rk_mpp_hw_commit_active_retry(struct rk_mpp_hw *hw,
 	if (!generation)
 		goto rollback_dispatch;
 
+	old->closure.group.result = *group;
+	old->closure.group.status = 0;
+	old->closure.group.valid = true;
+	old->closure.state = RK_MPP_ACTIVATION_CLOSURE_PENDING;
 	old->slot_state = RK_MPP_ACTIVATION_SUPERSEDED;
 	old->transition_reason = RK_MPP_TRANSITION_RETRY_REPLACED;
 	list_add_tail(&successor->job_link, &job->activations);
 	WRITE_ONCE(job->current_activation, successor);
 	hw->active_activation = successor;
+	token->activation = old;
+	token->generation = old->generation;
 	rk_mpp_hw_clear_irq_record_locked(hw);
 	hw->iommu_fault_pending = false;
 	hw->iommu_fault_generation = 0;
@@ -15884,6 +16073,63 @@ unlock:
 		rk_mpp_hw_put(hw);
 
 	return committed;
+}
+
+static bool
+rk_mpp_activation_finish_retry_locked(struct rk_mpp_hw *hw,
+				      struct rk_mpp_activation_retry_token *token,
+				      int status,
+				      const struct rk_mpp_cluster_recovery_result *core)
+{
+	struct rk_mpp_activation *old = token ? token->activation : NULL;
+	struct rk_mpp_job *job = old ? old->job : NULL;
+
+	lockdep_assert_held(&hw->lock);
+	if (!job || !core || !token->generation ||
+	    old->generation != token->generation ||
+	    old->selected_hw != hw || list_empty(&old->job_link) ||
+	    old == READ_ONCE(job->current_activation) ||
+	    old == rk_mpp_hw_active_activation_locked(hw) ||
+	    old->slot_state != RK_MPP_ACTIVATION_SUPERSEDED ||
+	    old->transition_reason != RK_MPP_TRANSITION_RETRY_REPLACED ||
+	    old->closure.state != RK_MPP_ACTIVATION_CLOSURE_PENDING ||
+	    !old->closure.group.valid || old->closure.group.status ||
+	    !old->closure.group.result.quiesced ||
+	    !old->closure.group.result.reusable || old->closure.core.valid)
+		return false;
+
+	old->closure.core.result = *core;
+	old->closure.core.status = status;
+	old->closure.core.valid = true;
+	old->closure.state = RK_MPP_ACTIVATION_CLOSURE_RETIRED;
+	token->activation = NULL;
+	token->generation = 0;
+
+	return true;
+}
+
+static bool
+rk_mpp_activation_finish_retry(struct rk_mpp_hw *hw,
+			       struct rk_mpp_activation_retry_token *token,
+			       int status,
+			       const struct rk_mpp_cluster_recovery_result *core)
+{
+	struct rk_mpp_session *session;
+	unsigned long flags;
+	bool finished;
+
+	if (!token || !token->activation || !token->activation->job)
+		return false;
+	session = token->activation->job->session;
+	lockdep_assert_held(&hw->run_lock);
+	mutex_lock(&session->lock);
+	spin_lock_irqsave(&hw->lock, flags);
+	finished = rk_mpp_activation_finish_retry_locked(hw, token, status,
+							 core);
+	spin_unlock_irqrestore(&hw->lock, flags);
+	mutex_unlock(&session->lock);
+
+	return finished;
 }
 
 static int
@@ -16289,7 +16535,7 @@ out_unlock_core:
 			rk_mpp_cluster_prepare_resend_chain(READ_ONCE(ccu->cluster),
 							    ccu);
 			restart_ret =
-				rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(ccu);
+				rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(ccu, &ccu_recovery);
 		}
 		if (restart_ret < 0) {
 			ccu_stop_ret = rk_mpp_rkvdec2_force_stop_ccu(ccu, &ccu_recovery);
@@ -16514,10 +16760,12 @@ out_put:
 
 static int
 rk_mpp_rkvdec2_prepare_ccu_retry_job(struct rk_mpp_job *job,
-				     struct rk_mpp_activation *successor)
+				     struct rk_mpp_activation *successor,
+				     const struct rk_mpp_cluster_recovery_result *group)
 {
 	struct rk_mpp_hw *hw = rk_mpp_job_get_hw(job);
 	struct rk_mpp_activation *old;
+	struct rk_mpp_activation_retry_token token = {};
 	struct rk_mpp_cluster_recovery_result recovery;
 	bool irq_disabled;
 	int ret = 0;
@@ -16546,13 +16794,18 @@ rk_mpp_rkvdec2_prepare_ccu_retry_job(struct rk_mpp_job *job,
 		ret = -ENOENT;
 		goto out_unlock;
 	}
-	if (!rk_mpp_hw_commit_active_retry(hw, job, old, successor)) {
+	if (!rk_mpp_hw_commit_active_retry(hw, job, old, successor, group,
+					   &token)) {
 		ret = -EAGAIN;
 		goto out_unlock;
 	}
 
 	rk_mpp_hw_cancel_timeout(hw);
 	ret = rk_mpp_hw_stop_and_recover(hw, job, &recovery);
+	if (!rk_mpp_activation_finish_retry(hw, &token, ret, &recovery)) {
+		ret = ret ?: -EUCLEAN;
+		goto out_unlock;
+	}
 	if (ret)
 		goto out_unlock;
 	if (!recovery.quiesced || !recovery.reusable) {
@@ -16568,7 +16821,9 @@ out_put:
 	return ret;
 }
 
-static int rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(struct rk_mpp_hw *ccu)
+static int
+rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(struct rk_mpp_hw *ccu,
+					   const struct rk_mpp_cluster_recovery_result *group)
 {
 	struct rk_mpp_cluster *cluster = READ_ONCE(ccu->cluster);
 	struct rk_mpp_activation **successors;
@@ -16577,6 +16832,8 @@ static int rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(struct rk_mpp_hw *ccu)
 	u32 i;
 	int ret;
 
+	if (!group || !group->quiesced || !group->reusable)
+		return -EINVAL;
 	ret = rk_mpp_cluster_collect_unfinished_jobs(cluster, ccu,
 						     &jobs, &count);
 	if (ret || !count)
@@ -16597,7 +16854,7 @@ static int rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(struct rk_mpp_hw *ccu)
 	for (i = 0; i < count; i++) {
 		struct rk_mpp_activation *successor = successors[i];
 
-		ret = rk_mpp_rkvdec2_prepare_ccu_retry_job(jobs[i], successor);
+		ret = rk_mpp_rkvdec2_prepare_ccu_retry_job(jobs[i], successor, group);
 		if (!list_empty(&successor->job_link))
 			successors[i] = NULL;
 		if (ret)
@@ -16948,7 +17205,7 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 			rk_mpp_cluster_prepare_resend_chain(READ_ONCE(ccu->cluster),
 							    ccu);
 			restart_ret =
-				rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(ccu);
+				rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(ccu, &ccu_recovery);
 		}
 		if (restart_ret < 0) {
 			ccu_stop_ret = rk_mpp_rkvdec2_force_stop_ccu(ccu, &ccu_recovery);
