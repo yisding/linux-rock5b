@@ -1962,6 +1962,34 @@ static void rk_mpp_cluster_init(struct rk_mpp_cluster *cluster,
 	INIT_LIST_HEAD(&cluster->members);
 }
 
+static int rk_mpp_cluster_validate_ccu(const struct rk_mpp_cluster *cluster,
+				       const struct rk_mpp_hw *ccu)
+{
+	if (!cluster || !ccu)
+		return -EINVAL;
+	if (READ_ONCE(ccu->cluster) != cluster ||
+	    READ_ONCE(cluster->coordinator) != ccu)
+		return -EXDEV;
+
+	return 0;
+}
+
+static int rk_mpp_cluster_validate_job(const struct rk_mpp_cluster *cluster,
+				       const struct rk_mpp_job *job)
+{
+	int ret;
+
+	if (!job || !job->hw)
+		return -EINVAL;
+	ret = rk_mpp_cluster_validate_ccu(cluster, job->rkvdec_ccu);
+	if (ret)
+		return ret;
+	if (READ_ONCE(job->hw->cluster) != cluster)
+		return -EXDEV;
+
+	return 0;
+}
+
 /* The caller transfers one OF-node reference only when a slot is added. */
 static struct rk_mpp_cluster *
 rk_mpp_cluster_get_locked(struct rk_mpp_service *srv,
@@ -3985,11 +4013,15 @@ static dma_addr_t rk_mpp_rkvdec2_next_unused_link_iova(struct rk_mpp_hw *hw)
 	return hw->rkvdec_link_iova + index * hw->rkvdec_link_node_size;
 }
 
-static void rk_mpp_rkvdec2_ccu_relink_tables_locked(struct rk_mpp_hw *ccu)
+static void
+rk_mpp_cluster_relink_ccu_tables_locked(struct rk_mpp_cluster *cluster,
+					struct rk_mpp_hw *ccu)
 {
 	const struct rk_mpp_rkvdec2_link_info *info =
 		&rk_mpp_rkvdec2_vdpu381_link_info;
 	struct rk_mpp_job *job;
+
+	WARN_ON_ONCE(rk_mpp_cluster_validate_ccu(cluster, ccu));
 
 	list_for_each_entry(job, &ccu->rkvdec_ccu_jobs, rkvdec_ccu_node) {
 		struct rk_mpp_job *next;
@@ -4011,12 +4043,13 @@ static void rk_mpp_rkvdec2_ccu_relink_tables_locked(struct rk_mpp_hw *ccu)
 	}
 }
 
-static bool rk_mpp_rkvdec2_ccu_has_jobs(struct rk_mpp_hw *ccu)
+static bool rk_mpp_cluster_ccu_has_jobs(struct rk_mpp_cluster *cluster,
+					struct rk_mpp_hw *ccu)
 {
 	unsigned long flags;
 	bool has_jobs;
 
-	if (!ccu)
+	if (WARN_ON_ONCE(rk_mpp_cluster_validate_ccu(cluster, ccu)))
 		return false;
 
 	spin_lock_irqsave(&ccu->lock, flags);
@@ -4047,13 +4080,16 @@ rk_mpp_rkvdec2_ccu_job_done(const struct rk_mpp_job *job,
 }
 
 static u32
-rk_mpp_rkvdec2_ccu_relink_unfinished_locked(struct rk_mpp_hw *ccu)
+rk_mpp_cluster_relink_unfinished_locked(struct rk_mpp_cluster *cluster,
+					struct rk_mpp_hw *ccu)
 {
 	const struct rk_mpp_rkvdec2_link_info *info =
 		&rk_mpp_rkvdec2_vdpu381_link_info;
 	struct rk_mpp_job *job;
 	struct rk_mpp_job *prev = NULL;
 	u32 count = 0;
+
+	WARN_ON_ONCE(rk_mpp_cluster_validate_ccu(cluster, ccu));
 
 	list_for_each_entry(job, &ccu->rkvdec_ccu_jobs, rkvdec_ccu_node) {
 		u32 *table = job->rkvdec_link_vaddr;
@@ -4082,25 +4118,28 @@ rk_mpp_rkvdec2_ccu_relink_unfinished_locked(struct rk_mpp_hw *ccu)
 	return count;
 }
 
-static u32 rk_mpp_rkvdec2_ccu_prepare_resend_chain(struct rk_mpp_hw *ccu)
+static u32
+rk_mpp_cluster_prepare_resend_chain(struct rk_mpp_cluster *cluster,
+				    struct rk_mpp_hw *ccu)
 {
 	unsigned long flags;
 	u32 count;
 
-	if (!ccu)
+	if (WARN_ON_ONCE(rk_mpp_cluster_validate_ccu(cluster, ccu)))
 		return 0;
 
 	spin_lock_irqsave(&ccu->lock, flags);
-	count = rk_mpp_rkvdec2_ccu_relink_unfinished_locked(ccu);
+	count = rk_mpp_cluster_relink_unfinished_locked(cluster, ccu);
 	spin_unlock_irqrestore(&ccu->lock, flags);
 
 	return count;
 }
 
 static int
-rk_mpp_rkvdec2_collect_unfinished_ccu_jobs(struct rk_mpp_hw *ccu,
-					   struct rk_mpp_job ***jobs_out,
-					   u32 *count_out)
+rk_mpp_cluster_collect_unfinished_jobs(struct rk_mpp_cluster *cluster,
+				       struct rk_mpp_hw *ccu,
+				       struct rk_mpp_job ***jobs_out,
+				       u32 *count_out)
 {
 	const struct rk_mpp_rkvdec2_link_info *info =
 		&rk_mpp_rkvdec2_vdpu381_link_info;
@@ -4113,8 +4152,8 @@ rk_mpp_rkvdec2_collect_unfinished_ccu_jobs(struct rk_mpp_hw *ccu,
 	*jobs_out = NULL;
 	*count_out = 0;
 
-	if (!ccu)
-		return 0;
+	if (rk_mpp_cluster_validate_ccu(cluster, ccu))
+		return -EXDEV;
 
 	spin_lock_irqsave(&ccu->lock, flags);
 	list_for_each_entry(job, &ccu->rkvdec_ccu_jobs, rkvdec_ccu_node) {
@@ -4151,50 +4190,66 @@ rk_mpp_rkvdec2_collect_unfinished_ccu_jobs(struct rk_mpp_hw *ccu,
 	return 0;
 }
 
-static void rk_mpp_rkvdec2_ccu_job_add(struct rk_mpp_job *job)
+static int rk_mpp_cluster_add_ccu_job(struct rk_mpp_cluster *cluster,
+				      struct rk_mpp_job *job)
 {
 	struct rk_mpp_hw *ccu = job->rkvdec_ccu;
 	unsigned long flags;
+	int ret;
 
-	if (!ccu || job->rkvdec_ccu_listed)
-		return;
+	ret = rk_mpp_cluster_validate_job(cluster, job);
+	if (ret)
+		return ret;
+	if (job->rkvdec_ccu_listed)
+		return 0;
 
 	spin_lock_irqsave(&ccu->lock, flags);
 	list_add_tail(&job->rkvdec_ccu_node, &ccu->rkvdec_ccu_jobs);
 	job->rkvdec_ccu_listed = true;
-	rk_mpp_rkvdec2_ccu_relink_tables_locked(ccu);
+	rk_mpp_cluster_relink_ccu_tables_locked(cluster, ccu);
 	spin_unlock_irqrestore(&ccu->lock, flags);
+
+	return 0;
 }
 
 static bool
-rk_mpp_rkvdec2_ccu_job_del(struct rk_mpp_job *job, struct rk_mpp_hw *ccu)
+rk_mpp_cluster_remove_ccu_job(struct rk_mpp_cluster *cluster,
+			      struct rk_mpp_job *job,
+			      struct rk_mpp_hw *ccu)
 {
 	unsigned long flags;
 	bool empty = true;
 
 	if (!ccu || !job->rkvdec_ccu_listed)
 		return true;
+	WARN_ON_ONCE(rk_mpp_cluster_validate_ccu(cluster, ccu));
+	WARN_ON_ONCE(!job->hw || READ_ONCE(job->hw->cluster) != cluster);
 
 	spin_lock_irqsave(&ccu->lock, flags);
 	list_del_init(&job->rkvdec_ccu_node);
 	job->rkvdec_ccu_listed = false;
 	empty = list_empty(&ccu->rkvdec_ccu_jobs);
 	if (!empty)
-		rk_mpp_rkvdec2_ccu_relink_tables_locked(ccu);
+		rk_mpp_cluster_relink_ccu_tables_locked(cluster, ccu);
 	spin_unlock_irqrestore(&ccu->lock, flags);
 
 	return empty;
 }
 
 static void
-rk_mpp_rkvdec2_transfer_cluster_power_lease(struct rk_mpp_job *from,
-					    struct rk_mpp_hw *ccu)
+rk_mpp_cluster_transfer_power_lease(struct rk_mpp_cluster *cluster,
+				    struct rk_mpp_job *from,
+				    struct rk_mpp_hw *ccu)
 {
+	struct rk_mpp_cluster_power_lease *lease;
 	struct rk_mpp_job *to;
 	unsigned long flags;
 
 	if (!ccu || !rk_mpp_cluster_power_lease_core_count(from))
 		return;
+	lease = READ_ONCE(from->rkvdec_ccu_power_lease);
+	WARN_ON_ONCE(rk_mpp_cluster_validate_ccu(cluster, ccu));
+	WARN_ON_ONCE(!lease || lease->power_lease_cluster != cluster);
 
 	spin_lock_irqsave(&ccu->lock, flags);
 	to = list_first_entry_or_null(&ccu->rkvdec_ccu_jobs,
@@ -4204,14 +4259,16 @@ rk_mpp_rkvdec2_transfer_cluster_power_lease(struct rk_mpp_job *from,
 	spin_unlock_irqrestore(&ccu->lock, flags);
 }
 
-static struct rk_mpp_job *rk_mpp_rkvdec2_ccu_first_done_job(struct rk_mpp_hw *ccu)
+static struct rk_mpp_job *
+rk_mpp_cluster_first_done_job(struct rk_mpp_cluster *cluster,
+			      struct rk_mpp_hw *ccu)
 {
 	const struct rk_mpp_rkvdec2_link_info *info =
 		&rk_mpp_rkvdec2_vdpu381_link_info;
 	struct rk_mpp_job *job;
 	unsigned long flags;
 
-	if (!ccu)
+	if (WARN_ON_ONCE(rk_mpp_cluster_validate_ccu(cluster, ccu)))
 		return NULL;
 
 	spin_lock_irqsave(&ccu->lock, flags);
@@ -4241,6 +4298,7 @@ static void rk_mpp_rkvdec2_release_link_table(struct rk_mpp_job *job)
 {
 	struct rk_mpp_hw *hw = job->hw;
 	struct rk_mpp_hw *ccu = job->rkvdec_ccu;
+	struct rk_mpp_cluster *cluster = ccu ? READ_ONCE(ccu->cluster) : NULL;
 	unsigned long flags;
 	bool ccu_empty = true;
 
@@ -4248,9 +4306,9 @@ static void rk_mpp_rkvdec2_release_link_table(struct rk_mpp_job *job)
 
 	if (job->rkvdec_ccu_started && ccu) {
 		mutex_lock(&ccu->run_lock);
-		ccu_empty = rk_mpp_rkvdec2_ccu_job_del(job, ccu);
+		ccu_empty = rk_mpp_cluster_remove_ccu_job(cluster, job, ccu);
 		if (!ccu_empty)
-			rk_mpp_rkvdec2_transfer_cluster_power_lease(job, ccu);
+			rk_mpp_cluster_transfer_power_lease(cluster, job, ccu);
 		/*
 		 * A terminally isolated coordinator has already had its
 		 * clocks and runtime-PM references drained, so its register
@@ -4270,7 +4328,7 @@ static void rk_mpp_rkvdec2_release_link_table(struct rk_mpp_job *job)
 				       RK_MPP_RKVDEC_CCU_WORK_BASE);
 		mutex_unlock(&ccu->run_lock);
 	} else {
-		rk_mpp_rkvdec2_ccu_job_del(job, ccu);
+		rk_mpp_cluster_remove_ccu_job(cluster, job, ccu);
 	}
 
 	rk_mpp_rkvdec2_release_ccu_power(job, ccu);
@@ -4279,7 +4337,7 @@ static void rk_mpp_rkvdec2_release_link_table(struct rk_mpp_job *job)
 	/*
 	 * Only return the node to the pool.  The coordinator running list
 	 * owns every DMA chain rewrite: a per-core rewrite here would race
-	 * rk_mpp_rkvdec2_ccu_relink_tables_locked() on the same next-table
+	 * rk_mpp_cluster_relink_ccu_tables_locked() on the same next-table
 	 * words and could point a running cross-core chain at an unused
 	 * node, silently dropping the queued jobs behind it.
 	 */
@@ -4372,8 +4430,8 @@ static int rk_mpp_rkvdec2_fill_ccu_descriptor(struct rk_mpp_job *job,
 }
 
 static void
-rk_mpp_rkvdec2_publish_ccu_doorbell(struct rk_mpp_job *job,
-				    void __iomem *regs)
+rk_mpp_rkvdec2_write_ccu_doorbell(struct rk_mpp_job *job,
+				  void __iomem *regs)
 {
 	/* Fault routing must see the software owner before hardware can fault. */
 	WRITE_ONCE(job->rkvdec_ccu_started, true);
@@ -4383,16 +4441,22 @@ rk_mpp_rkvdec2_publish_ccu_doorbell(struct rk_mpp_job *job,
 	       regs + RK_MPP_RKVDEC_CCU_CFG_DONE_BASE);
 }
 
-static void
-rk_mpp_rkvdec2_publish_and_start_ccu(struct rk_mpp_job *job,
-				     void __iomem *regs)
+static int
+rk_mpp_cluster_publish_ccu_job(struct rk_mpp_cluster *cluster,
+			       struct rk_mpp_job *job, void __iomem *regs)
 {
+	int ret;
+
 	lockdep_assert_held(&job->hw->run_lock);
 	lockdep_assert_held(&job->rkvdec_ccu->run_lock);
 
-	rk_mpp_rkvdec2_ccu_job_add(job);
+	ret = rk_mpp_cluster_add_ccu_job(cluster, job);
+	if (ret)
+		return ret;
 	rk_mpp_hw_schedule_timeout(job->hw);
-	rk_mpp_rkvdec2_publish_ccu_doorbell(job, regs);
+	rk_mpp_rkvdec2_write_ccu_doorbell(job, regs);
+
+	return 0;
 }
 
 static int rk_mpp_rkvdec2_prepare_ccu_descriptor(struct rk_mpp_job *job)
@@ -4494,7 +4558,7 @@ rk_mpp_scheduler_take_job(struct rk_mpp_service *srv);
 static int rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw,
 				   struct rk_mpp_job *job);
 static bool rk_mpp_job_rkvdec_rcb_enabled(struct rk_mpp_job *job);
-static int rk_mpp_rkvdec2_program_soft_ccu(struct rk_mpp_job *job);
+static int rk_mpp_cluster_arm_soft_ccu(struct rk_mpp_job *job);
 static int rk_mpp_rkvenc2_dchs_patch(struct rk_mpp_job *job);
 static void rk_mpp_rkvenc2_dchs_release(struct rk_mpp_job *job);
 static int rk_mpp_switch_session(struct rk_mpp_session **session,
@@ -6201,6 +6265,7 @@ static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
 {
 	const struct rk_mpp_rkvdec2_link_info *info =
 		&rk_mpp_rkvdec2_vdpu381_link_info;
+	struct rk_mpp_cluster *cluster;
 	struct rk_mpp_hw *hw;
 	struct rk_mpp_hw *ccu;
 	struct rk_mpp_job *job;
@@ -6208,6 +6273,8 @@ static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
 	u32 *core_regs;
 	u32 *link;
 
+	cluster = kunit_kzalloc(test, sizeof(*cluster), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, cluster);
 	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, hw);
 	ccu = kunit_kzalloc(test, sizeof(*ccu), GFP_KERNEL);
@@ -6217,6 +6284,9 @@ static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
 	hw->core_mask = 0x00030000;
 	job->hw = hw;
 	job->rkvdec_ccu = ccu;
+	cluster->coordinator = ccu;
+	hw->cluster = cluster;
+	ccu->cluster = cluster;
 
 	link = kunit_kcalloc(test, 0x60 / sizeof(*link), sizeof(*link),
 			     GFP_KERNEL);
@@ -6243,7 +6313,7 @@ static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
 	/* The submit path holds both run locks across arm -> start. */
 	mutex_lock(&hw->run_lock);
 	mutex_lock(&ccu->run_lock);
-	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_program_soft_ccu(job), 0);
+	KUNIT_EXPECT_EQ(test, rk_mpp_cluster_arm_soft_ccu(job), 0);
 	KUNIT_EXPECT_EQ(test,
 			link[info->irq_base / sizeof(*link)] &
 			(RK_MPP_RKVDEC_LINK_CORE_WORK_MODE |
@@ -6294,7 +6364,7 @@ static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
 
 	hw->core_mask = 0;
 	mutex_lock(&ccu->run_lock);
-	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_program_soft_ccu(job), -EINVAL);
+	KUNIT_EXPECT_EQ(test, rk_mpp_cluster_arm_soft_ccu(job), -EINVAL);
 	mutex_unlock(&ccu->run_lock);
 }
 
@@ -6741,6 +6811,7 @@ static void rk_mpp_rkvdec2_ccu_running_list_kunit(struct kunit *test)
 {
 	const struct rk_mpp_rkvdec2_link_info *info =
 		&rk_mpp_rkvdec2_vdpu381_link_info;
+	struct rk_mpp_cluster *cluster;
 	struct rk_mpp_hw *ccu;
 	struct rk_mpp_hw *core;
 	struct rk_mpp_job *job0;
@@ -6749,6 +6820,8 @@ static void rk_mpp_rkvdec2_ccu_running_list_kunit(struct kunit *test)
 	u32 *table0;
 	u32 *table1;
 
+	cluster = kunit_kzalloc(test, sizeof(*cluster), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, cluster);
 	ccu = kunit_kzalloc(test, sizeof(*ccu), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, ccu);
 	core = kunit_kzalloc(test, sizeof(*core), GFP_KERNEL);
@@ -6766,6 +6839,9 @@ static void rk_mpp_rkvdec2_ccu_running_list_kunit(struct kunit *test)
 
 	spin_lock_init(&ccu->lock);
 	INIT_LIST_HEAD(&ccu->rkvdec_ccu_jobs);
+	cluster->coordinator = ccu;
+	ccu->cluster = cluster;
+	core->cluster = cluster;
 	INIT_LIST_HEAD(&job0->rkvdec_ccu_node);
 	INIT_LIST_HEAD(&job1->rkvdec_ccu_node);
 	refcount_set(&job0->refs, 1);
@@ -6779,37 +6855,44 @@ static void rk_mpp_rkvdec2_ccu_running_list_kunit(struct kunit *test)
 	job1->rkvdec_link_vaddr = table1;
 	job1->rkvdec_link_iova = 0x2000;
 
-	rk_mpp_rkvdec2_ccu_job_add(job0);
+	core->cluster = NULL;
+	KUNIT_EXPECT_EQ(test, rk_mpp_cluster_add_ccu_job(cluster, job0),
+			-EXDEV);
+	KUNIT_EXPECT_TRUE(test, list_empty(&ccu->rkvdec_ccu_jobs));
+	core->cluster = cluster;
+	KUNIT_EXPECT_EQ(test, rk_mpp_cluster_add_ccu_job(cluster, job0), 0);
 	KUNIT_EXPECT_EQ(test, table0[info->next_word], 0U);
-	rk_mpp_rkvdec2_ccu_job_add(job1);
+	KUNIT_EXPECT_EQ(test, rk_mpp_cluster_add_ccu_job(cluster, job1), 0);
 	KUNIT_EXPECT_TRUE(test, job0->rkvdec_ccu_listed);
 	KUNIT_EXPECT_TRUE(test, job1->rkvdec_ccu_listed);
 	KUNIT_EXPECT_EQ(test, table0[info->next_word], 0x2000U);
 	KUNIT_EXPECT_EQ(test, table1[info->next_word], 0U);
-	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_rkvdec2_ccu_first_done_job(ccu),
+	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_cluster_first_done_job(cluster, ccu),
 			    NULL);
 
 	table1[info->irq_status_word] = 0x1234;
-	done = rk_mpp_rkvdec2_ccu_first_done_job(ccu);
+	done = rk_mpp_cluster_first_done_job(cluster, ccu);
 	KUNIT_EXPECT_PTR_EQ(test, done, job1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&job1->refs), 2);
 	refcount_dec(&job1->refs);
 	KUNIT_EXPECT_EQ(test, refcount_read(&job1->refs), 1);
 
 	table0[info->irq_status_word] = 0x5678;
-	done = rk_mpp_rkvdec2_ccu_first_done_job(ccu);
+	done = rk_mpp_cluster_first_done_job(cluster, ccu);
 	KUNIT_EXPECT_PTR_EQ(test, done, job0);
 	KUNIT_EXPECT_EQ(test, refcount_read(&job0->refs), 2);
 	refcount_dec(&job0->refs);
 
-	KUNIT_EXPECT_FALSE(test, rk_mpp_rkvdec2_ccu_job_del(job1, ccu));
+	KUNIT_EXPECT_FALSE(test,
+			   rk_mpp_cluster_remove_ccu_job(cluster, job1, ccu));
 	KUNIT_EXPECT_FALSE(test, job1->rkvdec_ccu_listed);
 	KUNIT_EXPECT_EQ(test, table0[info->next_word], 0U);
-	done = rk_mpp_rkvdec2_ccu_first_done_job(ccu);
+	done = rk_mpp_cluster_first_done_job(cluster, ccu);
 	KUNIT_EXPECT_PTR_EQ(test, done, job0);
 	refcount_dec(&job0->refs);
 
-	KUNIT_EXPECT_TRUE(test, rk_mpp_rkvdec2_ccu_job_del(job0, ccu));
+	KUNIT_EXPECT_TRUE(test,
+			  rk_mpp_cluster_remove_ccu_job(cluster, job0, ccu));
 	KUNIT_EXPECT_FALSE(test, job0->rkvdec_ccu_listed);
 	KUNIT_EXPECT_TRUE(test, list_empty(&ccu->rkvdec_ccu_jobs));
 }
@@ -6903,6 +6986,8 @@ static void rk_mpp_rkvdec2_ccu_power_transfer_kunit(struct kunit *test)
 
 	spin_lock_init(&ccu->lock);
 	INIT_LIST_HEAD(&ccu->rkvdec_ccu_jobs);
+	cluster->coordinator = ccu;
+	ccu->cluster = cluster;
 	INIT_LIST_HEAD(&to->rkvdec_ccu_node);
 	list_add_tail(&to->rkvdec_ccu_node, &ccu->rkvdec_ccu_jobs);
 	cores[0] = core0;
@@ -6911,7 +6996,7 @@ static void rk_mpp_rkvdec2_ccu_power_transfer_kunit(struct kunit *test)
 						  ARRAY_SIZE(cores));
 	from->rkvdec_ccu_power_lease = lease0;
 
-	rk_mpp_rkvdec2_transfer_cluster_power_lease(from, ccu);
+	rk_mpp_cluster_transfer_power_lease(cluster, from, ccu);
 
 	KUNIT_EXPECT_EQ(test, rk_mpp_cluster_power_lease_core_count(from), 0U);
 	KUNIT_EXPECT_PTR_EQ(test, from->rkvdec_ccu_power_lease, NULL);
@@ -6929,7 +7014,7 @@ static void rk_mpp_rkvdec2_ccu_power_transfer_kunit(struct kunit *test)
 	cores[0] = core2;
 	lease1 = rk_mpp_cluster_power_lease_kunit(test, cluster, cores, 1);
 	from->rkvdec_ccu_power_lease = lease1;
-	rk_mpp_rkvdec2_transfer_cluster_power_lease(from, ccu);
+	rk_mpp_cluster_transfer_power_lease(cluster, from, ccu);
 
 	KUNIT_EXPECT_PTR_EQ(test, from->rkvdec_ccu_power_lease, lease1);
 	KUNIT_EXPECT_PTR_EQ(test, to->rkvdec_ccu_power_lease, lease0);
@@ -6969,6 +7054,10 @@ static void rk_mpp_rkvdec2_release_power_transfer_kunit(struct kunit *test)
 	spin_lock_init(&ccu->lock);
 	mutex_init(&ccu->run_lock);
 	INIT_LIST_HEAD(&ccu->rkvdec_ccu_jobs);
+	cluster->coordinator = ccu;
+	ccu->cluster = cluster;
+	core0->cluster = cluster;
+	core1->cluster = cluster;
 	refcount_set(&ccu->refs, 1);
 	init_completion(&ccu->released);
 	INIT_LIST_HEAD(&from->rkvdec_ccu_node);
@@ -7006,6 +7095,7 @@ static void rk_mpp_rkvdec2_ccu_relink_unfinished_kunit(struct kunit *test)
 {
 	const struct rk_mpp_rkvdec2_link_info *info =
 		&rk_mpp_rkvdec2_vdpu381_link_info;
+	struct rk_mpp_cluster *cluster;
 	struct rk_mpp_hw *ccu;
 	struct rk_mpp_job *job0;
 	struct rk_mpp_job *job1;
@@ -7015,6 +7105,8 @@ static void rk_mpp_rkvdec2_ccu_relink_unfinished_kunit(struct kunit *test)
 	u32 *table2;
 	unsigned long flags;
 
+	cluster = kunit_kzalloc(test, sizeof(*cluster), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, cluster);
 	ccu = kunit_kzalloc(test, sizeof(*ccu), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, ccu);
 	job0 = kunit_kzalloc(test, sizeof(*job0), GFP_KERNEL);
@@ -7035,6 +7127,8 @@ static void rk_mpp_rkvdec2_ccu_relink_unfinished_kunit(struct kunit *test)
 
 	spin_lock_init(&ccu->lock);
 	INIT_LIST_HEAD(&ccu->rkvdec_ccu_jobs);
+	cluster->coordinator = ccu;
+	ccu->cluster = cluster;
 	INIT_LIST_HEAD(&job0->rkvdec_ccu_node);
 	INIT_LIST_HEAD(&job1->rkvdec_ccu_node);
 	INIT_LIST_HEAD(&job2->rkvdec_ccu_node);
@@ -7058,7 +7152,7 @@ static void rk_mpp_rkvdec2_ccu_relink_unfinished_kunit(struct kunit *test)
 
 	spin_lock_irqsave(&ccu->lock, flags);
 	KUNIT_EXPECT_EQ(test,
-			rk_mpp_rkvdec2_ccu_relink_unfinished_locked(ccu),
+			rk_mpp_cluster_relink_unfinished_locked(cluster, ccu),
 			2U);
 	spin_unlock_irqrestore(&ccu->lock, flags);
 
@@ -7071,6 +7165,7 @@ static void rk_mpp_rkvdec2_ccu_collect_unfinished_kunit(struct kunit *test)
 {
 	const struct rk_mpp_rkvdec2_link_info *info =
 		&rk_mpp_rkvdec2_vdpu381_link_info;
+	struct rk_mpp_cluster *cluster;
 	struct rk_mpp_job **jobs = NULL;
 	struct rk_mpp_hw *ccu;
 	struct rk_mpp_job *job0;
@@ -7081,6 +7176,8 @@ static void rk_mpp_rkvdec2_ccu_collect_unfinished_kunit(struct kunit *test)
 	u32 *table2;
 	u32 count = 0;
 
+	cluster = kunit_kzalloc(test, sizeof(*cluster), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, cluster);
 	ccu = kunit_kzalloc(test, sizeof(*ccu), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, ccu);
 	job0 = kunit_kzalloc(test, sizeof(*job0), GFP_KERNEL);
@@ -7101,6 +7198,8 @@ static void rk_mpp_rkvdec2_ccu_collect_unfinished_kunit(struct kunit *test)
 
 	spin_lock_init(&ccu->lock);
 	INIT_LIST_HEAD(&ccu->rkvdec_ccu_jobs);
+	cluster->coordinator = ccu;
+	ccu->cluster = cluster;
 	INIT_LIST_HEAD(&job0->rkvdec_ccu_node);
 	INIT_LIST_HEAD(&job1->rkvdec_ccu_node);
 	INIT_LIST_HEAD(&job2->rkvdec_ccu_node);
@@ -7117,8 +7216,8 @@ static void rk_mpp_rkvdec2_ccu_collect_unfinished_kunit(struct kunit *test)
 	list_add_tail(&job2->rkvdec_ccu_node, &ccu->rkvdec_ccu_jobs);
 
 	KUNIT_EXPECT_EQ(test,
-			rk_mpp_rkvdec2_collect_unfinished_ccu_jobs(ccu, &jobs,
-								   &count),
+			rk_mpp_cluster_collect_unfinished_jobs(cluster, ccu,
+							       &jobs, &count),
 			0);
 	KUNIT_ASSERT_EQ(test, count, 2U);
 	KUNIT_ASSERT_NOT_NULL(test, jobs);
@@ -7172,8 +7271,7 @@ static void rk_mpp_rkvdec2_ccu_descriptor_kunit(struct kunit *test)
 			(u32)(RK_MPP_RKVDEC_CCU_ADD_MODE |
 			      RK_MPP_RKVDEC_LINK_ADD_CFG_NUM));
 	KUNIT_EXPECT_FALSE(test, READ_ONCE(job->rkvdec_ccu_started));
-	rk_mpp_rkvdec2_publish_ccu_doorbell(job,
-					    (void __iomem *)ccu_regs);
+	rk_mpp_rkvdec2_write_ccu_doorbell(job, (void __iomem *)ccu_regs);
 	KUNIT_EXPECT_TRUE(test, READ_ONCE(job->rkvdec_ccu_started));
 	KUNIT_EXPECT_EQ(test,
 			ccu_regs[RK_MPP_RKVDEC_CCU_CFG_DONE_BASE /
@@ -13208,18 +13306,22 @@ static bool rk_mpp_rkvdec2_soft_ccu_regs_ready(struct rk_mpp_hw *ccu)
 					 sizeof(u32));
 }
 
-static int rk_mpp_rkvdec2_program_soft_ccu(struct rk_mpp_job *job)
+static int rk_mpp_cluster_arm_soft_ccu(struct rk_mpp_job *job)
 {
 	const struct rk_mpp_rkvdec2_link_info *link_info =
 		&rk_mpp_rkvdec2_vdpu381_link_info;
 	struct rk_mpp_hw *hw = job->hw;
 	struct rk_mpp_hw *ccu = job->rkvdec_ccu;
+	struct rk_mpp_cluster *cluster;
 	void __iomem *ccu_regs;
 	void __iomem *link;
 
 	if (!hw || !ccu || !rk_mpp_rkvdec2_link_regs_ready(hw, link_info) ||
 	    !rk_mpp_rkvdec2_soft_ccu_regs_ready(ccu))
 		return -EOPNOTSUPP;
+	cluster = READ_ONCE(ccu->cluster);
+	if (rk_mpp_cluster_validate_job(cluster, job))
+		return -EXDEV;
 	if (!hw->core_mask)
 		return -EINVAL;
 
@@ -13255,30 +13357,22 @@ static int rk_mpp_rkvdec2_program_soft_ccu(struct rk_mpp_job *job)
  * the interconnect (silent dual-core mpi_dec_mt START wedge, 2026-07-29;
  * mpi_dec_h265 first-submit wedge through the then-unlocked cache and
  * task-register window, 2026-07-30). The caller holds ccu->run_lock from
- * before rk_mpp_rkvdec2_program_soft_ccu() until this helper returns.
+ * before rk_mpp_cluster_arm_soft_ccu() until this helper returns.
  */
-static int rk_mpp_rkvdec2_publish_and_start_core(struct rk_mpp_job *job,
-						 u32 start_value)
+static int
+rk_mpp_cluster_publish_soft_ccu_job(struct rk_mpp_job *job, u32 start_value)
 {
 	struct rk_mpp_hw *hw = job->hw;
 	struct rk_mpp_hw *ccu = job->rkvdec_ccu;
+	struct rk_mpp_cluster *cluster = READ_ONCE(ccu->cluster);
 
 	lockdep_assert_held(&hw->run_lock);
-
-	if (!ccu) {
-		rk_mpp_hw_assert_powered(hw);
-		rk_mpp_hw_schedule_timeout(hw);
-		/* Publish the register image and watchdog generation before START. */
-		wmb();
-		writel(start_value | RK_MPP_RKVDEC_START_EN,
-		       hw->regs[0] + RK_MPP_RKVDEC_START_BASE);
-		return 0;
-	}
-
+	lockdep_assert_held(&ccu->run_lock);
+	if (rk_mpp_cluster_validate_job(cluster, job))
+		return -EXDEV;
 	if (!rk_mpp_rkvdec2_soft_ccu_regs_ready(ccu))
 		return -EOPNOTSUPP;
 
-	lockdep_assert_held(&ccu->run_lock);
 	if (!rk_mpp_hw_usable(ccu) || !rk_mpp_hw_usable(hw) ||
 	    READ_ONCE(job->canceled))
 		return READ_ONCE(job->canceled) ? -ECANCELED : -ENODEV;
@@ -13287,6 +13381,25 @@ static int rk_mpp_rkvdec2_publish_and_start_core(struct rk_mpp_job *job,
 	rk_mpp_hw_assert_powered(hw);
 	writel_relaxed(hw->core_mask,
 		       ccu->regs[0] + RK_MPP_RKVDEC_CCU_CORE_STA_BASE);
+	rk_mpp_hw_schedule_timeout(hw);
+	/* Publish the register image and watchdog generation before START. */
+	wmb();
+	writel(start_value | RK_MPP_RKVDEC_START_EN,
+	       hw->regs[0] + RK_MPP_RKVDEC_START_BASE);
+
+	return 0;
+}
+
+static int rk_mpp_rkvdec2_publish_and_start_core(struct rk_mpp_job *job,
+						 u32 start_value)
+{
+	struct rk_mpp_hw *hw = job->hw;
+
+	lockdep_assert_held(&hw->run_lock);
+	if (job->rkvdec_ccu)
+		return rk_mpp_cluster_publish_soft_ccu_job(job, start_value);
+
+	rk_mpp_hw_assert_powered(hw);
 	rk_mpp_hw_schedule_timeout(hw);
 	/* Publish the register image and watchdog generation before START. */
 	wmb();
@@ -13330,8 +13443,8 @@ static int rk_mpp_rkvdec2_acquire_soft_ccu(struct rk_mpp_job *job)
 	 * inside the next session's first-frame window — and the coordinator
 	 * poke at the gated register file stalls the interconnect
 	 * (mpi_dec_mt_h264 -> mpi_dec_h265 first-submit wedge, 2026-07-30;
-	 * mpi_dec_h265 alone passes on a fresh boot). The references are
-	 * The refcounted cluster lease is attached to one listed job at a time
+	 * mpi_dec_h265 alone passes on a fresh boot). The refcounted cluster
+	 * lease is attached to one listed job at a time
 	 * and released with the final job's coordinator reference in the common
 	 * CCU-release path.
 	 */
@@ -14586,7 +14699,8 @@ out_unlock_core:
 
 		rk_mpp_rkvdec2_drain_ccu_done_jobs(ccu);
 		if (!ccu_stop_ret && !reset_ret) {
-			rk_mpp_rkvdec2_ccu_prepare_resend_chain(ccu);
+			rk_mpp_cluster_prepare_resend_chain(READ_ONCE(ccu->cluster),
+							    ccu);
 			restart_ret =
 				rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(ccu);
 		}
@@ -14654,12 +14768,13 @@ static void rk_mpp_hw_schedule_timeout(struct rk_mpp_hw *hw)
 	}
 }
 
-static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
+static int rk_mpp_cluster_start_ccu_job(struct rk_mpp_job *job)
 {
 	const struct rk_mpp_rkvdec2_link_info *link_info =
 		&rk_mpp_rkvdec2_vdpu381_link_info;
 	struct rk_mpp_hw *hw = job->hw;
 	struct rk_mpp_hw *ccu = job->rkvdec_ccu;
+	struct rk_mpp_cluster *cluster = ccu ? READ_ONCE(ccu->cluster) : NULL;
 	void __iomem *ccu_regs;
 	u32 ccu_en;
 	u32 i;
@@ -14668,6 +14783,9 @@ static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
 	bool cores_powered_now = false;
 	int ret;
 
+	ret = rk_mpp_cluster_validate_job(cluster, job);
+	if (ret)
+		return ret;
 	if (!job->rkvdec_ccu_desc_valid || !job->rkvdec_link_active)
 		return -EOPNOTSUPP;
 	if (!rk_mpp_rkvdec2_link_regs_ready(hw, link_info) ||
@@ -14696,7 +14814,7 @@ static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
 		goto err_unlock_ccu;
 	}
 	ccu_en = readl_relaxed(ccu_regs + RK_MPP_RKVDEC_CCU_WORK_BASE);
-	add_mode = ccu_en && rk_mpp_rkvdec2_ccu_has_jobs(ccu);
+	add_mode = ccu_en && rk_mpp_cluster_ccu_has_jobs(cluster, ccu);
 	if (ccu_en && !add_mode) {
 		ret = -EBUSY;
 		goto err_unlock_ccu;
@@ -14751,7 +14869,9 @@ static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
 	if (hw->iommu_domain && hw->iommu_domain->ops)
 		iommu_flush_iotlb_all(hw->iommu_domain);
 
-	rk_mpp_rkvdec2_publish_and_start_ccu(job, ccu_regs);
+	ret = rk_mpp_cluster_publish_ccu_job(cluster, job, ccu_regs);
+	if (ret)
+		goto err_unlock_ccu;
 	rk_mpp_count_started_core(job);
 	mutex_unlock(&ccu->run_lock);
 
@@ -14788,7 +14908,7 @@ static int rk_mpp_rkvdec2_restart_ccu_job(struct rk_mpp_job *job)
 	}
 
 	rk_mpp_hw_cancel_timeout(hw);
-	ret = rk_mpp_rkvdec2_start_ccu_job(job);
+	ret = rk_mpp_cluster_start_ccu_job(job);
 
 out_unlock:
 	mutex_unlock(&hw->run_lock);
@@ -14841,12 +14961,14 @@ out_put:
 
 static int rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(struct rk_mpp_hw *ccu)
 {
+	struct rk_mpp_cluster *cluster = READ_ONCE(ccu->cluster);
 	struct rk_mpp_job **jobs;
 	u32 count;
 	u32 i;
 	int ret;
 
-	ret = rk_mpp_rkvdec2_collect_unfinished_ccu_jobs(ccu, &jobs, &count);
+	ret = rk_mpp_cluster_collect_unfinished_jobs(cluster, ccu,
+						     &jobs, &count);
 	if (ret || !count)
 		return ret;
 
@@ -14908,9 +15030,10 @@ static u32 rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu)
 	const struct rk_mpp_rkvdec2_link_info *link_info =
 		&rk_mpp_rkvdec2_vdpu381_link_info;
 	struct rk_mpp_job *job;
+	struct rk_mpp_cluster *cluster = READ_ONCE(ccu->cluster);
 	u32 completed = 0;
 
-	while ((job = rk_mpp_rkvdec2_ccu_first_done_job(ccu))) {
+	while ((job = rk_mpp_cluster_first_done_job(cluster, ccu))) {
 		struct rk_mpp_hw *hw = rk_mpp_job_get_hw(job);
 		bool ccu_error;
 		u32 completed_status;
@@ -15185,7 +15308,8 @@ static void rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 
 		rk_mpp_rkvdec2_drain_ccu_done_jobs(ccu);
 		if (!iommu_fault && !ccu_stop_ret && !reset_ret) {
-			rk_mpp_rkvdec2_ccu_prepare_resend_chain(ccu);
+			rk_mpp_cluster_prepare_resend_chain(READ_ONCE(ccu->cluster),
+							    ccu);
 			restart_ret =
 				rk_mpp_rkvdec2_restart_ccu_unfinished_jobs(ccu);
 		}
@@ -15372,9 +15496,10 @@ rk_mpp_rkvdec2_add_stop_core(struct rk_mpp_rkvdec2_stop_core *cores,
 }
 
 static bool
-rk_mpp_rkvdec2_collect_stop_cores(
-	struct rk_mpp_hw *ccu, struct rk_mpp_rkvdec2_stop_core *cores,
-	u32 *count, u32 *core_work)
+rk_mpp_cluster_collect_stop_cores(struct rk_mpp_cluster *cluster,
+				  struct rk_mpp_hw *ccu,
+				  struct rk_mpp_rkvdec2_stop_core *cores,
+				  u32 *count, u32 *core_work)
 {
 	struct rk_mpp_job *job;
 	unsigned long flags;
@@ -15383,6 +15508,8 @@ rk_mpp_rkvdec2_collect_stop_cores(
 
 	*count = 0;
 	*core_work = 0;
+	if (WARN_ON_ONCE(rk_mpp_cluster_validate_ccu(cluster, ccu)))
+		return false;
 	spin_lock_irqsave(&ccu->lock, flags);
 	list_for_each_entry(job, &ccu->rkvdec_ccu_jobs, rkvdec_ccu_node) {
 		*core_work |= job->rkvdec_ccu_core_work;
@@ -15572,11 +15699,14 @@ static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu)
 		return 0;
 	lockdep_assert_held(&ccu->ccu_recovery_lock);
 
-	if (!rk_mpp_rkvdec2_ccu_has_jobs(ccu))
+	cluster = READ_ONCE(ccu->cluster);
+	if (rk_mpp_cluster_validate_ccu(cluster, ccu))
+		return -EXDEV;
+	if (!rk_mpp_cluster_ccu_has_jobs(cluster, ccu))
 		return 0;
 
 	collection_complete =
-		rk_mpp_rkvdec2_collect_stop_cores(ccu, cores, &count,
+		rk_mpp_cluster_collect_stop_cores(cluster, ccu, cores, &count,
 						  &core_work);
 	if (!collection_complete)
 		terminal = true;
@@ -15660,7 +15790,6 @@ static int rk_mpp_rkvdec2_force_stop_ccu(struct rk_mpp_hw *ccu)
 		cores[i].bus_ret = rk_mpp_rkvdec2_poll_reset_bus_idle(hw);
 	}
 
-	cluster = READ_ONCE(ccu->cluster);
 	reset_request.cluster = cluster;
 	reset_request.ccu = ccu;
 	reset_request.cores = cores;
@@ -16880,7 +17009,7 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 		ret = rk_mpp_rkvdec2_stage_link_table(job);
 		if (ret)
 			goto err_power_off;
-		ret = rk_mpp_rkvdec2_start_ccu_job(job);
+		ret = rk_mpp_cluster_start_ccu_job(job);
 		if (ret)
 			goto err_power_off;
 		mutex_unlock(&hw->run_lock);
@@ -16919,7 +17048,7 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 		 * cache and task-register writes land on a core the CCU
 		 * already tracks as work-pending.
 		 */
-		ret = rk_mpp_rkvdec2_program_soft_ccu(job);
+		ret = rk_mpp_cluster_arm_soft_ccu(job);
 		if (ret)
 			goto err_unlock_soft_ccu;
 	} else if (!rk_mpp_hw_usable(hw) || READ_ONCE(job->canceled)) {
