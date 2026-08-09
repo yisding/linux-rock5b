@@ -10282,18 +10282,19 @@ static void rk_mpp_rkvdec_rcb_width_gate_kunit(struct kunit *test)
 	struct rk_mpp_session session = {
 		.client_type = RK_MPP_DEVICE_RKVDEC,
 	};
-	struct rk_mpp_hw hw = {
-		.rcb_min_width = 1920,
-	};
+	struct rk_mpp_hw *hw;
 	struct rk_mpp_job *job;
 
 	mutex_init(&session.lock);
+	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
+	hw->rcb_min_width = 1920;
 	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, job);
 	job->session = &session;
 	job->client_type = RK_MPP_DEVICE_RKVDEC;
 	rk_mpp_activation_init(job);
-	job->current_activation->selected_hw = &hw;
+	job->current_activation->selected_hw = hw;
 
 	job->codec_info[RK_MPP_DEC_INFO_WIDTH].val = 1919;
 	KUNIT_EXPECT_FALSE(test, rk_mpp_job_rkvdec_rcb_enabled(job));
@@ -10302,10 +10303,10 @@ static void rk_mpp_rkvdec_rcb_width_gate_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, rk_mpp_job_rkvdec_rcb_enabled(job));
 
 	job->codec_info[RK_MPP_DEC_INFO_WIDTH].val = 0;
-	hw.rcb_min_width = 0;
+	hw->rcb_min_width = 0;
 	KUNIT_EXPECT_TRUE(test, rk_mpp_job_rkvdec_rcb_enabled(job));
 
-	hw.rcb_min_width = 1920;
+	hw->rcb_min_width = 1920;
 	job->client_type = RK_MPP_DEVICE_RKVENC;
 	KUNIT_EXPECT_TRUE(test, rk_mpp_job_rkvdec_rcb_enabled(job));
 }
