@@ -90,6 +90,7 @@
 #define RK_MPP_CORE_COUNTER_COUNT	4
 #define RK_MPP_RKVDEC_MAX_CCU_CORES	4
 #define RK_MPP_MAX_RESET_DOMAINS	4
+#define RK_MPP_MAX_CLUSTERS		4
 #define RK_MPP_RKVDEC_PERF_SEL_NUM	64
 #define RK_MPP_RKVDEC_LINK_REGION	1
 #define RK_MPP_RKVDEC_LINK_NODE_ALIGN	256
@@ -389,16 +390,41 @@ struct rk_mpp_dma_group {
 
 struct rk_mpp_service;
 struct rk_mpp_reset_domain;
+struct rk_mpp_hw;
+
+/*
+ * Stable construction-time view of one explicit CCU topology. The service
+ * owns these slots and their OF-node references; hardware members only borrow
+ * the cluster pointer. Topology publication remains under service hw_lock.
+ * The existing coordinator ccu_recovery_lock remains the provisional
+ * transition lock until all admission and recovery callers migrate together.
+ *
+ * Reset domains and DMA groups deliberately remain separate owners. The
+ * explicit CCU identity currently gives every member one construction-time
+ * reset authority; DMA-group and IOMMU-domain relationships remain on the
+ * member records, so the cluster does not claim those groupings are identical.
+ */
+struct rk_mpp_cluster {
+	struct device_node *node;
+	struct list_head members;
+	struct rk_mpp_hw *coordinator;
+	struct rk_mpp_reset_domain *reset_domain;
+	enum rk_mpp_device_type member_type;
+	u32 member_count;
+	u32 core_count;
+};
 
 struct rk_mpp_hw {
 	struct list_head link;
 	struct list_head fault_link;
 	struct list_head dma_group_link;
 	struct list_head reset_domain_link;
+	struct list_head cluster_link;
 	struct device *dev;
 	struct rk_mpp_service *srv;
 	const struct rk_mpp_hw_match *match;
 	struct rk_mpp_dma_group *dma_group;
+	struct rk_mpp_cluster *cluster;
 	struct device_node *iommu_node;
 	struct iommu_domain *iommu_domain;
 	void __iomem *regs[RK_MPP_MAX_HW_REGS];
@@ -610,6 +636,9 @@ struct rk_mpp_service {
 	/* Reset-domain slots are added under hw_lock and never compacted. */
 	struct rk_mpp_reset_domain reset_domains[RK_MPP_MAX_RESET_DOMAINS];
 	u32 reset_domain_count;
+	/* Cluster slots are added under hw_lock and never compacted. */
+	struct rk_mpp_cluster clusters[RK_MPP_MAX_CLUSTERS];
+	u32 cluster_count;
 	struct mutex dma_group_lock;
 	struct mutex sched_lock; /* protects queued_jobs and dispatch stamps */
 	/*
@@ -1843,6 +1872,245 @@ static inline void rk_mpp_hw_assert_powered(const struct rk_mpp_hw *hw)
 		  hw->dev ? dev_name(hw->dev) : "<unbound>",
 		  atomic_read(&hw->power_count));
 #endif
+}
+
+static bool rk_mpp_hw_is_cluster_coordinator(const struct rk_mpp_hw *hw)
+{
+	return hw && hw->match && hw->match->type == RK_MPP_DEVICE_BUTT;
+}
+
+static struct device_node *
+rk_mpp_hw_cluster_identity(const struct rk_mpp_hw *hw)
+{
+	if (!hw)
+		return NULL;
+	if (hw->ccu_node)
+		return hw->ccu_node;
+	if (rk_mpp_hw_is_cluster_coordinator(hw) && hw->dev)
+		return hw->dev->of_node;
+
+	return NULL;
+}
+
+static void rk_mpp_cluster_init(struct rk_mpp_cluster *cluster,
+				struct device_node *node)
+{
+	cluster->node = node;
+	cluster->member_type = RK_MPP_DEVICE_BUTT;
+	INIT_LIST_HEAD(&cluster->members);
+}
+
+/* The caller transfers one OF-node reference only when a slot is added. */
+static struct rk_mpp_cluster *
+rk_mpp_cluster_get_locked(struct rk_mpp_service *srv,
+			  struct device_node *node, bool *added)
+{
+	struct rk_mpp_cluster *cluster;
+	u32 i;
+
+	lockdep_assert_held(&srv->hw_lock);
+	*added = false;
+	for (i = 0; i < srv->cluster_count; i++) {
+		cluster = &srv->clusters[i];
+		if (cluster->node == node)
+			return cluster;
+	}
+	if (srv->cluster_count >= ARRAY_SIZE(srv->clusters))
+		return ERR_PTR(-ENOSPC);
+
+	cluster = &srv->clusters[srv->cluster_count++];
+	rk_mpp_cluster_init(cluster, node);
+	*added = true;
+
+	return cluster;
+}
+
+static void rk_mpp_cluster_rebuild_locked(struct rk_mpp_cluster *cluster)
+{
+	struct rk_mpp_hw *member;
+
+	cluster->coordinator = NULL;
+	cluster->reset_domain = NULL;
+	cluster->member_type = RK_MPP_DEVICE_BUTT;
+	cluster->member_count = 0;
+	cluster->core_count = 0;
+
+	list_for_each_entry(member, &cluster->members, cluster_link) {
+		cluster->member_count++;
+		if (rk_mpp_hw_is_cluster_coordinator(member)) {
+			/*
+			 * A replacement may attach while the old coordinator is
+			 * draining after leaving hw_list. The newest attachment is
+			 * the construction view; two published coordinators remain
+			 * an invariant violation.
+			 */
+			WARN_ON_ONCE(cluster->coordinator &&
+				     (READ_ONCE(cluster->coordinator->online) ||
+				      !list_empty(&cluster->coordinator->link)) &&
+				     (READ_ONCE(member->online) ||
+				      !list_empty(&member->link)));
+			cluster->coordinator = member;
+		} else {
+			if (cluster->core_count)
+				WARN_ON_ONCE(cluster->member_type !=
+					     member->match->type);
+			else
+				cluster->member_type = member->match->type;
+			cluster->core_count++;
+		}
+
+		if (cluster->reset_domain)
+			WARN_ON_ONCE(cluster->reset_domain !=
+				     member->reset_domain);
+		else
+			cluster->reset_domain = member->reset_domain;
+	}
+}
+
+static int
+rk_mpp_cluster_register_member_locked(struct rk_mpp_cluster *cluster,
+				      struct rk_mpp_hw *hw)
+{
+	struct device_node *identity = rk_mpp_hw_cluster_identity(hw);
+	bool coordinator = rk_mpp_hw_is_cluster_coordinator(hw);
+
+	lockdep_assert_held(&hw->srv->hw_lock);
+	if (!identity || identity != cluster->node || !hw->reset_domain)
+		return -EINVAL;
+	if (hw->cluster || !list_empty(&hw->cluster_link))
+		return -EEXIST;
+	if (coordinator && cluster->coordinator &&
+	    (READ_ONCE(cluster->coordinator->online) ||
+	     !list_empty(&cluster->coordinator->link)))
+		return -EEXIST;
+	if (!coordinator && cluster->core_count &&
+	    cluster->member_type != hw->match->type)
+		return -EXDEV;
+	if (cluster->reset_domain &&
+	    cluster->reset_domain != hw->reset_domain)
+		return -EXDEV;
+
+	list_add_tail(&hw->cluster_link, &cluster->members);
+	hw->cluster = cluster;
+	rk_mpp_cluster_rebuild_locked(cluster);
+
+	return 0;
+}
+
+static int rk_mpp_cluster_unregister_member_locked(struct rk_mpp_hw *hw)
+{
+	struct rk_mpp_cluster *cluster = hw->cluster;
+
+	lockdep_assert_held(&hw->srv->hw_lock);
+	if (!cluster)
+		return 0;
+	if (WARN_ON_ONCE(list_empty(&hw->cluster_link)))
+		return -ENOENT;
+
+	list_del_init(&hw->cluster_link);
+	hw->cluster = NULL;
+	rk_mpp_cluster_rebuild_locked(cluster);
+
+	return 0;
+}
+
+/*
+ * Publish a fully acquired member into the stable service-owned cluster. No
+ * later probe step can fail after this helper succeeds. A newly allocated,
+ * still-empty slot is rolled back if its first member cannot be attached.
+ */
+static int rk_mpp_hw_init_cluster_locked(struct rk_mpp_hw *hw)
+{
+	struct rk_mpp_service *srv = hw->srv;
+	struct device_node *identity = rk_mpp_hw_cluster_identity(hw);
+	struct device_node *identity_ref;
+	struct rk_mpp_cluster *cluster;
+	bool added;
+	int ret;
+
+	lockdep_assert_held(&srv->hw_lock);
+	if (!identity)
+		return 0;
+	if (WARN_ON_ONCE(hw->cluster || !list_empty(&hw->cluster_link)))
+		return -EEXIST;
+
+	identity_ref = of_node_get(identity);
+	if (!identity_ref)
+		return -ENODEV;
+	cluster = rk_mpp_cluster_get_locked(srv, identity_ref, &added);
+	if (IS_ERR(cluster) || !added)
+		of_node_put(identity_ref);
+	if (IS_ERR(cluster))
+		return PTR_ERR(cluster);
+
+	ret = rk_mpp_cluster_register_member_locked(cluster, hw);
+	if (ret && added) {
+		WARN_ON_ONCE(!list_empty(&cluster->members));
+		WARN_ON_ONCE(cluster != &srv->clusters[srv->cluster_count - 1]);
+		cluster->node = NULL;
+		srv->cluster_count--;
+		of_node_put(identity_ref);
+	}
+
+	return ret;
+}
+
+static bool
+rk_mpp_cluster_contains_published_view_locked(struct rk_mpp_service *srv,
+					      struct rk_mpp_cluster *cluster)
+{
+	struct rk_mpp_hw *hw;
+
+	lockdep_assert_held(&srv->hw_lock);
+	list_for_each_entry(hw, &srv->hw_list, link) {
+		if (rk_mpp_hw_cluster_identity(hw) == cluster->node &&
+		    hw->cluster != cluster)
+			return false;
+	}
+
+	return true;
+}
+
+static u32
+rk_mpp_cluster_dma_group_count_locked(const struct rk_mpp_cluster *cluster)
+{
+	struct rk_mpp_hw *previous;
+	struct rk_mpp_hw *member;
+	u32 count = 0;
+
+	list_for_each_entry(member, &cluster->members, cluster_link) {
+		bool seen = false;
+
+		if (!member->dma_group)
+			continue;
+		list_for_each_entry(previous, &cluster->members, cluster_link) {
+			if (previous == member)
+				break;
+			if (previous->dma_group == member->dma_group) {
+				seen = true;
+				break;
+			}
+		}
+		if (!seen)
+			count++;
+	}
+
+	return count;
+}
+
+static void rk_mpp_clusters_destroy(struct rk_mpp_service *srv)
+{
+	u32 i;
+
+	for (i = 0; i < srv->cluster_count; i++) {
+		struct rk_mpp_cluster *cluster = &srv->clusters[i];
+
+		WARN_ON_ONCE(cluster->member_count ||
+			     !list_empty(&cluster->members));
+		of_node_put(cluster->node);
+		cluster->node = NULL;
+	}
+	srv->cluster_count = 0;
 }
 
 static bool rk_mpp_hw_ccu_online_locked(struct rk_mpp_service *srv,
@@ -9998,6 +10266,232 @@ static void rk_mpp_debug_event_ring_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, srv->debug_events[1].job_id, 2U);
 }
 
+static void rk_mpp_cluster_registry_kunit(struct kunit *test)
+{
+	struct rk_mpp_cluster *clusters[RK_MPP_MAX_CLUSTERS];
+	struct device_node *identities[RK_MPP_MAX_CLUSTERS + 1];
+	struct device_node *identity;
+	struct rk_mpp_cluster *cluster;
+	struct rk_mpp_service *srv;
+	bool added;
+	u32 i;
+
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
+	mutex_init(&srv->hw_lock);
+	for (i = 0; i < ARRAY_SIZE(identities); i++) {
+		identities[i] = kunit_kzalloc(test, 1, GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, identities[i]);
+	}
+
+	for (i = 0; i < ARRAY_SIZE(clusters); i++) {
+		mutex_lock(&srv->hw_lock);
+		clusters[i] = rk_mpp_cluster_get_locked(srv, identities[i],
+							&added);
+		mutex_unlock(&srv->hw_lock);
+		KUNIT_ASSERT_FALSE(test, IS_ERR(clusters[i]));
+		KUNIT_EXPECT_TRUE(test, added);
+	}
+	KUNIT_EXPECT_EQ(test, srv->cluster_count,
+			(u32)RK_MPP_MAX_CLUSTERS);
+
+	mutex_lock(&srv->hw_lock);
+	cluster = rk_mpp_cluster_get_locked(srv, identities[0], &added);
+	mutex_unlock(&srv->hw_lock);
+	KUNIT_EXPECT_PTR_EQ(test, cluster, clusters[0]);
+	KUNIT_EXPECT_FALSE(test, added);
+
+	mutex_lock(&srv->hw_lock);
+	identity = identities[RK_MPP_MAX_CLUSTERS];
+	cluster = rk_mpp_cluster_get_locked(srv, identity, &added);
+	mutex_unlock(&srv->hw_lock);
+	KUNIT_EXPECT_TRUE(test, IS_ERR(cluster));
+	KUNIT_EXPECT_EQ(test, PTR_ERR(cluster), -ENOSPC);
+	KUNIT_EXPECT_EQ(test, srv->cluster_count,
+			(u32)RK_MPP_MAX_CLUSTERS);
+}
+
+static void rk_mpp_cluster_membership_kunit(struct kunit *test)
+{
+	struct rk_mpp_dma_group *dma0;
+	struct rk_mpp_dma_group *dma1;
+	struct rk_mpp_reset_domain *other_domain;
+	struct rk_mpp_reset_domain *domain;
+	struct device_node *identity;
+	struct rk_mpp_cluster *cluster;
+	struct rk_mpp_service *srv;
+	struct rk_mpp_hw *wrong_domain;
+	struct rk_mpp_hw *wrong_type;
+	struct rk_mpp_hw *duplicate;
+	struct rk_mpp_hw *core0;
+	struct rk_mpp_hw *core1;
+	struct rk_mpp_hw *ccu;
+	struct device *ccu_dev;
+	struct device *duplicate_dev;
+	u32 dma_group_count;
+	int core0_ret;
+	int core1_ret;
+	int duplicate_ret;
+	int ret;
+
+	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
+	identity = kunit_kzalloc(test, sizeof(*identity), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, identity);
+	cluster = kunit_kzalloc(test, sizeof(*cluster), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, cluster);
+	domain = kunit_kzalloc(test, sizeof(*domain), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, domain);
+	other_domain = kunit_kzalloc(test, sizeof(*other_domain), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, other_domain);
+	dma0 = kunit_kzalloc(test, sizeof(*dma0), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dma0);
+	dma1 = kunit_kzalloc(test, sizeof(*dma1), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dma1);
+	core0 = kunit_kzalloc(test, sizeof(*core0), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, core0);
+	core1 = kunit_kzalloc(test, sizeof(*core1), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, core1);
+	ccu = kunit_kzalloc(test, sizeof(*ccu), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ccu);
+	duplicate = kunit_kzalloc(test, sizeof(*duplicate), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, duplicate);
+	wrong_type = kunit_kzalloc(test, sizeof(*wrong_type), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, wrong_type);
+	wrong_domain = kunit_kzalloc(test, sizeof(*wrong_domain), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, wrong_domain);
+	ccu_dev = kunit_kzalloc(test, sizeof(*ccu_dev), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ccu_dev);
+	duplicate_dev = kunit_kzalloc(test, sizeof(*duplicate_dev), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, duplicate_dev);
+
+	mutex_init(&srv->hw_lock);
+	rk_mpp_cluster_init(cluster, identity);
+	rk_mpp_reset_domain_init(domain, identity);
+	rk_mpp_reset_domain_init(other_domain, identity);
+	ccu_dev->of_node = identity;
+	duplicate_dev->of_node = identity;
+
+	core0->srv = srv;
+	core0->match = &rk_mpp_rkvdec2_core;
+	core0->ccu_node = identity;
+	core0->reset_domain = domain;
+	core0->dma_group = dma0;
+	INIT_LIST_HEAD(&core0->cluster_link);
+	core1->srv = srv;
+	core1->match = &rk_mpp_rkvdec2_core;
+	core1->ccu_node = identity;
+	core1->reset_domain = domain;
+	core1->dma_group = dma1;
+	INIT_LIST_HEAD(&core1->cluster_link);
+	ccu->srv = srv;
+	ccu->dev = ccu_dev;
+	ccu->match = &rk_mpp_rkvdec2_ccu;
+	ccu->reset_domain = domain;
+	ccu->online = true;
+	INIT_LIST_HEAD(&ccu->link);
+	INIT_LIST_HEAD(&ccu->cluster_link);
+	duplicate->srv = srv;
+	duplicate->dev = duplicate_dev;
+	duplicate->match = &rk_mpp_rkvdec2_ccu;
+	duplicate->reset_domain = domain;
+	INIT_LIST_HEAD(&duplicate->cluster_link);
+	wrong_type->srv = srv;
+	wrong_type->match = &rk_mpp_rkvenc2_core;
+	wrong_type->ccu_node = identity;
+	wrong_type->reset_domain = domain;
+	INIT_LIST_HEAD(&wrong_type->cluster_link);
+	wrong_domain->srv = srv;
+	wrong_domain->match = &rk_mpp_rkvdec2_core;
+	wrong_domain->ccu_node = identity;
+	wrong_domain->reset_domain = other_domain;
+	INIT_LIST_HEAD(&wrong_domain->cluster_link);
+
+	/* Core-first and coordinator-first probe orders share the same view. */
+	mutex_lock(&srv->hw_lock);
+	ret = rk_mpp_cluster_register_member_locked(cluster, core0);
+	mutex_unlock(&srv->hw_lock);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, cluster->member_count, 1U);
+	KUNIT_EXPECT_EQ(test, cluster->core_count, 1U);
+	KUNIT_EXPECT_PTR_EQ(test, cluster->reset_domain, domain);
+
+	mutex_lock(&srv->hw_lock);
+	ret = rk_mpp_cluster_register_member_locked(cluster, core1);
+	mutex_unlock(&srv->hw_lock);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	mutex_lock(&srv->hw_lock);
+	dma_group_count = rk_mpp_cluster_dma_group_count_locked(cluster);
+	mutex_unlock(&srv->hw_lock);
+	KUNIT_EXPECT_EQ(test, dma_group_count, 2U);
+
+	mutex_lock(&srv->hw_lock);
+	ret = rk_mpp_cluster_register_member_locked(cluster, ccu);
+	mutex_unlock(&srv->hw_lock);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_PTR_EQ(test, cluster->coordinator, ccu);
+	KUNIT_EXPECT_EQ(test, cluster->member_count, 3U);
+
+	mutex_lock(&srv->hw_lock);
+	ret = rk_mpp_cluster_register_member_locked(cluster, duplicate);
+	mutex_unlock(&srv->hw_lock);
+	KUNIT_EXPECT_EQ(test, ret, -EEXIST);
+	mutex_lock(&srv->hw_lock);
+	ret = rk_mpp_cluster_register_member_locked(cluster, wrong_type);
+	mutex_unlock(&srv->hw_lock);
+	KUNIT_EXPECT_EQ(test, ret, -EXDEV);
+	mutex_lock(&srv->hw_lock);
+	ret = rk_mpp_cluster_register_member_locked(cluster, wrong_domain);
+	mutex_unlock(&srv->hw_lock);
+	KUNIT_EXPECT_EQ(test, ret, -EXDEV);
+
+	/* A draining, unpublished coordinator may overlap its replacement. */
+	WRITE_ONCE(ccu->online, false);
+	mutex_lock(&srv->hw_lock);
+	ret = rk_mpp_cluster_register_member_locked(cluster, duplicate);
+	mutex_unlock(&srv->hw_lock);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_PTR_EQ(test, cluster->coordinator, duplicate);
+	KUNIT_EXPECT_EQ(test, cluster->member_count, 4U);
+	mutex_lock(&srv->hw_lock);
+	ret = rk_mpp_cluster_unregister_member_locked(ccu);
+	mutex_unlock(&srv->hw_lock);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_PTR_EQ(test, cluster->coordinator, duplicate);
+	KUNIT_EXPECT_EQ(test, cluster->member_count, 3U);
+
+	mutex_lock(&srv->hw_lock);
+	duplicate_ret = rk_mpp_cluster_unregister_member_locked(duplicate);
+	core1_ret = rk_mpp_cluster_unregister_member_locked(core1);
+	core0_ret = rk_mpp_cluster_unregister_member_locked(core0);
+	mutex_unlock(&srv->hw_lock);
+	KUNIT_EXPECT_EQ(test, duplicate_ret, 0);
+	KUNIT_EXPECT_EQ(test, core1_ret, 0);
+	KUNIT_EXPECT_EQ(test, core0_ret, 0);
+	KUNIT_EXPECT_TRUE(test, list_empty(&cluster->members));
+	KUNIT_EXPECT_EQ(test, cluster->member_count, 0U);
+	KUNIT_EXPECT_PTR_EQ(test, cluster->reset_domain, NULL);
+
+	/* Rebuild the same stable slot in coordinator-first probe order. */
+	mutex_lock(&srv->hw_lock);
+	duplicate_ret =
+		rk_mpp_cluster_register_member_locked(cluster, duplicate);
+	core0_ret = rk_mpp_cluster_register_member_locked(cluster, core0);
+	mutex_unlock(&srv->hw_lock);
+	KUNIT_ASSERT_EQ(test, duplicate_ret, 0);
+	KUNIT_ASSERT_EQ(test, core0_ret, 0);
+	KUNIT_EXPECT_PTR_EQ(test, cluster->coordinator, duplicate);
+	KUNIT_EXPECT_EQ(test, cluster->member_count, 2U);
+
+	mutex_lock(&srv->hw_lock);
+	core0_ret = rk_mpp_cluster_unregister_member_locked(core0);
+	duplicate_ret = rk_mpp_cluster_unregister_member_locked(duplicate);
+	mutex_unlock(&srv->hw_lock);
+	KUNIT_EXPECT_EQ(test, core0_ret, 0);
+	KUNIT_EXPECT_EQ(test, duplicate_ret, 0);
+	KUNIT_EXPECT_TRUE(test, list_empty(&cluster->members));
+}
+
 static void rk_mpp_reset_domain_registry_kunit(struct kunit *test)
 {
 	struct rk_mpp_reset_domain *domains[RK_MPP_MAX_RESET_DOMAINS];
@@ -10231,6 +10725,8 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_reset_session_hw_active_import_kunit),
 	KUNIT_CASE(rk_mpp_file_release_public_cleanup_kunit),
 	KUNIT_CASE(rk_mpp_debug_event_ring_kunit),
+	KUNIT_CASE(rk_mpp_cluster_registry_kunit),
+	KUNIT_CASE(rk_mpp_cluster_membership_kunit),
 	KUNIT_CASE(rk_mpp_reset_domain_registry_kunit),
 	KUNIT_CASE(rk_mpp_reset_domain_state_kunit),
 	{}
@@ -18092,6 +18588,19 @@ static int rk_mpp_debug_state_show(struct seq_file *s, void *unused)
 			   active_session, active_job, active_client, active_ms,
 			   ccu_mode);
 	}
+
+	seq_puts(s, "\n# clusters: node coordinator members cores core_type reset_domain dma_groups\n");
+	for (i = 0; i < srv->cluster_count; i++) {
+		struct rk_mpp_cluster *cluster = &srv->clusters[i];
+		const char *coordinator = cluster->coordinator ?
+			dev_name(cluster->coordinator->dev) : "-";
+
+		seq_printf(s, "%pOF %s %u %u %u %u %u\n", cluster->node,
+			   coordinator, cluster->member_count,
+			   cluster->core_count, cluster->member_type,
+			   !!cluster->reset_domain,
+			   rk_mpp_cluster_dma_group_count_locked(cluster));
+	}
 	mutex_unlock(&srv->hw_lock);
 
 	seq_puts(s, "\n# queue: device core session job client requests registers flags canceled queued_ms\n");
@@ -18437,6 +18946,7 @@ static int rk_mpp_hw_probe(struct platform_device *pdev)
 	atomic_set(&hw->power_count, 0);
 	INIT_LIST_HEAD(&hw->fault_link);
 	INIT_LIST_HEAD(&hw->reset_domain_link);
+	INIT_LIST_HEAD(&hw->cluster_link);
 	INIT_LIST_HEAD(&hw->rkvdec_ccu_jobs);
 	INIT_DELAYED_WORK(&hw->timeout_work, rk_mpp_hw_timeout_work);
 	INIT_WORK(&hw->iommu_fault_work, rk_mpp_hw_iommu_fault_work);
@@ -18610,8 +19120,14 @@ static int rk_mpp_hw_probe(struct platform_device *pdev)
 					       hw->ccu_node, hw->core_mask);
 	if (ret)
 		goto err_unlock_identity;
+	ret = rk_mpp_hw_init_cluster_locked(hw);
+	if (ret)
+		goto err_unlock_identity;
 	hw->online = true;
 	list_add_tail(&hw->link, &rk_mpp_srv.hw_list);
+	WARN_ON_ONCE(hw->cluster &&
+		     !rk_mpp_cluster_contains_published_view_locked(&rk_mpp_srv,
+							       hw->cluster));
 	hard_ccu_dma_ready =
 		rk_mpp_rkvdec2_hard_ccu_dma_ready_locked(&rk_mpp_srv, hw);
 	rk_mpp_refresh_hw_support_locked(&rk_mpp_srv);
@@ -18758,6 +19274,9 @@ retry_stop:
 		devm_free_irq(&pdev->dev, aux->irq, aux);
 		aux->registered = false;
 	}
+	mutex_lock(&rk_mpp_srv.hw_lock);
+	WARN_ON_ONCE(rk_mpp_cluster_unregister_member_locked(hw));
+	mutex_unlock(&rk_mpp_srv.hw_lock);
 	rk_mpp_dma_group_unregister(hw);
 }
 
@@ -19118,6 +19637,7 @@ err_deregister_misc:
 	misc_deregister(&rk_mpp_srv.miscdev);
 err_unregister_hw:
 	platform_driver_unregister(&rk_mpp_hw_driver);
+	rk_mpp_clusters_destroy(&rk_mpp_srv);
 	rk_mpp_reset_domains_destroy(&rk_mpp_srv);
 	rk_mpp_dma_groups_destroy();
 	WRITE_ONCE(rk_mpp_srv.debug_ready, false);
@@ -19134,6 +19654,7 @@ static void rk_mpp_runtime_unregister(void)
 	debugfs_remove_recursive(rk_mpp_srv.debugfs_root);
 	misc_deregister(&rk_mpp_srv.miscdev);
 	platform_driver_unregister(&rk_mpp_hw_driver);
+	rk_mpp_clusters_destroy(&rk_mpp_srv);
 	rk_mpp_reset_domains_destroy(&rk_mpp_srv);
 	rk_mpp_dma_groups_destroy();
 	flush_work(&rk_mpp_srv.sched_work);
