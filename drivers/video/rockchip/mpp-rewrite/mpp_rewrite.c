@@ -447,6 +447,25 @@ struct rk_mpp_cluster {
 	u32 core_count;
 };
 
+/*
+ * One refcounted hold over the member-core power references selected for an
+ * RKVDEC CCU chain.  A job owns one reference to the lease; when that job
+ * leaves a nonempty coordinator chain, ownership moves to the next listed
+ * job without changing the physical power references.  The final owner drops
+ * every power and hardware reference exactly once.
+ *
+ * The coordinator's per-job power reference remains separate: every job that
+ * publishes a descriptor owns that reference until its own teardown, while
+ * this lease covers only the member cores that must remain powered for the
+ * lifetime of the shared chain.
+ */
+struct rk_mpp_cluster_power_lease {
+	refcount_t power_lease_refs;
+	struct rk_mpp_cluster *power_lease_cluster;
+	u32 power_lease_core_count;
+	struct rk_mpp_hw *power_lease_cores[];
+};
+
 struct rk_mpp_hw {
 	struct list_head link;
 	struct list_head fault_link;
@@ -919,8 +938,7 @@ struct rk_mpp_job {
 	u32 rkvdec_ccu_work;
 	u32 rkvdec_ccu_cfg_done;
 	u32 rkvenc_dchs_core_id;
-	struct rk_mpp_hw *rkvdec_ccu_powered_cores[RK_MPP_RKVDEC_MAX_CCU_CORES];
-	u32 rkvdec_ccu_powered_core_count;
+	struct rk_mpp_cluster_power_lease *rkvdec_ccu_power_lease;
 	bool poll_irq;
 	bool canceled;
 	bool rkvdec_link_active;
@@ -3650,9 +3668,12 @@ static void rk_mpp_hw_power_off(struct rk_mpp_hw *hw);
 static void rk_mpp_job_get(struct rk_mpp_job *job);
 static void rk_mpp_job_put(struct rk_mpp_job *job);
 
-static u32 rk_mpp_rkvdec2_powered_ccu_core_count(const struct rk_mpp_job *job)
+static u32 rk_mpp_cluster_power_lease_core_count(const struct rk_mpp_job *job)
 {
-	return job->rkvdec_ccu_powered_core_count;
+	struct rk_mpp_cluster_power_lease *lease =
+		READ_ONCE(job->rkvdec_ccu_power_lease);
+
+	return lease ? lease->power_lease_core_count : 0;
 }
 
 static bool
@@ -3660,16 +3681,19 @@ rk_mpp_rkvdec2_job_has_live_leases(const struct rk_mpp_job *job)
 {
 	return job->rkvdec_ccu_started || job->rkvdec_ccu_listed ||
 	       job->rkvdec_ccu_powered ||
-	       rk_mpp_rkvdec2_powered_ccu_core_count(job);
+	       READ_ONCE(job->rkvdec_ccu_power_lease);
 }
 
 static struct rk_mpp_hw *
-rk_mpp_rkvdec2_powered_ccu_core(const struct rk_mpp_job *job, u32 index)
+rk_mpp_cluster_power_lease_core(const struct rk_mpp_job *job, u32 index)
 {
-	if (WARN_ON_ONCE(index >= rk_mpp_rkvdec2_powered_ccu_core_count(job)))
+	struct rk_mpp_cluster_power_lease *lease =
+		READ_ONCE(job->rkvdec_ccu_power_lease);
+
+	if (WARN_ON_ONCE(!lease || index >= lease->power_lease_core_count))
 		return NULL;
 
-	return job->rkvdec_ccu_powered_cores[index];
+	return lease->power_lease_cores[index];
 }
 
 static int rk_mpp_rkvdec2_acquire_ccu_power(struct rk_mpp_job *job,
@@ -3703,48 +3727,61 @@ static void rk_mpp_rkvdec2_release_ccu_power(struct rk_mpp_job *job,
 	job->rkvdec_ccu_powered = false;
 }
 
-static void rk_mpp_rkvdec2_power_off_ccu_cores(struct rk_mpp_job *job)
+static void
+rk_mpp_cluster_power_lease_put(struct rk_mpp_cluster_power_lease *lease)
 {
 	u32 i;
 
-	for (i = 0; i < rk_mpp_rkvdec2_powered_ccu_core_count(job); i++) {
-		struct rk_mpp_hw *hw = rk_mpp_rkvdec2_powered_ccu_core(job, i);
+	if (!lease || !refcount_dec_and_test(&lease->power_lease_refs))
+		return;
+
+	for (i = 0; i < lease->power_lease_core_count; i++) {
+		struct rk_mpp_hw *hw = lease->power_lease_cores[i];
 
 		rk_mpp_hw_power_off(hw);
 		rk_mpp_hw_put(hw);
-		job->rkvdec_ccu_powered_cores[i] = NULL;
 	}
-	job->rkvdec_ccu_powered_core_count = 0;
+	kfree(lease);
 }
 
-static bool rk_mpp_rkvdec2_move_powered_ccu_cores(struct rk_mpp_job *from,
-						  struct rk_mpp_job *to)
+static void rk_mpp_cluster_power_lease_release(struct rk_mpp_job *job)
 {
-	u32 i;
+	struct rk_mpp_cluster_power_lease *lease;
 
-	if (!from || !to || from == to ||
-	    !from->rkvdec_ccu_powered_core_count ||
-	    to->rkvdec_ccu_powered_core_count)
+	lease = xchg(&job->rkvdec_ccu_power_lease, NULL);
+	rk_mpp_cluster_power_lease_put(lease);
+}
+
+static bool
+rk_mpp_cluster_power_lease_move(struct rk_mpp_job *from,
+				struct rk_mpp_job *to)
+{
+	struct rk_mpp_cluster_power_lease *lease;
+
+	if (!from || !to || from == to)
+		return false;
+	lease = READ_ONCE(from->rkvdec_ccu_power_lease);
+	if (!lease || READ_ONCE(to->rkvdec_ccu_power_lease))
 		return false;
 
-	for (i = 0; i < from->rkvdec_ccu_powered_core_count; i++) {
-		to->rkvdec_ccu_powered_cores[i] =
-			from->rkvdec_ccu_powered_cores[i];
-		from->rkvdec_ccu_powered_cores[i] = NULL;
-	}
-	to->rkvdec_ccu_powered_core_count =
-		from->rkvdec_ccu_powered_core_count;
-	from->rkvdec_ccu_powered_core_count = 0;
+	if (WARN_ON_ONCE(!refcount_inc_not_zero(&lease->power_lease_refs)))
+		return false;
+
+	WRITE_ONCE(to->rkvdec_ccu_power_lease, lease);
+	WRITE_ONCE(from->rkvdec_ccu_power_lease, NULL);
+	refcount_dec(&lease->power_lease_refs);
 
 	return true;
 }
 
-static int rk_mpp_rkvdec2_power_on_ccu_cores(struct rk_mpp_job *job,
-					     u32 core_mask)
+static int rk_mpp_cluster_power_lease_acquire(struct rk_mpp_job *job,
+					      u32 core_mask)
 {
+	struct rk_mpp_cluster_power_lease *lease;
 	struct rk_mpp_hw *cores[RK_MPP_RKVDEC_MAX_CCU_CORES];
 	struct rk_mpp_service *srv = job->session->srv;
 	struct rk_mpp_hw *ccu = job->rkvdec_ccu;
+	struct rk_mpp_cluster *cluster;
 	struct rk_mpp_hw *hw;
 	u32 count = 0;
 	u32 i;
@@ -3752,6 +3789,12 @@ static int rk_mpp_rkvdec2_power_on_ccu_cores(struct rk_mpp_job *job,
 
 	if (!srv || !ccu || !ccu->dev)
 		return 0;
+	if (READ_ONCE(job->rkvdec_ccu_power_lease))
+		return 0;
+
+	cluster = READ_ONCE(ccu->cluster);
+	if (!cluster || READ_ONCE(job->hw->cluster) != cluster)
+		return -EXDEV;
 
 	mutex_lock(&srv->hw_lock);
 	list_for_each_entry(hw, &srv->hw_list, link) {
@@ -3764,34 +3807,55 @@ static int rk_mpp_rkvdec2_power_on_ccu_cores(struct rk_mpp_job *job,
 			ret = -EOPNOTSUPP;
 			goto err_put_locked;
 		}
+		if (READ_ONCE(hw->cluster) != cluster) {
+			ret = -EXDEV;
+			goto err_put_locked;
+		}
 		rk_mpp_hw_get(hw);
 		cores[count++] = hw;
 	}
 	mutex_unlock(&srv->hw_lock);
+	if (!count)
+		return 0;
+
+	lease = kzalloc(struct_size(lease, power_lease_cores, count), GFP_KERNEL);
+	if (!lease) {
+		ret = -ENOMEM;
+		goto err_put;
+	}
+	refcount_set(&lease->power_lease_refs, 1);
+	lease->power_lease_cluster = cluster;
 
 	/*
 	 * Hold a chain-owned power reference for every work-mask core, including
 	 * the submitter.  Its per-job reference is released at completion, while
-	 * this reference follows the remaining HARD-CCU chain.
+	 * this refcounted lease follows the remaining HARD-CCU chain.
 	 */
 	for (i = 0; i < count; i++) {
 		ret = rk_mpp_hw_power_on(cores[i]);
 		if (ret)
 			goto err_power_off;
-		job->rkvdec_ccu_powered_cores[i] = cores[i];
-		job->rkvdec_ccu_powered_core_count++;
+		lease->power_lease_cores[i] = cores[i];
+		lease->power_lease_core_count++;
 	}
+	WRITE_ONCE(job->rkvdec_ccu_power_lease, lease);
 
 	return 0;
 
 err_power_off:
+	i = lease->power_lease_core_count;
 	while (i--) {
-		rk_mpp_hw_power_off(cores[i]);
-		rk_mpp_hw_put(cores[i]);
+		rk_mpp_hw_power_off(lease->power_lease_cores[i]);
+		rk_mpp_hw_put(lease->power_lease_cores[i]);
 	}
-	for (i = job->rkvdec_ccu_powered_core_count; i < count; i++)
+	for (i = lease->power_lease_core_count; i < count; i++)
 		rk_mpp_hw_put(cores[i]);
-	job->rkvdec_ccu_powered_core_count = 0;
+	kfree(lease);
+	return ret;
+
+err_put:
+	while (count--)
+		rk_mpp_hw_put(cores[count]);
 	return ret;
 
 err_put_locked:
@@ -4122,20 +4186,21 @@ rk_mpp_rkvdec2_ccu_job_del(struct rk_mpp_job *job, struct rk_mpp_hw *ccu)
 	return empty;
 }
 
-static void rk_mpp_rkvdec2_transfer_powered_ccu_cores(struct rk_mpp_job *from,
-						      struct rk_mpp_hw *ccu)
+static void
+rk_mpp_rkvdec2_transfer_cluster_power_lease(struct rk_mpp_job *from,
+					    struct rk_mpp_hw *ccu)
 {
 	struct rk_mpp_job *to;
 	unsigned long flags;
 
-	if (!ccu || !rk_mpp_rkvdec2_powered_ccu_core_count(from))
+	if (!ccu || !rk_mpp_cluster_power_lease_core_count(from))
 		return;
 
 	spin_lock_irqsave(&ccu->lock, flags);
 	to = list_first_entry_or_null(&ccu->rkvdec_ccu_jobs,
 				      struct rk_mpp_job, rkvdec_ccu_node);
 	if (to)
-		rk_mpp_rkvdec2_move_powered_ccu_cores(from, to);
+		rk_mpp_cluster_power_lease_move(from, to);
 	spin_unlock_irqrestore(&ccu->lock, flags);
 }
 
@@ -4185,7 +4250,7 @@ static void rk_mpp_rkvdec2_release_link_table(struct rk_mpp_job *job)
 		mutex_lock(&ccu->run_lock);
 		ccu_empty = rk_mpp_rkvdec2_ccu_job_del(job, ccu);
 		if (!ccu_empty)
-			rk_mpp_rkvdec2_transfer_powered_ccu_cores(job, ccu);
+			rk_mpp_rkvdec2_transfer_cluster_power_lease(job, ccu);
 		/*
 		 * A terminally isolated coordinator has already had its
 		 * clocks and runtime-PM references drained, so its register
@@ -4209,7 +4274,7 @@ static void rk_mpp_rkvdec2_release_link_table(struct rk_mpp_job *job)
 	}
 
 	rk_mpp_rkvdec2_release_ccu_power(job, ccu);
-	rk_mpp_rkvdec2_power_off_ccu_cores(job);
+	rk_mpp_cluster_power_lease_release(job);
 
 	/*
 	 * Only return the node to the pool.  The coordinator running list
@@ -6769,16 +6834,42 @@ static void rk_mpp_rkvdec2_ccu_job_done_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, rk_mpp_rkvdec2_ccu_job_done(&job, info));
 }
 
+static struct rk_mpp_cluster_power_lease *
+rk_mpp_cluster_power_lease_kunit(struct kunit *test,
+				 struct rk_mpp_cluster *cluster,
+				 struct rk_mpp_hw **cores, u32 count)
+{
+	struct rk_mpp_cluster_power_lease *lease;
+	u32 i;
+
+	lease = kunit_kzalloc(test, struct_size(lease, power_lease_cores, count),
+			      GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, lease);
+	refcount_set(&lease->power_lease_refs, 1);
+	lease->power_lease_cluster = cluster;
+	lease->power_lease_core_count = count;
+	for (i = 0; i < count; i++)
+		lease->power_lease_cores[i] = cores[i];
+
+	return lease;
+}
+
 static void rk_mpp_rkvdec2_ccu_power_transfer_kunit(struct kunit *test)
 {
+	struct rk_mpp_cluster_power_lease *lease0;
+	struct rk_mpp_cluster_power_lease *lease1;
+	struct rk_mpp_cluster *cluster;
 	struct rk_mpp_hw *ccu;
 	struct rk_mpp_hw *core0;
 	struct rk_mpp_hw *core1;
 	struct rk_mpp_hw *core2;
+	struct rk_mpp_hw *cores[2];
 	struct rk_mpp_job *from;
 	struct rk_mpp_job *to;
 	bool acquired_now = true;
 
+	cluster = kunit_kzalloc(test, sizeof(*cluster), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, cluster);
 	ccu = kunit_kzalloc(test, sizeof(*ccu), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, ccu);
 	core0 = kunit_kzalloc(test, sizeof(*core0), GFP_KERNEL);
@@ -6814,44 +6905,56 @@ static void rk_mpp_rkvdec2_ccu_power_transfer_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&ccu->rkvdec_ccu_jobs);
 	INIT_LIST_HEAD(&to->rkvdec_ccu_node);
 	list_add_tail(&to->rkvdec_ccu_node, &ccu->rkvdec_ccu_jobs);
-	from->rkvdec_ccu_powered_cores[0] = core0;
-	from->rkvdec_ccu_powered_cores[1] = core1;
-	from->rkvdec_ccu_powered_core_count = 2;
+	cores[0] = core0;
+	cores[1] = core1;
+	lease0 = rk_mpp_cluster_power_lease_kunit(test, cluster, cores,
+						  ARRAY_SIZE(cores));
+	from->rkvdec_ccu_power_lease = lease0;
 
-	rk_mpp_rkvdec2_transfer_powered_ccu_cores(from, ccu);
+	rk_mpp_rkvdec2_transfer_cluster_power_lease(from, ccu);
 
-	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_powered_ccu_core_count(from), 0U);
-	KUNIT_EXPECT_PTR_EQ(test, from->rkvdec_ccu_powered_cores[0], NULL);
-	KUNIT_EXPECT_PTR_EQ(test, from->rkvdec_ccu_powered_cores[1], NULL);
-	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_powered_ccu_core_count(to), 2U);
-	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_rkvdec2_powered_ccu_core(to, 0), core0);
-	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_rkvdec2_powered_ccu_core(to, 1), core1);
+	KUNIT_EXPECT_EQ(test, rk_mpp_cluster_power_lease_core_count(from), 0U);
+	KUNIT_EXPECT_PTR_EQ(test, from->rkvdec_ccu_power_lease, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, to->rkvdec_ccu_power_lease, lease0);
+	KUNIT_EXPECT_PTR_EQ(test, lease0->power_lease_cluster, cluster);
+	KUNIT_EXPECT_EQ(test, refcount_read(&lease0->power_lease_refs), 1U);
+	KUNIT_EXPECT_EQ(test, rk_mpp_cluster_power_lease_core_count(to), 2U);
+	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_cluster_power_lease_core(to, 0), core0);
+	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_cluster_power_lease_core(to, 1), core1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&core0->refs), 2U);
 	KUNIT_EXPECT_EQ(test, refcount_read(&core1->refs), 3U);
 	KUNIT_EXPECT_EQ(test, atomic_read(&core0->power_count), 1);
 	KUNIT_EXPECT_EQ(test, atomic_read(&core1->power_count), 2);
 
-	from->rkvdec_ccu_powered_cores[0] = core2;
-	from->rkvdec_ccu_powered_core_count = 1;
-	rk_mpp_rkvdec2_transfer_powered_ccu_cores(from, ccu);
+	cores[0] = core2;
+	lease1 = rk_mpp_cluster_power_lease_kunit(test, cluster, cores, 1);
+	from->rkvdec_ccu_power_lease = lease1;
+	rk_mpp_rkvdec2_transfer_cluster_power_lease(from, ccu);
 
-	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_powered_ccu_core_count(from), 1U);
-	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_rkvdec2_powered_ccu_core(from, 0), core2);
-	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_powered_ccu_core_count(to), 2U);
-	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_rkvdec2_powered_ccu_core(to, 0), core0);
-	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_rkvdec2_powered_ccu_core(to, 1), core1);
+	KUNIT_EXPECT_PTR_EQ(test, from->rkvdec_ccu_power_lease, lease1);
+	KUNIT_EXPECT_PTR_EQ(test, to->rkvdec_ccu_power_lease, lease0);
+	KUNIT_EXPECT_EQ(test, rk_mpp_cluster_power_lease_core_count(from), 1U);
+	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_cluster_power_lease_core(from, 0), core2);
+	KUNIT_EXPECT_EQ(test, rk_mpp_cluster_power_lease_core_count(to), 2U);
+	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_cluster_power_lease_core(to, 0), core0);
+	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_cluster_power_lease_core(to, 1), core1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&core2->refs), 4U);
 	KUNIT_EXPECT_EQ(test, atomic_read(&core2->power_count), 3);
 }
 
 static void rk_mpp_rkvdec2_release_power_transfer_kunit(struct kunit *test)
 {
+	struct rk_mpp_cluster_power_lease *lease;
+	struct rk_mpp_cluster *cluster;
 	struct rk_mpp_hw *ccu;
 	struct rk_mpp_hw *core0;
 	struct rk_mpp_hw *core1;
+	struct rk_mpp_hw *cores[2];
 	struct rk_mpp_job *from;
 	struct rk_mpp_job *to;
 
+	cluster = kunit_kzalloc(test, sizeof(*cluster), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, cluster);
 	ccu = kunit_kzalloc(test, sizeof(*ccu), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, ccu);
 	core0 = kunit_kzalloc(test, sizeof(*core0), GFP_KERNEL);
@@ -6877,20 +6980,25 @@ static void rk_mpp_rkvdec2_release_power_transfer_kunit(struct kunit *test)
 	from->rkvdec_ccu = ccu;
 	from->rkvdec_ccu_started = true;
 	from->rkvdec_ccu_listed = true;
-	from->rkvdec_ccu_powered_cores[0] = core0;
-	from->rkvdec_ccu_powered_cores[1] = core1;
-	from->rkvdec_ccu_powered_core_count = 2;
+	cores[0] = core0;
+	cores[1] = core1;
+	lease = rk_mpp_cluster_power_lease_kunit(test, cluster, cores,
+						 ARRAY_SIZE(cores));
+	from->rkvdec_ccu_power_lease = lease;
 
 	rk_mpp_rkvdec2_release_link_table(from);
 
 	KUNIT_EXPECT_PTR_EQ(test, from->rkvdec_ccu, NULL);
 	KUNIT_EXPECT_FALSE(test, from->rkvdec_ccu_started);
-	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_powered_ccu_core_count(from), 0U);
+	KUNIT_EXPECT_EQ(test, rk_mpp_cluster_power_lease_core_count(from), 0U);
+	KUNIT_EXPECT_PTR_EQ(test, from->rkvdec_ccu_power_lease, NULL);
 	KUNIT_EXPECT_FALSE(test, from->rkvdec_ccu_listed);
-	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_powered_ccu_core_count(to), 2U);
-	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_rkvdec2_powered_ccu_core(to, 0),
+	KUNIT_EXPECT_PTR_EQ(test, to->rkvdec_ccu_power_lease, lease);
+	KUNIT_EXPECT_EQ(test, refcount_read(&lease->power_lease_refs), 1U);
+	KUNIT_EXPECT_EQ(test, rk_mpp_cluster_power_lease_core_count(to), 2U);
+	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_cluster_power_lease_core(to, 0),
 			    from->hw);
-	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_rkvdec2_powered_ccu_core(to, 1), core1);
+	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_cluster_power_lease_core(to, 1), core1);
 	KUNIT_EXPECT_TRUE(test, completion_done(&ccu->released));
 }
 
@@ -13223,17 +13331,18 @@ static int rk_mpp_rkvdec2_acquire_soft_ccu(struct rk_mpp_job *job)
 	 * poke at the gated register file stalls the interconnect
 	 * (mpi_dec_mt_h264 -> mpi_dec_h265 first-submit wedge, 2026-07-30;
 	 * mpi_dec_h265 alone passes on a fresh boot). The references are
-	 * job-owned and released with the job's coordinator reference in the
-	 * common CCU-release path.
+	 * The refcounted cluster lease is attached to one listed job at a time
+	 * and released with the final job's coordinator reference in the common
+	 * CCU-release path.
 	 */
-	if (!rk_mpp_rkvdec2_powered_ccu_core_count(job)) {
+	if (!rk_mpp_cluster_power_lease_core_count(job)) {
 		u32 ccu_cores = 0;
 
 		ret = rk_mpp_rkvdec2_ccu_core_mask(job->session->srv, ccu,
 						   hw, &ccu_cores);
 		if (ret)
 			return ret;
-		ret = rk_mpp_rkvdec2_power_on_ccu_cores(job, ccu_cores);
+		ret = rk_mpp_cluster_power_lease_acquire(job, ccu_cores);
 		if (ret)
 			return ret;
 	}
@@ -13693,7 +13802,7 @@ static int rk_mpp_hw_power_on(struct rk_mpp_hw *hw)
 
 	/*
 	 * This deassert is unconditional -- it runs even when the core is
-	 * already powered.  rk_mpp_rkvdec2_power_on_ccu_cores() reaches here
+	 * already powered.  rk_mpp_cluster_power_lease_acquire() reaches here
 	 * for *sibling* cores holding only the submitting core's run_lock,
 	 * while a sibling's own recovery pulses its reset under its own
 	 * run_lock; no lock was common to the two, so this deassert could land
@@ -14594,9 +14703,9 @@ static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
 	}
 
 	if (!add_mode) {
-		if (!rk_mpp_rkvdec2_powered_ccu_core_count(job)) {
-			ret = rk_mpp_rkvdec2_power_on_ccu_cores(job,
-					job->rkvdec_ccu_core_work);
+		if (!rk_mpp_cluster_power_lease_core_count(job)) {
+			ret = rk_mpp_cluster_power_lease_acquire(job,
+								 job->rkvdec_ccu_core_work);
 			if (ret)
 				goto err_unlock_ccu;
 			cores_powered_now = true;
@@ -14606,9 +14715,9 @@ static int rk_mpp_rkvdec2_start_ccu_job(struct rk_mpp_job *job)
 		if (ret)
 			goto err_unlock_ccu;
 		rk_mpp_rkvdec2_prepare_core_for_ccu(hw);
-		for (i = 0; i < rk_mpp_rkvdec2_powered_ccu_core_count(job); i++) {
+		for (i = 0; i < rk_mpp_cluster_power_lease_core_count(job); i++) {
 			struct rk_mpp_hw *core =
-				rk_mpp_rkvdec2_powered_ccu_core(job, i);
+				rk_mpp_cluster_power_lease_core(job, i);
 
 			if (core == hw)
 				continue;
@@ -14652,7 +14761,7 @@ err_unlock_ccu:
 	mutex_unlock(&ccu->run_lock);
 err_power_off:
 	if (cores_powered_now)
-		rk_mpp_rkvdec2_power_off_ccu_cores(job);
+		rk_mpp_cluster_power_lease_release(job);
 	if (ccu_powered_now)
 		rk_mpp_rkvdec2_release_ccu_power(job, ccu);
 	return ret;
@@ -15279,10 +15388,10 @@ rk_mpp_rkvdec2_collect_stop_cores(
 		*core_work |= job->rkvdec_ccu_core_work;
 		complete &= rk_mpp_rkvdec2_add_stop_core(cores, count,
 							 job->hw);
-		for (i = 0; i < rk_mpp_rkvdec2_powered_ccu_core_count(job); i++)
+		for (i = 0; i < rk_mpp_cluster_power_lease_core_count(job); i++)
 			complete &= rk_mpp_rkvdec2_add_stop_core(
 				cores, count,
-				rk_mpp_rkvdec2_powered_ccu_core(job, i));
+				rk_mpp_cluster_power_lease_core(job, i));
 	}
 	spin_unlock_irqrestore(&ccu->lock, flags);
 
