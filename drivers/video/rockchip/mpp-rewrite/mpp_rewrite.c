@@ -647,6 +647,7 @@ struct rk_mpp_activation_resources {
 	u32 rkvdec_ccu_work;
 	u32 rkvdec_ccu_cfg_done;
 	u32 rkvenc_dchs_core_id;
+	u32 rkvenc_dchs_value;
 	struct rk_mpp_cluster_power_lease *rkvdec_ccu_power_lease;
 	bool rkvdec_link_active;
 	bool rkvdec_ccu_listed;
@@ -654,6 +655,7 @@ struct rk_mpp_activation_resources {
 	bool rkvdec_ccu_powered;
 	bool rkvdec_ccu_started;
 	bool rkvenc_dchs_active;
+	bool rkvenc_dchs_override_valid;
 	u64 hw_start_ns;
 	u64 hw_elapsed_ns;
 };
@@ -1290,14 +1292,31 @@ struct rk_mpp_reg_image {
 	s32 fail_index;
 };
 
+enum rk_mpp_reg_builder_state {
+	RK_MPP_REG_BUILDER_OPEN,
+	RK_MPP_REG_BUILDER_SEALED,
+};
+
+struct rk_mpp_reg_builder {
+	struct rk_mpp_reg_image image;
+	enum rk_mpp_reg_builder_state state;
+};
+
+struct rk_mpp_reg_result {
+	struct rk_mpp_reg_region regions[RK_MPP_MAX_REGIONS];
+	u32 rkvdec_perf_sel[RK_MPP_RKVDEC_PERF_SEL_NUM];
+};
+
 struct rk_mpp_trans_table {
 	const u16 *regs;
 	u32 count;
 };
 
 struct rk_mpp_backend_ops {
-	int (*validate)(struct rk_mpp_job *job);
-	int (*submit)(struct rk_mpp_job *job);
+	int (*validate)(struct rk_mpp_job *job,
+			const struct rk_mpp_reg_image *image);
+	int (*submit)(struct rk_mpp_job *job,
+		      const struct rk_mpp_reg_image *image);
 	irqreturn_t (*irq)(struct rk_mpp_hw *hw,
 			   const struct rk_mpp_irq_register_lease *lease);
 	irqreturn_t (*thread)(struct rk_mpp_hw *hw);
@@ -1345,12 +1364,78 @@ struct rk_mpp_job {
 	u16 trans_table[RK_MPP_MAX_REG_TRANS_NUM];
 	u32 trans_count;
 	struct rk_mpp_codec_info_state codec_info[RK_MPP_CODEC_INFO_MAX];
-	struct rk_mpp_reg_image reg_image;
+	struct rk_mpp_reg_builder reg_builder;
+	struct rk_mpp_reg_result reg_result;
 	struct rk_mpp_import **imports;
 	u32 import_count;
 	u32 import_capacity;
 	struct rk_mpp_job_req reqs[RK_MPP_MAX_MSG_NUM];
 };
+
+static int rk_mpp_reg_builder_require_open(struct rk_mpp_job *job)
+{
+	return job->reg_builder.state == RK_MPP_REG_BUILDER_OPEN ? 0 : -EPERM;
+}
+
+static void rk_mpp_reg_result_release(struct rk_mpp_reg_result *result)
+{
+	u32 i;
+
+	for (i = 0; i < RK_MPP_MAX_REGIONS; i++) {
+		kfree(result->regions[i].regs);
+		memset(&result->regions[i], 0, sizeof(result->regions[i]));
+	}
+	memset(result->rkvdec_perf_sel, 0,
+	       sizeof(result->rkvdec_perf_sel));
+}
+
+static const struct rk_mpp_reg_image *
+rk_mpp_reg_builder_seal(struct rk_mpp_job *job)
+{
+	struct rk_mpp_reg_image *image = &job->reg_builder.image;
+	u32 i;
+
+	if (job->reg_builder.state == RK_MPP_REG_BUILDER_SEALED)
+		return image;
+	if (rk_mpp_reg_builder_require_open(job))
+		return ERR_PTR(-EPERM);
+
+	for (i = 0; i < RK_MPP_MAX_REGIONS; i++) {
+		struct rk_mpp_reg_region *dst = &job->reg_result.regions[i];
+		const struct rk_mpp_reg_region *src = &image->regions[i];
+
+		dst->reg_words = src->reg_words;
+		dst->reg_bytes = src->reg_bytes;
+		if (!src->reg_bytes)
+			continue;
+		if (!src->regs) {
+			rk_mpp_reg_result_release(&job->reg_result);
+			return ERR_PTR(-EINVAL);
+		}
+		dst->regs = kmemdup(src->regs, src->reg_bytes, GFP_KERNEL);
+		if (!dst->regs) {
+			rk_mpp_reg_result_release(&job->reg_result);
+			return ERR_PTR(-ENOMEM);
+		}
+	}
+
+	/* Publish the complete image before making the SEALED state visible. */
+	smp_store_release(&job->reg_builder.state,
+			  RK_MPP_REG_BUILDER_SEALED);
+
+	return image;
+}
+
+static const struct rk_mpp_reg_image *
+rk_mpp_job_sealed_image(const struct rk_mpp_job *job)
+{
+	/* Pair with the builder's release publication after the final write. */
+	if (smp_load_acquire(&job->reg_builder.state) !=
+	    RK_MPP_REG_BUILDER_SEALED)
+		return ERR_PTR(-EPERM);
+
+	return &job->reg_builder.image;
+}
 
 static __always_inline struct rk_mpp_activation_resources *
 rk_mpp_job_resources(const struct rk_mpp_job *job)
@@ -1928,6 +2013,7 @@ static bool rk_mpp_job_rkvenc_slice_done(struct rk_mpp_job *job);
 static void rk_mpp_job_push_rkvenc_slice(struct rk_mpp_job *job, u32 value);
 static int rk_mpp_job_pop_rkvenc_slice(struct rk_mpp_job *job, u32 *value);
 static int rk_mpp_job_apply_rcb_info(struct rk_mpp_job *job);
+static void rk_mpp_rkvdec2_prepare_ccu_regs(struct rk_mpp_job *job);
 static void rk_mpp_scheduler_work(struct work_struct *work);
 static void
 rk_mpp_session_abort_jobs(struct rk_mpp_session *session,
@@ -2284,7 +2370,7 @@ static void rk_mpp_count_started_core(struct rk_mpp_job *job)
 	atomic_inc(&srv->started_job_count);
 	rk_mpp_count_core(srv->started_core_count, job->current_activation->selected_hw);
 	rk_mpp_debug_record_job(job, RK_MPP_DEBUG_STARTED, 0, 0,
-				job->reg_image.reg_words);
+				job->reg_builder.image.reg_words);
 }
 
 static const struct rk_mpp_reg_layout rk_mpp_rkvenc2_reg_layout = {
@@ -4521,14 +4607,16 @@ rk_mpp_rkvdec2_fill_link_table(const struct rk_mpp_reg_image *image,
 }
 
 static int __maybe_unused
-rk_mpp_rkvdec2_read_link_table(struct rk_mpp_reg_image *image,
+rk_mpp_rkvdec2_read_link_table(struct rk_mpp_reg_result *result,
+			       const struct rk_mpp_reg_image *image,
 			       const struct rk_mpp_rkvdec2_link_info *info,
 			       const u32 *table, u32 irq_status)
 {
+	struct rk_mpp_reg_region *region = &result->regions[0];
 	u32 i;
 	int ret;
 
-	if (!table)
+	if (!table || !region->regs || region->reg_words < image->reg_words)
 		return -EINVAL;
 
 	for (i = 0; i < info->read_part_count; i++) {
@@ -4540,14 +4628,14 @@ rk_mpp_rkvdec2_read_link_table(struct rk_mpp_reg_image *image,
 							 image->reg_words);
 		if (ret)
 			return ret;
-		memcpy(&image->regs[part->reg_word], &table[part->table_word],
+		memcpy(&region->regs[part->reg_word], &table[part->table_word],
 		       part->word_count * sizeof(u32));
 	}
 
 	if (image->reg_words <= RK_MPP_RKVDEC_LINK_STATUS_WORD)
 		return -EINVAL;
 
-	image->regs[RK_MPP_RKVDEC_LINK_STATUS_WORD] = irq_status;
+	region->regs[RK_MPP_RKVDEC_LINK_STATUS_WORD] = irq_status;
 
 	return 0;
 }
@@ -4566,14 +4654,18 @@ static int rk_mpp_rkvdec2_read_ccu_link_table(struct rk_mpp_job *job,
 					      const struct rk_mpp_rkvdec2_link_info *info,
 					      u32 fallback_irq_status)
 {
+	const struct rk_mpp_reg_image *image = rk_mpp_job_sealed_image(job);
 	const u32 *table = rk_mpp_job_resources(job)->rkvdec_link_vaddr;
 	u32 irq_status;
+
+	if (IS_ERR(image))
+		return PTR_ERR(image);
 
 	irq_status =
 		rk_mpp_rkvdec2_link_table_irq_status(info, table,
 						     fallback_irq_status);
 
-	return rk_mpp_rkvdec2_read_link_table(&job->reg_image, info, table,
+	return rk_mpp_rkvdec2_read_link_table(&job->reg_result, image, info, table,
 					      irq_status);
 }
 
@@ -4581,13 +4673,13 @@ static bool
 rk_mpp_rkvdec2_ccu_job_error(const struct rk_mpp_job *job,
 			     const struct rk_mpp_rkvdec2_link_info *info)
 {
-	const struct rk_mpp_reg_image *image = &job->reg_image;
+	const struct rk_mpp_reg_region *region = &job->reg_result.regions[0];
 
 	if (!rk_mpp_job_resources(job)->rkvdec_ccu_started ||
-	    image->reg_words <= RK_MPP_RKVDEC_LINK_STATUS_WORD)
+	    region->reg_words <= RK_MPP_RKVDEC_LINK_STATUS_WORD)
 		return false;
 
-	return image->regs[RK_MPP_RKVDEC_LINK_STATUS_WORD] & info->err_mask;
+	return region->regs[RK_MPP_RKVDEC_LINK_STATUS_WORD] & info->err_mask;
 }
 
 static bool rk_mpp_rkvdec2_ccu_regs_ready(struct rk_mpp_hw *ccu);
@@ -5398,10 +5490,13 @@ static int
 rk_mpp_cluster_publish_ccu_job(struct rk_mpp_cluster *cluster,
 			       struct rk_mpp_job *job, void __iomem *regs)
 {
+	const struct rk_mpp_reg_image *image = rk_mpp_job_sealed_image(job);
 	int ret;
 
 	lockdep_assert_held(&job->current_activation->selected_hw->run_lock);
 	lockdep_assert_held(&rk_mpp_job_resources(job)->rkvdec_ccu->run_lock);
+	if (IS_ERR(image))
+		return PTR_ERR(image);
 
 	ret = rk_mpp_cluster_add_ccu_job(cluster, job);
 	if (ret)
@@ -5461,7 +5556,7 @@ static int rk_mpp_rkvdec2_stage_link_table(struct rk_mpp_job *job)
 	spin_lock_irqsave(&hw->lock, flags);
 	next_iova = rk_mpp_rkvdec2_next_unused_link_iova(hw);
 	spin_unlock_irqrestore(&hw->lock, flags);
-	ret = rk_mpp_rkvdec2_fill_link_table(&job->reg_image,
+	ret = rk_mpp_rkvdec2_fill_link_table(&job->reg_builder.image,
 					     &rk_mpp_rkvdec2_vdpu381_link_info,
 					     rk_mpp_job_resources(job)->rkvdec_link_vaddr,
 					     rk_mpp_job_resources(job)->rkvdec_link_iova,
@@ -5597,10 +5692,13 @@ static int rk_mpp_job_store_reg_offsets(struct rk_mpp_job *job,
 					const struct rk_mpp_job_req *job_req);
 static int rk_mpp_job_apply_reg_offsets(struct rk_mpp_job *job);
 static int rk_mpp_job_translate_reg_image(struct rk_mpp_job *job);
+static int rk_mpp_job_ensure_reg_bytes(struct rk_mpp_job *job, u32 reg_bytes);
 static int rk_mpp_job_validate_explicit_iovas(struct rk_mpp_job *job);
-static int rk_mpp_rkvdec2_validate(struct rk_mpp_job *job);
+static int rk_mpp_rkvdec2_validate(
+	struct rk_mpp_job *job, const struct rk_mpp_reg_image *image);
 static int
 rk_mpp_av1_build_afbc_config(struct rk_mpp_job *job,
+			     const struct rk_mpp_reg_image *image,
 			     struct rk_mpp_av1_afbc_config *config);
 static int
 rk_mpp_av1_afbc_required_span(u32 width, u32 height, u32 bits_per_pixel,
@@ -6396,20 +6494,20 @@ static void rk_mpp_av1_lazy_regions_kunit(struct kunit *test)
 		KUNIT_ASSERT_EQ(test,
 				rk_mpp_job_store_reg_write(job, &reqs[i]), 0);
 
-	KUNIT_ASSERT_NOT_NULL(test, job->reg_image.regions[0].regs);
-	KUNIT_ASSERT_NOT_NULL(test, job->reg_image.regions[1].regs);
-	KUNIT_ASSERT_NOT_NULL(test, job->reg_image.regions[2].regs);
-	KUNIT_EXPECT_EQ(test, job->reg_image.regions[0].reg_bytes,
+	KUNIT_ASSERT_NOT_NULL(test, job->reg_builder.image.regions[0].regs);
+	KUNIT_ASSERT_NOT_NULL(test, job->reg_builder.image.regions[1].regs);
+	KUNIT_ASSERT_NOT_NULL(test, job->reg_builder.image.regions[2].regs);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.regions[0].reg_bytes,
 			(u32)sizeof(vcd));
-	KUNIT_EXPECT_EQ(test, job->reg_image.regions[1].reg_bytes, 0x38U);
-	KUNIT_EXPECT_EQ(test, job->reg_image.regions[2].reg_bytes, 0x104U);
-	KUNIT_EXPECT_EQ(test, job->reg_image.regions[0].regs[0], vcd[0]);
-	KUNIT_EXPECT_EQ(test, job->reg_image.regions[0].regs[1], vcd[1]);
-	KUNIT_EXPECT_EQ(test, job->reg_image.regions[1].regs[0x34 / 4], cache);
-	KUNIT_EXPECT_EQ(test, job->reg_image.regions[2].regs[0x100 / 4], afbc);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.regions[1].reg_bytes, 0x38U);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.regions[2].reg_bytes, 0x104U);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.regions[0].regs[0], vcd[0]);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.regions[0].regs[1], vcd[1]);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.regions[1].regs[0x34 / 4], cache);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.regions[2].regs[0x100 / 4], afbc);
 
 	for (i = 0; i < RK_MPP_MAX_REGIONS; i++)
-		kfree(job->reg_image.regions[i].regs);
+		kfree(job->reg_builder.image.regions[i].regs);
 }
 
 static void rk_mpp_av1_dynamic_metadata_kunit(struct kunit *test)
@@ -6476,13 +6574,13 @@ static void rk_mpp_av1_dynamic_metadata_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, binding_index, av1_binding_count);
 	KUNIT_EXPECT_EQ(test, job->import_count, av1_binding_count);
 	KUNIT_EXPECT_GE(test, job->import_capacity, av1_binding_count);
-	KUNIT_EXPECT_EQ(test, job->reg_image.binding_count,
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.binding_count,
 			av1_binding_count);
-	KUNIT_EXPECT_GE(test, job->reg_image.binding_capacity,
+	KUNIT_EXPECT_GE(test, job->reg_builder.image.binding_capacity,
 			av1_binding_count);
 
 	kfree(job->imports);
-	kfree(job->reg_image.bindings);
+	kfree(job->reg_builder.image.bindings);
 }
 
 static void rk_mpp_av1_post_offset_provenance_kunit(struct kunit *test)
@@ -6522,38 +6620,38 @@ static void rk_mpp_av1_post_offset_provenance_kunit(struct kunit *test)
 	job->session = session;
 	job->current_activation->selected_hw = hw;
 	job->client_type = RK_MPP_DEVICE_AV1DEC;
-	job->reg_image.regs = regs;
-	job->reg_image.reg_words = 512;
-	job->reg_image.reg_bytes = 512 * sizeof(*regs);
-	job->reg_image.offsets[0].index = 65;
-	job->reg_image.offsets[0].offset = 0x1000;
-	job->reg_image.offset_count = 1;
+	job->reg_builder.image.regs = regs;
+	job->reg_builder.image.reg_words = 512;
+	job->reg_builder.image.reg_bytes = 512 * sizeof(*regs);
+	job->reg_builder.image.offsets[0].index = 65;
+	job->reg_builder.image.offsets[0].offset = 0x1000;
+	job->reg_builder.image.offset_count = 1;
 
 	/* An optional zero fd cannot become an unretained DMA literal. */
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_translate_reg_image(job), -ERANGE);
 
 	binding.import = &import;
-	job->reg_image.bindings = &binding;
-	job->reg_image.binding_count = 1;
-	job->reg_image.offsets[0].offset = 0x40;
+	job->reg_builder.image.bindings = &binding;
+	job->reg_builder.image.binding_count = 1;
+	job->reg_builder.image.offsets[0].offset = 0x40;
 	regs[65] = lower_32_bits(import.iova);
 	KUNIT_ASSERT_EQ(test, rk_mpp_job_translate_reg_image(job), 0);
 	KUNIT_EXPECT_EQ(test, binding.offset, 0x40U);
 	KUNIT_EXPECT_EQ(test, regs[65], 0x80000040U);
 
 	/* AV1 address registers are dereferenceable and reject exact-end. */
-	job->reg_image.translated = false;
+	job->reg_builder.image.translated = false;
 	binding.offset = 0;
 	regs[65] = lower_32_bits(import.iova);
-	job->reg_image.offsets[0].offset = (u32)dmabuf.size;
+	job->reg_builder.image.offsets[0].offset = (u32)dmabuf.size;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_translate_reg_image(job), -ERANGE);
 	KUNIT_EXPECT_EQ(test, binding.offset, 0U);
 
 	/* One byte further is a genuine out-of-bounds address. */
-	job->reg_image.translated = false;
+	job->reg_builder.image.translated = false;
 	binding.offset = 0;
 	regs[65] = lower_32_bits(import.iova);
-	job->reg_image.offsets[0].offset = (u32)dmabuf.size + 1;
+	job->reg_builder.image.offsets[0].offset = (u32)dmabuf.size + 1;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_translate_reg_image(job), -ERANGE);
 }
 
@@ -6580,11 +6678,11 @@ static void rk_mpp_av1_afbc_config_kunit(struct kunit *test)
 	regs = kunit_kcalloc(test, 512, sizeof(*regs), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, regs);
 	job->client_type = RK_MPP_DEVICE_AV1DEC;
-	job->reg_image.regs = regs;
-	job->reg_image.reg_words = 512;
-	job->reg_image.reg_bytes = 512 * sizeof(*regs);
-	job->reg_image.bindings = &binding;
-	job->reg_image.binding_count = 1;
+	job->reg_builder.image.regs = regs;
+	job->reg_builder.image.reg_words = 512;
+	job->reg_builder.image.reg_bytes = 512 * sizeof(*regs);
+	job->reg_builder.image.bindings = &binding;
+	job->reg_builder.image.binding_count = 1;
 	binding.import = &import;
 
 	regs[RK_MPP_AV1_PP_CONFIG_WORD] = RK_MPP_AV1_PP_TILE_16X16;
@@ -6594,7 +6692,9 @@ static void rk_mpp_av1_afbc_config_kunit(struct kunit *test)
 		(1U << 16) | (2U << 20) | (3U << 24) | (4U << 28);
 	regs[RK_MPP_AV1_AFBC_OUTPUT_WORD] = lower_32_bits(import.iova);
 
-	KUNIT_ASSERT_EQ(test, rk_mpp_av1_build_afbc_config(job, &config), 0);
+	KUNIT_ASSERT_EQ(test,
+			rk_mpp_av1_build_afbc_config(
+				job, &job->reg_builder.image, &config), 0);
 	KUNIT_EXPECT_TRUE(test, config.enabled);
 	KUNIT_EXPECT_EQ(test, config.format, 9U);
 	KUNIT_EXPECT_EQ(test, config.header_base, 0x80000000U);
@@ -6608,16 +6708,20 @@ static void rk_mpp_av1_afbc_config_kunit(struct kunit *test)
 					    0x20900, &required_span);
 	KUNIT_ASSERT_EQ(test, ret, 0);
 	dmabuf.size = required_span - 1;
-	KUNIT_EXPECT_EQ(test, rk_mpp_av1_build_afbc_config(job, &config),
+	KUNIT_EXPECT_EQ(test, rk_mpp_av1_build_afbc_config(job, &job->reg_builder.image, &config),
 			-ERANGE);
 	dmabuf.size = required_span;
-	KUNIT_ASSERT_EQ(test, rk_mpp_av1_build_afbc_config(job, &config), 0);
+	KUNIT_ASSERT_EQ(test,
+			rk_mpp_av1_build_afbc_config(
+				job, &job->reg_builder.image, &config), 0);
 
 	binding.offset = 0x100;
 	regs[RK_MPP_AV1_AFBC_OUTPUT_WORD] =
 		lower_32_bits(import.iova + binding.offset);
 	dmabuf.size = binding.offset + required_span;
-	KUNIT_ASSERT_EQ(test, rk_mpp_av1_build_afbc_config(job, &config), 0);
+	KUNIT_ASSERT_EQ(test,
+			rk_mpp_av1_build_afbc_config(
+				job, &job->reg_builder.image, &config), 0);
 	KUNIT_EXPECT_EQ(test, config.header_base, 0x80000100U);
 	KUNIT_EXPECT_EQ(test, config.payload_base, 0x80020a00U);
 	binding.offset = 0;
@@ -6625,7 +6729,9 @@ static void rk_mpp_av1_afbc_config_kunit(struct kunit *test)
 
 	regs[RK_MPP_AV1_BIT_DEPTH_WORD] = BIT(4);
 	dmabuf.size = SZ_8M;
-	KUNIT_ASSERT_EQ(test, rk_mpp_av1_build_afbc_config(job, &config), 0);
+	KUNIT_ASSERT_EQ(test,
+			rk_mpp_av1_build_afbc_config(
+				job, &job->reg_builder.image, &config), 0);
 	KUNIT_EXPECT_EQ(test, config.format, 3U);
 	KUNIT_EXPECT_EQ(test, config.input_stride, 3852U);
 	ret = rk_mpp_av1_afbc_required_span(1926, 1084,
@@ -6633,23 +6739,25 @@ static void rk_mpp_av1_afbc_config_kunit(struct kunit *test)
 					    0x20900, &required_span);
 	KUNIT_ASSERT_EQ(test, ret, 0);
 	dmabuf.size = required_span - 1;
-	KUNIT_EXPECT_EQ(test, rk_mpp_av1_build_afbc_config(job, &config),
+	KUNIT_EXPECT_EQ(test, rk_mpp_av1_build_afbc_config(job, &job->reg_builder.image, &config),
 			-ERANGE);
 	dmabuf.size = required_span;
-	KUNIT_ASSERT_EQ(test, rk_mpp_av1_build_afbc_config(job, &config), 0);
+	KUNIT_ASSERT_EQ(test,
+			rk_mpp_av1_build_afbc_config(
+				job, &job->reg_builder.image, &config), 0);
 
-	job->reg_image.binding_count = 0;
-	KUNIT_EXPECT_EQ(test, rk_mpp_av1_build_afbc_config(job, &config),
+	job->reg_builder.image.binding_count = 0;
+	KUNIT_EXPECT_EQ(test, rk_mpp_av1_build_afbc_config(job, &job->reg_builder.image, &config),
 			-ERANGE);
-	job->reg_image.binding_count = 1;
+	job->reg_builder.image.binding_count = 1;
 
 	dmabuf.size = 0x20900;
-	KUNIT_EXPECT_EQ(test, rk_mpp_av1_build_afbc_config(job, &config),
+	KUNIT_EXPECT_EQ(test, rk_mpp_av1_build_afbc_config(job, &job->reg_builder.image, &config),
 			-ERANGE);
 	dmabuf.size = SZ_8M;
 
 	regs[RK_MPP_AV1_AFBC_OUTPUT_WORD]++;
-	KUNIT_EXPECT_EQ(test, rk_mpp_av1_build_afbc_config(job, &config),
+	KUNIT_EXPECT_EQ(test, rk_mpp_av1_build_afbc_config(job, &job->reg_builder.image, &config),
 			-EINVAL);
 	regs[RK_MPP_AV1_AFBC_OUTPUT_WORD]--;
 
@@ -6657,11 +6765,15 @@ static void rk_mpp_av1_afbc_config_kunit(struct kunit *test)
 	regs[RK_MPP_AV1_DIMENSIONS_WORD] = (4U << 19) | (1U << 6);
 	regs[RK_MPP_AV1_BIT_DEPTH_WORD] = 0;
 	regs[RK_MPP_AV1_PADDING_WORD] = (12U << 20) | (13U << 28);
-	KUNIT_ASSERT_EQ(test, rk_mpp_av1_build_afbc_config(job, &config), 0);
+	KUNIT_ASSERT_EQ(test,
+			rk_mpp_av1_build_afbc_config(
+				job, &job->reg_builder.image, &config), 0);
 	KUNIT_EXPECT_EQ(test, config.payload_base, 0x80000080U);
 
 	regs[RK_MPP_AV1_PP_CONFIG_WORD] = 0;
-	KUNIT_ASSERT_EQ(test, rk_mpp_av1_build_afbc_config(job, &config), 0);
+	KUNIT_ASSERT_EQ(test,
+			rk_mpp_av1_build_afbc_config(
+				job, &job->reg_builder.image, &config), 0);
 	KUNIT_EXPECT_FALSE(test, config.enabled);
 
 	/* Re-arm the tile bit so the truncated image below is disabled by
@@ -6669,9 +6781,11 @@ static void rk_mpp_av1_afbc_config_kunit(struct kunit *test)
 	 * over from the previous case.
 	 */
 	regs[RK_MPP_AV1_PP_CONFIG_WORD] = RK_MPP_AV1_PP_TILE_16X16;
-	job->reg_image.reg_words = 320;
-	job->reg_image.reg_bytes = 320 * sizeof(*regs);
-	KUNIT_ASSERT_EQ(test, rk_mpp_av1_build_afbc_config(job, &config), 0);
+	job->reg_builder.image.reg_words = 320;
+	job->reg_builder.image.reg_bytes = 320 * sizeof(*regs);
+	KUNIT_ASSERT_EQ(test,
+			rk_mpp_av1_build_afbc_config(
+				job, &job->reg_builder.image, &config), 0);
 	KUNIT_EXPECT_FALSE(test, config.enabled);
 }
 
@@ -6979,34 +7093,34 @@ static void rk_mpp_reg_offsets_kunit(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, job);
 
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_store_reg_offsets(job, &job_req), 0);
-	KUNIT_EXPECT_EQ(test, job->reg_image.offset_count,
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.offset_count,
 			(u32)ARRAY_SIZE(offsets));
-	KUNIT_EXPECT_EQ(test, job->reg_image.offsets[0].index, 1U);
-	KUNIT_EXPECT_EQ(test, job->reg_image.offsets[0].offset, 4U);
-	KUNIT_EXPECT_EQ(test, job->reg_image.offsets[2].index, 3U);
-	KUNIT_EXPECT_EQ(test, job->reg_image.offsets[2].offset, 0x20U);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.offsets[0].index, 1U);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.offsets[0].offset, 4U);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.offsets[2].index, 3U);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.offsets[2].offset, 0x20U);
 
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_reg_offsets(job), 0);
-	KUNIT_ASSERT_NOT_NULL(test, job->reg_image.regs);
-	KUNIT_EXPECT_TRUE(test, job->reg_image.reg_words >= 4);
-	KUNIT_EXPECT_EQ(test, job->reg_image.regs[1], 12U);
-	KUNIT_EXPECT_EQ(test, job->reg_image.regs[3], 0x20U);
+	KUNIT_ASSERT_NOT_NULL(test, job->reg_builder.image.regs);
+	KUNIT_EXPECT_TRUE(test, job->reg_builder.image.reg_words >= 4);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.regs[1], 12U);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.regs[3], 0x20U);
 
-	job->reg_image.regs[1] = U32_MAX;
-	job->reg_image.offsets[0] = (struct rk_mpp_reg_offset) {
+	job->reg_builder.image.regs[1] = U32_MAX;
+	job->reg_builder.image.offsets[0] = (struct rk_mpp_reg_offset) {
 		.index = 1,
 		.offset = 1,
 	};
-	job->reg_image.offset_count = 1;
+	job->reg_builder.image.offset_count = 1;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_reg_offsets(job), -EOVERFLOW);
-	KUNIT_EXPECT_EQ(test, job->reg_image.regs[1], U32_MAX);
-	kfree(job->reg_image.regs);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.regs[1], U32_MAX);
+	kfree(job->reg_builder.image.regs);
 	memset(job, 0, sizeof(*job));
 
 	job_req.req.size = 0;
 	job_req.payload = NULL;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_store_reg_offsets(job, &job_req), 0);
-	KUNIT_EXPECT_EQ(test, job->reg_image.offset_count, 0U);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.offset_count, 0U);
 
 	job_req.req.size = sizeof(offsets) - 1;
 	job_req.payload = offsets;
@@ -7018,7 +7132,7 @@ static void rk_mpp_reg_offsets_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_store_reg_offsets(job, &job_req),
 			-EINVAL);
 
-	job->reg_image.offset_count = RK_MPP_MAX_REG_TRANS_NUM;
+	job->reg_builder.image.offset_count = RK_MPP_MAX_REG_TRANS_NUM;
 	job_req.payload = offsets;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_store_reg_offsets(job, &job_req),
 			-EINVAL);
@@ -7033,86 +7147,86 @@ static void rk_mpp_reg_offset_dma_bounds_kunit(struct kunit *test)
 	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, job);
 	job->client_type = RK_MPP_DEVICE_RKVENC;
-	job->reg_image.regs =
+	job->reg_builder.image.regs =
 		kunit_kcalloc(test, RK_MPP_RKVENC_BS_TOP_WORD + 2,
-			      sizeof(*job->reg_image.regs), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, job->reg_image.regs);
-	job->reg_image.reg_words = RK_MPP_RKVENC_BS_TOP_WORD + 2;
-	job->reg_image.reg_bytes = job->reg_image.reg_words *
-				    sizeof(*job->reg_image.regs);
-	job->reg_image.bindings =
+			      sizeof(*job->reg_builder.image.regs), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job->reg_builder.image.regs);
+	job->reg_builder.image.reg_words = RK_MPP_RKVENC_BS_TOP_WORD + 2;
+	job->reg_builder.image.reg_bytes = job->reg_builder.image.reg_words *
+				    sizeof(*job->reg_builder.image.regs);
+	job->reg_builder.image.bindings =
 		kunit_kcalloc(test, RK_MPP_MAX_REG_TRANS_NUM,
-			      sizeof(*job->reg_image.bindings), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, job->reg_image.bindings);
+			      sizeof(*job->reg_builder.image.bindings), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job->reg_builder.image.bindings);
 
 	dmabuf = kunit_kzalloc(test, sizeof(*dmabuf), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, dmabuf);
 	dmabuf->size = 0x1000;
 	import.dmabuf = dmabuf;
 	import.iova = 0xffffe000;
-	job->reg_image.bindings[0].index = RK_MPP_RKVENC_BS_TOP_WORD;
-	job->reg_image.bindings[0].offset = 0x100;
-	job->reg_image.bindings[0].import = &import;
-	job->reg_image.binding_count = 1;
-	job->reg_image.offsets[0].index = RK_MPP_RKVENC_BS_TOP_WORD;
-	job->reg_image.offsets[0].offset = 0xef0;
-	job->reg_image.offset_count = 1;
+	job->reg_builder.image.bindings[0].index = RK_MPP_RKVENC_BS_TOP_WORD;
+	job->reg_builder.image.bindings[0].offset = 0x100;
+	job->reg_builder.image.bindings[0].import = &import;
+	job->reg_builder.image.binding_count = 1;
+	job->reg_builder.image.offsets[0].index = RK_MPP_RKVENC_BS_TOP_WORD;
+	job->reg_builder.image.offsets[0].offset = 0xef0;
+	job->reg_builder.image.offset_count = 1;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_reg_offsets(job), 0);
-	KUNIT_EXPECT_EQ(test, job->reg_image.bindings[0].offset, 0xff0U);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.bindings[0].offset, 0xff0U);
 	KUNIT_EXPECT_EQ(test,
-			job->reg_image.regs[RK_MPP_RKVENC_BS_TOP_WORD],
+			job->reg_builder.image.regs[RK_MPP_RKVENC_BS_TOP_WORD],
 			0xffffeff0U);
 
 	/*
 	 * 0xff0 + 0x10 is exactly the end of the mapping: the end-exclusive
 	 * limit pointer libmpp has programmed on register 172 since 2021.
 	 */
-	job->reg_image.offsets[0].offset = 0x10;
+	job->reg_builder.image.offsets[0].offset = 0x10;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_reg_offsets(job), 0);
-	KUNIT_EXPECT_EQ(test, job->reg_image.bindings[0].offset, 0x1000U);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.bindings[0].offset, 0x1000U);
 	KUNIT_EXPECT_EQ(test,
-			job->reg_image.regs[RK_MPP_RKVENC_BS_TOP_WORD],
+			job->reg_builder.image.regs[RK_MPP_RKVENC_BS_TOP_WORD],
 			0xfffff000U);
 
 	/* The adjacent bitstream-bottom register is an ordinary address. */
-	job->reg_image.fail_index = -1;
-	job->reg_image.bindings[0].index = RK_MPP_RKVENC_BS_TOP_WORD + 1;
-	job->reg_image.bindings[0].offset = 0xff0;
-	job->reg_image.offsets[0].index = RK_MPP_RKVENC_BS_TOP_WORD + 1;
-	job->reg_image.offsets[0].offset = 0x10;
-	job->reg_image.regs[RK_MPP_RKVENC_BS_TOP_WORD + 1] = 0xffffeff0U;
+	job->reg_builder.image.fail_index = -1;
+	job->reg_builder.image.bindings[0].index = RK_MPP_RKVENC_BS_TOP_WORD + 1;
+	job->reg_builder.image.bindings[0].offset = 0xff0;
+	job->reg_builder.image.offsets[0].index = RK_MPP_RKVENC_BS_TOP_WORD + 1;
+	job->reg_builder.image.offsets[0].offset = 0x10;
+	job->reg_builder.image.regs[RK_MPP_RKVENC_BS_TOP_WORD + 1] = 0xffffeff0U;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_reg_offsets(job), -ERANGE);
-	KUNIT_EXPECT_EQ(test, job->reg_image.fail_index,
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.fail_index,
 			RK_MPP_RKVENC_BS_TOP_WORD + 1);
 
 	/* One byte past it is rejected, and names the register. */
-	job->reg_image.fail_index = -1;
-	job->reg_image.bindings[0].index = RK_MPP_RKVENC_BS_TOP_WORD;
-	job->reg_image.bindings[0].offset = 0xff0;
-	job->reg_image.offsets[0].index = RK_MPP_RKVENC_BS_TOP_WORD;
-	job->reg_image.regs[RK_MPP_RKVENC_BS_TOP_WORD] = 0xffffeff0U;
-	job->reg_image.offsets[0].offset = 0x11;
+	job->reg_builder.image.fail_index = -1;
+	job->reg_builder.image.bindings[0].index = RK_MPP_RKVENC_BS_TOP_WORD;
+	job->reg_builder.image.bindings[0].offset = 0xff0;
+	job->reg_builder.image.offsets[0].index = RK_MPP_RKVENC_BS_TOP_WORD;
+	job->reg_builder.image.regs[RK_MPP_RKVENC_BS_TOP_WORD] = 0xffffeff0U;
+	job->reg_builder.image.offsets[0].offset = 0x11;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_reg_offsets(job), -ERANGE);
-	KUNIT_EXPECT_EQ(test, job->reg_image.bindings[0].offset, 0xff0U);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.bindings[0].offset, 0xff0U);
 	KUNIT_EXPECT_EQ(test,
-			job->reg_image.regs[RK_MPP_RKVENC_BS_TOP_WORD],
+			job->reg_builder.image.regs[RK_MPP_RKVENC_BS_TOP_WORD],
 			0xffffeff0U);
-	KUNIT_EXPECT_EQ(test, job->reg_image.fail_index,
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.fail_index,
 			RK_MPP_RKVENC_BS_TOP_WORD);
 
 	/* The first rejected index wins over any later one. */
-	job->reg_image.fail_index = 7;
+	job->reg_builder.image.fail_index = 7;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_reg_offsets(job), -ERANGE);
-	KUNIT_EXPECT_EQ(test, job->reg_image.fail_index, 7);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.fail_index, 7);
 
 	dmabuf->size = 2;
 	import.iova = U32_MAX;
-	job->reg_image.fail_index = -1;
-	job->reg_image.bindings[0].offset = 0;
-	job->reg_image.offsets[0].offset = 1;
+	job->reg_builder.image.fail_index = -1;
+	job->reg_builder.image.bindings[0].offset = 0;
+	job->reg_builder.image.offsets[0].offset = 1;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_reg_offsets(job), -EOVERFLOW);
-	KUNIT_EXPECT_EQ(test, job->reg_image.bindings[0].offset, 0U);
-	KUNIT_EXPECT_EQ(test, job->reg_image.fail_index,
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.bindings[0].offset, 0U);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.fail_index,
 			RK_MPP_RKVENC_BS_TOP_WORD);
 }
 
@@ -7257,6 +7371,7 @@ static void rk_mpp_job_hw_available_kunit(struct kunit *test)
 	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, job);
 	rk_mpp_activation_init(job);
+	job->reg_builder.state = RK_MPP_REG_BUILDER_SEALED;
 
 	ccu_dev->of_node = ccu_node;
 	core->dev = core_dev;
@@ -7310,6 +7425,7 @@ static void rk_mpp_rkvdec2_soft_ccu_program_kunit(struct kunit *test)
 	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, job);
 	rk_mpp_activation_init(job);
+	job->reg_builder.state = RK_MPP_REG_BUILDER_SEALED;
 	hw->core_mask = 0x00030000;
 	job->current_activation->selected_hw = hw;
 	rk_mpp_job_resources(job)->rkvdec_ccu = ccu;
@@ -7519,8 +7635,8 @@ static void rk_mpp_rkvdec2_vp9_translate_validate_kunit(struct kunit *test)
 	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, job);
 	rk_mpp_activation_init(job);
-	job->reg_image.regs = kunit_kcalloc(test, 200, sizeof(u32), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, job->reg_image.regs);
+	job->reg_builder.image.regs = kunit_kcalloc(test, 200, sizeof(u32), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job->reg_builder.image.regs);
 	fd = rk_mpp_kunit_dmabuf_fd(test, PAGE_SIZE, &dmabuf);
 	KUNIT_ASSERT_GT(test, fd, 0);
 	KUNIT_ASSERT_NOT_NULL(test, dmabuf);
@@ -7567,42 +7683,45 @@ static void rk_mpp_rkvdec2_vp9_translate_validate_kunit(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, ret, 0);
 	list_add_tail(&import->link, &session.imports);
 
-	job->reg_image.reg_words = 200;
-	job->reg_image.reg_bytes = 200 * sizeof(u32);
-	job->reg_image.regs[RK_MPP_RKVDEC_REG_FMT] = RK_MPP_RKVDEC_FMT_VP9D;
-	job->reg_image.regs[160] = raw_vp9_160;
-	job->reg_image.regs[162] = raw_vp9_162;
-	job->reg_image.regs[173] = raw_h264_only_173;
-	job->reg_image.read_req_count = 1;
-	job->reg_image.read_reqs[0].cmd = MPP_CMD_SET_REG_READ;
-	job->reg_image.read_reqs[0].offset = RK_MPP_RKVDEC_INT_STA_BASE;
-	job->reg_image.read_reqs[0].size = sizeof(u32);
+	job->reg_builder.image.reg_words = 200;
+	job->reg_builder.image.reg_bytes = 200 * sizeof(u32);
+	job->reg_builder.image.regs[RK_MPP_RKVDEC_REG_FMT] = RK_MPP_RKVDEC_FMT_VP9D;
+	job->reg_builder.image.regs[160] = raw_vp9_160;
+	job->reg_builder.image.regs[162] = raw_vp9_162;
+	job->reg_builder.image.regs[173] = raw_h264_only_173;
+	job->reg_builder.image.read_req_count = 1;
+	job->reg_builder.image.read_reqs[0].cmd = MPP_CMD_SET_REG_READ;
+	job->reg_builder.image.read_reqs[0].offset = RK_MPP_RKVDEC_INT_STA_BASE;
+	job->reg_builder.image.read_reqs[0].size = sizeof(u32);
 	job->reqs[0].req.cmd = MPP_CMD_SET_REG_WRITE;
 	job->reqs[0].req.offset = RK_MPP_RKVDEC_START_BASE;
 	job->reqs[0].req.size = sizeof(u32);
 
 	ret = rk_mpp_job_translate_reg_image(job);
-	if (job->reg_image.bindings) {
+	if (job->reg_builder.image.bindings) {
 		int action_ret;
 
 		action_ret =
 			kunit_add_action_or_reset(test, rk_mpp_kunit_kfree,
-						  job->reg_image.bindings);
+						  job->reg_builder.image.bindings);
 		KUNIT_ASSERT_EQ(test, action_ret, 0);
 	}
 	KUNIT_ASSERT_EQ(test, ret, 0);
-	KUNIT_ASSERT_NOT_NULL(test, job->reg_image.bindings);
-	KUNIT_EXPECT_TRUE(test, job->reg_image.translated);
-	KUNIT_EXPECT_EQ(test, job->reg_image.regs[160], 0x80000004U);
-	KUNIT_EXPECT_EQ(test, job->reg_image.regs[162], 0x80000008U);
-	KUNIT_EXPECT_EQ(test, job->reg_image.regs[173], raw_h264_only_173);
+	KUNIT_ASSERT_NOT_NULL(test, job->reg_builder.image.bindings);
+	KUNIT_EXPECT_TRUE(test, job->reg_builder.image.translated);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.regs[160], 0x80000004U);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.regs[162], 0x80000008U);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.regs[173], raw_h264_only_173);
 	KUNIT_EXPECT_EQ(test, job->import_count, 1U);
 	KUNIT_EXPECT_PTR_EQ(test, job->imports[0], import);
 	KUNIT_EXPECT_EQ(test, refcount_read(&import->refs), 2);
-	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_validate(job), 0);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_rkvdec2_validate(job,
+						 &job->reg_builder.image),
+			0);
 
-	job->reg_image.translated = false;
-	job->reg_image.regs[RK_MPP_RKVDEC_REG_FMT] =
+	job->reg_builder.image.translated = false;
+	job->reg_builder.image.regs[RK_MPP_RKVDEC_REG_FMT] =
 		ARRAY_SIZE(rk_mpp_rkvdec_tables);
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_translate_reg_image(job), -EINVAL);
 
@@ -7633,7 +7752,9 @@ static void rk_mpp_rkvdec2_fill_link_table_kunit(struct kunit *test)
 	const struct rk_mpp_rkvdec2_link_info *info =
 		&rk_mpp_rkvdec2_vdpu381_link_info;
 	struct rk_mpp_reg_image *image;
+	struct rk_mpp_reg_result *result;
 	u32 *regs;
+	u32 *readback;
 	u32 *table;
 	struct rk_mpp_job *job;
 	dma_addr_t iova = 0x12345000;
@@ -7642,9 +7763,14 @@ static void rk_mpp_rkvdec2_fill_link_table_kunit(struct kunit *test)
 
 	image = kunit_kzalloc(test, sizeof(*image), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, image);
+	result = kunit_kzalloc(test, sizeof(*result), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, result);
 	image->reg_words = 360;
 	regs = kunit_kcalloc(test, image->reg_words, sizeof(*regs), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, regs);
+	readback = kunit_kcalloc(test, image->reg_words, sizeof(*readback),
+				 GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, readback);
 	table = kunit_kzalloc(test, rk_mpp_rkvdec2_link_node_size(info),
 			      GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, table);
@@ -7652,7 +7778,12 @@ static void rk_mpp_rkvdec2_fill_link_table_kunit(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, job);
 	rk_mpp_activation_init(job);
 	image->regs = regs;
-	job->reg_image = *image;
+	job->reg_builder.image = *image;
+	job->reg_builder.state = RK_MPP_REG_BUILDER_SEALED;
+	result->regions[0].regs = readback;
+	result->regions[0].reg_words = image->reg_words;
+	result->regions[0].reg_bytes = image->reg_words * sizeof(*readback);
+	job->reg_result = *result;
 	rk_mpp_job_resources(job)->rkvdec_link_vaddr = table;
 
 	for (i = 0; i < image->reg_words; i++)
@@ -7690,28 +7821,31 @@ static void rk_mpp_rkvdec2_fill_link_table_kunit(struct kunit *test)
 		table[190 + i] = 0xbb000000 | i;
 
 	KUNIT_EXPECT_EQ(test,
-			rk_mpp_rkvdec2_read_link_table(image, info, table,
+			rk_mpp_rkvdec2_read_link_table(result, image, info, table,
 						       0x1234),
 			0);
-	KUNIT_EXPECT_EQ(test, regs[RK_MPP_RKVDEC_LINK_STATUS_WORD], 0x1234U);
-	KUNIT_EXPECT_EQ(test, regs[258], 0xbb000000U);
-	KUNIT_EXPECT_EQ(test, regs[285], 0xbb00001bU);
+	KUNIT_EXPECT_EQ(test, readback[RK_MPP_RKVDEC_LINK_STATUS_WORD],
+			0x1234U);
+	KUNIT_EXPECT_EQ(test, readback[258], 0xbb000000U);
+	KUNIT_EXPECT_EQ(test, readback[285], 0xbb00001bU);
+	KUNIT_EXPECT_EQ(test, regs[RK_MPP_RKVDEC_LINK_STATUS_WORD],
+			0xa5000000U | RK_MPP_RKVDEC_LINK_STATUS_WORD);
 
-	regs[RK_MPP_RKVDEC_LINK_STATUS_WORD] = 0;
+	readback[RK_MPP_RKVDEC_LINK_STATUS_WORD] = 0;
 	table[info->irq_status_word] = 0x2222;
 	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_read_ccu_link_table(job, info,
 								 0x1234),
 			0);
-	KUNIT_EXPECT_EQ(test, regs[RK_MPP_RKVDEC_LINK_STATUS_WORD],
+	KUNIT_EXPECT_EQ(test, readback[RK_MPP_RKVDEC_LINK_STATUS_WORD],
 			0x2222U);
 	KUNIT_EXPECT_FALSE(test, rk_mpp_rkvdec2_ccu_job_error(job, info));
 	rk_mpp_job_resources(job)->rkvdec_ccu_started = true;
-	regs[RK_MPP_RKVDEC_LINK_STATUS_WORD] = info->err_mask;
+	readback[RK_MPP_RKVDEC_LINK_STATUS_WORD] = info->err_mask;
 	KUNIT_EXPECT_TRUE(test, rk_mpp_rkvdec2_ccu_job_error(job, info));
 
 	image->reg_words = 285;
 	KUNIT_EXPECT_EQ(test,
-			rk_mpp_rkvdec2_read_link_table(image, info, table,
+			rk_mpp_rkvdec2_read_link_table(result, image, info, table,
 						       0x1234),
 			-EINVAL);
 	KUNIT_EXPECT_EQ(test,
@@ -7772,11 +7906,11 @@ static void rk_mpp_rkvdec2_link_table_ownership_kunit(struct kunit *test)
 	table2 = (void *)((u8 *)tables + 2 * hw->rkvdec_link_node_size);
 	image->regs = regs;
 	job0->current_activation->selected_hw = hw;
-	job0->reg_image = *image;
+	job0->reg_builder.image = *image;
 	job1->current_activation->selected_hw = hw;
-	job1->reg_image = *image;
+	job1->reg_builder.image = *image;
 	job2->current_activation->selected_hw = hw;
-	job2->reg_image = *image;
+	job2->reg_builder.image = *image;
 	spin_lock_init(&hw->lock);
 	raw_spin_lock_init(&hw->regs_lock);
 
@@ -11128,9 +11262,9 @@ static void rk_mpp_explicit_iova_validation_kunit(struct kunit *test)
 	job->client_type = RK_MPP_DEVICE_RKVDEC;
 	job->current_activation->selected_hw = hw;
 	job->trans_count = 1;
-	job->reg_image.regs = regs;
-	job->reg_image.reg_words = 200;
-	job->reg_image.reg_bytes = 200 * sizeof(*regs);
+	job->reg_builder.image.regs = regs;
+	job->reg_builder.image.reg_words = 200;
+	job->reg_builder.image.reg_bytes = 200 * sizeof(*regs);
 
 	job->trans_table[0] = 17;
 	regs[RK_MPP_RKVDEC_REG_FMT] = RK_MPP_RKVDEC_FMT_H264D;
@@ -11157,18 +11291,18 @@ static void rk_mpp_explicit_iova_validation_kunit(struct kunit *test)
 	regs[128] = 0x1080;
 	regs[17] = 0x1000;
 	job->flags = MPP_FLAGS_REG_FD_NO_TRANS;
-	job->reg_image.offsets[0] = (struct rk_mpp_reg_offset) {
+	job->reg_builder.image.offsets[0] = (struct rk_mpp_reg_offset) {
 		.index = 17,
 		.offset = 0x20,
 	};
-	job->reg_image.offset_count = 1;
+	job->reg_builder.image.offset_count = 1;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_translate_reg_image(job), 0);
 	KUNIT_EXPECT_EQ(test, regs[17], 0x1020U);
-	KUNIT_EXPECT_TRUE(test, job->reg_image.translated);
+	KUNIT_EXPECT_TRUE(test, job->reg_builder.image.translated);
 
 	job->import_count = 0;
 	refcount_dec(&import->refs);
-	kfree(job->reg_image.bindings);
+	kfree(job->reg_builder.image.bindings);
 	kfree(job->imports);
 
 	/* Repeat NO_TRANS offset validation with no preexisting bindings. */
@@ -11185,14 +11319,14 @@ static void rk_mpp_explicit_iova_validation_kunit(struct kunit *test)
 		offset_jobs[i]->client_type = RK_MPP_DEVICE_RKVDEC;
 		offset_jobs[i]->current_activation->selected_hw = hw;
 		offset_jobs[i]->flags = MPP_FLAGS_REG_FD_NO_TRANS;
-		offset_jobs[i]->reg_image.regs = regs;
-		offset_jobs[i]->reg_image.reg_words = 200;
-		offset_jobs[i]->reg_image.reg_bytes = 200 * sizeof(*regs);
-		offset_jobs[i]->reg_image.offsets[0] = (struct rk_mpp_reg_offset) {
+		offset_jobs[i]->reg_builder.image.regs = regs;
+		offset_jobs[i]->reg_builder.image.reg_words = 200;
+		offset_jobs[i]->reg_builder.image.reg_bytes = 200 * sizeof(*regs);
+		offset_jobs[i]->reg_builder.image.offsets[0] = (struct rk_mpp_reg_offset) {
 			.index = 128,
 			.offset = 0x20,
 		};
-		offset_jobs[i]->reg_image.offset_count = 1;
+		offset_jobs[i]->reg_builder.image.offset_count = 1;
 		regs[RK_MPP_RKVDEC_REG_FMT] = RK_MPP_RKVDEC_FMT_H264D;
 		regs[128] = initial_iovas[i];
 
@@ -11202,19 +11336,19 @@ static void rk_mpp_explicit_iova_validation_kunit(struct kunit *test)
 	}
 
 	/* The successful case began without a binding and retained the final IOVA. */
-	KUNIT_EXPECT_EQ(test, offset_jobs[0]->reg_image.regs[128], 0x1020U);
-	KUNIT_EXPECT_EQ(test, offset_jobs[0]->reg_image.binding_count, 1U);
-	KUNIT_EXPECT_EQ(test, offset_jobs[0]->reg_image.bindings[0].index, 128U);
-	KUNIT_EXPECT_EQ(test, offset_jobs[0]->reg_image.bindings[0].offset, 0x20U);
+	KUNIT_EXPECT_EQ(test, offset_jobs[0]->reg_builder.image.regs[128], 0x1020U);
+	KUNIT_EXPECT_EQ(test, offset_jobs[0]->reg_builder.image.binding_count, 1U);
+	KUNIT_EXPECT_EQ(test, offset_jobs[0]->reg_builder.image.bindings[0].index, 128U);
+	KUNIT_EXPECT_EQ(test, offset_jobs[0]->reg_builder.image.bindings[0].offset, 0x20U);
 	KUNIT_EXPECT_EQ(test, offset_jobs[0]->import_count, 1U);
 	KUNIT_EXPECT_EQ(test, refcount_read(&import->refs), 2);
-	KUNIT_EXPECT_EQ(test, offset_jobs[1]->reg_image.regs[128], 0xfffffff0U);
-	KUNIT_EXPECT_EQ(test, offset_jobs[2]->reg_image.regs[128], 0x1110U);
+	KUNIT_EXPECT_EQ(test, offset_jobs[1]->reg_builder.image.regs[128], 0xfffffff0U);
+	KUNIT_EXPECT_EQ(test, offset_jobs[2]->reg_builder.image.regs[128], 0x1110U);
 
 	refcount_dec(&import->refs);
 	list_del_init(&import->link);
 	for (i = 0; i < ARRAY_SIZE(offset_jobs); i++) {
-		kfree(offset_jobs[i]->reg_image.bindings);
+		kfree(offset_jobs[i]->reg_builder.image.bindings);
 		kfree(offset_jobs[i]->imports);
 	}
 }
@@ -11496,7 +11630,7 @@ static void rk_mpp_rkvenc_slice_mode_kunit(struct kunit *test)
 	struct rk_mpp_job job = {
 		.session = &session,
 		.client_type = RK_MPP_DEVICE_RKVENC,
-		.reg_image = {
+		.reg_builder.image = {
 			.regs = regs,
 			.reg_words = ARRAY_SIZE(regs),
 		},
@@ -11741,34 +11875,41 @@ static void rk_mpp_rkvenc2_dchs_remap_kunit(struct kunit *test)
 	producer->client_type = RK_MPP_DEVICE_RKVENC;
 	producer->current_activation->selected_hw = hw0;
 	producer->id = 100;
-	producer->reg_image.reg_words = reg_words;
-	producer->reg_image.regs =
+	producer->reg_builder.image.reg_words = reg_words;
+	producer->reg_builder.image.regs =
 		kunit_kcalloc(test, reg_words, sizeof(u32), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, producer->reg_image.regs);
+	KUNIT_ASSERT_NOT_NULL(test, producer->reg_builder.image.regs);
+	producer->reg_builder.state = RK_MPP_REG_BUILDER_SEALED;
 
 	consumer->session = session0;
 	consumer->client_type = RK_MPP_DEVICE_RKVENC;
 	consumer->current_activation->selected_hw = hw1;
 	consumer->id = 101;
-	consumer->reg_image.reg_words = reg_words;
-	consumer->reg_image.regs =
+	consumer->reg_builder.image.reg_words = reg_words;
+	consumer->reg_builder.image.regs =
 		kunit_kcalloc(test, reg_words, sizeof(u32), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, consumer->reg_image.regs);
+	KUNIT_ASSERT_NOT_NULL(test, consumer->reg_builder.image.regs);
+	consumer->reg_builder.state = RK_MPP_REG_BUILDER_SEALED;
 
 	unrelated->session = session1;
 	unrelated->client_type = RK_MPP_DEVICE_RKVENC;
 	unrelated->current_activation->selected_hw = hw2;
 	unrelated->id = 102;
-	unrelated->reg_image.reg_words = reg_words;
-	unrelated->reg_image.regs =
+	unrelated->reg_builder.image.reg_words = reg_words;
+	unrelated->reg_builder.image.regs =
 		kunit_kcalloc(test, reg_words, sizeof(u32), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, unrelated->reg_image.regs);
+	KUNIT_ASSERT_NOT_NULL(test, unrelated->reg_builder.image.regs);
+	unrelated->reg_builder.state = RK_MPP_REG_BUILDER_SEALED;
 
 	producer_low = 2 << RK_MPP_RKVENC_DCHS_TXID_SHIFT;
-	producer->reg_image.regs[RK_MPP_RKVENC_DCHS_WORD] = producer_low;
+	producer->reg_builder.image.regs[RK_MPP_RKVENC_DCHS_WORD] = producer_low;
 	KUNIT_ASSERT_EQ(test,
 			rk_mpp_rkvenc2_dchs_patch_kunit_locked(producer), 0);
-	producer_patched = producer->reg_image.regs[RK_MPP_RKVENC_DCHS_WORD];
+	producer_patched =
+		rk_mpp_job_resources(producer)->rkvenc_dchs_value;
+	KUNIT_EXPECT_EQ(test,
+			producer->reg_builder.image.regs[RK_MPP_RKVENC_DCHS_WORD],
+			producer_low);
 	KUNIT_EXPECT_TRUE(test, rk_mpp_job_resources(producer)->rkvenc_dchs_active);
 	KUNIT_EXPECT_PTR_EQ(test, srv->rkvenc_dchs[0].job, producer);
 	KUNIT_EXPECT_EQ(test, srv->rkvenc_dchs[0].txid_orig, 2U);
@@ -11782,10 +11923,14 @@ static void rk_mpp_rkvenc2_dchs_remap_kunit(struct kunit *test)
 
 	unrelated_low = (2 << RK_MPP_RKVENC_DCHS_RXID_SHIFT) |
 			RK_MPP_RKVENC_DCHS_RXE;
-	unrelated->reg_image.regs[RK_MPP_RKVENC_DCHS_WORD] = unrelated_low;
+	unrelated->reg_builder.image.regs[RK_MPP_RKVENC_DCHS_WORD] = unrelated_low;
 	KUNIT_ASSERT_EQ(test,
 			rk_mpp_rkvenc2_dchs_patch_kunit_locked(unrelated), 0);
-	unrelated_patched = unrelated->reg_image.regs[RK_MPP_RKVENC_DCHS_WORD];
+	unrelated_patched =
+		rk_mpp_job_resources(unrelated)->rkvenc_dchs_value;
+	KUNIT_EXPECT_EQ(test,
+			unrelated->reg_builder.image.regs[RK_MPP_RKVENC_DCHS_WORD],
+			unrelated_low);
 	KUNIT_EXPECT_TRUE(test, rk_mpp_job_resources(unrelated)->rkvenc_dchs_active);
 	KUNIT_EXPECT_PTR_EQ(test, srv->rkvenc_dchs[2].job, unrelated);
 	KUNIT_EXPECT_EQ(test, unrelated_patched & RK_MPP_RKVENC_DCHS_RXE,
@@ -11801,10 +11946,14 @@ static void rk_mpp_rkvenc2_dchs_remap_kunit(struct kunit *test)
 	consumer_low = (3 << RK_MPP_RKVENC_DCHS_TXID_SHIFT) |
 		       (2 << RK_MPP_RKVENC_DCHS_RXID_SHIFT) |
 		       RK_MPP_RKVENC_DCHS_RXE;
-	consumer->reg_image.regs[RK_MPP_RKVENC_DCHS_WORD] = consumer_low;
+	consumer->reg_builder.image.regs[RK_MPP_RKVENC_DCHS_WORD] = consumer_low;
 	KUNIT_ASSERT_EQ(test,
 			rk_mpp_rkvenc2_dchs_patch_kunit_locked(consumer), 0);
-	consumer_patched = consumer->reg_image.regs[RK_MPP_RKVENC_DCHS_WORD];
+	consumer_patched =
+		rk_mpp_job_resources(consumer)->rkvenc_dchs_value;
+	KUNIT_EXPECT_EQ(test,
+			consumer->reg_builder.image.regs[RK_MPP_RKVENC_DCHS_WORD],
+			consumer_low);
 	KUNIT_EXPECT_TRUE(test, rk_mpp_job_resources(consumer)->rkvenc_dchs_active);
 	KUNIT_EXPECT_PTR_EQ(test, srv->rkvenc_dchs[1].job, consumer);
 	KUNIT_EXPECT_EQ(test, consumer_patched & RK_MPP_RKVENC_DCHS_RXE,
@@ -11861,18 +12010,23 @@ static void rk_mpp_rkvenc2_dchs_independent_cores_kunit(struct kunit *test)
 		jobs[i]->client_type = RK_MPP_DEVICE_RKVENC;
 		jobs[i]->current_activation->selected_hw = hws[i];
 		jobs[i]->id = 200 + i;
-		jobs[i]->reg_image.reg_words = reg_words;
-		jobs[i]->reg_image.regs =
+		jobs[i]->reg_builder.image.reg_words = reg_words;
+		jobs[i]->reg_builder.image.regs =
 			kunit_kcalloc(test, reg_words, sizeof(u32),
 				      GFP_KERNEL);
-		KUNIT_ASSERT_NOT_NULL(test, jobs[i]->reg_image.regs);
+		KUNIT_ASSERT_NOT_NULL(test, jobs[i]->reg_builder.image.regs);
+		jobs[i]->reg_builder.state = RK_MPP_REG_BUILDER_SEALED;
 
-		jobs[i]->reg_image.regs[RK_MPP_RKVENC_DCHS_WORD] =
+		jobs[i]->reg_builder.image.regs[RK_MPP_RKVENC_DCHS_WORD] =
 			i << RK_MPP_RKVENC_DCHS_TXID_SHIFT;
 		KUNIT_ASSERT_EQ(test,
 				rk_mpp_rkvenc2_dchs_patch_kunit_locked(jobs[i]),
 				0);
-		patched = jobs[i]->reg_image.regs[RK_MPP_RKVENC_DCHS_WORD];
+		patched = rk_mpp_job_resources(jobs[i])->rkvenc_dchs_value;
+		KUNIT_EXPECT_EQ(test,
+			jobs[i]->reg_builder.image.regs[
+				RK_MPP_RKVENC_DCHS_WORD],
+			i << RK_MPP_RKVENC_DCHS_TXID_SHIFT);
 
 		KUNIT_EXPECT_TRUE(test, rk_mpp_job_resources(jobs[i])->rkvenc_dchs_active);
 		KUNIT_EXPECT_PTR_EQ(test, srv->rkvenc_dchs[i].job, jobs[i]);
@@ -11933,32 +12087,32 @@ static void rk_mpp_rcb_invalid_index_kunit(struct kunit *test)
 	hw->rcb_descs[0].size = 0x100;
 	hw->rcb_descs[1].index = 4;
 	hw->rcb_descs[1].size = 0x100;
-	job->reg_image.rcb_count = 3;
-	job->reg_image.rcb_descs[0].index = 2;
-	job->reg_image.rcb_descs[0].size = 0x100;
-	job->reg_image.rcb_descs[1].index = max_words;
-	job->reg_image.rcb_descs[1].size = 0x100;
-	job->reg_image.rcb_descs[2].index = 4;
-	job->reg_image.rcb_descs[2].size = 0x100;
+	job->reg_builder.image.rcb_count = 3;
+	job->reg_builder.image.rcb_descs[0].index = 2;
+	job->reg_builder.image.rcb_descs[0].size = 0x100;
+	job->reg_builder.image.rcb_descs[1].index = max_words;
+	job->reg_builder.image.rcb_descs[1].size = 0x100;
+	job->reg_builder.image.rcb_descs[2].index = 4;
+	job->reg_builder.image.rcb_descs[2].size = 0x100;
 
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_rcb_info(job), 0);
-	KUNIT_ASSERT_NOT_NULL(test, job->reg_image.regs);
-	KUNIT_ASSERT_GT(test, job->reg_image.reg_words, 4U);
-	KUNIT_EXPECT_EQ(test, job->reg_image.regs[2], 0x80000000U);
-	KUNIT_EXPECT_EQ(test, job->reg_image.regs[4], 0x80000100U);
-	KUNIT_EXPECT_EQ(test, job->reg_image.kernel_binding_count, 2U);
+	KUNIT_ASSERT_NOT_NULL(test, job->reg_builder.image.regs);
+	KUNIT_ASSERT_GT(test, job->reg_builder.image.reg_words, 4U);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.regs[2], 0x80000000U);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.regs[4], 0x80000100U);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.kernel_binding_count, 2U);
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_hold_explicit_iova(job, 4), 0);
-	job->reg_image.regs[4]++;
+	job->reg_builder.image.regs[4]++;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_hold_explicit_iova(job, 4), -ERANGE);
-	job->reg_image.regs[4] = 0x80000100U;
+	job->reg_builder.image.regs[4] = 0x80000100U;
 
 	hw->rcb_iova = 0;
-	job->reg_image.rcb_count = 1;
-	job->reg_image.rcb_descs[0].index = 4;
-	job->reg_image.rcb_descs[0].size = 0x100;
-	job->reg_image.regs[4] = 0xdeadbeef;
+	job->reg_builder.image.rcb_count = 1;
+	job->reg_builder.image.rcb_descs[0].index = 4;
+	job->reg_builder.image.rcb_descs[0].size = 0x100;
+	job->reg_builder.image.regs[4] = 0xdeadbeef;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_rcb_info(job), 0);
-	KUNIT_EXPECT_EQ(test, job->reg_image.regs[4], 0U);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.regs[4], 0U);
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_hold_explicit_iova(job, 4), 0);
 
 	/*
@@ -11968,35 +12122,35 @@ static void rk_mpp_rcb_invalid_index_kunit(struct kunit *test)
 	 * job on the session rather than just ignoring one bad entry.
 	 */
 	hw->rcb_iova = 0x80000000;
-	job->reg_image.rcb_count = 2;
-	job->reg_image.rcb_descs[0].index =
+	job->reg_builder.image.rcb_count = 2;
+	job->reg_builder.image.rcb_descs[0].index =
 		RK_MPP_RKVENC2_MIN_REG_SIZE / sizeof(u32);
-	job->reg_image.rcb_descs[0].size = 0x100;
-	job->reg_image.rcb_descs[1].index = 4;
-	job->reg_image.rcb_descs[1].size = 0x100;
+	job->reg_builder.image.rcb_descs[0].size = 0x100;
+	job->reg_builder.image.rcb_descs[1].index = 4;
+	job->reg_builder.image.rcb_descs[1].size = 0x100;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_rcb_info(job), 0);
-	KUNIT_EXPECT_EQ(test, job->reg_image.regs[4], 0x80000000U);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.regs[4], 0x80000000U);
 
 	/* A valid register number that is absent from trusted DT RCB data is not patched. */
-	job->reg_image.rcb_count = 2;
-	job->reg_image.rcb_descs[0].index = 3;
-	job->reg_image.rcb_descs[0].size = 0x80;
-	job->reg_image.rcb_descs[1].index = 4;
-	job->reg_image.rcb_descs[1].size = 0x100;
-	job->reg_image.regs[3] = 0xdeadbeef;
+	job->reg_builder.image.rcb_count = 2;
+	job->reg_builder.image.rcb_descs[0].index = 3;
+	job->reg_builder.image.rcb_descs[0].size = 0x80;
+	job->reg_builder.image.rcb_descs[1].index = 4;
+	job->reg_builder.image.rcb_descs[1].size = 0x100;
+	job->reg_builder.image.regs[3] = 0xdeadbeef;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_rcb_info(job), 0);
-	KUNIT_EXPECT_EQ(test, job->reg_image.regs[3], 0xdeadbeefU);
-	KUNIT_EXPECT_EQ(test, job->reg_image.regs[4], 0x80000000U);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.regs[3], 0xdeadbeefU);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.regs[4], 0x80000000U);
 
 	/* A request cannot reserve more than the trusted descriptor permits. */
-	job->reg_image.rcb_count = 1;
-	job->reg_image.rcb_descs[0].index = 4;
-	job->reg_image.rcb_descs[0].size = 0x101;
-	job->reg_image.regs[4] = 0xa5a5a5a5;
+	job->reg_builder.image.rcb_count = 1;
+	job->reg_builder.image.rcb_descs[0].index = 4;
+	job->reg_builder.image.rcb_descs[0].size = 0x101;
+	job->reg_builder.image.regs[4] = 0xa5a5a5a5;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_rcb_info(job), 0);
-	KUNIT_EXPECT_EQ(test, job->reg_image.regs[4], 0xa5a5a5a5U);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.regs[4], 0xa5a5a5a5U);
 
-	kfree(job->reg_image.regs);
+	kfree(job->reg_builder.image.regs);
 }
 
 static void rk_mpp_rcb_trusted_extent_kunit(struct kunit *test)
@@ -12018,10 +12172,10 @@ static void rk_mpp_rcb_trusted_extent_kunit(struct kunit *test)
 	hw->rcb_count = 2;
 	job->client_type = RK_MPP_DEVICE_RKVENC;
 	job->current_activation->selected_hw = hw;
-	job->reg_image.regs = regs;
-	job->reg_image.reg_words = 8;
-	job->reg_image.reg_bytes = 8 * sizeof(*regs);
-	job->reg_image.rcb_count = 3;
+	job->reg_builder.image.regs = regs;
+	job->reg_builder.image.reg_words = 8;
+	job->reg_builder.image.reg_bytes = 8 * sizeof(*regs);
+	job->reg_builder.image.rcb_count = 3;
 
 	hw->rcb_descs[0] = (struct rk_mpp_rcb_desc) {
 		.index = 2,
@@ -12031,12 +12185,12 @@ static void rk_mpp_rcb_trusted_extent_kunit(struct kunit *test)
 		.index = 4,
 		.size = 0x100,
 	};
-	job->reg_image.rcb_descs[0] = (struct rk_mpp_rcb_desc) {
+	job->reg_builder.image.rcb_descs[0] = (struct rk_mpp_rcb_desc) {
 		.index = 2,
 		.size = 1,
 	};
-	job->reg_image.rcb_descs[1] = job->reg_image.rcb_descs[0];
-	job->reg_image.rcb_descs[2] = (struct rk_mpp_rcb_desc) {
+	job->reg_builder.image.rcb_descs[1] = job->reg_builder.image.rcb_descs[0];
+	job->reg_builder.image.rcb_descs[2] = (struct rk_mpp_rcb_desc) {
 		.index = 4,
 		.size = 1,
 	};
@@ -12046,17 +12200,17 @@ static void rk_mpp_rcb_trusted_extent_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_rcb_info(job), 0);
 	KUNIT_EXPECT_EQ(test, regs[2], 0x80000000U);
 	KUNIT_EXPECT_EQ(test, regs[4], 0xa5a5a5a5U);
-	KUNIT_EXPECT_EQ(test, job->reg_image.kernel_binding_count, 1U);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.kernel_binding_count, 1U);
 
 	/* With enough room, the duplicate is ignored and consumes no extent. */
 	hw->rcb_size = 0x300;
-	job->reg_image.kernel_binding_count = 0;
+	job->reg_builder.image.kernel_binding_count = 0;
 	regs[2] = 0;
 	regs[4] = 0;
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_apply_rcb_info(job), 0);
 	KUNIT_EXPECT_EQ(test, regs[2], 0x80000000U);
 	KUNIT_EXPECT_EQ(test, regs[4], 0x80000180U);
-	KUNIT_EXPECT_EQ(test, job->reg_image.kernel_binding_count, 2U);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.kernel_binding_count, 2U);
 }
 
 static void rk_mpp_rkvdec_rcb_width_gate_kunit(struct kunit *test)
@@ -12382,8 +12536,8 @@ static void rk_mpp_batch_session_snapshot_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, job0->trans_count, 2U);
 	KUNIT_EXPECT_EQ(test, job0->trans_table[0], (u16)17);
 	KUNIT_EXPECT_EQ(test, job0->trans_table[1], (u16)29);
-	KUNIT_EXPECT_EQ(test, job0->reg_image.rcb_count, 1U);
-	KUNIT_EXPECT_EQ(test, job0->reg_image.rcb_descs[0].index, 4U);
+	KUNIT_EXPECT_EQ(test, job0->reg_builder.image.rcb_count, 1U);
+	KUNIT_EXPECT_EQ(test, job0->reg_builder.image.rcb_descs[0].index, 4U);
 	KUNIT_EXPECT_EQ(test,
 			job0->codec_info[RK_MPP_DEC_INFO_WIDTH].val, 1920ULL);
 
@@ -13992,6 +14146,36 @@ static void rk_mpp_reset_domain_state_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, domain->reset_domain_member_count, 0U);
 }
 
+static void rk_mpp_reg_builder_seal_kunit(struct kunit *test)
+{
+	const struct rk_mpp_reg_image *image;
+	struct rk_mpp_job *job;
+	u32 snapshot;
+
+	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+	job->client_type = RK_MPP_DEVICE_RKVENC;
+	KUNIT_ASSERT_EQ(test,
+			 rk_mpp_job_ensure_reg_bytes(job, sizeof(u32)), 0);
+	job->reg_builder.image.regs[0] = 0x5a5aa5a5;
+	snapshot = job->reg_builder.image.regs[0];
+
+	image = rk_mpp_reg_builder_seal(job);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(image));
+	KUNIT_EXPECT_PTR_EQ(test, image, &job->reg_builder.image);
+	KUNIT_ASSERT_NOT_NULL(test, job->reg_result.regions[0].regs);
+	KUNIT_EXPECT_EQ(test, job->reg_result.regions[0].regs[0], snapshot);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_job_ensure_reg_bytes(job, 2 * sizeof(u32)),
+			-EPERM);
+	KUNIT_EXPECT_EQ(test, job->reg_builder.image.regs[0], snapshot);
+	KUNIT_EXPECT_PTR_EQ(test, rk_mpp_reg_builder_seal(job), image);
+
+	rk_mpp_reg_result_release(&job->reg_result);
+	kfree(job->reg_builder.image.regs);
+	job->reg_builder.image.regs = NULL;
+}
+
 static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_check_cmd_v1_kunit),
 	KUNIT_CASE(rk_mpp_check_msg_flags_kunit),
@@ -14008,6 +14192,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_av1_reg_layout_kunit),
 	KUNIT_CASE(rk_mpp_av1_lazy_regions_kunit),
 	KUNIT_CASE(rk_mpp_av1_dynamic_metadata_kunit),
+	KUNIT_CASE(rk_mpp_reg_builder_seal_kunit),
 	KUNIT_CASE(rk_mpp_av1_post_offset_provenance_kunit),
 	KUNIT_CASE(rk_mpp_av1_afbc_config_kunit),
 	KUNIT_CASE(rk_mpp_av1_afbc_status_observation_kunit),
@@ -14115,7 +14300,7 @@ kunit_test_suite(rk_mpp_rewrite_test_suite);
 static int rk_mpp_job_ensure_region_bytes(struct rk_mpp_job *job,
 					  u32 region_index, u32 reg_bytes)
 {
-	struct rk_mpp_reg_image *image = &job->reg_image;
+	struct rk_mpp_reg_image *image = &job->reg_builder.image;
 	const struct rk_mpp_reg_layout *layout =
 		rk_mpp_reg_layout_for_type(job->client_type);
 	struct rk_mpp_reg_region *region;
@@ -14125,6 +14310,11 @@ static int rk_mpp_job_ensure_region_bytes(struct rk_mpp_job *job,
 	size_t old_bytes;
 	size_t new_bytes;
 	u32 *regs;
+	int ret;
+
+	ret = rk_mpp_reg_builder_require_open(job);
+	if (ret)
+		return ret;
 
 	if (region_index >= RK_MPP_MAX_REGIONS)
 		return -EINVAL;
@@ -14197,7 +14387,7 @@ rk_mpp_job_reg_word(struct rk_mpp_job *job, u32 index, bool create, u32 **word)
 		region_offset = absolute_offset;
 	}
 
-	region = &job->reg_image.regions[region_index];
+	region = &job->reg_builder.image.regions[region_index];
 	if (create) {
 		ret = rk_mpp_job_ensure_region_bytes(job, region_index,
 						     region_offset + sizeof(u32));
@@ -14236,7 +14426,7 @@ static int rk_mpp_job_store_reg_write(struct rk_mpp_job *job,
 	if (ret)
 		return ret;
 
-	region = &job->reg_image.regions[region_index];
+	region = &job->reg_builder.image.regions[region_index];
 	memcpy((u8 *)region->regs + region_offset, job_req->payload,
 	       req->size);
 
@@ -14246,11 +14436,15 @@ static int rk_mpp_job_store_reg_write(struct rk_mpp_job *job,
 static int rk_mpp_job_store_reg_read(struct rk_mpp_job *job,
 				     const struct mpp_request *req)
 {
-	struct rk_mpp_reg_image *image = &job->reg_image;
+	struct rk_mpp_reg_image *image = &job->reg_builder.image;
 	u32 region_index;
 	u32 region_offset;
 	u32 reg_end;
 	int ret;
+
+	ret = rk_mpp_reg_builder_require_open(job);
+	if (ret)
+		return ret;
 
 	if (!req->size)
 		return 0;
@@ -14284,9 +14478,14 @@ static int rk_mpp_job_store_reg_read(struct rk_mpp_job *job,
 static int rk_mpp_job_store_reg_offsets(struct rk_mpp_job *job,
 					const struct rk_mpp_job_req *job_req)
 {
-	struct rk_mpp_reg_image *image = &job->reg_image;
+	struct rk_mpp_reg_image *image = &job->reg_builder.image;
 	const struct mpp_request *req = &job_req->req;
 	u32 count;
+	int ret;
+
+	ret = rk_mpp_reg_builder_require_open(job);
+	if (ret)
+		return ret;
 
 	if (!req->size)
 		return 0;
@@ -14309,11 +14508,16 @@ static int rk_mpp_job_store_reg_offsets(struct rk_mpp_job *job,
 static int rk_mpp_job_store_rcb_info(struct rk_mpp_job *job,
 				     const struct rk_mpp_job_req *job_req)
 {
-	struct rk_mpp_reg_image *image = &job->reg_image;
+	struct rk_mpp_reg_image *image = &job->reg_builder.image;
 	struct rk_mpp_session *session = job->session;
 	const struct mpp_request *req = &job_req->req;
 	u32 count;
 	u32 limit;
+	int ret;
+
+	ret = rk_mpp_reg_builder_require_open(job);
+	if (ret)
+		return ret;
 
 	if (!req->size)
 		return 0;
@@ -14349,7 +14553,7 @@ static int rk_mpp_job_ensure_reg_word(struct rk_mpp_job *job, u32 index)
 static struct rk_mpp_reg_binding *
 rk_mpp_job_find_reg_binding(struct rk_mpp_job *job, u32 index)
 {
-	struct rk_mpp_reg_image *image = &job->reg_image;
+	struct rk_mpp_reg_image *image = &job->reg_builder.image;
 	u32 i;
 
 	for (i = 0; i < image->binding_count; i++) {
@@ -14363,7 +14567,7 @@ rk_mpp_job_find_reg_binding(struct rk_mpp_job *job, u32 index)
 static struct rk_mpp_kernel_reg_binding *
 rk_mpp_job_find_kernel_binding(struct rk_mpp_job *job, u32 index)
 {
-	struct rk_mpp_reg_image *image = &job->reg_image;
+	struct rk_mpp_reg_image *image = &job->reg_builder.image;
 	u32 i;
 
 	for (i = 0; i < image->kernel_binding_count; i++) {
@@ -14377,7 +14581,7 @@ rk_mpp_job_find_kernel_binding(struct rk_mpp_job *job, u32 index)
 static int rk_mpp_job_record_kernel_binding(struct rk_mpp_job *job, u32 index,
 					    dma_addr_t iova)
 {
-	struct rk_mpp_reg_image *image = &job->reg_image;
+	struct rk_mpp_reg_image *image = &job->reg_builder.image;
 	struct rk_mpp_kernel_reg_binding *binding;
 
 	binding = rk_mpp_job_find_kernel_binding(job, index);
@@ -14432,7 +14636,7 @@ static int rk_mpp_job_hold_import(struct rk_mpp_job *job,
 static struct rk_mpp_reg_binding *
 rk_mpp_job_append_reg_binding(struct rk_mpp_job *job)
 {
-	struct rk_mpp_reg_image *image = &job->reg_image;
+	struct rk_mpp_reg_image *image = &job->reg_builder.image;
 	struct rk_mpp_reg_binding *bindings;
 	u32 capacity;
 
@@ -14460,7 +14664,7 @@ rk_mpp_job_append_reg_binding(struct rk_mpp_job *job)
 static void rk_mpp_job_reject_reg(struct rk_mpp_job *job, u32 index, u32 offset,
 				  const struct rk_mpp_import *import, int ret)
 {
-	struct rk_mpp_reg_image *image = &job->reg_image;
+	struct rk_mpp_reg_image *image = &job->reg_builder.image;
 	size_t size = import && import->dmabuf ? import->dmabuf->size : 0;
 
 	if (image->fail_index < 0)
@@ -14668,7 +14872,7 @@ static int rk_mpp_job_translate_table(struct rk_mpp_job *job,
 
 static int rk_mpp_job_apply_reg_offsets(struct rk_mpp_job *job)
 {
-	struct rk_mpp_reg_image *image = &job->reg_image;
+	struct rk_mpp_reg_image *image = &job->reg_builder.image;
 	int ret;
 	u32 i;
 
@@ -14767,7 +14971,7 @@ rk_mpp_hw_find_rcb_desc(const struct rk_mpp_hw *hw, u32 index)
 
 static int rk_mpp_job_apply_rcb_info(struct rk_mpp_job *job)
 {
-	struct rk_mpp_reg_image *image = &job->reg_image;
+	struct rk_mpp_reg_image *image = &job->reg_builder.image;
 	struct rk_mpp_hw *hw = job->current_activation->selected_hw;
 	DECLARE_BITMAP(used, RK_MPP_MAX_RCB_ELEMS) = {};
 	dma_addr_t rcb_iova;
@@ -14875,7 +15079,7 @@ static int rk_mpp_job_validate_explicit_custom_table(struct rk_mpp_job *job)
 
 static int rk_mpp_job_translate_rkvdec(struct rk_mpp_job *job)
 {
-	const struct rk_mpp_reg_image *image = &job->reg_image;
+	const struct rk_mpp_reg_image *image = &job->reg_builder.image;
 	u32 fmt = 0;
 
 	if (image->reg_words > RK_MPP_RKVDEC_REG_FMT)
@@ -14888,7 +15092,7 @@ static int rk_mpp_job_translate_rkvdec(struct rk_mpp_job *job)
 
 static int rk_mpp_job_translate_rkvenc(struct rk_mpp_job *job)
 {
-	const struct rk_mpp_reg_image *image = &job->reg_image;
+	const struct rk_mpp_reg_image *image = &job->reg_builder.image;
 	u32 fmt;
 	int ret;
 
@@ -14929,7 +15133,7 @@ static int rk_mpp_job_translate_av1(struct rk_mpp_job *job)
 
 static int rk_mpp_job_validate_explicit_rkvdec(struct rk_mpp_job *job)
 {
-	const struct rk_mpp_reg_image *image = &job->reg_image;
+	const struct rk_mpp_reg_image *image = &job->reg_builder.image;
 	u32 fmt = 0;
 
 	if (image->reg_words > RK_MPP_RKVDEC_REG_FMT)
@@ -14943,7 +15147,7 @@ static int rk_mpp_job_validate_explicit_rkvdec(struct rk_mpp_job *job)
 
 static int rk_mpp_job_validate_explicit_rkvenc(struct rk_mpp_job *job)
 {
-	const struct rk_mpp_reg_image *image = &job->reg_image;
+	const struct rk_mpp_reg_image *image = &job->reg_builder.image;
 	u32 fmt;
 	int ret;
 
@@ -15013,7 +15217,7 @@ static bool rk_mpp_job_has_reg_image(const struct rk_mpp_job *job)
 	u32 i;
 
 	for (i = 0; i < region_count; i++) {
-		if (job->reg_image.regions[i].reg_words)
+		if (job->reg_builder.image.regions[i].reg_words)
 			return true;
 	}
 
@@ -15022,7 +15226,7 @@ static bool rk_mpp_job_has_reg_image(const struct rk_mpp_job *job)
 
 static bool rk_mpp_job_rkvenc_slice_mode(struct rk_mpp_job *job)
 {
-	const struct rk_mpp_reg_image *image = &job->reg_image;
+	const struct rk_mpp_reg_image *image = &job->reg_builder.image;
 	u32 enc_pic;
 	u32 sli_split;
 
@@ -15048,7 +15252,10 @@ static bool rk_mpp_job_rkvenc_slice_mode(struct rk_mpp_job *job)
  */
 static void rk_mpp_job_rkvenc_fixup_slice_flush(struct rk_mpp_job *job)
 {
-	struct rk_mpp_reg_image *image = &job->reg_image;
+	struct rk_mpp_reg_image *image = &job->reg_builder.image;
+
+	if (rk_mpp_reg_builder_require_open(job))
+		return;
 
 	if (RK_MPP_RKVENC_EXT_LINE_BUF_WORD >= image->reg_words)
 		return;
@@ -15125,7 +15332,7 @@ rk_mpp_rkvenc2_dchs_lifecycle_unlock(struct rk_mpp_job *job, bool locked)
 
 static int rk_mpp_rkvenc2_dchs_patch(struct rk_mpp_job *job)
 {
-	struct rk_mpp_reg_image *image = &job->reg_image;
+	const struct rk_mpp_reg_image *image = rk_mpp_job_sealed_image(job);
 	struct rk_mpp_service *srv = job->session->srv;
 	struct rk_mpp_hw *hw = job->current_activation->selected_hw;
 	struct rk_mpp_rkvenc_dchs_entry *entry;
@@ -15141,13 +15348,16 @@ static int rk_mpp_rkvenc2_dchs_patch(struct rk_mpp_job *job)
 	bool rxe_map;
 	u32 i;
 
+	if (IS_ERR(image))
+		return PTR_ERR(image);
 	if (job->client_type != RK_MPP_DEVICE_RKVENC || !hw)
 		return 0;
 	if (image->reg_words <= RK_MPP_RKVENC_DCHS_WORD)
 		return 0;
 
 	low = image->regs[RK_MPP_RKVENC_DCHS_WORD] | RK_MPP_RKVENC_DCHS_TXE;
-	image->regs[RK_MPP_RKVENC_DCHS_WORD] = low;
+	rk_mpp_job_resources(job)->rkvenc_dchs_value = low;
+	rk_mpp_job_resources(job)->rkvenc_dchs_override_valid = true;
 
 	if (!hw->ccu_node)
 		return 0;
@@ -15239,7 +15449,7 @@ static int rk_mpp_rkvenc2_dchs_patch(struct rk_mpp_job *job)
 	entry->rxid_orig = rxid_orig;
 	rk_mpp_job_resources(job)->rkvenc_dchs_core_id = core_id;
 	rk_mpp_job_resources(job)->rkvenc_dchs_active = true;
-	image->regs[RK_MPP_RKVENC_DCHS_WORD] = patched;
+	rk_mpp_job_resources(job)->rkvenc_dchs_value = patched;
 
 	spin_unlock_irqrestore(&srv->rkvenc_dchs_lock, flags);
 
@@ -15263,13 +15473,19 @@ static void rk_mpp_rkvenc2_dchs_release(struct rk_mpp_job *job)
 			       sizeof(srv->rkvenc_dchs[core_id]));
 		rk_mpp_job_resources(job)->rkvenc_dchs_active = false;
 	}
+	rk_mpp_job_resources(job)->rkvenc_dchs_override_valid = false;
+	rk_mpp_job_resources(job)->rkvenc_dchs_value = 0;
 	spin_unlock_irqrestore(&srv->rkvenc_dchs_lock, flags);
 }
 
 static int rk_mpp_job_translate_reg_image(struct rk_mpp_job *job)
 {
-	struct rk_mpp_reg_image *image = &job->reg_image;
+	struct rk_mpp_reg_image *image = &job->reg_builder.image;
 	int ret = 0;
+
+	ret = rk_mpp_reg_builder_require_open(job);
+	if (ret)
+		return ret;
 
 	if (image->translated)
 		return 0;
@@ -15461,6 +15677,7 @@ static int rk_mpp_job_submit(struct rk_mpp_job *job)
 {
 	struct rk_mpp_service *srv = job->session->srv;
 	const struct rk_mpp_backend_ops *ops;
+	const struct rk_mpp_reg_image *image;
 	int ret = 0;
 
 	if (!job->current_activation->selected_hw)
@@ -15469,16 +15686,19 @@ static int rk_mpp_job_submit(struct rk_mpp_job *job)
 	ops = job->current_activation->selected_hw->match->ops;
 	if (!ops || !ops->submit)
 		return -EOPNOTSUPP;
+	job->rkvenc_slice_mode = rk_mpp_job_rkvenc_slice_mode(job);
+	if (job->rkvenc_slice_mode)
+		rk_mpp_job_rkvenc_fixup_slice_flush(job);
+	rk_mpp_rkvdec2_prepare_ccu_regs(job);
+	image = rk_mpp_reg_builder_seal(job);
+	if (IS_ERR(image))
+		return PTR_ERR(image);
 	if (ops->validate) {
-		ret = ops->validate(job);
+		ret = ops->validate(job, image);
 
 		if (ret)
 			return ret;
 	}
-
-	job->rkvenc_slice_mode = rk_mpp_job_rkvenc_slice_mode(job);
-	if (job->rkvenc_slice_mode)
-		rk_mpp_job_rkvenc_fixup_slice_flush(job);
 
 	/*
 	 * Serialize admission with core/CCU removal.  Once this check passes,
@@ -15509,6 +15729,10 @@ unlock_hw:
 static int rk_mpp_job_materialize_request(struct rk_mpp_job *job,
 					  const struct rk_mpp_job_req *job_req)
 {
+	int ret = rk_mpp_reg_builder_require_open(job);
+
+	if (ret)
+		return ret;
 	switch (job_req->req.cmd) {
 	case MPP_CMD_SET_REG_WRITE:
 		return rk_mpp_job_store_reg_write(job, job_req);
@@ -15525,12 +15749,15 @@ static int rk_mpp_job_materialize_request(struct rk_mpp_job *job,
 
 static int rk_mpp_job_copy_readback(struct rk_mpp_job *job)
 {
-	struct rk_mpp_reg_image *image = &job->reg_image;
+	const struct rk_mpp_reg_image *image = rk_mpp_job_sealed_image(job);
 	u32 i;
+
+	if (IS_ERR(image))
+		return PTR_ERR(image);
 
 	for (i = 0; i < image->read_req_count; i++) {
 		const struct mpp_request *req = &image->read_reqs[i];
-		struct rk_mpp_reg_region *region;
+		const struct rk_mpp_reg_region *region;
 		u32 region_index;
 		u32 region_offset;
 		int ret;
@@ -15541,7 +15768,8 @@ static int rk_mpp_job_copy_readback(struct rk_mpp_job *job)
 			if (rk_mpp_request_check_rkvdec_perf_span(req))
 				return -EINVAL;
 			if (copy_to_user(req->data,
-					 (u8 *)image->rkvdec_perf_sel + offset,
+					 (u8 *)job->reg_result.rkvdec_perf_sel +
+					 offset,
 					 req->size))
 				return -EFAULT;
 			continue;
@@ -15551,7 +15779,7 @@ static int rk_mpp_job_copy_readback(struct rk_mpp_job *job)
 						    &region_offset);
 		if (ret)
 			return ret;
-		region = &image->regions[region_index];
+		region = &job->reg_result.regions[region_index];
 		if (region_offset > region->reg_bytes ||
 		    req->size > region->reg_bytes - region_offset)
 			return -EINVAL;
@@ -15606,8 +15834,9 @@ static void rk_mpp_job_release(struct rk_mpp_job *job)
 	rk_mpp_rkvdec2_release_link_table(job);
 	rk_mpp_job_release_activation_storage(job);
 	for (i = 0; i < RK_MPP_MAX_REGIONS; i++)
-		kfree(job->reg_image.regions[i].regs);
-	kfree(job->reg_image.bindings);
+		kfree(job->reg_builder.image.regions[i].regs);
+	rk_mpp_reg_result_release(&job->reg_result);
+	kfree(job->reg_builder.image.bindings);
 	kfree(job->imports);
 	rk_mpp_session_put(job->session);
 	kfree(job);
@@ -16011,7 +16240,7 @@ rk_mpp_batch_get_job(struct rk_mpp_batch_state *batch,
 	rk_mpp_activation_init(job);
 	job->state = RK_MPP_JOB_STAGED;
 	/* Zero is a valid register index, so "none" cannot be the kzalloc value. */
-	job->reg_image.fail_index = -1;
+	job->reg_builder.image.fail_index = -1;
 	refcount_set(&job->refs, 1);
 	mutex_lock(&session->lock);
 	job->session_seq = session->state_seq;
@@ -16020,9 +16249,9 @@ rk_mpp_batch_get_job(struct rk_mpp_batch_state *batch,
 	job->trans_count = session->trans_count;
 	memcpy(job->trans_table, session->trans_table,
 	       job->trans_count * sizeof(job->trans_table[0]));
-	job->reg_image.rcb_count = session->rcb_count;
-	memcpy(job->reg_image.rcb_descs, session->rcb_descs,
-	       job->reg_image.rcb_count * sizeof(job->reg_image.rcb_descs[0]));
+	job->reg_builder.image.rcb_count = session->rcb_count;
+	memcpy(job->reg_builder.image.rcb_descs, session->rcb_descs,
+	       job->reg_builder.image.rcb_count * sizeof(job->reg_builder.image.rcb_descs[0]));
 	memcpy(job->codec_info, session->codec_info,
 	       sizeof(job->codec_info));
 	mutex_unlock(&session->lock);
@@ -16583,6 +16812,8 @@ static void rk_mpp_scheduler_work(struct work_struct *work)
 	while ((job = rk_mpp_scheduler_take_job(srv))) {
 		struct rk_mpp_hw *hw = rk_mpp_job_get_hw(job);
 		const struct rk_mpp_backend_ops *ops = hw ? hw->match->ops : NULL;
+		const struct rk_mpp_reg_image *image =
+			rk_mpp_job_sealed_image(job);
 		int ret;
 
 		rk_mpp_count_dispatched_core(job);
@@ -16593,8 +16824,10 @@ static void rk_mpp_scheduler_work(struct work_struct *work)
 			ret = -ENODEV;
 		else if (!ops || !ops->submit)
 			ret = -EOPNOTSUPP;
+		else if (IS_ERR(image))
+			ret = PTR_ERR(image);
 		else
-			ret = ops->submit(job);
+			ret = ops->submit(job, image);
 
 		if (ret) {
 			if (ret == -EOPNOTSUPP)
@@ -16720,12 +16953,15 @@ static int
 rk_mpp_cluster_publish_soft_ccu_job(struct rk_mpp_job *job, u64 generation,
 				    u32 start_value)
 {
+	const struct rk_mpp_reg_image *image = rk_mpp_job_sealed_image(job);
 	struct rk_mpp_hw *hw = job->current_activation->selected_hw;
 	struct rk_mpp_hw *ccu = rk_mpp_job_resources(job)->rkvdec_ccu;
 	struct rk_mpp_cluster *cluster = READ_ONCE(ccu->cluster);
 
 	lockdep_assert_held(&hw->run_lock);
 	lockdep_assert_held(&ccu->run_lock);
+	if (IS_ERR(image))
+		return PTR_ERR(image);
 	if (rk_mpp_cluster_validate_job(cluster, job))
 		return -EXDEV;
 	if (!rk_mpp_rkvdec2_soft_ccu_regs_ready(ccu))
@@ -16740,8 +16976,10 @@ rk_mpp_cluster_publish_soft_ccu_job(struct rk_mpp_job *job, u64 generation,
 	writel_relaxed(hw->core_mask,
 		       ccu->regs[0] + RK_MPP_RKVDEC_CCU_CORE_STA_BASE);
 	rk_mpp_hw_schedule_timeout(hw);
-	if (rk_mpp_hw_publish_register_lease(hw, generation))
+	if (rk_mpp_hw_publish_register_lease(hw, generation)) {
+		rk_mpp_hw_cancel_timeout(hw);
 		return -ENODEV;
+	}
 	/* Publish the register image and watchdog generation before START. */
 	wmb();
 	writel(start_value | RK_MPP_RKVDEC_START_EN,
@@ -16754,17 +16992,22 @@ static int rk_mpp_rkvdec2_publish_and_start_core(struct rk_mpp_job *job,
 						 u64 generation,
 						 u32 start_value)
 {
+	const struct rk_mpp_reg_image *image = rk_mpp_job_sealed_image(job);
 	struct rk_mpp_hw *hw = job->current_activation->selected_hw;
 
 	lockdep_assert_held(&hw->run_lock);
+	if (IS_ERR(image))
+		return PTR_ERR(image);
 	if (rk_mpp_job_resources(job)->rkvdec_ccu)
 		return rk_mpp_cluster_publish_soft_ccu_job(job, generation,
 							   start_value);
 
 	rk_mpp_hw_assert_powered(hw);
 	rk_mpp_hw_schedule_timeout(hw);
-	if (rk_mpp_hw_publish_register_lease(hw, generation))
+	if (rk_mpp_hw_publish_register_lease(hw, generation)) {
+		rk_mpp_hw_cancel_timeout(hw);
 		return -ENODEV;
+	}
 	/* Publish the register image and watchdog generation before START. */
 	wmb();
 	writel(start_value | RK_MPP_RKVDEC_START_EN,
@@ -19419,9 +19662,11 @@ static u32 rk_mpp_rkvdec2_drain_ccu_done_jobs(struct rk_mpp_hw *ccu)
 		ret = rk_mpp_rkvdec2_read_ccu_link_table(job, link_info,
 							 irq_status);
 		if (!ret &&
-		    job->reg_image.reg_words > RK_MPP_RKVDEC_LINK_STATUS_WORD)
+		    job->reg_result.regions[0].reg_words >
+			RK_MPP_RKVDEC_LINK_STATUS_WORD)
 			completed_status =
-				job->reg_image.regs[RK_MPP_RKVDEC_LINK_STATUS_WORD];
+				job->reg_result.regions[0].regs[
+					RK_MPP_RKVDEC_LINK_STATUS_WORD];
 		rk_mpp_debug_record_job(job, RK_MPP_DEBUG_IRQ, ret,
 					completed_status, 0);
 		ccu_error = !!(completed_status & link_info->err_mask);
@@ -20747,27 +20992,38 @@ rk_mpp_iommu_unregister_fault_handler(struct rk_mpp_hw *hw,
 	return 0;
 }
 
-static int rk_mpp_job_store_reg_word(struct rk_mpp_job *job, u32 offset,
-				     u32 value)
+static int rk_mpp_job_store_result_word(struct rk_mpp_job *job, u32 offset,
+					u32 value)
 {
-	u32 *word;
-	int ret;
+	const struct rk_mpp_reg_image *image = rk_mpp_job_sealed_image(job);
+	const struct mpp_request req = {
+		.offset = offset,
+		.size = sizeof(value),
+	};
+	struct rk_mpp_reg_region *region;
+	u32 region_index;
+	u32 region_offset;
 
 	if (offset % sizeof(u32))
 		return -EINVAL;
+	if (IS_ERR(image))
+		return PTR_ERR(image);
+	if (rk_mpp_job_request_reg_region(job, &req, &region_index,
+					  &region_offset))
+		return -EINVAL;
 
-	ret = rk_mpp_job_reg_word(job, offset / sizeof(u32), true, &word);
-	if (ret)
-		return ret;
+	region = &job->reg_result.regions[region_index];
+	if (!region->regs || region_offset >= region->reg_bytes)
+		return -EINVAL;
 
-	*word = value;
+	region->regs[region_offset / sizeof(u32)] = value;
 	return 0;
 }
 
-static int rk_mpp_job_validate_readbacks(struct rk_mpp_job *job,
-					 struct rk_mpp_hw *hw)
+static int rk_mpp_job_validate_readbacks(
+	struct rk_mpp_job *job, const struct rk_mpp_reg_image *image,
+	struct rk_mpp_hw *hw)
 {
-	struct rk_mpp_reg_image *image = &job->reg_image;
 	int ret;
 	u32 i;
 
@@ -20799,17 +21055,17 @@ static int rk_mpp_job_validate_readbacks(struct rk_mpp_job *job,
 	return 0;
 }
 
-static int rk_mpp_job_validate_write_regs(struct rk_mpp_job *job,
-					  u32 start_offset)
+static int rk_mpp_job_validate_write_regs(
+	struct rk_mpp_job *job, const struct rk_mpp_reg_image *image,
+	u32 start_offset)
 {
-	struct rk_mpp_reg_image *image = &job->reg_image;
 	struct rk_mpp_hw *hw = job->current_activation->selected_hw;
 	bool start_seen = false;
 	u32 i;
 
 	for (i = 0; i < job->req_cnt; i++) {
 		const struct mpp_request *req = &job->reqs[i].req;
-		struct rk_mpp_reg_region *region;
+		const struct rk_mpp_reg_region *region;
 		u32 region_index;
 		u32 region_offset;
 		u32 offset;
@@ -20842,10 +21098,10 @@ static int rk_mpp_job_validate_write_regs(struct rk_mpp_job *job,
 	return start_seen ? 0 : -EINVAL;
 }
 
-static int rk_mpp_job_write_regs(struct rk_mpp_job *job, u32 start_offset,
-				 u32 *start_value, bool *start_seen)
+static int rk_mpp_job_write_regs(
+	struct rk_mpp_job *job, const struct rk_mpp_reg_image *image,
+	u32 start_offset, u32 *start_value, bool *start_seen)
 {
-	struct rk_mpp_reg_image *image = &job->reg_image;
 	struct rk_mpp_hw *hw = job->current_activation->selected_hw;
 	u32 i;
 
@@ -20855,7 +21111,7 @@ static int rk_mpp_job_write_regs(struct rk_mpp_job *job, u32 start_offset,
 	rk_mpp_hw_assert_powered(hw);
 	for (i = 0; i < job->req_cnt; i++) {
 		const struct mpp_request *req = &job->reqs[i].req;
-		struct rk_mpp_reg_region *region;
+		const struct rk_mpp_reg_region *region;
 		u32 region_index;
 		u32 region_offset;
 		u32 offset;
@@ -20880,6 +21136,8 @@ static int rk_mpp_job_write_regs(struct rk_mpp_job *job, u32 start_offset,
 		for (offset = req->offset; offset < end; offset += sizeof(u32)) {
 			u32 local = region_offset + offset - req->offset;
 			u32 value = region->regs[local / sizeof(u32)];
+			struct rk_mpp_activation_resources *resources =
+				rk_mpp_job_resources(job);
 
 			/*
 			 * AV1 AFBC control is derived from the validated VCD
@@ -20889,6 +21147,11 @@ static int rk_mpp_job_write_regs(struct rk_mpp_job *job, u32 start_offset,
 			if (job->client_type == RK_MPP_DEVICE_AV1DEC &&
 			    region_index == RK_MPP_AV1_AFBC_REGION)
 				continue;
+			if (job->client_type == RK_MPP_DEVICE_RKVENC &&
+			    region_index == 0 &&
+			    local / sizeof(u32) == RK_MPP_RKVENC_DCHS_WORD &&
+			    resources->rkvenc_dchs_override_valid)
+				value = resources->rkvenc_dchs_value;
 			if (offset == start_offset) {
 				*start_value = value;
 				*start_seen = true;
@@ -20905,8 +21168,8 @@ static int rk_mpp_job_write_regs(struct rk_mpp_job *job, u32 start_offset,
 static void rk_mpp_rkvdec2_read_perf_sel(struct rk_mpp_job *job,
 					 const struct mpp_request *req)
 {
-	struct rk_mpp_reg_image *image = &job->reg_image;
 	struct rk_mpp_hw *hw = job->current_activation->selected_hw;
+	u32 *values = job->reg_result.rkvdec_perf_sel;
 	u32 start = (req->offset - RK_MPP_RKVDEC_PERF_SEL_OFFSET) / sizeof(u32);
 	u32 end = start + req->size / sizeof(u32);
 	u32 i;
@@ -20918,14 +21181,14 @@ static void rk_mpp_rkvdec2_read_perf_sel(struct rk_mpp_job *job,
 		u32 val = RK_MPP_RKVDEC_SET_PERF_SEL(sel0, sel1, sel2);
 
 		writel_relaxed(val, hw->regs[0] + RK_MPP_RKVDEC_PERF_SEL_BASE);
-		image->rkvdec_perf_sel[sel0] =
+		values[sel0] =
 			readl_relaxed(hw->regs[0] + RK_MPP_RKVDEC_SEL_VAL0_BASE);
 		if (sel1)
-			image->rkvdec_perf_sel[sel1] =
+			values[sel1] =
 				readl_relaxed(hw->regs[0] +
 					      RK_MPP_RKVDEC_SEL_VAL1_BASE);
 		if (sel2)
-			image->rkvdec_perf_sel[sel2] =
+			values[sel2] =
 				readl_relaxed(hw->regs[0] +
 					      RK_MPP_RKVDEC_SEL_VAL2_BASE);
 	}
@@ -20933,10 +21196,13 @@ static void rk_mpp_rkvdec2_read_perf_sel(struct rk_mpp_job *job,
 
 static int rk_mpp_job_read_regs(struct rk_mpp_job *job)
 {
-	struct rk_mpp_reg_image *image = &job->reg_image;
+	const struct rk_mpp_reg_image *image = rk_mpp_job_sealed_image(job);
 	struct rk_mpp_hw *hw = job->current_activation->selected_hw;
 	u32 i;
 	int ret;
+
+	if (IS_ERR(image))
+		return PTR_ERR(image);
 
 	for (i = 0; i < image->read_req_count; i++) {
 		const struct mpp_request *req = &image->read_reqs[i];
@@ -20962,7 +21228,7 @@ static int rk_mpp_job_read_regs(struct rk_mpp_job *job)
 						    &region_offset);
 		if (ret)
 			return ret;
-		region = &image->regions[region_index];
+		region = &job->reg_result.regions[region_index];
 		if (region_offset > region->reg_bytes ||
 		    req->size > region->reg_bytes - region_offset)
 			return -EINVAL;
@@ -20984,13 +21250,16 @@ static int rk_mpp_job_read_regs(struct rk_mpp_job *job)
 
 static void rk_mpp_rkvdec2_prepare_ccu_regs(struct rk_mpp_job *job)
 {
-	struct rk_mpp_reg_image *image = &job->reg_image;
+	struct rk_mpp_reg_image *image = &job->reg_builder.image;
 	struct rk_mpp_session *session = job->session;
 	u32 width;
 	u32 height;
 	u32 bitdepth;
 	u32 timeout;
 	u32 session_id;
+
+	if (rk_mpp_reg_builder_require_open(job))
+		return;
 
 	if (job->client_type != RK_MPP_DEVICE_RKVDEC || !job->current_activation->selected_hw ||
 	    !job->current_activation->selected_hw->ccu_node)
@@ -21050,7 +21319,8 @@ static int rk_mpp_rkvenc2_program_watchdog(struct rk_mpp_hw *hw)
 	return 0;
 }
 
-static int rk_mpp_rkvenc2_validate(struct rk_mpp_job *job)
+static int rk_mpp_rkvenc2_validate(
+	struct rk_mpp_job *job, const struct rk_mpp_reg_image *image)
 {
 	struct rk_mpp_hw *hw = job->current_activation->selected_hw;
 	int ret;
@@ -21066,25 +21336,31 @@ static int rk_mpp_rkvenc2_validate(struct rk_mpp_job *job)
 	    !rk_mpp_hw_find_clk(hw, "clk_core"))
 		return -ENODEV;
 
-	ret = rk_mpp_job_validate_readbacks(job, hw);
+	ret = rk_mpp_job_validate_readbacks(job, image, hw);
 	if (ret)
 		return ret;
 
-	return rk_mpp_job_validate_write_regs(job, RK_MPP_RKVENC_START_BASE);
+	return rk_mpp_job_validate_write_regs(job, image,
+					      RK_MPP_RKVENC_START_BASE);
 }
 
 static int rk_mpp_rkvenc2_publish_and_start(struct rk_mpp_job *job,
 					    u64 generation,
 					    u32 start_value)
 {
+	const struct rk_mpp_reg_image *image = rk_mpp_job_sealed_image(job);
 	struct rk_mpp_hw *hw = job->current_activation->selected_hw;
 	int ret;
 
 	lockdep_assert_held(&hw->run_lock);
+	if (IS_ERR(image))
+		return PTR_ERR(image);
 	rk_mpp_hw_schedule_timeout(hw);
 	ret = rk_mpp_hw_publish_register_lease(hw, generation);
-	if (ret)
+	if (ret) {
+		rk_mpp_hw_cancel_timeout(hw);
 		return ret;
+	}
 	/* Publish the register image and watchdog generation before START. */
 	wmb();
 	writel(start_value, hw->regs[0] + RK_MPP_RKVENC_START_BASE);
@@ -21092,7 +21368,8 @@ static int rk_mpp_rkvenc2_publish_and_start(struct rk_mpp_job *job,
 	return 0;
 }
 
-static int rk_mpp_rkvenc2_submit(struct rk_mpp_job *job)
+static int rk_mpp_rkvenc2_submit(
+	struct rk_mpp_job *job, const struct rk_mpp_reg_image *image)
 {
 	struct rk_mpp_activation_claim_token claim = {};
 	struct rk_mpp_hw *hw = rk_mpp_job_get_hw(job);
@@ -21118,7 +21395,7 @@ static int rk_mpp_rkvenc2_submit(struct rk_mpp_job *job)
 		goto out_put_hw;
 	}
 
-	ret = rk_mpp_job_validate_readbacks(job, hw);
+	ret = rk_mpp_job_validate_readbacks(job, image, hw);
 	if (ret)
 		goto out_put_hw;
 
@@ -21185,7 +21462,7 @@ static int rk_mpp_rkvenc2_submit(struct rk_mpp_job *job)
 	if (ret)
 		goto err_power_off;
 
-	ret = rk_mpp_job_write_regs(job, RK_MPP_RKVENC_START_BASE,
+	ret = rk_mpp_job_write_regs(job, image, RK_MPP_RKVENC_START_BASE,
 				    &start_value, &start_seen);
 	if (ret)
 		goto err_power_off;
@@ -21538,8 +21815,9 @@ static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 
 	ret = rk_mpp_job_read_regs(job);
 	if (!ret)
-		ret = rk_mpp_job_store_reg_word(job, RK_MPP_RKVENC_INT_STA_BASE,
-						irq_status);
+		ret = rk_mpp_job_store_result_word(job,
+						   RK_MPP_RKVENC_INT_STA_BASE,
+						   irq_status);
 
 	dchs_lifecycle_locked = rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
 	if (rk_mpp_rkvenc2_irq_needs_reset(irq_status)) {
@@ -21594,7 +21872,8 @@ static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 	return IRQ_HANDLED;
 }
 
-static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
+static int rk_mpp_rkvdec2_submit(
+	struct rk_mpp_job *job, const struct rk_mpp_reg_image *image)
 {
 	struct rk_mpp_activation_claim_token claim = {};
 	struct rk_mpp_hw *hw = rk_mpp_job_get_hw(job);
@@ -21625,14 +21904,14 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 		goto out_put_hw;
 	}
 
-	ret = rk_mpp_job_validate_readbacks(job, hw);
+	ret = rk_mpp_job_validate_readbacks(job, image, hw);
 	if (ret)
 		goto out_put_hw;
 	hard_ccu = rk_mpp_rkvdec2_hard_ccu_enabled(hw);
 
-	if (RK_MPP_RKVDEC_RLC_WORD < job->reg_image.reg_words)
+	if (image->reg_words > RK_MPP_RKVDEC_RLC_WORD)
 		rk_mpp_job_resources(job)->rkvdec_stream_addr =
-			job->reg_image.regs[RK_MPP_RKVDEC_RLC_WORD];
+			image->regs[RK_MPP_RKVDEC_RLC_WORD];
 
 	if (hard_ccu) {
 		ccu = rk_mpp_hw_get_ccu_for_core(job->session->srv, hw);
@@ -21670,8 +21949,6 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 		ret = READ_ONCE(job->canceled) ? -ECANCELED : -ENODEV;
 		goto err_power_off;
 	}
-
-	rk_mpp_rkvdec2_prepare_ccu_regs(job);
 
 	if (hard_ccu) {
 		if (!rk_mpp_hw_usable(hw) || READ_ONCE(job->canceled)) {
@@ -21737,7 +22014,7 @@ static int rk_mpp_rkvdec2_submit(struct rk_mpp_job *job)
 	 */
 	if (soft_ccu && hw->iommu_domain && hw->iommu_domain->ops)
 		iommu_flush_iotlb_all(hw->iommu_domain);
-	ret = rk_mpp_job_write_regs(job, RK_MPP_RKVDEC_START_BASE,
+	ret = rk_mpp_job_write_regs(job, image, RK_MPP_RKVDEC_START_BASE,
 				    &start_value, &start_seen);
 	if (ret)
 		goto err_deregister_soft_ccu;
@@ -21822,7 +22099,8 @@ out_put_hw:
 	return ret;
 }
 
-static int rk_mpp_rkvdec2_validate(struct rk_mpp_job *job)
+static int rk_mpp_rkvdec2_validate(
+	struct rk_mpp_job *job, const struct rk_mpp_reg_image *image)
 {
 	struct rk_mpp_hw *hw = job->current_activation->selected_hw;
 	int ret;
@@ -21835,11 +22113,12 @@ static int rk_mpp_rkvdec2_validate(struct rk_mpp_job *job)
 				       sizeof(u32)))
 		return -ENODEV;
 
-	ret = rk_mpp_job_validate_readbacks(job, hw);
+	ret = rk_mpp_job_validate_readbacks(job, image, hw);
 	if (ret)
 		return ret;
 
-	return rk_mpp_job_validate_write_regs(job, RK_MPP_RKVDEC_START_BASE);
+	return rk_mpp_job_validate_write_regs(job, image,
+					      RK_MPP_RKVDEC_START_BASE);
 }
 
 static irqreturn_t
@@ -21971,17 +22250,17 @@ static irqreturn_t rk_mpp_rkvdec2_thread(struct rk_mpp_hw *hw)
 	rk_mpp_hw_cancel_timeout(hw);
 	ret = rk_mpp_job_read_regs(job);
 	if (!ret)
-		ret = rk_mpp_job_store_reg_word(job,
-						RK_MPP_RKVDEC_INT_STA_BASE,
-						irq_status);
+		ret = rk_mpp_job_store_result_word(job,
+						   RK_MPP_RKVDEC_INT_STA_BASE,
+						   irq_status);
 	if (!ret &&
-	    job->reg_image.reg_words > RK_MPP_RKVDEC_RLC_WORD) {
+	    job->reg_result.regions[0].reg_words > RK_MPP_RKVDEC_RLC_WORD) {
 		u32 dec_get = readl_relaxed(hw->regs[0] + RK_MPP_RKVDEC_RLC_BASE);
 		u32 stream_addr = rk_mpp_job_resources(job)->rkvdec_stream_addr;
 		u32 dec_length;
 
 		dec_length = rk_mpp_rkvdec2_decoded_length(dec_get, stream_addr);
-		job->reg_image.regs[RK_MPP_RKVDEC_RLC_WORD] = dec_length;
+		job->reg_result.regions[0].regs[RK_MPP_RKVDEC_RLC_WORD] = dec_length;
 	}
 
 	if (irq_status & link_info->err_mask) {
@@ -22031,13 +22310,49 @@ static irqreturn_t rk_mpp_rkvdec2_thread(struct rk_mpp_hw *hw)
 	return IRQ_HANDLED;
 }
 
-static int rk_mpp_av1_required_word(struct rk_mpp_job *job, u32 index,
-				    u32 *value)
+static int rk_mpp_reg_image_word(const struct rk_mpp_job *job,
+				 const struct rk_mpp_reg_image *image,
+				 u32 index, const u32 **word)
 {
-	u32 *word;
+	const struct rk_mpp_reg_layout *layout =
+		rk_mpp_reg_layout_for_type(job->client_type);
+	u32 absolute_offset;
+	u32 region_offset;
+	u32 region_index;
 	int ret;
 
-	ret = rk_mpp_job_reg_word(job, index, false, &word);
+	*word = NULL;
+	if (check_mul_overflow(index, (u32)sizeof(u32), &absolute_offset))
+		return -EOVERFLOW;
+	if (layout) {
+		ret = rk_mpp_reg_region_for_span(layout, absolute_offset,
+						 sizeof(u32), &region_index,
+						 &region_offset);
+		if (ret)
+			return ret;
+	} else {
+		region_index = 0;
+		region_offset = absolute_offset;
+	}
+	if (region_index >= RK_MPP_MAX_REGIONS ||
+	    region_offset >= image->regions[region_index].reg_bytes)
+		return 0;
+	*word = &image->regions[region_index]
+			.regs[region_offset / sizeof(u32)];
+
+	return 0;
+}
+
+static int rk_mpp_av1_required_word(
+	const struct rk_mpp_job *job, const struct rk_mpp_reg_image *image,
+	u32 index, u32 *value)
+{
+	const u32 *word;
+	int ret;
+
+	if (IS_ERR_OR_NULL(image))
+		return image ? PTR_ERR(image) : -EINVAL;
+	ret = rk_mpp_reg_image_word(job, image, index, &word);
 	if (ret)
 		return ret;
 	if (!word)
@@ -22105,9 +22420,10 @@ rk_mpp_av1_afbc_required_span(u32 width, u32 height, u32 bits_per_pixel,
 
 static int
 rk_mpp_av1_build_afbc_config(struct rk_mpp_job *job,
+			     const struct rk_mpp_reg_image *image,
 			     struct rk_mpp_av1_afbc_config *config)
 {
-	struct rk_mpp_reg_binding *binding;
+	const struct rk_mpp_reg_binding *binding = NULL;
 	dma_addr_t header_iova;
 	dma_addr_t payload_iova;
 	u64 header_size;
@@ -22125,12 +22441,12 @@ rk_mpp_av1_build_afbc_config(struct rk_mpp_job *job,
 	u32 padded_height;
 	u32 payload_offset;
 	u32 stride;
-	u32 *word;
+	const u32 *word;
 	int ret;
 
 	memset(config, 0, sizeof(*config));
-	ret = rk_mpp_job_reg_word(job, RK_MPP_AV1_PP_CONFIG_WORD, false,
-				  &word);
+	ret = rk_mpp_reg_image_word(job, image, RK_MPP_AV1_PP_CONFIG_WORD,
+				    &word);
 	if (ret)
 		return ret;
 	if (!word)
@@ -22140,19 +22456,22 @@ rk_mpp_av1_build_afbc_config(struct rk_mpp_job *job,
 	    RK_MPP_AV1_PP_TILE_16X16)
 		return 0;
 
-	ret = rk_mpp_av1_required_word(job, RK_MPP_AV1_DIMENSIONS_WORD,
+	ret = rk_mpp_av1_required_word(job, image,
+				       RK_MPP_AV1_DIMENSIONS_WORD,
 				       &dimensions);
 	if (ret)
 		return ret;
-	ret = rk_mpp_av1_required_word(job, RK_MPP_AV1_BIT_DEPTH_WORD,
+	ret = rk_mpp_av1_required_word(job, image,
+				       RK_MPP_AV1_BIT_DEPTH_WORD,
 				       &bit_depth);
 	if (ret)
 		return ret;
-	ret = rk_mpp_av1_required_word(job, RK_MPP_AV1_PADDING_WORD,
+	ret = rk_mpp_av1_required_word(job, image, RK_MPP_AV1_PADDING_WORD,
 				       &padding);
 	if (ret)
 		return ret;
-	ret = rk_mpp_av1_required_word(job, RK_MPP_AV1_AFBC_OUTPUT_WORD,
+	ret = rk_mpp_av1_required_word(job, image,
+				       RK_MPP_AV1_AFBC_OUTPUT_WORD,
 				       &output);
 	if (ret)
 		return ret;
@@ -22195,8 +22514,12 @@ rk_mpp_av1_build_afbc_config(struct rk_mpp_job *job,
 	if (header_size > U32_MAX)
 		return -EOVERFLOW;
 
-	binding = rk_mpp_job_find_reg_binding(job,
-					      RK_MPP_AV1_AFBC_OUTPUT_WORD);
+	for (u32 i = 0; i < image->binding_count; i++) {
+		if (image->bindings[i].index == RK_MPP_AV1_AFBC_OUTPUT_WORD) {
+			binding = &image->bindings[i];
+			break;
+		}
+	}
 	if (!binding || !binding->import)
 		return -ERANGE;
 	ret = rk_mpp_import_iova_at_offset(binding->import, binding->offset,
@@ -22487,6 +22810,27 @@ static int rk_mpp_av1_publish_and_start(struct rk_mpp_hw *hw, u64 generation,
 	return 0;
 }
 
+static int
+rk_mpp_av1_activation_publish_and_start(struct rk_mpp_job *job,
+					u64 generation, bool afbc_enabled,
+					u32 start_value)
+{
+	const struct rk_mpp_reg_image *image = rk_mpp_job_sealed_image(job);
+	struct rk_mpp_hw *hw = job->current_activation->selected_hw;
+	int ret;
+
+	lockdep_assert_held(&hw->run_lock);
+	if (IS_ERR(image))
+		return PTR_ERR(image);
+	rk_mpp_hw_schedule_timeout(hw);
+	ret = rk_mpp_av1_publish_and_start(hw, generation, afbc_enabled,
+					   start_value);
+	if (ret)
+		rk_mpp_hw_cancel_timeout(hw);
+
+	return ret;
+}
+
 static void rk_mpp_av1_observe_afbc_at_vcd(struct rk_mpp_hw *hw,
 					   u64 generation)
 {
@@ -22526,7 +22870,8 @@ static void rk_mpp_av1_clear_cache(struct rk_mpp_hw *hw)
 	}
 }
 
-static int rk_mpp_av1_validate(struct rk_mpp_job *job)
+static int rk_mpp_av1_validate(
+	struct rk_mpp_job *job, const struct rk_mpp_reg_image *image)
 {
 	struct rk_mpp_av1_afbc_config config;
 	struct rk_mpp_hw *hw = job->current_activation->selected_hw;
@@ -22539,17 +22884,19 @@ static int rk_mpp_av1_validate(struct rk_mpp_job *job)
 				       sizeof(u32)))
 		return -ENODEV;
 
-	ret = rk_mpp_job_validate_readbacks(job, hw);
+	ret = rk_mpp_job_validate_readbacks(job, image, hw);
 	if (ret)
 		return ret;
-	ret = rk_mpp_job_validate_write_regs(job, RK_MPP_AV1_IRQ_BASE);
+	ret = rk_mpp_job_validate_write_regs(job, image,
+					     RK_MPP_AV1_IRQ_BASE);
 	if (ret)
 		return ret;
 
-	return rk_mpp_av1_build_afbc_config(job, &config);
+	return rk_mpp_av1_build_afbc_config(job, image, &config);
 }
 
-static int rk_mpp_av1_submit(struct rk_mpp_job *job)
+static int rk_mpp_av1_submit(
+	struct rk_mpp_job *job, const struct rk_mpp_reg_image *image)
 {
 	struct rk_mpp_activation_claim_token claim = {};
 	struct rk_mpp_av1_afbc_config config;
@@ -22568,7 +22915,7 @@ static int rk_mpp_av1_submit(struct rk_mpp_job *job)
 	int stop_ret;
 	int ret;
 
-	ret = rk_mpp_av1_build_afbc_config(job, &config);
+	ret = rk_mpp_av1_build_afbc_config(job, image, &config);
 	if (ret)
 		return ret;
 	job->av1_afbc_enabled = config.enabled;
@@ -22598,8 +22945,8 @@ static int rk_mpp_av1_submit(struct rk_mpp_job *job)
 		goto err_power_off;
 	}
 
-	ret = rk_mpp_job_write_regs(job, RK_MPP_AV1_IRQ_BASE, &start_value,
-				    &start_seen);
+	ret = rk_mpp_job_write_regs(job, image, RK_MPP_AV1_IRQ_BASE,
+				    &start_value, &start_seen);
 	if (ret)
 		goto err_power_off;
 	if (!start_seen) {
@@ -22628,9 +22975,9 @@ static int rk_mpp_av1_submit(struct rk_mpp_job *job)
 		goto err_power_off;
 	}
 
-	rk_mpp_hw_schedule_timeout(hw);
-	ret = rk_mpp_av1_publish_and_start(hw, generation, config.enabled,
-					   start_value);
+	ret = rk_mpp_av1_activation_publish_and_start(job, generation,
+						      config.enabled,
+						      start_value);
 	if (iommu_reserved) {
 		vsi_iommu_release_dma(hw->dev);
 		iommu_reserved = false;
@@ -22787,15 +23134,16 @@ static irqreturn_t rk_mpp_av1_thread(struct rk_mpp_hw *hw)
 	rk_mpp_hw_cancel_timeout(hw);
 
 	rk_mpp_av1_clear_cache(hw);
-	if (!rk_mpp_av1_required_word(job, RK_MPP_AV1_PP_CONFIG_WORD,
+	if (!rk_mpp_av1_required_word(job, rk_mpp_job_sealed_image(job),
+				      RK_MPP_AV1_PP_CONFIG_WORD,
 				      &pp_config) &&
 	    (pp_config & RK_MPP_AV1_PP_TILE_MASK) ==
 	    RK_MPP_AV1_PP_TILE_16X16)
 		rk_mpp_av1_afbc_ack(hw);
 	ret = rk_mpp_job_read_regs(job);
 	if (!ret)
-		ret = rk_mpp_job_store_reg_word(job, RK_MPP_AV1_IRQ_BASE,
-						irq_status);
+		ret = rk_mpp_job_store_result_word(job, RK_MPP_AV1_IRQ_BASE,
+						   irq_status);
 
 	if (!ret && (irq_status & RK_MPP_AV1_ERR_MASK))
 		ret = -EIO;
@@ -23464,7 +23812,7 @@ static int rk_mpp_execute_jobs(struct rk_mpp_batch_state *batch)
 				rk_mpp_debug_record_job(job,
 							RK_MPP_DEBUG_TRANSLATE_FAIL,
 							ret, 0,
-							(u32)job->reg_image.fail_index);
+							(u32)job->reg_builder.image.fail_index);
 				goto rejected;
 			}
 			ret = rk_mpp_job_submit(job);
@@ -24155,7 +24503,7 @@ static int rk_mpp_debug_state_show(struct seq_file *s, void *unused)
 			   job->current_activation->selected_hw->core_id,
 			   job->session->id, job->id,
 			   job->client_type, job->req_cnt,
-			   job->reg_image.reg_words, job->flags,
+			   job->reg_builder.image.reg_words, job->flags,
 			   READ_ONCE(job->canceled), queued_ms);
 	}
 	mutex_unlock(&srv->sched_lock);
