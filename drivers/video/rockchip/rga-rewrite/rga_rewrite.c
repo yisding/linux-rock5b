@@ -1153,6 +1153,15 @@ struct rk_rga_job_mapping {
 	bool userptr;
 	bool iommu_mapped;
 	bool rga2_mmu_required;
+	enum {
+		RK_RGA_EXEC_MAP_DIRECT,
+		RK_RGA_EXEC_MAP_STAGED,
+	} mode;
+	enum {
+		RK_RGA_EXEC_COPY_NONE,
+		RK_RGA_EXEC_COPY_DMA_API,
+		RK_RGA_EXEC_COPY_USERPTR_SHADOW,
+	} copy_owner;
 };
 
 enum rk_rga2_mmu_channel {
@@ -1229,9 +1238,23 @@ struct rk_rga_request {
 	bool configured;
 };
 
+struct rk_rga_acquire_set;
+
 struct rk_rga_fence_waiter {
 	struct dma_fence_cb cb;
+	struct rk_rga_acquire_set *set;
+};
+
+struct rk_rga_acquire_set {
+	struct work_struct work;
 	struct rk_rga_job *job;
+	struct dma_fence **fences;
+	struct rk_rga_fence_waiter *waiters;
+	atomic_t pending_count;
+	atomic_t work_queued;
+	u32 count;
+	int result;
+	bool waiting;
 };
 
 struct rk_rga_acquire_fd {
@@ -1239,57 +1262,255 @@ struct rk_rga_acquire_fd {
 	bool kernel_close;
 };
 
-struct rk_rga_job {
-	struct list_head node;
-	struct list_head session_node;
+struct rk_rga_task_plan;
+
+enum rk_rga_task_exec_state {
+	RK_RGA_TASK_EXEC_UNINSTALLED,
+	RK_RGA_TASK_EXEC_SLOTTED,
+	RK_RGA_TASK_EXEC_CLAIMED,
+	RK_RGA_TASK_EXEC_RETIRED,
+	RK_RGA_TASK_EXEC_RECLAIMABLE,
+	RK_RGA_TASK_EXEC_QUARANTINED,
+};
+
+struct rk_rga_task_exec {
+	struct list_head job_link;
+	struct rk_rga_job *job;
 	struct rk_rga_hw *hw;
-	struct rk_rga_session *session;
-	struct rk_rga_service *rga;
-	struct work_struct acquire_work;
-	refcount_t refs;
-	struct rga_req *tasks;
-	struct rk_rga_task_imports *task_imports;
-	struct rk_rga_import **imports;
 	struct rk_rga_job_mapping *mappings;
 	struct rk_rga2_mmu_table *rga2_mmu;
-	struct dma_fence **acquire_fences;
-	u32 *gauss_coeffs;
-	struct rk_rga_fence_waiter *acquire_waiters;
-	struct dma_fence *release_fence;
 	struct rk_rga_hw *cmd_hw;
+	struct rk_rga_task_plan *plan;
 	struct device *cmd_dev;
 	void *cmd_vaddr;
 	dma_addr_t cmd_dma;
 	size_t cmd_size;
-	wait_queue_head_t wait;
-	atomic_t pending_acquire_count;
-	atomic_t acquire_work_queued;
-	u32 task_count;
-	u32 current_task;
-	u32 import_count;
+	refcount_t refs;
+	u64 generation;
+	u64 hw_start_ns;
+	u64 hw_elapsed_ns;
+	u32 task_index;
 	u32 mapping_count;
-	u32 dmabuf_incompatible_hw_type_mask;
-	u32 acquire_fence_count;
 	u32 intr_status;
 	u32 hw_status;
 	u32 cmd_status;
 	u32 work_cycle;
 	u32 parse_status;
-	u64 hw_start_ns;
-	u64 hw_elapsed_ns;
-	__u32 sync_mode;
-	u8 priority;
-	int release_fence_fd;
 	int irq_result;
-	int result;
-	bool queued;
-	bool session_linked;
+	enum rk_rga_task_exec_state state;
 	bool cmd_ready;
 	bool irq_seen;
 	bool userptr_device_owned;
-	bool waiting_acquire;
+	bool power_owned;
+};
+
+struct rk_rga_task_exec_ref {
+	struct rk_rga_task_exec *exec;
+	u64 generation;
+};
+
+struct rk_rga_fault_event {
+	struct list_head node;
+	struct rk_rga_task_exec_ref ref;
+};
+
+struct rk_rga_job {
+	struct list_head node;
+	struct list_head session_node;
+	struct list_head executions;
+	struct rk_rga_task_exec exec_storage;
+	struct rk_rga_task_exec *current_exec;
+	struct rk_rga_session *session;
+	struct rk_rga_service *rga;
+	struct rk_rga_acquire_set acquires;
+	refcount_t refs;
+	struct rga_req *tasks;
+	struct rk_rga_task_imports *task_imports;
+	struct rk_rga_import **imports;
+	u32 *gauss_coeffs;
+	struct dma_fence *release_fence;
+	wait_queue_head_t wait;
+	u32 task_count;
+	u32 current_task;
+	u32 import_count;
+	u32 dmabuf_incompatible_hw_type_mask;
+	u64 total_hw_elapsed_ns;
+	__u32 sync_mode;
+	u8 priority;
+	int release_fence_fd;
+	int result;
+	bool queued;
+	bool session_linked;
 	bool done;
 };
+
+static void rk_rga_job_get(struct rk_rga_job *job);
+static void rk_rga_job_put(struct rk_rga_job *job);
+
+static void rk_rga_task_exec_storage_init(struct rk_rga_task_exec *exec,
+					  struct rk_rga_job *job,
+					  u32 task_index)
+{
+	INIT_LIST_HEAD(&exec->job_link);
+	refcount_set(&exec->refs, 1);
+	exec->job = job;
+	exec->hw = NULL;
+	exec->generation = 0;
+	exec->task_index = task_index;
+	exec->state = RK_RGA_TASK_EXEC_UNINSTALLED;
+}
+
+static void rk_rga_job_init_first_exec(struct rk_rga_job *job)
+{
+	INIT_LIST_HEAD(&job->executions);
+	rk_rga_task_exec_storage_init(&job->exec_storage, job, 0);
+	list_add_tail(&job->exec_storage.job_link, &job->executions);
+	WRITE_ONCE(job->current_exec, &job->exec_storage);
+}
+
+static struct rk_rga_task_exec *
+rk_rga_task_exec_alloc_successor(struct rk_rga_job *job, u32 task_index)
+{
+	struct rk_rga_task_exec *exec;
+
+	exec = kzalloc(sizeof(*exec), GFP_KERNEL);
+	if (!exec)
+		return NULL;
+	rk_rga_task_exec_storage_init(exec, job, task_index);
+	list_add_tail(&exec->job_link, &job->executions);
+
+	return exec;
+}
+
+static bool
+rk_rga_task_exec_ref_empty(const struct rk_rga_task_exec_ref *ref)
+{
+	return ref && !ref->exec && !ref->generation;
+}
+
+static bool
+rk_rga_task_exec_ref_valid(const struct rk_rga_task_exec_ref *ref)
+{
+	return ref && ref->exec && ref->generation && ref->exec->job;
+}
+
+static bool rk_rga_task_exec_ref_get(struct rk_rga_task_exec_ref *ref,
+				     struct rk_rga_task_exec *exec)
+{
+	struct rk_rga_job *job;
+
+	if (!rk_rga_task_exec_ref_empty(ref) || !exec || !exec->generation)
+		return false;
+	job = exec->job;
+	if (!job || !refcount_inc_not_zero(&exec->refs))
+		return false;
+	rk_rga_job_get(job);
+	ref->exec = exec;
+	ref->generation = exec->generation;
+
+	return true;
+}
+
+static bool
+rk_rga_task_exec_ref_clone(struct rk_rga_task_exec_ref *dst,
+			   const struct rk_rga_task_exec_ref *src)
+{
+	if (!rk_rga_task_exec_ref_empty(dst) ||
+	    !rk_rga_task_exec_ref_valid(src) ||
+	    src->generation != src->exec->generation ||
+	    !refcount_inc_not_zero(&src->exec->refs))
+		return false;
+	rk_rga_job_get(src->exec->job);
+	*dst = *src;
+
+	return true;
+}
+
+static bool rk_rga_task_exec_ref_move(struct rk_rga_task_exec_ref *dst,
+				      struct rk_rga_task_exec_ref *src)
+{
+	if (!rk_rga_task_exec_ref_empty(dst) ||
+	    !rk_rga_task_exec_ref_valid(src))
+		return false;
+	*dst = *src;
+	memset(src, 0, sizeof(*src));
+
+	return true;
+}
+
+static bool rk_rga_task_exec_try_reclaim(struct rk_rga_task_exec *exec)
+{
+	struct rk_rga_job *job = exec ? exec->job : NULL;
+	bool free_exec = false;
+
+	if (!job || refcount_read(&exec->refs) != 1 ||
+	    (exec->state != RK_RGA_TASK_EXEC_RETIRED &&
+	     exec->state != RK_RGA_TASK_EXEC_RECLAIMABLE))
+		return false;
+	if (exec->state == RK_RGA_TASK_EXEC_RETIRED)
+		exec->state = RK_RGA_TASK_EXEC_RECLAIMABLE;
+	if (exec == READ_ONCE(job->current_exec) ||
+	    exec == &job->exec_storage)
+		return true;
+	list_del_init(&exec->job_link);
+	if (WARN_ON_ONCE(!refcount_dec_and_test(&exec->refs)))
+		return false;
+	kfree(exec->plan);
+	exec->plan = NULL;
+	free_exec = true;
+	if (free_exec)
+		kfree(exec);
+
+	return true;
+}
+
+static bool rk_rga_task_exec_ref_put(struct rk_rga_task_exec_ref *ref)
+{
+	struct rk_rga_task_exec *exec;
+	struct rk_rga_job *job;
+
+	if (!rk_rga_task_exec_ref_valid(ref))
+		return false;
+	exec = ref->exec;
+	job = exec->job;
+	WARN_ON_ONCE(ref->generation != exec->generation);
+	if (WARN_ON_ONCE(!refcount_dec_not_one(&exec->refs)))
+		return false;
+	memset(ref, 0, sizeof(*ref));
+	rk_rga_task_exec_try_reclaim(exec);
+	rk_rga_job_put(job);
+
+	return true;
+}
+
+static bool rk_rga_task_exec_retire(struct rk_rga_task_exec *exec)
+{
+	if (!exec || exec->state != RK_RGA_TASK_EXEC_CLAIMED)
+		return false;
+	exec->state = RK_RGA_TASK_EXEC_RETIRED;
+
+	return true;
+}
+
+static struct rk_rga_task_exec *
+rk_rga_job_current_exec(const struct rk_rga_job *job)
+{
+	struct rk_rga_task_exec *exec = READ_ONCE(job->current_exec);
+
+#if IS_ENABLED(CONFIG_ROCKCHIP_RGA_REWRITE_KUNIT_TEST)
+	/* Command-emission fixtures predate lifecycle initialization. */
+	if (!exec)
+		exec = (struct rk_rga_task_exec *)&job->exec_storage;
+#endif
+	return exec;
+}
+
+static struct rk_rga_hw *rk_rga_job_hw(const struct rk_rga_job *job)
+{
+	struct rk_rga_task_exec *exec = rk_rga_job_current_exec(job);
+
+	return exec ? exec->hw : NULL;
+}
 
 static const struct rga_req *
 rk_rga_job_validation_task(const struct rk_rga_job *job, u32 task_index,
@@ -1338,12 +1559,12 @@ struct rk_rga_hw {
 	struct mutex run_lock; /* serializes start, timeout, IRQ, and remove */
 	struct delayed_work timeout_work;
 	struct work_struct iommu_fault_work;
+	struct list_head iommu_fault_events;
 	struct list_head job_queue;
-	struct rk_rga_job *active_job;
-	struct rk_rga_job *timeout_job;
-	u64 active_generation;
-	u64 timeout_generation;
-	u64 iommu_fault_generation;
+	struct rk_rga_task_exec_ref active_ref;
+	struct rk_rga_task_exec_ref irq_ref;
+	struct rk_rga_task_exec_ref timeout_ref;
+	u64 activation_generation_seq;
 	atomic_t irq_disable_depth;
 	u32 queued_jobs;
 	/* job_lock-held count of clock-live power holders; gates IRQ MMIO */
@@ -1358,78 +1579,114 @@ struct rk_rga_hw {
 	bool removing;
 };
 
-/*
- * Phase-one active-slot funnel. Callers still own job_lock and the existing
- * run_lock ordering; these helpers only make the slot and its generation a
- * single typed write/read boundary for the later task-execution migration.
- */
-static struct rk_rga_job *
-rk_rga_hw_active_job_locked(const struct rk_rga_hw *hw)
+static struct rk_rga_task_exec *
+rk_rga_hw_active_exec_locked(const struct rk_rga_hw *hw)
 {
 	lockdep_assert_held(&hw->job_lock);
 
-	return hw->active_job;
+	return hw->active_ref.exec;
+}
+
+static struct rk_rga_job *
+rk_rga_hw_active_job_locked(const struct rk_rga_hw *hw)
+{
+	struct rk_rga_task_exec *exec = rk_rga_hw_active_exec_locked(hw);
+
+	return exec ? exec->job : NULL;
 }
 
 static u64 rk_rga_hw_active_generation_locked(const struct rk_rga_hw *hw)
 {
 	lockdep_assert_held(&hw->job_lock);
 
-	return hw->active_generation;
+	return hw->active_ref.generation;
 }
 
-static void rk_rga_hw_install_active_locked(struct rk_rga_hw *hw,
-					    struct rk_rga_job *job)
+static bool rk_rga_hw_install_active_locked(struct rk_rga_hw *hw,
+					    struct rk_rga_task_exec *exec)
 {
 	lockdep_assert_held(&hw->run_lock);
 	lockdep_assert_held(&hw->job_lock);
 
-	WARN_ON_ONCE(hw->active_job);
-	hw->active_job = job;
-	hw->active_generation++;
-	if (!hw->active_generation)
-		hw->active_generation++;
-	hw->iommu_fault_generation = 0;
-}
-
-static struct rk_rga_job *rk_rga_hw_take_active_locked(struct rk_rga_hw *hw)
-{
-	struct rk_rga_job *job;
-
-	lockdep_assert_held(&hw->job_lock);
-
-	job = hw->active_job;
-	hw->active_job = NULL;
-
-	return job;
-}
-
-static struct rk_rga_job *
-rk_rga_hw_take_active_if_locked(struct rk_rga_hw *hw,
-				struct rk_rga_job *match)
-{
-	lockdep_assert_held(&hw->job_lock);
-
-	if (hw->active_job != match)
-		return NULL;
-
-	return rk_rga_hw_take_active_locked(hw);
-}
-
-static bool rk_rga_hw_restore_active_locked(struct rk_rga_hw *hw,
-					    struct rk_rga_job *job,
-					    bool iommu_fault)
-{
-	lockdep_assert_held(&hw->job_lock);
-
-	if (hw->active_job)
+	if (WARN_ON_ONCE(!rk_rga_task_exec_ref_empty(&hw->active_ref)) ||
+	    WARN_ON_ONCE(!exec || exec->state != RK_RGA_TASK_EXEC_UNINSTALLED ||
+			 exec != READ_ONCE(exec->job->current_exec)))
 		return false;
-
-	hw->active_job = job;
-	if (iommu_fault)
-		hw->iommu_fault_generation = hw->active_generation;
+	hw->activation_generation_seq++;
+	if (!hw->activation_generation_seq)
+		hw->activation_generation_seq++;
+	exec->generation = hw->activation_generation_seq;
+	exec->state = RK_RGA_TASK_EXEC_SLOTTED;
+	if (WARN_ON_ONCE(!rk_rga_task_exec_ref_get(&hw->active_ref, exec))) {
+		exec->generation = 0;
+		exec->state = RK_RGA_TASK_EXEC_UNINSTALLED;
+		return false;
+	}
 
 	return true;
+}
+
+static struct rk_rga_task_exec *
+rk_rga_hw_take_active_locked(struct rk_rga_hw *hw,
+			     struct rk_rga_task_exec_ref *claim)
+{
+	struct rk_rga_task_exec *exec;
+
+	lockdep_assert_held(&hw->job_lock);
+
+	if (!claim || !rk_rga_task_exec_ref_empty(claim) ||
+	    !rk_rga_task_exec_ref_valid(&hw->active_ref))
+		return NULL;
+	exec = hw->active_ref.exec;
+	if (WARN_ON_ONCE(exec->state != RK_RGA_TASK_EXEC_SLOTTED &&
+			 exec->state != RK_RGA_TASK_EXEC_QUARANTINED) ||
+	    WARN_ON_ONCE(!rk_rga_task_exec_ref_move(claim, &hw->active_ref)))
+		return NULL;
+	exec->state = RK_RGA_TASK_EXEC_CLAIMED;
+
+	return exec;
+}
+
+static struct rk_rga_task_exec *
+rk_rga_hw_take_active_if_locked(struct rk_rga_hw *hw,
+				struct rk_rga_task_exec *match,
+				struct rk_rga_task_exec_ref *claim)
+{
+	lockdep_assert_held(&hw->job_lock);
+
+	if (hw->active_ref.exec != match)
+		return NULL;
+
+	return rk_rga_hw_take_active_locked(hw, claim);
+}
+
+static bool rk_rga_hw_take_irq_ref(struct rk_rga_hw *hw,
+				   struct rk_rga_task_exec_ref *ref)
+{
+	unsigned long flags;
+	bool taken;
+
+	spin_lock_irqsave(&hw->job_lock, flags);
+	taken = rk_rga_task_exec_ref_valid(&hw->irq_ref) &&
+		rk_rga_task_exec_ref_move(ref, &hw->irq_ref);
+	spin_unlock_irqrestore(&hw->job_lock, flags);
+
+	return taken;
+}
+
+static void rk_rga_hw_drop_matching_irq_ref(
+	struct rk_rga_hw *hw, const struct rk_rga_task_exec *exec)
+{
+	struct rk_rga_task_exec_ref ref = {};
+	unsigned long flags;
+
+	spin_lock_irqsave(&hw->job_lock, flags);
+	if (hw->irq_ref.exec == exec &&
+	    hw->irq_ref.generation == exec->generation)
+		WARN_ON_ONCE(!rk_rga_task_exec_ref_move(&ref, &hw->irq_ref));
+	spin_unlock_irqrestore(&hw->job_lock, flags);
+	if (rk_rga_task_exec_ref_valid(&ref))
+		WARN_ON_ONCE(!rk_rga_task_exec_ref_put(&ref));
 }
 
 struct rk_rga_session {
@@ -1636,8 +1893,8 @@ static void rk_rga_debug_record(struct rk_rga_service *rga,
 		event.session = READ_ONCE(job->session);
 		if (task_index < job->task_count && job->tasks)
 			event.render_mode = job->tasks[task_index].render_mode;
-		if (job->hw)
-			strscpy(event.hw_name, dev_name(job->hw->dev),
+		if (rk_rga_job_hw(job))
+			strscpy(event.hw_name, dev_name(rk_rga_job_hw(job)->dev),
 				sizeof(event.hw_name));
 	}
 
@@ -1765,28 +2022,32 @@ static void rk_rga_count_core_ns(atomic64_t counters[RK_RGA_CORE_COUNTER_COUNT],
 		atomic64_add(value, &counters[index]);
 }
 
-static void rk_rga_job_note_hw_done(struct rk_rga_job *job)
+static void rk_rga_task_exec_note_hw_done(struct rk_rga_task_exec *exec)
 {
+	struct rk_rga_job *job = exec->job;
 	struct rk_rga_service *rga = job->rga;
 	u64 elapsed;
-	u64 start = job->hw_start_ns;
+	u64 start = exec->hw_start_ns;
 
 	if (!start)
 		return;
 
 	elapsed = ktime_get_ns() - start;
-	job->hw_elapsed_ns += elapsed;
-	job->hw_start_ns = 0;
+	exec->hw_elapsed_ns += elapsed;
+	exec->hw_start_ns = 0;
+	job->total_hw_elapsed_ns += elapsed;
 	if (!rga)
 		return;
-	rk_rga_count_core_ns(rga->hw_total_core_ns, job->hw, elapsed, false);
-	rk_rga_count_core_ns(rga->hw_max_core_ns, job->hw, elapsed, true);
+	rk_rga_count_core_ns(rga->hw_total_core_ns, exec->hw, elapsed,
+			     false);
+	rk_rga_count_core_ns(rga->hw_max_core_ns, exec->hw, elapsed,
+			     true);
 }
 
 static void rk_rga_job_record_hw_stats(struct rk_rga_job *job)
 {
 	struct rk_rga_service *rga = job->rga;
-	u64 elapsed = job->hw_elapsed_ns;
+	u64 elapsed = job->total_hw_elapsed_ns;
 
 	if (!elapsed)
 		return;
@@ -1795,7 +2056,7 @@ static void rk_rga_job_record_hw_stats(struct rk_rga_job *job)
 		atomic64_add(elapsed, &rga->hw_total_ns);
 		rk_rga_atomic64_max(&rga->hw_max_ns, elapsed);
 	}
-	job->hw_elapsed_ns = 0;
+	job->total_hw_elapsed_ns = 0;
 }
 
 static u32 rk_rga_core_distance(u32 core_mask, u32 start)
@@ -4732,11 +4993,12 @@ rk_rga_sync_userptr_sgt(struct device *dev, struct sg_table *sgt,
 	}
 }
 
-static void rk_rga_job_sync_userptr_for_device(struct rk_rga_job *job,
-					       struct device *dev)
+static void
+rk_rga_task_exec_sync_userptr_for_device(struct rk_rga_task_exec *exec,
+					 struct device *dev)
 {
-	for (u32 i = 0; i < job->mapping_count; i++) {
-		struct rk_rga_job_mapping *mapping = &job->mappings[i];
+	for (u32 i = 0; i < exec->mapping_count; i++) {
+		struct rk_rga_job_mapping *mapping = &exec->mappings[i];
 
 		if (mapping->userptr && mapping->dev == dev && mapping->sgt)
 			rk_rga_sync_userptr_sgt(dev, mapping->sgt,
@@ -4745,11 +5007,11 @@ static void rk_rga_job_sync_userptr_for_device(struct rk_rga_job *job,
 	}
 }
 
-static void rk_rga_job_sync_userptr_for_cpu(struct rk_rga_job *job,
-					    struct device *dev)
+static void rk_rga_task_exec_sync_userptr_for_cpu(
+	struct rk_rga_task_exec *exec, struct device *dev)
 {
-	for (u32 i = 0; i < job->mapping_count; i++) {
-		struct rk_rga_job_mapping *mapping = &job->mappings[i];
+	for (u32 i = 0; i < exec->mapping_count; i++) {
+		struct rk_rga_job_mapping *mapping = &exec->mappings[i];
 
 		if (mapping->userptr && mapping->dev == dev && mapping->sgt)
 			rk_rga_sync_userptr_sgt(mapping->dev, mapping->sgt,
@@ -4758,13 +5020,13 @@ static void rk_rga_job_sync_userptr_for_cpu(struct rk_rga_job *job,
 	}
 }
 
-static void rk_rga_job_release_rga2_mmu(struct rk_rga_job *job)
+static void rk_rga_task_exec_release_rga2_mmu(struct rk_rga_task_exec *exec)
 {
-	if (!job->rga2_mmu)
+	if (!exec->rga2_mmu)
 		return;
 
 	for (u32 i = 0; i < RK_RGA2_MMU_CHANNEL_COUNT; i++) {
-		struct rk_rga2_mmu_table *table = &job->rga2_mmu[i];
+		struct rk_rga2_mmu_table *table = &exec->rga2_mmu[i];
 
 		if (table->vaddr)
 			dma_free_coherent(table->dev, table->size, table->vaddr,
@@ -4773,18 +5035,18 @@ static void rk_rga_job_release_rga2_mmu(struct rk_rga_job *job)
 			put_device(table->dev);
 		memset(table, 0, sizeof(*table));
 	}
-	kfree(job->rga2_mmu);
-	job->rga2_mmu = NULL;
+	kfree(exec->rga2_mmu);
+	exec->rga2_mmu = NULL;
 }
 
 static void
-__rk_rga_job_release_execution_mappings(struct rk_rga_job *job)
+__rk_rga_task_exec_release_mappings(struct rk_rga_task_exec *exec)
 {
 	/* RGA2 page-table entries refer to the job mappings released below. */
-	rk_rga_job_release_rga2_mmu(job);
+	rk_rga_task_exec_release_rga2_mmu(exec);
 
-	for (u32 i = 0; i < job->mapping_count; i++) {
-		struct rk_rga_job_mapping *mapping = &job->mappings[i];
+	for (u32 i = 0; i < exec->mapping_count; i++) {
+		struct rk_rga_job_mapping *mapping = &exec->mappings[i];
 
 		if (mapping->sgt && mapping->userptr) {
 			rk_rga_unmap_userptr_sgt(mapping->import->rga,
@@ -4808,9 +5070,9 @@ __rk_rga_job_release_execution_mappings(struct rk_rga_job *job)
 		rk_rga_hw_put(mapping->hw);
 	}
 
-	kfree(job->mappings);
-	job->mappings = NULL;
-	job->mapping_count = 0;
+	kfree(exec->mappings);
+	exec->mappings = NULL;
+	exec->mapping_count = 0;
 }
 
 /*
@@ -4819,38 +5081,25 @@ __rk_rga_job_release_execution_mappings(struct rk_rga_job *job)
  * engine first. DMA-BUF unmap may perform bounce-buffer copyback, and USERPTR
  * copyback must likewise finish before completion is published.
  */
-static void
-rk_rga_job_release_execution_mappings_powered(struct rk_rga_job *job,
-					      struct rk_rga_hw *hw)
+static void rk_rga_task_exec_release_mappings_powered(
+	struct rk_rga_task_exec *exec, struct rk_rga_hw *hw)
 {
 	unsigned long flags;
 	bool powered;
 
 	lockdep_assert_held(&hw->run_lock);
-	WARN_ON_ONCE(job->hw != hw);
+	WARN_ON_ONCE(exec->hw != hw);
 	spin_lock_irqsave(&hw->job_lock, flags);
 	powered = hw->regs_live_count;
 	spin_unlock_irqrestore(&hw->job_lock, flags);
 	WARN_ON_ONCE(!powered);
 
-	if (job->userptr_device_owned) {
-		rk_rga_job_sync_userptr_for_cpu(job, hw->dev);
-		job->userptr_device_owned = false;
+	if (exec->userptr_device_owned) {
+		rk_rga_task_exec_sync_userptr_for_cpu(exec, hw->dev);
+		exec->userptr_device_owned = false;
 	}
 
-	__rk_rga_job_release_execution_mappings(job);
-}
-
-/*
- * Completion and the final destructor should only observe executions whose
- * powered retirement already released every selected-core mapping. Preserve
- * the old defensive cleanup, but make a missed powered retirement noisy.
- */
-static void rk_rga_job_discard_execution_mappings(struct rk_rga_job *job)
-{
-	WARN_ON_ONCE(job->mappings || job->mapping_count || job->rga2_mmu ||
-		     job->userptr_device_owned);
-	__rk_rga_job_release_execution_mappings(job);
+	__rk_rga_task_exec_release_mappings(exec);
 }
 
 /*
@@ -4864,22 +5113,22 @@ static bool rk_rga_job_cancel_acquire_callbacks(struct rk_rga_job *job)
 {
 	bool crossed = false;
 
-	if (!job->acquire_waiters)
+	if (!job->acquires.waiters)
 		return false;
 
-	for (u32 i = 0; i < job->acquire_fence_count; i++) {
-		struct rk_rga_fence_waiter *waiter = &job->acquire_waiters[i];
-		struct rk_rga_job *owner;
+	for (u32 i = 0; i < job->acquires.count; i++) {
+		struct rk_rga_fence_waiter *waiter = &job->acquires.waiters[i];
+		struct rk_rga_acquire_set *owner;
 
-		if (!READ_ONCE(waiter->job))
+		if (!READ_ONCE(waiter->set))
 			continue;
 
-		dma_fence_remove_callback(job->acquire_fences[i],
+		dma_fence_remove_callback(job->acquires.fences[i],
 					  &waiter->cb);
 		/* Removal and callback claim the waiter exactly once. */
-		owner = xchg(&waiter->job, NULL);
+		owner = xchg(&waiter->set, NULL);
 		if (owner &&
-		    atomic_dec_and_test(&owner->pending_acquire_count))
+		    atomic_dec_and_test(&owner->pending_count))
 			crossed = true;
 	}
 
@@ -4894,51 +5143,123 @@ static size_t rk_rga_cmd_size(struct rk_rga_hw *hw)
 	return RK_RGA2_CMD_REG_COUNT * sizeof(u32);
 }
 
-static void rk_rga_job_free_cmd(struct rk_rga_job *job)
+static void rk_rga_task_exec_free_cmd(struct rk_rga_task_exec *exec)
 {
-	if (!job->cmd_vaddr)
+	if (!exec->cmd_vaddr)
 		return;
 
-	dma_free_coherent(job->cmd_dev, job->cmd_size, job->cmd_vaddr,
-			  job->cmd_dma);
-	put_device(job->cmd_dev);
-	rk_rga_hw_put(job->cmd_hw);
-	job->cmd_hw = NULL;
-	job->cmd_dev = NULL;
-	job->cmd_vaddr = NULL;
-	job->cmd_dma = 0;
-	job->cmd_size = 0;
+	dma_free_coherent(exec->cmd_dev, exec->cmd_size, exec->cmd_vaddr,
+			  exec->cmd_dma);
+	put_device(exec->cmd_dev);
+	rk_rga_hw_put(exec->cmd_hw);
+	exec->cmd_hw = NULL;
+	exec->cmd_dev = NULL;
+	exec->cmd_vaddr = NULL;
+	exec->cmd_dma = 0;
+	exec->cmd_size = 0;
+	exec->cmd_ready = false;
 }
 
-static int rk_rga_job_alloc_cmd(struct rk_rga_job *job, struct rk_rga_hw *hw)
+enum rk_rga_retire_disposition {
+	RK_RGA_RETIRE_DESTROYED,
+	RK_RGA_RETIRE_QUARANTINED,
+};
+
+struct rk_rga_retirement {
+	struct rk_rga_job *job;
+	int result;
+	enum rk_rga_retire_disposition disposition;
+};
+
+/*
+ * The sole execution-resource retirement engine.  A caller arrives with the
+ * exact slot claim and an isolation verdict.  Once DMA is known stopped this
+ * function performs copyback, destroys every execution allocation, releases
+ * power, crosses RETIRED, and drops the claim.  Without that proof it moves
+ * the same typed reference back to the hardware slot as an accounted
+ * quarantine tombstone; no DMA-visible resource is released.
+ */
+static bool rk_rga_task_exec_retire_engine(
+	struct rk_rga_hw *hw, struct rk_rga_task_exec_ref *claim, int result,
+	bool dma_stopped, struct rk_rga_retirement *retirement)
 {
+	struct rk_rga_task_exec *exec;
+	unsigned long flags;
+
+	lockdep_assert_held(&hw->run_lock);
+	if (WARN_ON_ONCE(!rk_rga_task_exec_ref_valid(claim) ||
+			 claim->generation != claim->exec->generation ||
+			 claim->exec->state != RK_RGA_TASK_EXEC_CLAIMED))
+		return false;
+	exec = claim->exec;
+	retirement->job = exec->job;
+	retirement->result = result;
+	rk_rga_hw_drop_matching_irq_ref(hw, exec);
+
+	if (!dma_stopped) {
+		spin_lock_irqsave(&hw->job_lock, flags);
+		if (WARN_ON_ONCE(!rk_rga_task_exec_ref_empty(&hw->active_ref) ||
+				 !rk_rga_task_exec_ref_move(&hw->active_ref,
+							claim))) {
+			spin_unlock_irqrestore(&hw->job_lock, flags);
+			return false;
+		}
+		exec->state = RK_RGA_TASK_EXEC_QUARANTINED;
+		spin_unlock_irqrestore(&hw->job_lock, flags);
+		retirement->disposition = RK_RGA_RETIRE_QUARANTINED;
+		return true;
+	}
+
+	rk_rga_task_exec_note_hw_done(exec);
+	if (exec->power_owned) {
+		rk_rga_task_exec_release_mappings_powered(exec, hw);
+		rk_rga_task_exec_free_cmd(exec);
+		rk_rga_hw_power_off(hw);
+		exec->power_owned = false;
+	} else {
+		WARN_ON_ONCE(exec->mappings || exec->mapping_count ||
+			     exec->rga2_mmu || exec->userptr_device_owned);
+		rk_rga_task_exec_free_cmd(exec);
+	}
+	if (WARN_ON_ONCE(!rk_rga_task_exec_retire(exec)) ||
+	    WARN_ON_ONCE(!rk_rga_task_exec_ref_put(claim)))
+		return false;
+	retirement->disposition = RK_RGA_RETIRE_DESTROYED;
+
+	return true;
+}
+
+static int rk_rga_task_exec_alloc_cmd(struct rk_rga_task_exec *exec,
+				      struct rk_rga_hw *hw)
+{
+	struct rk_rga_job *job = exec->job;
 	size_t size = rk_rga_cmd_size(hw);
 
-	if (job->cmd_vaddr && job->cmd_hw == hw &&
-	    job->cmd_size >= size)
+	if (exec->cmd_vaddr && exec->cmd_hw == hw &&
+	    exec->cmd_size >= size)
 		return 0;
 
-	rk_rga_job_free_cmd(job);
+	rk_rga_task_exec_free_cmd(exec);
 
-	job->cmd_size = size;
-	job->cmd_dev = get_device(hw->dev);
-	job->cmd_vaddr = dma_alloc_coherent(hw->dev, job->cmd_size,
-					    &job->cmd_dma, GFP_KERNEL);
-	if (!job->cmd_vaddr) {
-		put_device(job->cmd_dev);
-		job->cmd_dev = NULL;
-		job->cmd_size = 0;
+	exec->cmd_size = size;
+	exec->cmd_dev = get_device(hw->dev);
+	exec->cmd_vaddr = dma_alloc_coherent(hw->dev, exec->cmd_size,
+					     &exec->cmd_dma, GFP_KERNEL);
+	if (!exec->cmd_vaddr) {
+		put_device(exec->cmd_dev);
+		exec->cmd_dev = NULL;
+		exec->cmd_size = 0;
 		return -ENOMEM;
 	}
 	refcount_inc(&hw->refs);
-	job->cmd_hw = hw;
-	if (rk_rga_check_iova_span(job->cmd_dma, job->cmd_size,
+	exec->cmd_hw = hw;
+	if (rk_rga_check_iova_span(exec->cmd_dma, exec->cmd_size,
 				   "command buffer", true)) {
-		rk_rga_job_free_cmd(job);
+		rk_rga_task_exec_free_cmd(exec);
 		return -EOVERFLOW;
 	}
 
-	memset(job->cmd_vaddr, 0, job->cmd_size);
+	memset(exec->cmd_vaddr, 0, exec->cmd_size);
 	if (job->rga)
 		atomic_inc(&job->rga->cmd_alloc_count);
 
@@ -4960,6 +5281,7 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 				 struct rk_rga_hw *hw,
 				 dma_addr_t *iova)
 {
+	struct rk_rga_task_exec *exec = rk_rga_job_current_exec(job);
 	struct rk_rga_dmabuf_extent *dmabuf_extents = NULL;
 	struct dma_buf_attachment *attach;
 	struct rk_rga_job_mapping *mappings;
@@ -4972,8 +5294,10 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 	u32 count;
 	int ret;
 
-	for (u32 i = 0; i < job->mapping_count; i++) {
-		struct rk_rga_job_mapping *mapping = &job->mappings[i];
+	if (WARN_ON_ONCE(!exec))
+		return -EUCLEAN;
+	for (u32 i = 0; i < exec->mapping_count; i++) {
+		struct rk_rga_job_mapping *mapping = &exec->mappings[i];
 
 		if (mapping->import == import && mapping->hw == hw) {
 			*iova = mapping->iova;
@@ -4981,16 +5305,16 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 		}
 	}
 
-	if (check_add_overflow(job->mapping_count, 1U, &count))
+	if (check_add_overflow(exec->mapping_count, 1U, &count))
 		return -EOVERFLOW;
 	bytes = array_size(count, sizeof(*mappings));
 	if (bytes == SIZE_MAX)
 		return -EOVERFLOW;
 
-	mappings = krealloc(job->mappings, bytes, GFP_KERNEL);
+	mappings = krealloc(exec->mappings, bytes, GFP_KERNEL);
 	if (!mappings)
 		return -ENOMEM;
-	job->mappings = mappings;
+	exec->mappings = mappings;
 	refcount_inc(&hw->refs);
 
 	if (import->type == RK_RGA_IMPORT_USERPTR) {
@@ -5018,7 +5342,7 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 		if (hw->type == RK_RGA_HW_RGA2 && rga2_mmu)
 			atomic_inc(&job->rga->userptr_rga2_mmu_mapping_count);
 
-		job->mappings[job->mapping_count] = (struct rk_rga_job_mapping) {
+		exec->mappings[exec->mapping_count] = (struct rk_rga_job_mapping) {
 			.import = import,
 			.hw = hw,
 			.dev = get_device(dev),
@@ -5031,9 +5355,13 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 			.userptr = true,
 			.iommu_mapped = iommu_mapped,
 			.rga2_mmu_required = rga2_mmu,
+			.mode = RK_RGA_EXEC_MAP_DIRECT,
+			.copy_owner = view->shadow_count ?
+				RK_RGA_EXEC_COPY_USERPTR_SHADOW :
+				RK_RGA_EXEC_COPY_NONE,
 		};
-		*iova = job->mappings[job->mapping_count].iova;
-		job->mapping_count = count;
+		*iova = exec->mappings[exec->mapping_count].iova;
+		exec->mapping_count = count;
 
 		return 0;
 	}
@@ -5123,8 +5451,8 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 		return ret;
 	}
 
-	for (u32 i = 0; i < job->mapping_count; i++) {
-		struct rk_rga_job_mapping *mapping = &job->mappings[i];
+	for (u32 i = 0; i < exec->mapping_count; i++) {
+		struct rk_rga_job_mapping *mapping = &exec->mappings[i];
 
 		if (mapping->userptr || mapping->hw != hw ||
 		    mapping->import->dmabuf == import->dmabuf)
@@ -5138,7 +5466,7 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 		}
 	}
 
-	job->mappings[job->mapping_count] = (struct rk_rga_job_mapping) {
+	exec->mappings[exec->mapping_count] = (struct rk_rga_job_mapping) {
 		.import = import,
 		.hw = hw,
 		.dev = get_device(dev),
@@ -5149,8 +5477,11 @@ static int rk_rga_job_map_import(struct rk_rga_job *job,
 		.dmabuf_extent_count = dmabuf_extent_count,
 		.dma_dir = dma_dir,
 		.rga2_mmu_required = rga2_mmu,
+		.mode = RK_RGA_EXEC_MAP_DIRECT,
+		.copy_owner = dma_dir == DMA_BIDIRECTIONAL ?
+			RK_RGA_EXEC_COPY_DMA_API : RK_RGA_EXEC_COPY_NONE,
 	};
-	job->mapping_count = count;
+	exec->mapping_count = count;
 	mutex_unlock(&import->map_lock);
 
 	return 0;
@@ -5177,8 +5508,12 @@ rk_rga_job_find_mapping(struct rk_rga_job *job,
 			struct rk_rga_import *import,
 			struct rk_rga_hw *hw)
 {
-	for (u32 i = 0; i < job->mapping_count; i++) {
-		struct rk_rga_job_mapping *mapping = &job->mappings[i];
+	struct rk_rga_task_exec *exec = rk_rga_job_current_exec(job);
+
+	if (!exec)
+		return NULL;
+	for (u32 i = 0; i < exec->mapping_count; i++) {
+		struct rk_rga_job_mapping *mapping = &exec->mappings[i];
 
 		if (mapping->import == import && mapping->hw == hw)
 			return mapping;
@@ -5462,6 +5797,7 @@ static int rk_rga2_prepare_img_mmu(struct rk_rga_job *job,
 				   struct rk_rga_hw *hw,
 				   enum rk_rga2_mmu_channel channel)
 {
+	struct rk_rga_task_exec *exec = rk_rga_job_current_exec(job);
 	struct rk_rga2_mmu_table *table;
 	struct rk_rga_import *plane_imports[] = {
 		imports->yrgb, imports->uv, imports->v,
@@ -5482,13 +5818,15 @@ static int rk_rga2_prepare_img_mmu(struct rk_rga_job *job,
 		return 0;
 	if (channel >= RK_RGA2_MMU_CHANNEL_COUNT)
 		return -EINVAL;
-	if (!job->rga2_mmu) {
-		job->rga2_mmu = kcalloc(RK_RGA2_MMU_CHANNEL_COUNT,
-					      sizeof(*job->rga2_mmu), GFP_KERNEL);
-		if (!job->rga2_mmu)
+	if (WARN_ON_ONCE(!exec))
+		return -EUCLEAN;
+	if (!exec->rga2_mmu) {
+		exec->rga2_mmu = kcalloc(RK_RGA2_MMU_CHANNEL_COUNT,
+					       sizeof(*exec->rga2_mmu), GFP_KERNEL);
+		if (!exec->rga2_mmu)
 			return -ENOMEM;
 	}
-	table = &job->rga2_mmu[channel];
+	table = &exec->rga2_mmu[channel];
 	if (table->vaddr)
 		return -EINVAL;
 
@@ -5621,6 +5959,34 @@ prepare_mmu:
 	return ret;
 }
 
+static bool rk_rga_job_release_exec_storage(struct rk_rga_job *job)
+{
+	struct rk_rga_task_exec *exec, *tmp;
+
+	list_for_each_entry(exec, &job->executions, job_link) {
+		if (WARN_ON_ONCE(refcount_read(&exec->refs) != 1 || exec->hw ||
+				 exec->mappings || exec->mapping_count ||
+				 exec->rga2_mmu || exec->cmd_vaddr ||
+				 exec->cmd_hw || exec->cmd_dev ||
+				 exec->userptr_device_owned || exec->power_owned ||
+				 (exec->state != RK_RGA_TASK_EXEC_UNINSTALLED &&
+				  exec->state != RK_RGA_TASK_EXEC_RECLAIMABLE)))
+			return false;
+	}
+	WRITE_ONCE(job->current_exec, NULL);
+	list_for_each_entry_safe(exec, tmp, &job->executions, job_link) {
+		list_del_init(&exec->job_link);
+		if (WARN_ON_ONCE(!refcount_dec_and_test(&exec->refs)))
+			return false;
+		kfree(exec->plan);
+		exec->plan = NULL;
+		if (exec != &job->exec_storage)
+			kfree(exec);
+	}
+
+	return true;
+}
+
 static void rk_rga_job_free(struct rk_rga_job *job)
 {
 	if (!job)
@@ -5632,14 +5998,14 @@ static void rk_rga_job_free(struct rk_rga_job *job)
 		dma_fence_put(job->release_fence);
 	}
 	rk_rga_job_cancel_acquire_callbacks(job);
-	rk_rga_job_free_cmd(job);
-	rk_rga_job_discard_execution_mappings(job);
 	kfree(job->task_imports);
 	rk_rga_put_import_array(job->imports, job->import_count);
-	rk_rga_put_fence_array(job->acquire_fences, job->acquire_fence_count);
-	kfree(job->acquire_waiters);
+	rk_rga_put_fence_array(job->acquires.fences, job->acquires.count);
+	kfree(job->acquires.waiters);
 	kfree(job->gauss_coeffs);
 	kfree(job->tasks);
+	if (WARN_ON_ONCE(!rk_rga_job_release_exec_storage(job)))
+		return;
 	kfree(job);
 }
 
@@ -5797,11 +6163,13 @@ static void rk_rga_job_init(struct rk_rga_job *job)
 {
 	INIT_LIST_HEAD(&job->node);
 	INIT_LIST_HEAD(&job->session_node);
-	INIT_WORK(&job->acquire_work, rk_rga_job_acquire_work);
+	rk_rga_job_init_first_exec(job);
+	INIT_WORK(&job->acquires.work, rk_rga_job_acquire_work);
+	job->acquires.job = job;
 	refcount_set(&job->refs, 1);
 	init_waitqueue_head(&job->wait);
-	atomic_set(&job->pending_acquire_count, 0);
-	atomic_set(&job->acquire_work_queued, 0);
+	atomic_set(&job->acquires.pending_count, 0);
+	atomic_set(&job->acquires.work_queued, 0);
 	job->release_fence_fd = -1;
 }
 
@@ -6066,8 +6434,8 @@ static int rk_rga_job_clone_request_locked(struct rk_rga_request *request,
 
 	job->imports = imports;
 	job->import_count = request->import_count;
-	job->acquire_fences = fences;
-	job->acquire_fence_count = request->acquire_fence_count;
+	job->acquires.fences = fences;
+	job->acquires.count = request->acquire_fence_count;
 	job->task_count = request->task_count;
 	job->sync_mode = request->sync_mode;
 	job->priority = rk_rga_job_priority_from_tasks(job->tasks, job->task_count);
@@ -6103,8 +6471,8 @@ static int rk_rga_job_take_prepared(struct rk_rga_service *rga,
 	job->sync_mode = sync_mode;
 	job->imports = imports;
 	job->import_count = import_count;
-	job->acquire_fences = fences;
-	job->acquire_fence_count = fence_count;
+	job->acquires.fences = fences;
+	job->acquires.count = fence_count;
 	job->gauss_coeffs = gauss_coeffs;
 	job->rga = rga;
 	job->priority = rk_rga_job_priority_from_tasks(job->tasks, job->task_count);
@@ -6117,8 +6485,8 @@ static int rk_rga_job_take_prepared(struct rk_rga_service *rga,
 
 static int rk_rga_job_acquire_status(struct rk_rga_job *job, bool *pending)
 {
-	for (u32 i = 0; i < job->acquire_fence_count; i++) {
-		int status = dma_fence_get_status(job->acquire_fences[i]);
+	for (u32 i = 0; i < job->acquires.count; i++) {
+		int status = dma_fence_get_status(job->acquires.fences[i]);
 
 		if (status < 0)
 			return status;
@@ -6139,8 +6507,8 @@ static int rk_rga_job_acquire_status(struct rk_rga_job *job, bool *pending)
  */
 static int rk_rga_job_wait_acquire_fences(struct rk_rga_job *job)
 {
-	for (u32 i = 0; i < job->acquire_fence_count; i++) {
-		struct dma_fence *fence = job->acquire_fences[i];
+	for (u32 i = 0; i < job->acquires.count; i++) {
+		struct dma_fence *fence = job->acquires.fences[i];
 		int ret;
 
 		ret = dma_fence_wait(fence, true);
@@ -6157,8 +6525,8 @@ static int rk_rga_job_wait_acquire_fences(struct rk_rga_job *job)
 
 static void rk_rga_job_set_acquire_result(struct rk_rga_job *job, int result)
 {
-	if (result < 0 && !READ_ONCE(job->result))
-		WRITE_ONCE(job->result, result);
+	if (result < 0 && !READ_ONCE(job->acquires.result))
+		WRITE_ONCE(job->acquires.result, result);
 }
 
 static void rk_rga_job_set_waiting_acquire(struct rk_rga_job *job,
@@ -6168,13 +6536,13 @@ static void rk_rga_job_set_waiting_acquire(struct rk_rga_job *job,
 	unsigned long flags;
 
 	if (!session) {
-		WRITE_ONCE(job->waiting_acquire, waiting);
+		WRITE_ONCE(job->acquires.waiting, waiting);
 		return;
 	}
 
 	spin_lock_irqsave(&session->job_lock, flags);
 	if (job->session == session && job->session_linked)
-		job->waiting_acquire = waiting;
+		job->acquires.waiting = waiting;
 	spin_unlock_irqrestore(&session->job_lock, flags);
 }
 
@@ -6185,18 +6553,18 @@ static void rk_rga_job_abort_acquire_state(struct rk_rga_job *job,
 	unsigned long flags;
 
 	if (!session) {
-		if (READ_ONCE(job->waiting_acquire)) {
+		if (READ_ONCE(job->acquires.waiting)) {
 			rk_rga_job_set_acquire_result(job, result);
-			WRITE_ONCE(job->waiting_acquire, false);
+			WRITE_ONCE(job->acquires.waiting, false);
 		}
 		return;
 	}
 
 	spin_lock_irqsave(&session->job_lock, flags);
 	if (job->session == session && job->session_linked &&
-	    job->waiting_acquire) {
+	    job->acquires.waiting) {
 		rk_rga_job_set_acquire_result(job, result);
-		job->waiting_acquire = false;
+		job->acquires.waiting = false;
 	}
 	spin_unlock_irqrestore(&session->job_lock, flags);
 }
@@ -6210,8 +6578,8 @@ rk_rga_session_begin_acquire_dispatch(struct rk_rga_session *session,
 
 	spin_lock_irqsave(&session->job_lock, flags);
 	if (job->session == session && job->session_linked &&
-	    job->waiting_acquire) {
-		job->waiting_acquire = false;
+	    job->acquires.waiting) {
+		job->acquires.waiting = false;
 		if (!session->closing) {
 			session->dispatching_jobs++;
 			dispatch = true;
@@ -6224,13 +6592,13 @@ rk_rga_session_begin_acquire_dispatch(struct rk_rga_session *session,
 
 static void rk_rga_job_queue_acquire_work(struct rk_rga_job *job)
 {
-	if (atomic_cmpxchg(&job->acquire_work_queued, 0, 1) == 0)
-		queue_work(system_highpri_wq, &job->acquire_work);
+	if (atomic_cmpxchg(&job->acquires.work_queued, 0, 1) == 0)
+		queue_work(system_highpri_wq, &job->acquires.work);
 }
 
 static bool rk_rga_job_is_pending_acquire(struct rk_rga_job *job)
 {
-	return job->waiting_acquire;
+	return job->acquires.waiting;
 }
 
 static void rk_rga_job_abort_pending_acquire(struct rk_rga_job *job,
@@ -6259,7 +6627,7 @@ static void rk_rga_session_abort_pending_acquire_jobs(
 		list_for_each_entry(job, &session->jobs, session_node) {
 			if (rk_rga_job_is_pending_acquire(job)) {
 				rk_rga_job_set_acquire_result(job, result);
-				job->waiting_acquire = false;
+				job->acquires.waiting = false;
 				rk_rga_job_get(job);
 				found = true;
 				break;
@@ -6335,7 +6703,7 @@ rk_rga_session_take_incompatible_pending_acquire_job(
 			continue;
 
 		rk_rga_job_set_acquire_result(job, result);
-		job->waiting_acquire = false;
+		job->acquires.waiting = false;
 		rk_rga_job_get(job);
 		spin_unlock_irqrestore(&session->job_lock, flags);
 		return job;
@@ -6403,7 +6771,7 @@ rk_rga_session_abort_incompatible_pending_acquire_jobs(
 
 	for (size_t i = 0; i < count; i++) {
 		job = jobs[i];
-		if (READ_ONCE(job->waiting_acquire) &&
+		if (READ_ONCE(job->acquires.waiting) &&
 		    !rk_rga_pending_job_can_run_on_core_mask(
 			    job, available_core_mask))
 			rk_rga_job_abort_pending_acquire(job, result);
@@ -6431,17 +6799,21 @@ static void rk_rga_job_acquire_cb(struct dma_fence *fence,
 {
 	struct rk_rga_fence_waiter *waiter =
 		container_of(cb, struct rk_rga_fence_waiter, cb);
-	struct rk_rga_job *job = xchg(&waiter->job, NULL);
+	struct rk_rga_acquire_set *set = xchg(&waiter->set, NULL);
+	struct rk_rga_job *job;
 	int status;
 
-	if (!job)
+	if (!set)
+		return;
+	job = READ_ONCE(set->job);
+	if (WARN_ON_ONCE(!job))
 		return;
 
 	status = dma_fence_get_status_locked(fence);
 	if (status < 0)
 		rk_rga_job_set_acquire_result(job, status);
 
-	if (atomic_dec_and_test(&job->pending_acquire_count))
+	if (atomic_dec_and_test(&set->pending_count))
 		rk_rga_job_queue_acquire_work(job);
 }
 
@@ -6457,7 +6829,7 @@ rk_rga_job_publish_armed_acquire_callbacks(struct rk_rga_job *job)
 	 * zero-crossing right to queue acquire_work.
 	 */
 	rk_rga_job_set_waiting_acquire(job, true);
-	if (atomic_dec_and_test(&job->pending_acquire_count))
+	if (atomic_dec_and_test(&job->acquires.pending_count))
 		rk_rga_job_queue_acquire_work(job);
 }
 
@@ -6466,18 +6838,18 @@ static int rk_rga_job_arm_acquire_callbacks(struct rk_rga_job *job)
 	struct rk_rga_fence_waiter *waiters;
 	int ret;
 
-	waiters = kcalloc(job->acquire_fence_count, sizeof(*waiters),
+	waiters = kcalloc(job->acquires.count, sizeof(*waiters),
 			 GFP_KERNEL);
 	if (!waiters)
 		return -ENOMEM;
 
-	job->acquire_waiters = waiters;
-	atomic_set(&job->pending_acquire_count, 1);
-	atomic_set(&job->acquire_work_queued, 0);
-	WRITE_ONCE(job->result, 0);
+	job->acquires.waiters = waiters;
+	atomic_set(&job->acquires.pending_count, 1);
+	atomic_set(&job->acquires.work_queued, 0);
+	WRITE_ONCE(job->acquires.result, 0);
 
-	for (u32 i = 0; i < job->acquire_fence_count; i++) {
-		struct dma_fence *fence = job->acquire_fences[i];
+	for (u32 i = 0; i < job->acquires.count; i++) {
+		struct dma_fence *fence = job->acquires.fences[i];
 		int status;
 
 		status = dma_fence_get_status(fence);
@@ -6488,21 +6860,21 @@ static int rk_rga_job_arm_acquire_callbacks(struct rk_rga_job *job)
 		if (status > 0)
 			continue;
 
-		atomic_inc(&job->pending_acquire_count);
-		waiters[i].job = job;
+		atomic_inc(&job->acquires.pending_count);
+		waiters[i].set = &job->acquires;
 		ret = dma_fence_add_callback(fence, &waiters[i].cb,
 					     rk_rga_job_acquire_cb);
 		if (ret == -ENOENT) {
-			WRITE_ONCE(waiters[i].job, NULL);
+			WRITE_ONCE(waiters[i].set, NULL);
 			status = dma_fence_get_status(fence);
 			if (status < 0)
 				rk_rga_job_set_acquire_result(job, status);
-			if (atomic_dec_and_test(&job->pending_acquire_count))
+			if (atomic_dec_and_test(&job->acquires.pending_count))
 				rk_rga_job_queue_acquire_work(job);
 		} else if (ret) {
-			WRITE_ONCE(waiters[i].job, NULL);
+			WRITE_ONCE(waiters[i].set, NULL);
 			rk_rga_job_set_acquire_result(job, ret);
-			if (atomic_dec_and_test(&job->pending_acquire_count))
+			if (atomic_dec_and_test(&job->acquires.pending_count))
 				rk_rga_job_queue_acquire_work(job);
 		}
 	}
@@ -6531,19 +6903,15 @@ static int rk_rga_job_prepare_release_fence(struct rk_rga_job *job)
 static void rk_rga_job_complete(struct rk_rga_job *job, int result)
 {
 	struct rk_rga_service *rga = job->rga;
-	struct rk_rga_hw *hw = job->hw;
+	struct rk_rga_task_exec *exec = rk_rga_job_current_exec(job);
+	struct rk_rga_hw *hw = rk_rga_job_hw(job);
 
-	rk_rga_job_note_hw_done(job);
 	rk_rga_job_record_hw_stats(job);
-	/*
-	 * DMA-BUF unmap performs any required bounce-buffer copyback. Finish
-	 * it before publishing completion or signaling the release fence.
-	 */
-	rk_rga_job_discard_execution_mappings(job);
 	WRITE_ONCE(job->result, result);
 	/* Publish the result before waking synchronous waiters. */
 	smp_store_release(&job->done, true);
-	job->hw = NULL;
+	if (exec)
+		exec->hw = NULL;
 	rk_rga_fence_signal(job->release_fence, result);
 	wake_up_all(&job->wait);
 	if (rga)
@@ -6559,36 +6927,63 @@ static void rk_rga_job_complete_queued(struct rk_rga_job *job, int result)
 	rk_rga_job_put(job);
 }
 
-static bool rk_rga_job_advance_task(struct rk_rga_job *job, int result)
+static int rk_rga_job_replace_exec(struct rk_rga_job *job, u32 task_index)
 {
-	if (result)
-		return false;
-	if (job->current_task + 1 >= job->task_count)
-		return false;
+	struct rk_rga_task_exec *old = READ_ONCE(job->current_exec);
+	struct rk_rga_task_exec *successor;
 
+	if (!old || (old->state != RK_RGA_TASK_EXEC_RETIRED &&
+		     old->state != RK_RGA_TASK_EXEC_RECLAIMABLE))
+		return -EUCLEAN;
+	successor = rk_rga_task_exec_alloc_successor(job, task_index);
+	if (!successor)
+		return -ENOMEM;
+	WRITE_ONCE(job->current_exec, successor);
+	rk_rga_task_exec_try_reclaim(old);
+
+	return 0;
+}
+
+static int rk_rga_job_advance_task(struct rk_rga_job *job, int result)
+{
+	int ret;
+
+	if (result)
+		return 0;
+	if (job->current_task + 1 >= job->task_count)
+		return 0;
+
+	ret = rk_rga_job_replace_exec(job, job->current_task + 1);
+	if (ret)
+		return ret;
 	job->current_task++;
 	job->dmabuf_incompatible_hw_type_mask = 0;
-	return true;
+
+	return 1;
 }
 
 static void rk_rga_job_release_hw(struct rk_rga_job *job)
 {
-	struct rk_rga_hw *hw = job->hw;
+	struct rk_rga_task_exec *exec = READ_ONCE(job->current_exec);
+	struct rk_rga_hw *hw = rk_rga_job_hw(job);
 
 	if (!hw)
 		return;
 
-	job->hw = NULL;
+	exec->hw = NULL;
 	rk_rga_hw_put(hw);
 }
 
 static void rk_rga_hw_dispatch(struct rk_rga_hw *hw);
-static struct rk_rga_job *rk_rga_hw_take_active(struct rk_rga_hw *hw);
 static void rk_rga_hw_timeout_work(struct work_struct *work);
 static void rk_rga_hw_iommu_fault_work(struct work_struct *work);
-static bool rk_rga_hw_iommu_fault_matches_locked(struct rk_rga_hw *hw);
-static bool rk_rga_hw_restore_active_after_reset_failure(
-	struct rk_rga_hw *hw, struct rk_rga_job *job, bool iommu_fault);
+static bool rk_rga_hw_mark_iommu_fault(struct rk_rga_hw *hw);
+static bool
+rk_rga_hw_take_iommu_fault_ref(struct rk_rga_hw *hw,
+			       struct rk_rga_task_exec_ref *fault);
+static bool
+rk_rga_hw_iommu_fault_matches_locked(
+	struct rk_rga_hw *hw, const struct rk_rga_task_exec_ref *fault);
 static void rk_rga_hw_abort_queued_jobs(struct rk_rga_hw *hw, int result);
 static int rk_rga_hw_abort_jobs(struct rk_rga_hw *hw, int result);
 static int rk_rga_job_queue_ref(struct rk_rga_job *job, bool take_ref);
@@ -6611,19 +7006,20 @@ static u32 rk_rga2_csc_coeff(__s16 coeff)
 }
 
 static void rk_rga2_write_full_csc(struct rk_rga_hw *hw,
-				   const struct rga_req *task)
+				   const struct rga_full_csc *csc,
+				   bool clip_enabled,
+				   const struct rga_csc_clip *full_clip)
 {
 	struct rga_csc_clip clip = {
 		.y = { .max = 0xff, .min = 0 },
 		.uv = { .max = 0xff, .min = 0 },
 	};
-	const struct rga_full_csc *csc = &task->full_csc;
 
 	if (!(csc->flag & RK_RGA_FULL_CSC_ENABLE))
 		return;
 
-	if (task->feature.full_csc_clip_en)
-		clip = task->full_csc_clip;
+	if (clip_enabled)
+		clip = *full_clip;
 
 	rk_rga_write(hw, rk_rga2_csc_coeff(csc->coe_y.r_v) |
 		     ((u32)clip.y.max << 16) | ((u32)clip.y.min << 24),
@@ -6653,23 +7049,23 @@ static void rk_rga2_write_full_csc(struct rk_rga_hw *hw,
 }
 
 static void rk_rga2_read_irq_status(struct rk_rga_hw *hw,
-				    struct rk_rga_job *job)
+				    struct rk_rga_task_exec *exec)
 {
-	job->intr_status = rk_rga_read(hw, RK_RGA2_INT);
-	job->hw_status = rk_rga_read(hw, RK_RGA2_STATUS2);
-	job->cmd_status = rk_rga_read(hw, RK_RGA2_STATUS1);
-	job->work_cycle = rk_rga_read(hw, RK_RGA2_WORK_CNT);
-	job->parse_status = rk_rga_read(hw, RK_RGA2_INTR_STATUS2);
+	exec->intr_status = rk_rga_read(hw, RK_RGA2_INT);
+	exec->hw_status = rk_rga_read(hw, RK_RGA2_STATUS2);
+	exec->cmd_status = rk_rga_read(hw, RK_RGA2_STATUS1);
+	exec->work_cycle = rk_rga_read(hw, RK_RGA2_WORK_CNT);
+	exec->parse_status = rk_rga_read(hw, RK_RGA2_INTR_STATUS2);
 }
 
 static void rk_rga3_read_irq_status(struct rk_rga_hw *hw,
-				    struct rk_rga_job *job)
+				    struct rk_rga_task_exec *exec)
 {
-	job->intr_status = rk_rga_read(hw, RK_RGA3_INT_RAW);
-	job->hw_status = rk_rga_read(hw, RK_RGA3_STATUS0);
-	job->cmd_status = rk_rga_read(hw, RK_RGA3_CMD_STATE);
-	job->work_cycle = 0;
-	job->parse_status = 0;
+	exec->intr_status = rk_rga_read(hw, RK_RGA3_INT_RAW);
+	exec->hw_status = rk_rga_read(hw, RK_RGA3_STATUS0);
+	exec->cmd_status = rk_rga_read(hw, RK_RGA3_CMD_STATE);
+	exec->work_cycle = 0;
+	exec->parse_status = 0;
 }
 
 static void rk_rga2_clear_irq(struct rk_rga_hw *hw)
@@ -6820,24 +7216,46 @@ static u32 rk_rga3_start_sys_ctrl(const struct rk_rga_hw_match *match)
 	return sys_ctrl;
 }
 
-static int rk_rga2_publish_and_start(struct rk_rga_hw *hw,
-				     struct rk_rga_job *job)
+static const struct rga_pre_intr_info *
+rk_rga_task_exec_pre_intr(const struct rk_rga_task_exec *exec);
+static const struct rk_rga_task_plan *
+rk_rga_task_exec_plan(const struct rk_rga_task_exec *exec);
+static int rk_rga_task_exec_write_full_csc(struct rk_rga_hw *hw,
+					   const struct rk_rga_task_exec *exec);
+static int rk_rga_hw_schedule_timeout(struct rk_rga_hw *hw,
+				      struct rk_rga_task_exec *exec);
+static void rk_rga_hw_cancel_timeout(struct rk_rga_hw *hw);
+
+static int rk_rga2_execution_publish_and_start(struct rk_rga_hw *hw,
+					       struct rk_rga_task_exec *exec)
 {
-	const struct rga_pre_intr_info *intr =
-		&job->tasks[job->current_task].pre_intr_info;
+	const struct rga_pre_intr_info *intr = rk_rga_task_exec_pre_intr(exec);
 	u32 sys_ctrl = rk_rga2_start_sys_ctrl(hw->match);
 	u32 int_enable = RK_RGA2_INT_ENABLE_MASK |
 			 rk_rga2_pre_intr_int_enable(intr);
 	int ret;
 
+	lockdep_assert_held(&hw->run_lock);
+	if (!intr || exec->hw != hw || !exec->cmd_ready)
+		return -EUCLEAN;
+	exec->irq_result = 0;
+	exec->irq_seen = false;
+	exec->hw_start_ns = ktime_get_ns();
+	ret = rk_rga_hw_schedule_timeout(hw, exec);
+	if (ret)
+		goto err_start;
+	dma_wmb();
+
 	if (hw->match->quirks & RK_RGA_QUIRK_RGA2_DISABLE_AUTO_RST) {
 		ret = rk_rga2_soft_reset(hw);
 		if (ret)
-			return ret;
+			goto err_timeout;
 	}
 
 	rk_rga2_clear_irq(hw);
-	rk_rga2_write_full_csc(hw, &job->tasks[job->current_task]);
+	ret = rk_rga_task_exec_write_full_csc(hw, exec);
+	if (ret)
+		goto err_timeout;
 	if (intr->enable) {
 		u32 read_line = rk_rga2_pre_intr_read_line(intr);
 		u32 write_line = rk_rga2_pre_intr_write_line(intr);
@@ -6850,135 +7268,135 @@ static int rk_rga2_publish_and_start(struct rk_rga_hw *hw,
 	}
 	rk_rga_write(hw, rk_rga_read(hw, RK_RGA2_INT) |
 		     int_enable, RK_RGA2_INT);
-	rk_rga_write(hw, lower_32_bits(job->cmd_dma), RK_RGA2_CMD_BASE);
+	rk_rga_write(hw, lower_32_bits(exec->cmd_dma), RK_RGA2_CMD_BASE);
 	rk_rga_write(hw, sys_ctrl, RK_RGA2_SYS_CTRL);
 	rk_rga_write(hw, rk_rga_read(hw, RK_RGA2_CMD_CTRL) |
 		     RK_RGA2_CMD_CTRL_CMD_LINE_ST, RK_RGA2_CMD_CTRL);
+	atomic_inc(&hw->rga->started_job_count);
+	rk_rga_count_core(hw->rga->started_core_count, hw);
 
 	return 0;
+
+err_timeout:
+	rk_rga_hw_cancel_timeout(hw);
+err_start:
+	exec->hw_start_ns = 0;
+	return ret;
 }
 
-static int rk_rga3_publish_and_start(struct rk_rga_hw *hw,
-				     struct rk_rga_job *job)
-{
-	rk_rga3_clear_irq(hw);
-	rk_rga_write(hw, RK_RGA3_INT_DONE_MASK | RK_RGA3_INT_ERROR_MASK,
-		     RK_RGA3_INT_EN);
-	rk_rga_write(hw, lower_32_bits(job->cmd_dma), RK_RGA3_CMD_ADDR);
-	rk_rga_write(hw, rk_rga3_start_sys_ctrl(hw->match), RK_RGA3_SYS_CTRL);
-	rk_rga_write(hw, RK_RGA3_CMD_CTRL_LINE_START, RK_RGA3_CMD_CTRL);
-
-	return 0;
-}
-
-static struct rk_rga_job *rk_rga_hw_take_timeout_job(struct rk_rga_hw *hw,
-						    u64 *generation)
-{
-	struct rk_rga_job *job;
-	unsigned long flags;
-
-	spin_lock_irqsave(&hw->job_lock, flags);
-	job = hw->timeout_job;
-	hw->timeout_job = NULL;
-	if (generation)
-		*generation = hw->timeout_generation;
-	hw->timeout_generation = 0;
-	spin_unlock_irqrestore(&hw->job_lock, flags);
-
-	return job;
-}
-
-static void rk_rga_hw_cancel_timeout(struct rk_rga_hw *hw)
-{
-	struct rk_rga_job *job;
-
-	cancel_delayed_work(&hw->timeout_work);
-	job = rk_rga_hw_take_timeout_job(hw, NULL);
-	rk_rga_job_put(job);
-}
-
-static void rk_rga_hw_cancel_timeout_sync(struct rk_rga_hw *hw)
-{
-	struct rk_rga_job *job;
-
-	cancel_delayed_work_sync(&hw->timeout_work);
-	job = rk_rga_hw_take_timeout_job(hw, NULL);
-	rk_rga_job_put(job);
-}
-
-static void rk_rga_hw_schedule_timeout(struct rk_rga_hw *hw,
-				       struct rk_rga_job *job)
-{
-	struct rk_rga_job *old = NULL;
-	unsigned long flags;
-
-	spin_lock_irqsave(&hw->job_lock, flags);
-	if (job != hw->timeout_job) {
-		rk_rga_job_get(job);
-		old = hw->timeout_job;
-		hw->timeout_job = job;
-	}
-	/*
-	 * Stamp the activation this watchdog belongs to.  A multi-task job is
-	 * re-dispatched under the same pointer, so the pointer alone cannot
-	 * tell a stale worker apart from the task it was armed for.  The
-	 * caller reaches here from rk_rga_hw_dispatch() under run_lock, right
-	 * after that dispatch bumped active_generation.
-	 */
-	hw->timeout_generation = rk_rga_hw_active_generation_locked(hw);
-	spin_unlock_irqrestore(&hw->job_lock, flags);
-	rk_rga_job_put(old);
-
-	mod_delayed_work(system_wq, &hw->timeout_work,
-			 msecs_to_jiffies(RK_RGA_JOB_TIMEOUT_MS));
-}
-
-static int rk_rga_publish_and_start(struct rk_rga_hw *hw,
-				    struct rk_rga_job *job)
+static int rk_rga3_execution_publish_and_start(struct rk_rga_hw *hw,
+					       struct rk_rga_task_exec *exec)
 {
 	int ret;
 
 	lockdep_assert_held(&hw->run_lock);
-	/*
-	 * Publish every coherent command-buffer store before the MMIO doorbell.
-	 * Coherent allocation makes CPU and device views agree, but does not by
-	 * itself order the final register-image writes against starting the DMA
-	 * command fetch. That ordering matters when pipelined jobs rapidly reuse
-	 * command-buffer IOVAs.
-	 */
+	if (exec->hw != hw || !exec->cmd_ready ||
+	    !rk_rga_task_exec_plan(exec))
+		return -EUCLEAN;
+	exec->irq_result = 0;
+	exec->irq_seen = false;
+	exec->hw_start_ns = ktime_get_ns();
+	ret = rk_rga_hw_schedule_timeout(hw, exec);
+	if (ret) {
+		exec->hw_start_ns = 0;
+		return ret;
+	}
 	dma_wmb();
 
-	job->irq_result = 0;
-	job->irq_seen = false;
-	job->hw_start_ns = ktime_get_ns();
-
-	if (hw->type == RK_RGA_HW_RGA3)
-		ret = rk_rga3_publish_and_start(hw, job);
-	else
-		ret = rk_rga2_publish_and_start(hw, job);
-	if (ret)
-		return ret;
-
+	rk_rga3_clear_irq(hw);
+	rk_rga_write(hw, RK_RGA3_INT_DONE_MASK | RK_RGA3_INT_ERROR_MASK,
+		     RK_RGA3_INT_EN);
+	rk_rga_write(hw, lower_32_bits(exec->cmd_dma), RK_RGA3_CMD_ADDR);
+	rk_rga_write(hw, rk_rga3_start_sys_ctrl(hw->match), RK_RGA3_SYS_CTRL);
+	rk_rga_write(hw, RK_RGA3_CMD_CTRL_LINE_START, RK_RGA3_CMD_CTRL);
 	atomic_inc(&hw->rga->started_job_count);
 	rk_rga_count_core(hw->rga->started_core_count, hw);
-	rk_rga_hw_schedule_timeout(hw, job);
 
 	return 0;
 }
 
-static int rk_rga2_irq_result(const struct rk_rga_job *job)
+static bool
+rk_rga_hw_take_timeout_ref(struct rk_rga_hw *hw,
+			   struct rk_rga_task_exec_ref *ref)
 {
-	if (job->intr_status & RK_RGA2_INT_CONFIG_ERR)
+	unsigned long flags;
+	bool taken;
+
+	spin_lock_irqsave(&hw->job_lock, flags);
+	taken = rk_rga_task_exec_ref_valid(&hw->timeout_ref) &&
+		rk_rga_task_exec_ref_move(ref, &hw->timeout_ref);
+	spin_unlock_irqrestore(&hw->job_lock, flags);
+
+	return taken;
+}
+
+static void rk_rga_hw_cancel_timeout(struct rk_rga_hw *hw)
+{
+	struct rk_rga_task_exec_ref ref = {};
+
+	cancel_delayed_work(&hw->timeout_work);
+	if (rk_rga_hw_take_timeout_ref(hw, &ref))
+		WARN_ON_ONCE(!rk_rga_task_exec_ref_put(&ref));
+}
+
+static void rk_rga_hw_cancel_timeout_sync(struct rk_rga_hw *hw)
+{
+	struct rk_rga_task_exec_ref ref = {};
+
+	cancel_delayed_work_sync(&hw->timeout_work);
+	if (rk_rga_hw_take_timeout_ref(hw, &ref))
+		WARN_ON_ONCE(!rk_rga_task_exec_ref_put(&ref));
+}
+
+static int rk_rga_hw_schedule_timeout(struct rk_rga_hw *hw,
+				      struct rk_rga_task_exec *exec)
+{
+	struct rk_rga_task_exec_ref old = {};
+	struct rk_rga_task_exec_ref next = {};
+	unsigned long flags;
+	int ret = 0;
+
+	spin_lock_irqsave(&hw->job_lock, flags);
+	if (hw->active_ref.exec != exec ||
+	    hw->active_ref.generation != exec->generation) {
+		ret = -ESTALE;
+	} else if (hw->timeout_ref.exec != exec ||
+		   hw->timeout_ref.generation != exec->generation) {
+		if (!rk_rga_task_exec_ref_clone(&next, &hw->active_ref)) {
+			ret = -EUCLEAN;
+		} else {
+			if (rk_rga_task_exec_ref_valid(&hw->timeout_ref))
+				WARN_ON_ONCE(!rk_rga_task_exec_ref_move(
+						     &old, &hw->timeout_ref));
+			WARN_ON_ONCE(!rk_rga_task_exec_ref_move(
+					     &hw->timeout_ref, &next));
+		}
+	}
+	spin_unlock_irqrestore(&hw->job_lock, flags);
+	if (rk_rga_task_exec_ref_valid(&old))
+		WARN_ON_ONCE(!rk_rga_task_exec_ref_put(&old));
+	if (ret)
+		return ret;
+
+	mod_delayed_work(system_wq, &hw->timeout_work,
+			 msecs_to_jiffies(RK_RGA_JOB_TIMEOUT_MS));
+
+	return 0;
+}
+
+static int rk_rga2_irq_result(const struct rk_rga_task_exec *exec)
+{
+	if (exec->intr_status & RK_RGA2_INT_CONFIG_ERR)
 		return -EACCES;
-	if (job->intr_status & RK_RGA2_INT_ERROR_INT_FLAG)
+	if (exec->intr_status & RK_RGA2_INT_ERROR_INT_FLAG)
 		return -EFAULT;
-	if (job->intr_status & RK_RGA2_INT_MMU_INT_FLAG)
+	if (exec->intr_status & RK_RGA2_INT_MMU_INT_FLAG)
 		return -EACCES;
-	if (job->intr_status & RK_RGA2_INT_SCL_ERROR_INTR)
+	if (exec->intr_status & RK_RGA2_INT_SCL_ERROR_INTR)
 		return -EACCES;
-	if (job->intr_status & RK_RGA2_INT_FBCIN_DEC_ERROR)
+	if (exec->intr_status & RK_RGA2_INT_FBCIN_DEC_ERROR)
 		return -EACCES;
-	if (job->hw_status & (RK_RGA2_STATUS2_RPP_ERROR |
+	if (exec->hw_status & (RK_RGA2_STATUS2_RPP_ERROR |
 			      RK_RGA2_STATUS2_BUS_ERROR))
 		return -EFAULT;
 
@@ -6986,13 +7404,13 @@ static int rk_rga2_irq_result(const struct rk_rga_job *job)
 }
 
 static void rk_rga2_log_parse_error(struct rk_rga_hw *hw,
-				    const struct rk_rga_job *job)
+				    const struct rk_rga_task_exec *exec)
 {
-	u32 status = job->parse_status;
+	u32 status = exec->parse_status;
 
 	dev_err_ratelimited(hw->dev,
 			    "RGA2 config error: intr=%#x parse_status=%#x\n",
-			    job->intr_status, status);
+			    exec->intr_status, status);
 	if (status & RK_RGA2_PARSE_SRC_DST_RECT_NOT_EQUAL)
 		dev_err_ratelimited(hw->dev,
 				    "RGA2 parser: source and destination rectangles differ\n");
@@ -7011,11 +7429,11 @@ static void rk_rga2_log_parse_error(struct rk_rga_hw *hw,
 				    (u32)(status & ~RK_RGA2_PARSE_KNOWN_MASK));
 }
 
-static int rk_rga3_irq_result(const struct rk_rga_job *job)
+static int rk_rga3_irq_result(const struct rk_rga_task_exec *exec)
 {
-	if (job->intr_status & RK_RGA3_INT_RGA_MMU_INTR)
+	if (exec->intr_status & RK_RGA3_INT_RGA_MMU_INTR)
 		return -EACCES;
-	if (job->intr_status & (RK_RGA3_INT_RGA_MI_RD_BUS_ERR |
+	if (exec->intr_status & (RK_RGA3_INT_RGA_MI_RD_BUS_ERR |
 				RK_RGA3_INT_RGA_MI_WR_BUS_ERR |
 				RK_RGA3_INT_WIN0_FBCD_DEC_ERR |
 				RK_RGA3_INT_WIN1_FBCD_DEC_ERR))
@@ -7025,56 +7443,56 @@ static int rk_rga3_irq_result(const struct rk_rga_job *job)
 }
 
 static int rk_rga_irq_completion_result(enum rk_rga_hw_type type,
-					const struct rk_rga_job *job)
+					const struct rk_rga_task_exec *exec)
 {
 	if (type == RK_RGA_HW_RGA3)
-		return job->intr_status & RK_RGA3_INT_ERROR_MASK ?
-		       rk_rga3_irq_result(job) : 0;
+		return exec->intr_status & RK_RGA3_INT_ERROR_MASK ?
+		       rk_rga3_irq_result(exec) : 0;
 	if (type == RK_RGA_HW_RGA2)
-		return job->intr_status & RK_RGA2_INT_ERROR_MASK ?
-		       rk_rga2_irq_result(job) : 0;
+		return exec->intr_status & RK_RGA2_INT_ERROR_MASK ?
+		       rk_rga2_irq_result(exec) : 0;
 
 	return -EINVAL;
 }
 
 static irqreturn_t rk_rga_hw_irq_status(struct rk_rga_hw *hw,
-					struct rk_rga_job *job)
+					struct rk_rga_task_exec *exec)
 {
 	bool done;
 	bool error;
 
 	if (hw->type == RK_RGA_HW_RGA3) {
-		rk_rga3_read_irq_status(hw, job);
-		done = job->intr_status & RK_RGA3_INT_DONE_MASK;
-		error = job->intr_status & RK_RGA3_INT_ERROR_MASK;
+		rk_rga3_read_irq_status(hw, exec);
+		done = exec->intr_status & RK_RGA3_INT_DONE_MASK;
+		error = exec->intr_status & RK_RGA3_INT_ERROR_MASK;
 		if (!done && !error)
 			return IRQ_NONE;
-		job->irq_seen = true;
+		exec->irq_seen = true;
 		rk_rga3_clear_irq(hw);
 	} else {
-		rk_rga2_read_irq_status(hw, job);
-		done = job->intr_status & RK_RGA2_INT_DONE_MASK;
-		error = job->intr_status & RK_RGA2_INT_ERROR_MASK;
+		rk_rga2_read_irq_status(hw, exec);
+		done = exec->intr_status & RK_RGA2_INT_DONE_MASK;
+		error = exec->intr_status & RK_RGA2_INT_ERROR_MASK;
 		if (!done && !error) {
-			if (job->intr_status & RK_RGA2_INT_LINE_MASK) {
+			if (exec->intr_status & RK_RGA2_INT_LINE_MASK) {
 				rk_rga2_clear_irq(hw);
 				return IRQ_HANDLED;
 			}
 			return IRQ_NONE;
 		}
-		job->irq_seen = true;
-		if (job->intr_status & RK_RGA2_INT_CONFIG_ERR) {
+		exec->irq_seen = true;
+		if (exec->intr_status & RK_RGA2_INT_CONFIG_ERR) {
 			atomic_inc(&hw->rga->rga2_config_error_count);
 			atomic_set(&hw->rga->rga2_last_config_intr,
-				   job->intr_status);
+				   exec->intr_status);
 			atomic_set(&hw->rga->rga2_last_parse_status,
-				   job->parse_status);
+				   exec->parse_status);
 		}
 		rk_rga2_clear_irq(hw);
 	}
-	job->irq_result = rk_rga_irq_completion_result(hw->type, job);
+	exec->irq_result = rk_rga_irq_completion_result(hw->type, exec);
 
-	if (job->irq_result)
+	if (exec->irq_result)
 		atomic_inc(&hw->rga->irq_error_count);
 
 	return IRQ_WAKE_THREAD;
@@ -7193,6 +7611,84 @@ struct rk_rga2_fill_profile {
 struct rk_rga2_palette_profile {
 	struct rk_rga2_format_info dst_fmt;
 };
+
+/*
+ * Immutable semantic command plan.  The userspace ABI request remains the
+ * parser/validator input; emitters consume only this normalized, execution-
+ * owned representation and the backend profile selected during planning.
+ */
+struct rk_rga_task_plan {
+	enum rk_rga_hw_type hw_type;
+	u8 render_mode;
+	struct rga_img_info_t src;
+	struct rga_img_info_t dst;
+	struct rga_img_info_t pat;
+	u16 alpha_rop_flag;
+	struct rga_interp interp;
+	u32 color_key_max;
+	u32 color_key_min;
+	u32 fg_color;
+	u32 bg_color;
+	struct rga_color_fill_t gr_color;
+	struct rga_fading_t fading;
+	u8 PD_mode;
+	u16 rop_code;
+	u8 bsfilter_flag;
+	u8 palette_mode;
+	u8 palette_shift;
+	u8 yuv2rgb_mode;
+	u8 endian_mode;
+	u8 alpha_rop_mode;
+	u8 src_trans_mode;
+	u8 dither_mode;
+	struct rga_full_csc full_csc;
+	struct rga_mosaic_info mosaic_info;
+	struct rga_osd_info osd_info;
+	struct rga_pre_intr_info pre_intr_info;
+	u8 fg_global_alpha;
+	u8 bg_global_alpha;
+	struct rga_feature feature;
+	struct rga_csc_clip full_csc_clip;
+	struct rga_rgba5551_alpha rgba5551_alpha;
+	struct rga_gauss_config gauss_config;
+	bool uses_rop;
+	bool uses_color_key;
+	bool uses_quantize;
+	union {
+		struct rk_rga3_bitblt_profile rga3_bitblt;
+		struct rk_rga2_bitblt_profile rga2_bitblt;
+		struct rk_rga2_fill_profile rga2_fill;
+		struct rk_rga2_palette_profile rga2_palette;
+	} profile;
+};
+
+static const struct rga_pre_intr_info *
+rk_rga_task_exec_pre_intr(const struct rk_rga_task_exec *exec)
+{
+	const struct rk_rga_task_plan *plan;
+
+	/* Pair with task-plan release publication after validation completes. */
+	plan = exec ? smp_load_acquire(&exec->plan) : NULL;
+
+	return plan ? &plan->pre_intr_info : NULL;
+}
+
+static int rk_rga_task_exec_write_full_csc(struct rk_rga_hw *hw,
+					   const struct rk_rga_task_exec *exec)
+{
+	const struct rk_rga_task_plan *plan;
+
+	/* Pair with task-plan release publication after validation completes. */
+	plan = exec ? smp_load_acquire(&exec->plan) : NULL;
+
+	if (!plan)
+		return -EUCLEAN;
+	rk_rga2_write_full_csc(hw, &plan->full_csc,
+			       plan->feature.full_csc_clip_en,
+			       &plan->full_csc_clip);
+
+	return 0;
+}
 
 static bool rk_rga_format_is_yuv(u32 format)
 {
@@ -8082,7 +8578,8 @@ static int rk_rga3_rotate_flags(const struct rga_req *task, u32 *rotate_flags)
 
 static void rk_rga_cmd_write(struct rk_rga_job *job, u32 offset, u32 value)
 {
-	u32 *cmd = job->cmd_vaddr;
+	struct rk_rga_task_exec *exec = rk_rga_job_current_exec(job);
+	u32 *cmd = exec->cmd_vaddr;
 
 	cmd[offset / sizeof(*cmd)] = value;
 }
@@ -8980,6 +9477,29 @@ static int rk_rga2_validate_gauss(const struct rga_req *task)
 }
 
 #if IS_ENABLED(CONFIG_ROCKCHIP_RGA_REWRITE_KUNIT_TEST)
+static int rk_rga_kunit_advance_task(struct rk_rga_job *job, int result)
+{
+	struct rk_rga_task_exec *exec;
+	void *cmd_vaddr;
+	size_t cmd_size;
+	int ret;
+
+	if (!job->current_exec)
+		rk_rga_job_init_first_exec(job);
+	exec = job->current_exec;
+	cmd_vaddr = exec->cmd_vaddr;
+	cmd_size = exec->cmd_size;
+	if (exec->state == RK_RGA_TASK_EXEC_UNINSTALLED)
+		exec->state = RK_RGA_TASK_EXEC_RETIRED;
+	ret = rk_rga_job_advance_task(job, result);
+	if (ret > 0) {
+		job->current_exec->cmd_vaddr = cmd_vaddr;
+		job->current_exec->cmd_size = cmd_size;
+	}
+
+	return ret;
+}
+
 static int rk_rga2_select_dst_addresses(const struct rga_img_info_t *dst,
 					const struct rk_rga2_format_info *fmt,
 					const struct rk_rga2_transform *transform,
@@ -9382,14 +9902,6 @@ static void rk_rga_kunit_cancel_delayed_work(void *data)
 	cancel_delayed_work_sync(data);
 }
 
-static void rk_rga_kunit_cancel_hw_work(void *data)
-{
-	struct rk_rga_hw *hw = data;
-
-	cancel_work_sync(&hw->iommu_fault_work);
-	cancel_delayed_work_sync(&hw->timeout_work);
-}
-
 static int rk_rga_kunit_track_fd(struct kunit *test, int fd)
 {
 	if (fd < 0)
@@ -9650,8 +10162,8 @@ static void rk_rga2_fill_dst_offset_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 1,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 stride_bytes;
 	u32 expected_base;
@@ -9665,7 +10177,7 @@ static void rk_rga2_fill_dst_offset_emit_kunit(struct kunit *test)
 	task.fg_color = 0xff00ff00;
 
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_fill(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	stride_bytes = ALIGN((u32)task.dst.vir_w * 4, 4);
 	expected_base = lower_32_bits(task.dst.yrgb_addr +
@@ -9690,8 +10202,8 @@ static void rk_rga2_pre_intr_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 1,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	struct rga_pre_intr_info intr = {
 		.enable = 1,
@@ -9724,7 +10236,7 @@ static void rk_rga2_pre_intr_kunit(struct kunit *test)
 	intr.enable = 1;
 	task.pre_intr_info = intr;
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_fill(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	memset(cmd, 0, sizeof(cmd));
 	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
@@ -9733,9 +10245,9 @@ static void rk_rga2_pre_intr_kunit(struct kunit *test)
 	task.pre_intr_info = intr;
 	job.tasks = &task;
 	job.import_count = 2;
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 }
 
 static void rk_rga2_fill_yuv_emit_kunit(struct kunit *test)
@@ -9746,8 +10258,8 @@ static void rk_rga2_fill_yuv_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 1,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 y_stride_bytes;
 	u32 uv_stride_bytes;
@@ -9764,7 +10276,7 @@ static void rk_rga2_fill_yuv_emit_kunit(struct kunit *test)
 	task.fg_color = 0xff00ff00;
 
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_fill(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	y_stride_bytes = ALIGN((u32)task.dst.vir_w, 4);
 	uv_stride_bytes = ALIGN((u32)task.dst.vir_w, 4);
@@ -9794,14 +10306,14 @@ static void rk_rga2_fill_yuv_emit_kunit(struct kunit *test)
 
 	memset(cmd, 0, sizeof(cmd));
 	task.dst.x_offset = 1;
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_fill(&job), -EINVAL);
-	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+	KUNIT_EXPECT_FALSE(test, job.exec_storage.cmd_ready);
 
 	task.dst.x_offset = 16;
 	task.yuv2rgb_mode = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_fill(&job), -EOPNOTSUPP);
-	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+	KUNIT_EXPECT_FALSE(test, job.exec_storage.cmd_ready);
 }
 
 static void rk_rga2_fill_packed_yuv_emit_kunit(struct kunit *test)
@@ -9812,8 +10324,8 @@ static void rk_rga2_fill_packed_yuv_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 1,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 stride_bytes;
 	u32 expected_base;
@@ -9829,7 +10341,7 @@ static void rk_rga2_fill_packed_yuv_emit_kunit(struct kunit *test)
 	task.fg_color = 0xff00ff00;
 
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_fill(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	stride_bytes = ALIGN((u32)task.dst.vir_w * 2, 4);
 	expected_base = lower_32_bits(task.dst.yrgb_addr +
@@ -9854,11 +10366,11 @@ static void rk_rga2_fill_packed_yuv_emit_kunit(struct kunit *test)
 			task.fg_color);
 
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	task.dst.format = RK_RGA_FORMAT_UYVY_422;
 
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_fill(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	expected_dst_info = FIELD_PREP(RK_RGA2_DST_FORMAT, 0xc) |
 			    RK_RGA2_DST_UV_SWAP |
 			    FIELD_PREP(RK_RGA2_DST_CSC_MODE, 2);
@@ -9866,11 +10378,11 @@ static void rk_rga2_fill_packed_yuv_emit_kunit(struct kunit *test)
 			expected_dst_info);
 
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	task.dst.format = RK_RGA_FORMAT_YUYV_420;
 
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_fill(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	expected_dst_info = FIELD_PREP(RK_RGA2_DST_FORMAT, 0xf) |
 			    RK_RGA2_DST_UV_SWAP |
 			    FIELD_PREP(RK_RGA2_DST_CSC_MODE, 2);
@@ -9880,11 +10392,11 @@ static void rk_rga2_fill_packed_yuv_emit_kunit(struct kunit *test)
 			expected_base);
 
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	task.dst.format = RK_RGA_FORMAT_YVYU_420;
 
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_fill(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	expected_dst_info = FIELD_PREP(RK_RGA2_DST_FORMAT, 0xf) |
 			    FIELD_PREP(RK_RGA2_DST_CSC_MODE, 2);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_INFO_OFFSET / 4],
@@ -9893,11 +10405,11 @@ static void rk_rga2_fill_packed_yuv_emit_kunit(struct kunit *test)
 			expected_base);
 
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	task.dst.format = RK_RGA_FORMAT_VYUY_420;
 
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_fill(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	expected_dst_info = FIELD_PREP(RK_RGA2_DST_FORMAT, 0xd) |
 			    FIELD_PREP(RK_RGA2_DST_CSC_MODE, 2);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_INFO_OFFSET / 4],
@@ -9906,11 +10418,11 @@ static void rk_rga2_fill_packed_yuv_emit_kunit(struct kunit *test)
 			expected_base);
 
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	task.dst.format = RK_RGA_FORMAT_UYVY_420;
 
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_fill(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	expected_dst_info = FIELD_PREP(RK_RGA2_DST_FORMAT, 0xd) |
 			    RK_RGA2_DST_UV_SWAP |
 			    FIELD_PREP(RK_RGA2_DST_CSC_MODE, 2);
@@ -9938,8 +10450,8 @@ static void rk_rga2_rectangle_task_emit_kunit(struct kunit *test)
 	struct rk_rga_job job = {
 		.task_count = ARRAY_SIZE(rects),
 		.import_count = 1,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 stride_bytes;
 
@@ -9965,12 +10477,12 @@ static void rk_rga2_rectangle_task_emit_kunit(struct kunit *test)
 		u32 expected_base;
 
 		memset(cmd, 0, sizeof(cmd));
-		job.cmd_ready = false;
+		job.exec_storage.cmd_ready = false;
 
 		KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 		KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 		KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_fill(&job), 0);
-		KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+		KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 		expected_base = lower_32_bits(tasks[i].dst.yrgb_addr +
 					      (u64)rects[i].y *
@@ -9985,10 +10497,10 @@ static void rk_rga2_rectangle_task_emit_kunit(struct kunit *test)
 				tasks[i].fg_color);
 
 		if (i + 1 < job.task_count)
-			KUNIT_EXPECT_TRUE(test, rk_rga_job_advance_task(&job,
+			KUNIT_EXPECT_TRUE(test, rk_rga_kunit_advance_task(&job,
 									0));
 		else
-			KUNIT_EXPECT_FALSE(test, rk_rga_job_advance_task(&job,
+			KUNIT_EXPECT_FALSE(test, rk_rga_kunit_advance_task(&job,
 									 0));
 	}
 }
@@ -10007,8 +10519,8 @@ static void rk_rga2_mosaic_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 
 	img.act_w = 300;
@@ -10022,7 +10534,7 @@ static void rk_rga2_mosaic_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA2_MODE_CTRL_OFFSET / 4] &
 			  RK_RGA2_MODE_MOSAIC_EN);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_MOSAIC_MODE_OFFSET / 4], 2U);
@@ -10036,19 +10548,19 @@ static void rk_rga2_mosaic_emit_kunit(struct kunit *test)
 			299U | (199U << 16));
 
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	task.mosaic_info.mode = 5;
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
 			-EOPNOTSUPP);
-	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+	KUNIT_EXPECT_FALSE(test, job.exec_storage.cmd_ready);
 
 	task.mosaic_info.mode = 2;
 	task.dst.x_offset = 4;
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
 			-EOPNOTSUPP);
-	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+	KUNIT_EXPECT_FALSE(test, job.exec_storage.cmd_ready);
 }
 
 static void rk_rga2_mosaic_task_array_emit_kunit(struct kunit *test)
@@ -10068,8 +10580,8 @@ static void rk_rga2_mosaic_task_array_emit_kunit(struct kunit *test)
 	struct rk_rga_job job = {
 		.task_count = ARRAY_SIZE(rects),
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 stride_bytes;
 
@@ -10102,12 +10614,12 @@ static void rk_rga2_mosaic_task_array_emit_kunit(struct kunit *test)
 		u32 expected_base;
 
 		memset(cmd, 0, sizeof(cmd));
-		job.cmd_ready = false;
+		job.exec_storage.cmd_ready = false;
 
 		KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 		KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 		KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-		KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+		KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 		expected_base = lower_32_bits(tasks[i].src.yrgb_addr +
 					      (u64)rects[i].y *
@@ -10129,10 +10641,10 @@ static void rk_rga2_mosaic_task_array_emit_kunit(struct kunit *test)
 				(u32)rects[i].mode);
 
 		if (i + 1 < job.task_count)
-			KUNIT_EXPECT_TRUE(test, rk_rga_job_advance_task(&job,
+			KUNIT_EXPECT_TRUE(test, rk_rga_kunit_advance_task(&job,
 									0));
 		else
-			KUNIT_EXPECT_FALSE(test, rk_rga_job_advance_task(&job,
+			KUNIT_EXPECT_FALSE(test, rk_rga_kunit_advance_task(&job,
 									 0));
 	}
 }
@@ -10148,8 +10660,8 @@ static void rk_rga2_rop_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 
 	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
@@ -10166,7 +10678,7 @@ static void rk_rga2_rop_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_ALPHA_CTRL0_OFFSET / 4],
 			RK_RGA2_ALPHA_ROP_0 | RK_RGA2_ALPHA_ROP_SEL |
 			FIELD_PREP(RK_RGA2_ALPHA_ROP_MODE, 1));
@@ -10184,22 +10696,22 @@ static void rk_rga2_rop_emit_kunit(struct kunit *test)
 			0U);
 
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	task.rop_code = 0x12;
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
 			-EOPNOTSUPP);
-	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+	KUNIT_EXPECT_FALSE(test, job.exec_storage.cmd_ready);
 
 	task.rop_code = RK_RGA_ROP_AND;
 	task.dst.act_w = 640;
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
 			-EOPNOTSUPP);
-	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+	KUNIT_EXPECT_FALSE(test, job.exec_storage.cmd_ready);
 
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
 				    64, 32);
 	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_RGBA_8888,
@@ -10213,7 +10725,7 @@ static void rk_rga2_rop_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_EQ(test,
 			cmd[RK_RGA2_SRC_INFO_OFFSET / 4] &
 			RK_RGA2_SRC_ROT_MODE,
@@ -10238,8 +10750,8 @@ static void rk_rga2_colorkey_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 src_info;
 	u32 expected_trans;
@@ -10284,7 +10796,7 @@ static void rk_rga2_colorkey_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	src_info = cmd[RK_RGA2_SRC_INFO_OFFSET / 4];
 	expected_trans =
@@ -10305,10 +10817,10 @@ static void rk_rga2_colorkey_emit_kunit(struct kunit *test)
 			expected_ctrl1);
 
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	task.src_trans_mode = 0x1f;
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	src_info = cmd[RK_RGA2_SRC_INFO_OFFSET / 4];
 	expected_trans =
 		FIELD_PREP(RK_RGA2_SRC_TRANS_MODE, task.src_trans_mode) |
@@ -10319,11 +10831,11 @@ static void rk_rga2_colorkey_emit_kunit(struct kunit *test)
 			expected_trans);
 
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	task.src_trans_mode = 0x1d;
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job),
 			-EOPNOTSUPP);
-	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+	KUNIT_EXPECT_FALSE(test, job.exec_storage.cmd_ready);
 
 	task.src_trans_mode = 0x1e;
 	task.src.format = RK_RGA_FORMAT_RGB_888;
@@ -10349,8 +10861,8 @@ static void rk_rga2_gauss_emit_kunit(struct kunit *test)
 		.task_count = 1,
 		.import_count = 2,
 		.gauss_coeffs = gauss_coeffs,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 
 	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
@@ -10366,7 +10878,7 @@ static void rk_rga2_gauss_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA2_MODE_CTRL_OFFSET / 4] &
 			  RK_RGA2_MODE_SRC_GAUSS_EN);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_GAUSS_COE_OFFSET / 4],
@@ -10375,12 +10887,12 @@ static void rk_rga2_gauss_emit_kunit(struct kunit *test)
 			FIELD_PREP(RK_RGA2_ALPHA_SRC_GLOBAL, 0xfe));
 
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	task.dst.act_w = 640;
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
 			-EOPNOTSUPP);
-	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+	KUNIT_EXPECT_FALSE(test, job.exec_storage.cmd_ready);
 
 	task.dst.act_w = task.src.act_w;
 	task.gauss_config.size = 5;
@@ -10462,8 +10974,8 @@ static void rk_rga2_quantize_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 expected_scale;
 	u32 expected_offset;
@@ -10486,7 +10998,7 @@ static void rk_rga2_quantize_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA2_DST_INFO_OFFSET / 4] &
 			  RK_RGA2_DST_NN_QUANTIZE_EN);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_QUANTIZE_SCALE_OFFSET / 4],
@@ -10497,10 +11009,10 @@ static void rk_rga2_quantize_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_ALPHA_CTRL1_OFFSET / 4], 0U);
 
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	task.gr_color.gr_x_g = 0x400;
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), -EINVAL);
-	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+	KUNIT_EXPECT_FALSE(test, job.exec_storage.cmd_ready);
 
 	task.gr_color.gr_x_g = 0x080;
 	task.alpha_rop_flag = BIT(8) | BIT(0);
@@ -10528,8 +11040,8 @@ static void rk_rga2_alpha_bitmap_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 3,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 expected_ctrl0;
 	u32 expected_dst_info;
@@ -10575,7 +11087,7 @@ static void rk_rga2_alpha_bitmap_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA2_MODE_CTRL_OFFSET / 4] &
 			  RK_RGA2_MODE_BITBLT_MODE);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_INFO_OFFSET / 4],
@@ -10594,11 +11106,11 @@ static void rk_rga2_alpha_bitmap_emit_kunit(struct kunit *test)
 			rk_rga2_alpha_bitmap_ctrl1());
 
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	task.pat.format = RK_RGA_FORMAT_RGB_565;
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job),
 			-EOPNOTSUPP);
-	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+	KUNIT_EXPECT_FALSE(test, job.exec_storage.cmd_ready);
 
 	task.pat.format = RK_RGA_FORMAT_ARGB_5551;
 	task.alpha_rop_flag &= ~RK_RGA2_ALPHA_FLAG_REAL_COLOR;
@@ -10623,8 +11135,8 @@ static void rk_rga2_osd_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 3,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 expected_ctrl0 = FIELD_PREP(RK_RGA2_OSD_CTRL0_MODE, 3) |
 			     FIELD_PREP(RK_RGA2_OSD_CTRL0_DIRECTION, 1) |
@@ -10683,7 +11195,7 @@ static void rk_rga2_osd_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA2_MODE_CTRL_OFFSET / 4] &
 			  RK_RGA2_MODE_BITBLT_MODE);
 	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA2_MODE_CTRL_OFFSET / 4] &
@@ -10713,19 +11225,19 @@ static void rk_rga2_osd_emit_kunit(struct kunit *test)
 			0x01020304U);
 
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	type = 0;
 	task.pat.vir_w = task.pat.act_w - 1;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), -EINVAL);
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), -EINVAL);
-	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+	KUNIT_EXPECT_FALSE(test, job.exec_storage.cmd_ready);
 
 	task.pat.vir_w = osd.vir_w;
 	task.pat.vir_h = task.pat.act_h - 1;
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), -EINVAL);
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), -EINVAL);
-	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+	KUNIT_EXPECT_FALSE(test, job.exec_storage.cmd_ready);
 
 	task.pat.vir_h = osd.vir_h;
 	type = 0;
@@ -10733,7 +11245,7 @@ static void rk_rga2_osd_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	task.osd_info.mode_ctrl.color_mode = 1;
 	task.osd_info.bpp2_info.color0.value = 0xff336699;
 	task.osd_info.bpp2_info.color1.value = 0x80123456;
@@ -10742,7 +11254,7 @@ static void rk_rga2_osd_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_OSD_CTRL1_OFFSET / 4],
 			expected_ctrl1);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_OSD_COLOR0_OFFSET / 4],
@@ -10752,11 +11264,11 @@ static void rk_rga2_osd_emit_kunit(struct kunit *test)
 
 	task.osd_info.mode_ctrl.color_mode = 0;
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	task.pat.format = RK_RGA_FORMAT_RGB_565;
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job),
 			-EOPNOTSUPP);
-	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+	KUNIT_EXPECT_FALSE(test, job.exec_storage.cmd_ready);
 
 	task.pat.format = RK_RGA_FORMAT_RGBA_8888;
 	task.osd_info.mode_ctrl.block_fix_width = 95;
@@ -10784,8 +11296,8 @@ static void rk_rga2_palette_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 3,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 stride = ALIGN((u32)task.src.vir_w, 4);
 	u32 expected_src_info = FIELD_PREP(RK_RGA2_SRC_FORMAT, 0xf) |
@@ -10801,7 +11313,7 @@ static void rk_rga2_palette_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_palette(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_MODE_CTRL_OFFSET / 4],
 			FIELD_PREP(RK_RGA2_MODE_RENDER_MODE,
 				   RK_RGA_RENDER_COLOR_PALETTE) |
@@ -10822,7 +11334,7 @@ static void rk_rga2_palette_emit_kunit(struct kunit *test)
 			lower_32_bits(task.dst.yrgb_addr));
 
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	task.src.format = RK_RGA_FORMAT_BPP4;
 	task.palette_mode = 2;
 	task.endian_mode = 0;
@@ -10832,7 +11344,7 @@ static void rk_rga2_palette_emit_kunit(struct kunit *test)
 	expected_src_info = FIELD_PREP(RK_RGA2_SRC_FORMAT, 0xe);
 
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_palette(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_BASE0_OFFSET / 4],
 			lower_32_bits(task.src.yrgb_addr +
 				      (u64)task.src.y_offset * stride +
@@ -10843,10 +11355,10 @@ static void rk_rga2_palette_emit_kunit(struct kunit *test)
 			stride >> 2);
 
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	task.palette_mode = 1;
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_palette(&job), -EOPNOTSUPP);
-	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+	KUNIT_EXPECT_FALSE(test, job.exec_storage.cmd_ready);
 }
 
 static void rk_rga2_update_palette_emit_kunit(struct kunit *test)
@@ -10866,14 +11378,14 @@ static void rk_rga2_update_palette_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 1,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_update_palette(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_MODE_CTRL_OFFSET / 4],
 			FIELD_PREP(RK_RGA2_MODE_RENDER_MODE,
 				   RK_RGA2_HW_RENDER_UPDATE_PALETTE) |
@@ -10884,25 +11396,25 @@ static void rk_rga2_update_palette_emit_kunit(struct kunit *test)
 			lower_32_bits(task.pat.yrgb_addr));
 
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	task.palette_mode = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_update_palette(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_MASK_BASE_OFFSET / 4],
 			lower_32_bits(task.pat.yrgb_addr));
 
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	task.palette_mode = 4;
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_update_palette(&job),
 			-EOPNOTSUPP);
-	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+	KUNIT_EXPECT_FALSE(test, job.exec_storage.cmd_ready);
 
 	task.palette_mode = 3;
 	task.pat.act_w = 8;
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_update_palette(&job),
 			-EOPNOTSUPP);
-	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+	KUNIT_EXPECT_FALSE(test, job.exec_storage.cmd_ready);
 }
 
 static void rk_rga_request_check_kunit(struct kunit *test)
@@ -12172,11 +12684,11 @@ rk_rga_incompatible_hw_pending_acquire_kunit(struct kunit *test)
 	acquire_fence = rk_rga_kunit_alloc_fence(test);
 	KUNIT_ASSERT_NOT_NULL(test, acquire_fence);
 	dma_fence_get(acquire_fence);
-	job->acquire_fences = kcalloc(1, sizeof(*job->acquire_fences),
+	job->acquires.fences = kcalloc(1, sizeof(*job->acquires.fences),
 				      GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, job->acquire_fences);
-	job->acquire_fences[0] = acquire_fence;
-	job->acquire_fence_count = 1;
+	KUNIT_ASSERT_NOT_NULL(test, job->acquires.fences);
+	job->acquires.fences[0] = acquire_fence;
+	job->acquires.count = 1;
 
 	release_fence = rk_rga_kunit_alloc_fence(test);
 	KUNIT_ASSERT_NOT_NULL(test, release_fence);
@@ -12186,13 +12698,13 @@ rk_rga_incompatible_hw_pending_acquire_kunit(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, rk_rga_session_track_job(session, job), 0);
 	rk_rga_job_get(job);
 	KUNIT_ASSERT_EQ(test, rk_rga_job_arm_acquire_callbacks(job), 0);
-	KUNIT_ASSERT_TRUE(test, job->waiting_acquire);
+	KUNIT_ASSERT_TRUE(test, job->acquires.waiting);
 	KUNIT_ASSERT_EQ(test, dma_fence_get_status(release_fence), 0);
 
 	/* An RGA3 remains, but the RGA2/core2-only job cannot use it. */
 	rk_rga_abort_incompatible_pending_acquire_jobs(session->rga,
 						       -ENODEV);
-	flush_work(&job->acquire_work);
+	flush_work(&job->acquires.work);
 
 	KUNIT_EXPECT_TRUE(test, job->done);
 	KUNIT_EXPECT_EQ(test, job->result, -ENODEV);
@@ -12235,16 +12747,16 @@ rk_rga_incompatible_pending_acquire_oom_fallback_kunit(struct kunit *test)
 	rk_rga_job_init(compatible);
 	rk_rga_job_init(incompatible);
 	ret = kunit_add_action_or_reset(test, rk_rga_kunit_cancel_work,
-					&compatible->acquire_work);
+					&compatible->acquires.work);
 	KUNIT_ASSERT_EQ(test, ret, 0);
 	ret = kunit_add_action_or_reset(test, rk_rga_kunit_cancel_work,
-					&incompatible->acquire_work);
+					&incompatible->acquires.work);
 	KUNIT_ASSERT_EQ(test, ret, 0);
 
 	compatible->tasks = &compatible_task;
 	compatible->task_count = 1;
 	compatible->import_count = 1;
-	compatible->waiting_acquire = true;
+	compatible->acquires.waiting = true;
 	compatible->session = session;
 	compatible->rga = session->rga;
 	compatible->session_linked = true;
@@ -12252,7 +12764,7 @@ rk_rga_incompatible_pending_acquire_oom_fallback_kunit(struct kunit *test)
 	incompatible->tasks = &incompatible_task;
 	incompatible->task_count = 1;
 	incompatible->import_count = 1;
-	incompatible->waiting_acquire = true;
+	incompatible->acquires.waiting = true;
 	incompatible->session = session;
 	incompatible->rga = session->rga;
 	incompatible->session_linked = true;
@@ -12263,10 +12775,10 @@ rk_rga_incompatible_pending_acquire_oom_fallback_kunit(struct kunit *test)
 	job = rk_rga_session_take_incompatible_pending_acquire_job(
 		session, BIT(2), -ENODEV);
 	KUNIT_ASSERT_PTR_EQ(test, job, incompatible);
-	KUNIT_EXPECT_FALSE(test, incompatible->waiting_acquire);
-	KUNIT_EXPECT_EQ(test, incompatible->result, -ENODEV);
-	KUNIT_EXPECT_TRUE(test, compatible->waiting_acquire);
-	KUNIT_EXPECT_EQ(test, compatible->result, 0);
+	KUNIT_EXPECT_FALSE(test, incompatible->acquires.waiting);
+	KUNIT_EXPECT_EQ(test, incompatible->acquires.result, -ENODEV);
+	KUNIT_EXPECT_TRUE(test, compatible->acquires.waiting);
+	KUNIT_EXPECT_EQ(test, compatible->acquires.result, 0);
 	rk_rga_job_put(job);
 
 	KUNIT_EXPECT_PTR_EQ(
@@ -12278,9 +12790,9 @@ rk_rga_incompatible_pending_acquire_oom_fallback_kunit(struct kunit *test)
 	list_del_init(&compatible->session_node);
 	list_del_init(&incompatible->session_node);
 	kunit_release_action(test, rk_rga_kunit_cancel_work,
-			     &compatible->acquire_work);
+			     &compatible->acquires.work);
 	kunit_release_action(test, rk_rga_kunit_cancel_work,
-			     &incompatible->acquire_work);
+			     &incompatible->acquires.work);
 	idr_destroy(&session->imports);
 	idr_destroy(&session->requests);
 }
@@ -12322,7 +12834,7 @@ static void rk_rga_release_queued_job_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&hw->job_queue);
 	refcount_set(&hw->refs, 2);
 
-	job->hw = hw;
+	job->current_exec->hw = hw;
 	rk_rga_job_get(job);
 	job->queued = true;
 	list_add_tail(&job->node, &hw->job_queue);
@@ -12542,7 +13054,11 @@ static void rk_rga_legacy_blit_sync_wait_kunit(struct kunit *test)
 	refcount_set(&hw->refs, 1);
 	hw->type = RK_RGA_HW_RGA3;
 	hw->core_mask = BIT(0);
-	hw->active_job = active;
+	rk_rga_job_init(active);
+	active->current_exec->generation = 1;
+	active->current_exec->state = RK_RGA_TASK_EXEC_SLOTTED;
+	hw->active_ref.exec = active->current_exec;
+	hw->active_ref.generation = 1;
 	hw->rga = session.rga;
 	init_completion(&job_queued);
 	hw->kunit_job_queued = &job_queued;
@@ -12616,7 +13132,9 @@ static void rk_rga_legacy_blit_sync_wait_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, user_task->in_fence_fd, 0);
 	KUNIT_EXPECT_EQ(test, user_task->out_fence_fd, -1);
 
-	hw->active_job = NULL;
+	memset(&hw->active_ref, 0, sizeof(hw->active_ref));
+	active->current_exec->state = RK_RGA_TASK_EXEC_RETIRED;
+	KUNIT_EXPECT_TRUE(test, rk_rga_job_release_exec_storage(active));
 	list_del_init(&hw->node);
 	KUNIT_EXPECT_PTR_EQ(test, idr_remove(&session.imports, 11),
 			    src_import);
@@ -13240,8 +13758,8 @@ static void rk_rga2_mmu_plane_layout_kunit(struct kunit *test)
 	hw->type = RK_RGA_HW_RGA2;
 	mappings[0].hw = hw;
 	mappings[1].hw = hw;
-	job->mappings = mappings;
-	job->mapping_count = ARRAY_SIZE(mappings);
+	job->exec_storage.mappings = mappings;
+	job->exec_storage.mapping_count = ARRAY_SIZE(mappings);
 
 	sg_init_table(&y_sg, 1);
 	sg_dma_address(&y_sg) = 0x1003;
@@ -13284,9 +13802,9 @@ static void rk_rga2_mmu_emit_kunit(struct kunit *test)
 	struct rk_rga_job job = {
 		.tasks = &task,
 		.task_count = 1,
-		.rga2_mmu = tables,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.rga2_mmu = tables,
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 
 	rk_rga2_emit_mmu(&job);
@@ -13685,8 +14203,10 @@ static void rk_rga_acquire_fence_status_kunit(struct kunit *test)
 	struct dma_fence *fences[2];
 	struct dma_fence *err_fence;
 	struct rk_rga_job job = {
-		.acquire_fences = fences,
-		.acquire_fence_count = ARRAY_SIZE(fences),
+		.acquires = {
+			.fences = fences,
+			.count = ARRAY_SIZE(fences),
+		},
 	};
 	bool pending = false;
 
@@ -13715,8 +14235,8 @@ static void rk_rga_acquire_fence_status_kunit(struct kunit *test)
 	err_fence = rk_rga_kunit_alloc_fence(test);
 	KUNIT_ASSERT_NOT_NULL(test, err_fence);
 	rk_rga_fence_signal(err_fence, -EIO);
-	job.acquire_fences = &err_fence;
-	job.acquire_fence_count = 1;
+	job.acquires.fences = &err_fence;
+	job.acquires.count = 1;
 	pending = false;
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_acquire_status(&job, &pending),
@@ -13736,35 +14256,35 @@ static void rk_rga_acquire_callbacks_result_kunit(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, job);
 	rk_rga_job_init(job);
 
-	job->acquire_fences = kcalloc(2, sizeof(*job->acquire_fences),
+	job->acquires.fences = kcalloc(2, sizeof(*job->acquires.fences),
 				      GFP_KERNEL);
-	if (!job->acquire_fences) {
+	if (!job->acquires.fences) {
 		kfree(job);
 		KUNIT_FAIL(test, "failed to allocate acquire fence array");
 		return;
 	}
-	job->acquire_fence_count = 2;
+	job->acquires.count = 2;
 
-	job->acquire_fences[0] = rk_rga_kunit_alloc_fence(test);
-	if (!job->acquire_fences[0]) {
-		kfree(job->acquire_fences);
+	job->acquires.fences[0] = rk_rga_kunit_alloc_fence(test);
+	if (!job->acquires.fences[0]) {
+		kfree(job->acquires.fences);
 		kfree(job);
 		KUNIT_FAIL(test, "failed to allocate ready fence");
 		return;
 	}
-	job->acquire_fences[1] = rk_rga_kunit_alloc_fence(test);
-	if (!job->acquire_fences[1]) {
-		kfree(job->acquire_fences);
+	job->acquires.fences[1] = rk_rga_kunit_alloc_fence(test);
+	if (!job->acquires.fences[1]) {
+		kfree(job->acquires.fences);
 		kfree(job);
 		KUNIT_FAIL(test, "failed to allocate pending fence");
 		return;
 	}
 	kunit_remove_action(test, rk_rga_kunit_fence_put,
-			    job->acquire_fences[0]);
+			    job->acquires.fences[0]);
 	kunit_remove_action(test, rk_rga_kunit_fence_put,
-			    job->acquire_fences[1]);
+			    job->acquires.fences[1]);
 
-	rk_rga_fence_signal(job->acquire_fences[0], 0);
+	rk_rga_fence_signal(job->acquires.fences[0], 0);
 	rk_rga_job_get(job);
 	ret = rk_rga_job_arm_acquire_callbacks(job);
 	KUNIT_EXPECT_EQ(test, ret, 0);
@@ -13774,15 +14294,15 @@ static void rk_rga_acquire_callbacks_result_kunit(struct kunit *test)
 		return;
 	}
 
-	KUNIT_EXPECT_EQ(test, atomic_read(&job->pending_acquire_count), 1);
-	KUNIT_EXPECT_TRUE(test, job->waiting_acquire);
+	KUNIT_EXPECT_EQ(test, atomic_read(&job->acquires.pending_count), 1);
+	KUNIT_EXPECT_TRUE(test, job->acquires.waiting);
 	KUNIT_EXPECT_FALSE(test, job->done);
 
-	rk_rga_fence_signal(job->acquire_fences[1], -EIO);
-	flush_work(&job->acquire_work);
+	rk_rga_fence_signal(job->acquires.fences[1], -EIO);
+	flush_work(&job->acquires.work);
 
 	KUNIT_EXPECT_EQ(test, job->result, -EIO);
-	KUNIT_EXPECT_FALSE(test, job->waiting_acquire);
+	KUNIT_EXPECT_FALSE(test, job->acquires.waiting);
 	KUNIT_EXPECT_TRUE(test, job->done);
 
 	rk_rga_job_put(job);
@@ -13798,23 +14318,23 @@ static void rk_rga_acquire_abort_during_arming_kunit(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, job);
 	rk_rga_job_init(job);
 
-	job->acquire_fences = kcalloc(2, sizeof(*job->acquire_fences),
+	job->acquires.fences = kcalloc(2, sizeof(*job->acquires.fences),
 				      GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, job->acquire_fences);
-	job->acquire_waiters = kcalloc(2, sizeof(*job->acquire_waiters),
+	KUNIT_ASSERT_NOT_NULL(test, job->acquires.fences);
+	job->acquires.waiters = kcalloc(2, sizeof(*job->acquires.waiters),
 				       GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, job->acquire_waiters);
-	job->acquire_fence_count = 2;
+	KUNIT_ASSERT_NOT_NULL(test, job->acquires.waiters);
+	job->acquires.count = 2;
 	for (u32 i = 0; i < ARRAY_SIZE(fences); i++) {
 		fences[i] = rk_rga_kunit_alloc_fence(test);
 		KUNIT_ASSERT_NOT_NULL(test, fences[i]);
-		job->acquire_fences[i] = fences[i];
+		job->acquires.fences[i] = fences[i];
 		kunit_remove_action(test, rk_rga_kunit_fence_put, fences[i]);
 	}
 
-	atomic_set(&job->pending_acquire_count, 1);
-	atomic_set(&job->acquire_work_queued, 0);
-	WRITE_ONCE(job->result, 0);
+	atomic_set(&job->acquires.pending_count, 1);
+	atomic_set(&job->acquires.work_queued, 0);
+	WRITE_ONCE(job->acquires.result, 0);
 	rk_rga_job_get(job);
 
 	/*
@@ -13822,36 +14342,36 @@ static void rk_rga_acquire_abort_during_arming_kunit(struct kunit *test)
 	 * but the sentinel prevents work from being queued and waiting_acquire is
 	 * not visible to abort paths yet.
 	 */
-	atomic_inc(&job->pending_acquire_count);
-	job->acquire_waiters[0].job = job;
+	atomic_inc(&job->acquires.pending_count);
+	job->acquires.waiters[0].set = &job->acquires;
 	ret = dma_fence_add_callback(fences[0],
-				     &job->acquire_waiters[0].cb,
+				     &job->acquires.waiters[0].cb,
 				     rk_rga_job_acquire_cb);
 	KUNIT_ASSERT_EQ(test, ret, 0);
 	rk_rga_fence_signal(fences[0], 0);
-	KUNIT_EXPECT_EQ(test, atomic_read(&job->pending_acquire_count), 1);
-	KUNIT_EXPECT_PTR_EQ(test, job->acquire_waiters[0].job, NULL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&job->acquire_work_queued), 0);
-	KUNIT_EXPECT_FALSE(test, job->waiting_acquire);
+	KUNIT_EXPECT_EQ(test, atomic_read(&job->acquires.pending_count), 1);
+	KUNIT_EXPECT_PTR_EQ(test, job->acquires.waiters[0].set, NULL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&job->acquires.work_queued), 0);
+	KUNIT_EXPECT_FALSE(test, job->acquires.waiting);
 	KUNIT_EXPECT_FALSE(test, job->done);
 
-	atomic_inc(&job->pending_acquire_count);
-	job->acquire_waiters[1].job = job;
+	atomic_inc(&job->acquires.pending_count);
+	job->acquires.waiters[1].set = &job->acquires;
 	ret = dma_fence_add_callback(fences[1],
-				     &job->acquire_waiters[1].cb,
+				     &job->acquires.waiters[1].cb,
 				     rk_rga_job_acquire_cb);
 	KUNIT_ASSERT_EQ(test, ret, 0);
 	rk_rga_job_publish_armed_acquire_callbacks(job);
-	KUNIT_EXPECT_TRUE(test, job->waiting_acquire);
-	KUNIT_EXPECT_EQ(test, atomic_read(&job->pending_acquire_count), 1);
-	KUNIT_EXPECT_EQ(test, atomic_read(&job->acquire_work_queued), 0);
+	KUNIT_EXPECT_TRUE(test, job->acquires.waiting);
+	KUNIT_EXPECT_EQ(test, atomic_read(&job->acquires.pending_count), 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&job->acquires.work_queued), 0);
 
 	/* Once published, every visible waiter has a valid registered callback. */
 	rk_rga_job_abort_pending_acquire(job, -ECANCELED);
-	KUNIT_EXPECT_PTR_EQ(test, job->acquire_waiters[1].job, NULL);
-	KUNIT_EXPECT_EQ(test, atomic_read(&job->pending_acquire_count), 0);
-	KUNIT_EXPECT_EQ(test, atomic_read(&job->acquire_work_queued), 1);
-	flush_work(&job->acquire_work);
+	KUNIT_EXPECT_PTR_EQ(test, job->acquires.waiters[1].set, NULL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&job->acquires.pending_count), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&job->acquires.work_queued), 1);
+	flush_work(&job->acquires.work);
 	KUNIT_EXPECT_TRUE(test, job->done);
 	KUNIT_EXPECT_EQ(test, job->result, -ECANCELED);
 	KUNIT_EXPECT_EQ(test, refcount_read(&job->refs), 1);
@@ -13910,32 +14430,32 @@ static void rk_rga_acquire_abort_queues_last_kunit(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, job);
 	rk_rga_job_init(job);
 
-	job->acquire_fences = kcalloc(ARRAY_SIZE(fences),
-				      sizeof(*job->acquire_fences),
+	job->acquires.fences = kcalloc(ARRAY_SIZE(fences),
+				      sizeof(*job->acquires.fences),
 				      GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, job->acquire_fences);
-	job->acquire_waiters = kcalloc(ARRAY_SIZE(fences),
-				       sizeof(*job->acquire_waiters),
+	KUNIT_ASSERT_NOT_NULL(test, job->acquires.fences);
+	job->acquires.waiters = kcalloc(ARRAY_SIZE(fences),
+				       sizeof(*job->acquires.waiters),
 				       GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, job->acquire_waiters);
-	job->acquire_fence_count = ARRAY_SIZE(fences);
+	KUNIT_ASSERT_NOT_NULL(test, job->acquires.waiters);
+	job->acquires.count = ARRAY_SIZE(fences);
 	for (u32 i = 0; i < ARRAY_SIZE(fences); i++) {
 		fences[i] = rk_rga_kunit_alloc_fence(test);
 		KUNIT_ASSERT_NOT_NULL(test, fences[i]);
-		job->acquire_fences[i] = fences[i];
+		job->acquires.fences[i] = fences[i];
 		kunit_remove_action(test, rk_rga_kunit_fence_put, fences[i]);
 	}
 
 	/* Two callbacks race, with the arming bias already dropped. */
-	atomic_set(&job->pending_acquire_count, ARRAY_SIZE(fences));
-	atomic_set(&job->acquire_work_queued, 0);
-	WRITE_ONCE(job->result, 0);
-	WRITE_ONCE(job->waiting_acquire, true);
+	atomic_set(&job->acquires.pending_count, ARRAY_SIZE(fences));
+	atomic_set(&job->acquires.work_queued, 0);
+	WRITE_ONCE(job->acquires.result, 0);
+	WRITE_ONCE(job->acquires.waiting, true);
 	rk_rga_job_get(job);
 	for (u32 i = 0; i < ARRAY_SIZE(fences); i++) {
-		job->acquire_waiters[i].job = job;
+		job->acquires.waiters[i].set = &job->acquires;
 		ret = dma_fence_add_callback(fences[i],
-					     &job->acquire_waiters[i].cb,
+					     &job->acquires.waiters[i].cb,
 					     rk_rga_job_acquire_cb);
 		KUNIT_ASSERT_EQ(test, ret, 0);
 	}
@@ -13958,7 +14478,7 @@ static void rk_rga_acquire_abort_queues_last_kunit(struct kunit *test)
 				  "rga-kunit-signal");
 	if (IS_ERR(signal_task)) {
 		rk_rga_job_abort_pending_acquire(job, -ECANCELED);
-		flush_work(&job->acquire_work);
+		flush_work(&job->acquires.work);
 		rk_rga_job_put(job);
 		KUNIT_FAIL_AND_ABORT(test, "failed to start signal thread");
 	}
@@ -13968,7 +14488,7 @@ static void rk_rga_acquire_abort_queues_last_kunit(struct kunit *test)
 		complete_all(&start);
 		kthread_stop(signal_task);
 		rk_rga_job_abort_pending_acquire(job, -ECANCELED);
-		flush_work(&job->acquire_work);
+		flush_work(&job->acquires.work);
 		rk_rga_job_put(job);
 		KUNIT_FAIL_AND_ABORT(test, "failed to start abort thread");
 	}
@@ -13984,11 +14504,11 @@ static void rk_rga_acquire_abort_queues_last_kunit(struct kunit *test)
 	kthread_stop(signal_task);
 	kthread_stop(abort_task);
 
-	KUNIT_EXPECT_EQ(test, atomic_read(&job->acquire_work_queued), 1);
-	KUNIT_EXPECT_PTR_EQ(test, job->acquire_waiters[0].job, NULL);
-	KUNIT_EXPECT_PTR_EQ(test, job->acquire_waiters[1].job, NULL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&job->acquires.work_queued), 1);
+	KUNIT_EXPECT_PTR_EQ(test, job->acquires.waiters[0].set, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, job->acquires.waiters[1].set, NULL);
 
-	flush_work(&job->acquire_work);
+	flush_work(&job->acquires.work);
 	KUNIT_EXPECT_TRUE(test, job->done);
 	KUNIT_EXPECT_EQ(test, job->result, -ECANCELED);
 	KUNIT_EXPECT_EQ(test, refcount_read(&job->refs), 1);
@@ -14864,8 +15384,8 @@ static void rk_rga_iova_import_identity_kunit(struct kunit *test)
 		},
 	};
 	struct rk_rga_job job = {
-		.mappings = mappings,
-		.mapping_count = ARRAY_SIZE(mappings),
+		.exec_storage.mappings = mappings,
+		.exec_storage.mapping_count = ARRAY_SIZE(mappings),
 	};
 	struct rk_rga_img_imports img_imports = {
 		.yrgb = &import_b,
@@ -14910,7 +15430,7 @@ static void rk_rga_iova_import_identity_kunit(struct kunit *test)
 						    RK_RGA2_MMU_SRC0),
 			0);
 	KUNIT_EXPECT_EQ(test, img.yrgb_addr, (__u64)0x70000000);
-	KUNIT_EXPECT_EQ(test, job.mapping_count, ARRAY_SIZE(mappings));
+	KUNIT_EXPECT_EQ(test, job.exec_storage.mapping_count, ARRAY_SIZE(mappings));
 	KUNIT_EXPECT_EQ(test, refcount_read(&import_a.refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&import_b.refs), 1);
 }
@@ -15099,22 +15619,23 @@ static void rk_rga_dma_mapping_hw_lifetime_kunit(struct kunit *test)
 	hw.regs_live_count = 1;
 	refcount_set(&hw.refs, 1);
 	init_waitqueue_head(&hw.idle);
+	rk_rga_job_init_first_exec(&job);
 
-	job.mappings = kcalloc(1, sizeof(*job.mappings), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, job.mappings);
-	job.mapping_count = 1;
-	job.mappings[0].hw = &hw;
-	job.userptr_device_owned = true;
+	job.exec_storage.mappings = kcalloc(1, sizeof(*job.exec_storage.mappings), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job.exec_storage.mappings);
+	job.exec_storage.mapping_count = 1;
+	job.exec_storage.mappings[0].hw = &hw;
+	job.exec_storage.userptr_device_owned = true;
 	refcount_inc(&hw.refs);
 	mutex_init(&hw.run_lock);
-	job.hw = &hw;
+	job.current_exec->hw = &hw;
 	mutex_lock(&hw.run_lock);
-	rk_rga_job_release_execution_mappings_powered(&job, &hw);
+	rk_rga_task_exec_release_mappings_powered(job.current_exec, &hw);
 	mutex_unlock(&hw.run_lock);
 	KUNIT_EXPECT_EQ(test, refcount_read(&hw.refs), 1);
-	KUNIT_EXPECT_PTR_EQ(test, job.mappings, NULL);
-	KUNIT_EXPECT_EQ(test, job.mapping_count, 0U);
-	KUNIT_EXPECT_FALSE(test, job.userptr_device_owned);
+	KUNIT_EXPECT_PTR_EQ(test, job.exec_storage.mappings, NULL);
+	KUNIT_EXPECT_EQ(test, job.exec_storage.mapping_count, 0U);
+	KUNIT_EXPECT_FALSE(test, job.exec_storage.userptr_device_owned);
 }
 
 static void rk_rga_direct_import_reuse_kunit(struct kunit *test)
@@ -15217,7 +15738,7 @@ static void rk_rga_session_dispatch_close_handoff_kunit(struct kunit *test)
 	/* Model the shared reference owned by queued acquire work. */
 	rk_rga_job_get(job);
 	rk_rga_session_mark_closing(&worker_session);
-	rk_rga_job_acquire_work(&job->acquire_work);
+	rk_rga_job_acquire_work(&job->acquires.work);
 
 	KUNIT_EXPECT_TRUE(test, job->done);
 	KUNIT_EXPECT_EQ(test, job->result, -EFAULT);
@@ -15371,8 +15892,8 @@ static void rk_rga_hw_abort_queued_jobs_kunit(struct kunit *test)
 	rk_rga_job_init(job1);
 	rk_rga_job_get(job0);
 	rk_rga_job_get(job1);
-	job0->hw = hw;
-	job1->hw = hw;
+	job0->current_exec->hw = hw;
+	job1->current_exec->hw = hw;
 	job0->queued = true;
 	job1->queued = true;
 
@@ -15399,8 +15920,8 @@ static void rk_rga_hw_abort_queued_jobs_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, job1->done);
 	KUNIT_EXPECT_EQ(test, job0->result, -ENODEV);
 	KUNIT_EXPECT_EQ(test, job1->result, -ENODEV);
-	KUNIT_EXPECT_PTR_EQ(test, job0->hw, NULL);
-	KUNIT_EXPECT_PTR_EQ(test, job1->hw, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, rk_rga_job_hw(job0), NULL);
+	KUNIT_EXPECT_PTR_EQ(test, rk_rga_job_hw(job1), NULL);
 	KUNIT_EXPECT_EQ(test, refcount_read(&job0->refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&job1->refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&hw->refs), 1);
@@ -15428,7 +15949,6 @@ static void rk_rga_queue_on_removing_hw_kunit(struct kunit *test)
 	job = kzalloc_obj(*job, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, job);
 	rk_rga_job_init(job);
-	job->hw = NULL;
 
 	fence = rk_rga_kunit_alloc_fence(test);
 	KUNIT_ASSERT_NOT_NULL(test, fence);
@@ -15442,7 +15962,7 @@ static void rk_rga_queue_on_removing_hw_kunit(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, job->queued);
 	KUNIT_EXPECT_TRUE(test, job->done);
 	KUNIT_EXPECT_EQ(test, job->result, -ENODEV);
-	KUNIT_EXPECT_PTR_EQ(test, job->hw, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, rk_rga_job_hw(job), NULL);
 	KUNIT_EXPECT_EQ(test, refcount_read(&job->refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&hw.refs), 1);
 	KUNIT_EXPECT_EQ(test, dma_fence_get_status(fence), -ENODEV);
@@ -15478,7 +15998,7 @@ static void rk_rga_queue_on_recovery_failed_hw_kunit(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, job->queued);
 	KUNIT_EXPECT_TRUE(test, job->done);
 	KUNIT_EXPECT_EQ(test, job->result, -EIO);
-	KUNIT_EXPECT_PTR_EQ(test, job->hw, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, rk_rga_job_hw(job), NULL);
 	KUNIT_EXPECT_EQ(test, refcount_read(&job->refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&hw.refs), 1);
 	KUNIT_EXPECT_EQ(test, dma_fence_get_status(fence), -EIO);
@@ -15507,8 +16027,8 @@ static void rk_rga_recovery_failed_dispatch_kunit(struct kunit *test)
 	rk_rga_job_init(job1);
 	rk_rga_job_get(job0);
 	rk_rga_job_get(job1);
-	job0->hw = &hw;
-	job1->hw = &hw;
+	job0->current_exec->hw = &hw;
+	job1->current_exec->hw = &hw;
 	job0->queued = true;
 	job1->queued = true;
 	list_add_tail(&job0->node, &hw.job_queue);
@@ -15519,7 +16039,7 @@ static void rk_rga_recovery_failed_dispatch_kunit(struct kunit *test)
 
 	KUNIT_EXPECT_TRUE(test, list_empty(&hw.job_queue));
 	KUNIT_EXPECT_EQ(test, hw.queued_jobs, 0U);
-	KUNIT_EXPECT_PTR_EQ(test, hw.active_job, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, hw.active_ref.exec, NULL);
 	KUNIT_EXPECT_TRUE(test, job0->done);
 	KUNIT_EXPECT_TRUE(test, job1->done);
 	KUNIT_EXPECT_EQ(test, job0->result, -EIO);
@@ -15662,29 +16182,34 @@ static void rk_rga_irq_completion_result_kunit(struct kunit *test)
 {
 	struct rk_rga_job job = { };
 
-	job.intr_status = RK_RGA3_INT_FRM_DONE;
+	job.exec_storage.intr_status = RK_RGA3_INT_FRM_DONE;
 	KUNIT_EXPECT_EQ(test,
-			rk_rga_irq_completion_result(RK_RGA_HW_RGA3, &job), 0);
-	job.intr_status = RK_RGA3_INT_FRM_DONE | RK_RGA3_INT_RGA_MMU_INTR;
+			rk_rga_irq_completion_result(RK_RGA_HW_RGA3,
+						     &job.exec_storage), 0);
+	job.exec_storage.intr_status = RK_RGA3_INT_FRM_DONE | RK_RGA3_INT_RGA_MMU_INTR;
 	KUNIT_EXPECT_EQ(test,
-			rk_rga_irq_completion_result(RK_RGA_HW_RGA3, &job),
+			rk_rga_irq_completion_result(RK_RGA_HW_RGA3,
+						     &job.exec_storage),
 			-EACCES);
-	job.intr_status = RK_RGA3_INT_FRM_DONE |
+	job.exec_storage.intr_status = RK_RGA3_INT_FRM_DONE |
 			  RK_RGA3_INT_RGA_MI_RD_BUS_ERR;
 	KUNIT_EXPECT_EQ(test,
-			rk_rga_irq_completion_result(RK_RGA_HW_RGA3, &job),
+			rk_rga_irq_completion_result(RK_RGA_HW_RGA3,
+						     &job.exec_storage),
 			-EFAULT);
 
-	job.intr_status = RK_RGA2_INT_ALL_CMD_DONE_INT_FLAG |
+	job.exec_storage.intr_status = RK_RGA2_INT_ALL_CMD_DONE_INT_FLAG |
 			  RK_RGA2_INT_MMU_INT_FLAG;
 	KUNIT_EXPECT_EQ(test,
-			rk_rga_irq_completion_result(RK_RGA_HW_RGA2, &job),
+			rk_rga_irq_completion_result(RK_RGA_HW_RGA2,
+						     &job.exec_storage),
 			-EACCES);
-	job.intr_status = RK_RGA2_INT_ALL_CMD_DONE_INT_FLAG |
+	job.exec_storage.intr_status = RK_RGA2_INT_ALL_CMD_DONE_INT_FLAG |
 			  RK_RGA2_INT_CONFIG_ERR;
-	job.parse_status = RK_RGA2_PARSE_SRC1_ODD_VIOLATION;
+	job.exec_storage.parse_status = RK_RGA2_PARSE_SRC1_ODD_VIOLATION;
 	KUNIT_EXPECT_EQ(test,
-			rk_rga_irq_completion_result(RK_RGA_HW_RGA2, &job),
+			rk_rga_irq_completion_result(RK_RGA_HW_RGA2,
+						     &job.exec_storage),
 			-EACCES);
 	KUNIT_EXPECT_TRUE(test, RK_RGA2_INT_ERROR_MASK &
 			  RK_RGA2_INT_CONFIG_ERR);
@@ -15695,7 +16220,7 @@ static void rk_rga_irq_completion_result_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, RK_RGA2_PARSE_KNOWN_MASK, GENMASK(3, 0));
 	KUNIT_EXPECT_EQ(test,
 			rk_rga_irq_completion_result((enum rk_rga_hw_type)-1,
-						     &job),
+						     &job.exec_storage),
 			-EINVAL);
 }
 
@@ -15814,11 +16339,13 @@ static void rk_rga_mixed_task_core_handoff_kunit(struct kunit *test)
 	selected = rk_rga_find_best_hw_for_job(&hw_list, &job, type_mask, 0);
 	KUNIT_ASSERT_PTR_EQ(test, selected, rga3);
 
-	job.hw = selected;
+	rk_rga_job_init_first_exec(&job);
+	job.current_exec->hw = selected;
+	job.current_exec->state = RK_RGA_TASK_EXEC_RECLAIMABLE;
 	job.dmabuf_incompatible_hw_type_mask = RK_RGA_HW_TYPE_MASK_RGA2;
-	KUNIT_EXPECT_TRUE(test, rk_rga_job_advance_task(&job, 0));
 	rk_rga_job_release_hw(&job);
-	KUNIT_EXPECT_PTR_EQ(test, job.hw, NULL);
+	KUNIT_EXPECT_TRUE(test, rk_rga_kunit_advance_task(&job, 0));
+	KUNIT_EXPECT_PTR_EQ(test, rk_rga_job_hw(&job), NULL);
 	KUNIT_EXPECT_EQ(test, refcount_read(&rga3->refs), 1);
 	KUNIT_EXPECT_EQ(test, job.current_task, 1U);
 	KUNIT_EXPECT_EQ(test, job.dmabuf_incompatible_hw_type_mask, 0U);
@@ -15830,6 +16357,7 @@ static void rk_rga_mixed_task_core_handoff_kunit(struct kunit *test)
 	selected = rk_rga_find_best_hw_for_job(&hw_list, &job, type_mask, 0);
 	KUNIT_EXPECT_PTR_EQ(test, selected, rga2);
 	KUNIT_EXPECT_EQ(test, refcount_read(&rga2->refs), 1);
+	KUNIT_EXPECT_TRUE(test, rk_rga_job_release_exec_storage(&job));
 }
 
 static void rk_rga_bitblt_hw_type_mask_kunit(struct kunit *test)
@@ -15986,6 +16514,7 @@ static void rk_rga_find_best_hw_for_job_kunit(struct kunit *test)
 
 	*task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
 					  RK_RGA_FORMAT_BGRA_8888);
+	rk_rga_job_init(active);
 	job->tasks = task;
 	job->task_count = 1;
 	busy->type = RK_RGA_HW_RGA3;
@@ -16027,7 +16556,10 @@ static void rk_rga_find_best_hw_for_job_kunit(struct kunit *test)
 			    idle);
 
 	task->core = 0;
-	idle->active_job = active;
+	active->current_exec->generation = 1;
+	active->current_exec->state = RK_RGA_TASK_EXEC_SLOTTED;
+	idle->active_ref.exec = active->current_exec;
+	idle->active_ref.generation = 1;
 	idle->queued_jobs = 3;
 	KUNIT_EXPECT_PTR_EQ(test,
 			    rk_rga_find_best_hw_for_job(&hw_list, job,
@@ -16087,9 +16619,9 @@ static void rk_rga_find_best_hw_for_job_kunit(struct kunit *test)
 	job->task_count = 1;
 	job->current_task = 0;
 	task->core = 0;
-	idle->active_job = NULL;
+	memset(&idle->active_ref, 0, sizeof(idle->active_ref));
 	idle->queued_jobs = 0;
-	busy->active_job = NULL;
+	memset(&busy->active_ref, 0, sizeof(busy->active_ref));
 	busy->queued_jobs = 0;
 	busy->removing = false;
 	KUNIT_EXPECT_PTR_EQ(test,
@@ -16297,90 +16829,112 @@ static void rk_rga_priority_enqueue_kunit(struct kunit *test)
 
 static void rk_rga_iommu_fault_generation_kunit(struct kunit *test)
 {
+	struct rk_rga_task_exec_ref claim = {};
+	struct rk_rga_task_exec_ref fault = {};
+	struct rk_rga_task_exec *taken;
 	struct rk_rga_hw *hw;
 	struct rk_rga_job target = {};
 	struct rk_rga_job replacement = {};
-	struct rk_rga_job *taken;
 	unsigned long flags;
 	bool matches;
-	bool queued;
-	int ret;
 
-	/* Both embedded work items use ordinary, non-stack initializers. */
 	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, hw);
 	spin_lock_init(&hw->job_lock);
 	init_waitqueue_head(&hw->idle);
 	mutex_init(&hw->run_lock);
-	INIT_DELAYED_WORK(&hw->timeout_work, rk_rga_hw_timeout_work);
-	INIT_WORK(&hw->iommu_fault_work, rk_rga_hw_iommu_fault_work);
-	ret = kunit_add_action_or_reset(test, rk_rga_kunit_cancel_hw_work,
-					hw);
-	KUNIT_ASSERT_EQ(test, ret, 0);
+	INIT_LIST_HEAD(&hw->iommu_fault_events);
+	rk_rga_job_init(&target);
+	rk_rga_job_init(&replacement);
 
-	hw->active_generation = U64_MAX;
-	hw->iommu_fault_generation = 7;
+	hw->activation_generation_seq = U64_MAX;
 	mutex_lock(&hw->run_lock);
 	spin_lock_irqsave(&hw->job_lock, flags);
-	rk_rga_hw_install_active_locked(hw, &target);
+	KUNIT_ASSERT_TRUE(test, rk_rga_hw_install_active_locked(
+					hw, target.current_exec));
 	spin_unlock_irqrestore(&hw->job_lock, flags);
 	mutex_unlock(&hw->run_lock);
-	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, &target);
-	KUNIT_EXPECT_EQ(test, hw->active_generation, 1ULL);
-	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 0ULL);
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_ref.exec, target.current_exec);
+	KUNIT_EXPECT_EQ(test, hw->active_ref.generation, 1ULL);
+	KUNIT_ASSERT_TRUE(test, rk_rga_hw_mark_iommu_fault(hw));
+	KUNIT_ASSERT_TRUE(test, rk_rga_hw_take_iommu_fault_ref(hw, &fault));
 	spin_lock_irqsave(&hw->job_lock, flags);
-	taken = rk_rga_hw_take_active_locked(hw);
-	spin_unlock_irqrestore(&hw->job_lock, flags);
-	KUNIT_EXPECT_PTR_EQ(test, taken, &target);
-	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, NULL);
-
-	hw->active_job = &target;
-	hw->active_generation = 1;
-	hw->iommu_fault_generation = 1;
-	spin_lock_irqsave(&hw->job_lock, flags);
-	matches = rk_rga_hw_iommu_fault_matches_locked(hw);
+	matches = rk_rga_hw_iommu_fault_matches_locked(hw, &fault);
+	taken = rk_rga_hw_take_active_locked(hw, &claim);
 	spin_unlock_irqrestore(&hw->job_lock, flags);
 	KUNIT_EXPECT_TRUE(test, matches);
-	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 0ULL);
+	KUNIT_EXPECT_PTR_EQ(test, taken, target.current_exec);
+	KUNIT_EXPECT_TRUE(test, rk_rga_task_exec_retire(taken));
+	KUNIT_EXPECT_TRUE(test, rk_rga_task_exec_ref_put(&claim));
 
-	hw->active_job = &replacement;
-	hw->active_generation = 2;
-	hw->iommu_fault_generation = 1;
-	queued = schedule_delayed_work(&hw->timeout_work,
-				       msecs_to_jiffies(60000));
-	KUNIT_ASSERT_TRUE(test, queued);
+	mutex_lock(&hw->run_lock);
+	spin_lock_irqsave(&hw->job_lock, flags);
+	KUNIT_ASSERT_TRUE(test, rk_rga_hw_install_active_locked(
+					hw, replacement.current_exec));
+	matches = rk_rga_hw_iommu_fault_matches_locked(hw, &fault);
+	spin_unlock_irqrestore(&hw->job_lock, flags);
+	mutex_unlock(&hw->run_lock);
+	KUNIT_EXPECT_FALSE(test, matches);
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_ref.exec,
+			    replacement.current_exec);
+	KUNIT_EXPECT_TRUE(test, rk_rga_task_exec_ref_put(&fault));
 
-	rk_rga_hw_iommu_fault_work(&hw->iommu_fault_work);
-
-	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, &replacement);
-	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 0ULL);
-	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&hw->timeout_work));
-	kunit_release_action(test, rk_rga_kunit_cancel_hw_work, hw);
+	spin_lock_irqsave(&hw->job_lock, flags);
+	taken = rk_rga_hw_take_active_locked(hw, &claim);
+	spin_unlock_irqrestore(&hw->job_lock, flags);
+	KUNIT_ASSERT_NOT_NULL(test, taken);
+	KUNIT_EXPECT_TRUE(test, rk_rga_task_exec_retire(taken));
+	KUNIT_EXPECT_TRUE(test, rk_rga_task_exec_ref_put(&claim));
+	KUNIT_EXPECT_TRUE(test, rk_rga_job_release_exec_storage(&target));
+	KUNIT_EXPECT_TRUE(test, rk_rga_job_release_exec_storage(&replacement));
 }
 
 static void rk_rga_reset_failure_retains_active_kunit(struct kunit *test)
 {
+	struct rk_rga_task_exec_ref claim = {};
+	struct rk_rga_retirement retirement = {};
+	struct rk_rga_task_exec *taken;
 	struct rk_rga_hw *hw;
 	struct rk_rga_job target = {};
-	struct rk_rga_job replacement = {};
+	unsigned long flags;
+	bool quarantined = false;
 
 	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, hw);
 	spin_lock_init(&hw->job_lock);
-	hw->active_generation = 7;
+	mutex_init(&hw->run_lock);
+	INIT_LIST_HEAD(&hw->iommu_fault_events);
+	rk_rga_job_init(&target);
+	hw->activation_generation_seq = 6;
+	mutex_lock(&hw->run_lock);
+	spin_lock_irqsave(&hw->job_lock, flags);
+	KUNIT_ASSERT_TRUE(test, rk_rga_hw_install_active_locked(
+					hw, target.current_exec));
+	taken = rk_rga_hw_take_active_locked(hw, &claim);
+	spin_unlock_irqrestore(&hw->job_lock, flags);
+	if (taken == target.current_exec)
+		quarantined = rk_rga_task_exec_retire_engine(
+			hw, &claim, -EIO, false, &retirement);
+	mutex_unlock(&hw->run_lock);
+	KUNIT_ASSERT_PTR_EQ(test, taken, target.current_exec);
+	KUNIT_ASSERT_TRUE(test, quarantined);
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_ref.exec, target.current_exec);
+	KUNIT_EXPECT_EQ(test, hw->active_ref.generation, 7ULL);
+	KUNIT_EXPECT_EQ(test, target.current_exec->state,
+			RK_RGA_TASK_EXEC_QUARANTINED);
+	KUNIT_EXPECT_PTR_EQ(test, retirement.job, &target);
+	KUNIT_EXPECT_EQ(test, retirement.result, -EIO);
+	KUNIT_EXPECT_EQ(test, retirement.disposition,
+			RK_RGA_RETIRE_QUARANTINED);
+	KUNIT_EXPECT_TRUE(test, rk_rga_task_exec_ref_empty(&claim));
 
-	KUNIT_EXPECT_TRUE(test,
-			  rk_rga_hw_restore_active_after_reset_failure(hw,
-								       &target,
-								       true));
-	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, &target);
-	KUNIT_EXPECT_EQ(test, hw->iommu_fault_generation, 7ULL);
-
-	KUNIT_EXPECT_FALSE(test,
-			   rk_rga_hw_restore_active_after_reset_failure(hw,
-									&replacement,
-									false));
-	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, &target);
+	spin_lock_irqsave(&hw->job_lock, flags);
+	taken = rk_rga_hw_take_active_locked(hw, &claim);
+	spin_unlock_irqrestore(&hw->job_lock, flags);
+	KUNIT_ASSERT_NOT_NULL(test, taken);
+	KUNIT_EXPECT_TRUE(test, rk_rga_task_exec_retire(taken));
+	KUNIT_EXPECT_TRUE(test, rk_rga_task_exec_ref_put(&claim));
+	KUNIT_EXPECT_TRUE(test, rk_rga_job_release_exec_storage(&target));
 }
 
 static void rk_rga_abort_reset_failure_retains_dma_kunit(struct kunit *test)
@@ -16413,31 +16967,49 @@ static void rk_rga_abort_reset_failure_retains_dma_kunit(struct kunit *test)
 	hw->dev = dev;
 	hw->rga = rga;
 	hw->match = &match;
-	hw->active_job = job;
 	hw->regs_live_count = 1;
 	hw->kunit_recovery_reset_result = -ETIMEDOUT;
 	refcount_set(&hw->refs, 3);
 
-	job->hw = hw;
+	rk_rga_job_init(job);
+	job->current_exec->hw = hw;
 	job->rga = rga;
-	job->mappings = &mapping;
-	job->mapping_count = 1;
-	job->userptr_device_owned = true;
+	job->exec_storage.mappings = &mapping;
+	job->exec_storage.mapping_count = 1;
+	job->exec_storage.userptr_device_owned = true;
+	mutex_lock(&hw->run_lock);
+	spin_lock_irq(&hw->job_lock);
+	KUNIT_ASSERT_TRUE(test, rk_rga_hw_install_active_locked(
+					hw, job->current_exec));
+	spin_unlock_irq(&hw->job_lock);
+	mutex_unlock(&hw->run_lock);
 
 	ret = rk_rga_hw_abort_jobs(hw, -ENODEV);
 	KUNIT_EXPECT_EQ(test, ret, -ETIMEDOUT);
-	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, job);
-	KUNIT_EXPECT_PTR_EQ(test, job->mappings, &mapping);
-	KUNIT_EXPECT_EQ(test, job->mapping_count, 1U);
-	KUNIT_EXPECT_TRUE(test, job->userptr_device_owned);
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_ref.exec, job->current_exec);
+	KUNIT_EXPECT_EQ(test, job->current_exec->state,
+			RK_RGA_TASK_EXEC_QUARANTINED);
+	KUNIT_EXPECT_PTR_EQ(test, job->exec_storage.mappings, &mapping);
+	KUNIT_EXPECT_EQ(test, job->exec_storage.mapping_count, 1U);
+	KUNIT_EXPECT_TRUE(test, job->exec_storage.userptr_device_owned);
 	KUNIT_EXPECT_EQ(test, hw->regs_live_count, 1U);
 	KUNIT_EXPECT_EQ(test, refcount_read(&hw->refs), 3);
 	KUNIT_EXPECT_FALSE(test, job->done);
 
 	/* Stack-backed mapping is intentionally retained only for this check. */
-	hw->active_job = NULL;
-	job->mappings = NULL;
-	job->mapping_count = 0;
+	spin_lock_irq(&hw->job_lock);
+	KUNIT_ASSERT_PTR_EQ(test,
+			    rk_rga_hw_take_active_locked(hw, &hw->timeout_ref),
+			    job->current_exec);
+	spin_unlock_irq(&hw->job_lock);
+	job->exec_storage.mappings = NULL;
+	job->exec_storage.mapping_count = 0;
+	job->exec_storage.userptr_device_owned = false;
+	job->current_exec->hw = NULL;
+	KUNIT_EXPECT_TRUE(test, rk_rga_task_exec_retire(job->current_exec));
+	KUNIT_EXPECT_TRUE(test,
+			  rk_rga_task_exec_ref_put(&hw->timeout_ref));
+	KUNIT_EXPECT_TRUE(test, rk_rga_job_release_exec_storage(job));
 	put_device(dev);
 }
 
@@ -16459,54 +17031,55 @@ static void rk_rga_timeout_target_replacement_kunit(struct kunit *test)
 					rk_rga_kunit_cancel_delayed_work,
 					&hw->timeout_work);
 	KUNIT_ASSERT_EQ(test, ret, 0);
-	refcount_set(&target.refs, 1);
-	refcount_set(&replacement.refs, 1);
-	hw->active_job = &replacement;
+	rk_rga_job_init(&target);
+	rk_rga_job_init(&replacement);
+	mutex_lock(&hw->run_lock);
+	spin_lock_irq(&hw->job_lock);
+	KUNIT_ASSERT_TRUE(test, rk_rga_hw_install_active_locked(
+					hw, replacement.current_exec));
+	spin_unlock_irq(&hw->job_lock);
+	mutex_unlock(&hw->run_lock);
 	/*
-	 * Arm the watchdog the way dispatch does: a live nonzero generation
-	 * carried by both sides. Only the job != timeout_job clause may
-	 * block recovery here, so the pointer guard stays load-bearing; a
-	 * zero generation would mask its loss.
+	 * An old execution from another dispatch must not consume the current
+	 * slot.  The typed reference keeps that stale identity alive long enough
+	 * for the worker to reject it without dereferencing recycled storage.
 	 */
-	hw->active_generation = 1;
-	hw->timeout_generation = 1;
-	hw->timeout_job = &target;
-	rk_rga_job_get(&target);
+	target.current_exec->generation = 1;
+	KUNIT_ASSERT_TRUE(test, rk_rga_task_exec_ref_get(
+					&hw->timeout_ref, target.current_exec));
 
 	rk_rga_hw_timeout_work(&hw->timeout_work.work);
 
-	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, &replacement);
-	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_job, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_ref.exec,
+			    replacement.current_exec);
+	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_ref.exec, NULL);
 	KUNIT_EXPECT_EQ(test, refcount_read(&target.refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&replacement.refs), 1);
 
-	rk_rga_hw_schedule_timeout(hw, &replacement);
-	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_job, &replacement);
-	KUNIT_EXPECT_EQ(test, hw->timeout_generation, 1ULL);
+	KUNIT_ASSERT_EQ(test, rk_rga_hw_schedule_timeout(
+					hw, replacement.current_exec), 0);
+	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_ref.exec,
+			    replacement.current_exec);
+	KUNIT_EXPECT_EQ(test, hw->timeout_ref.generation,
+			replacement.current_exec->generation);
 	KUNIT_EXPECT_EQ(test, refcount_read(&replacement.refs), 2);
 	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&hw->timeout_work));
 	rk_rga_hw_cancel_timeout_sync(hw);
-	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_job, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_ref.exec, NULL);
 	KUNIT_EXPECT_EQ(test, refcount_read(&replacement.refs), 1);
 
-	/*
-	 * An old timeout for the same job pointer must not consume a freshly
-	 * restarted generation.  A multi-task job is re-dispatched under the
-	 * same pointer, so the pointer match alone would reset the job's next
-	 * task after the previous one completed.
-	 */
-	hw->active_job = &replacement;
-	hw->active_generation = 2;
-	hw->timeout_job = &replacement;
-	hw->timeout_generation = 1;
-	rk_rga_job_get(&replacement);
-
-	rk_rga_hw_timeout_work(&hw->timeout_work.work);
-
-	KUNIT_EXPECT_PTR_EQ(test, hw->active_job, &replacement);
-	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_job, NULL);
-	KUNIT_EXPECT_EQ(test, hw->timeout_generation, 0ULL);
-	KUNIT_EXPECT_EQ(test, refcount_read(&replacement.refs), 1);
+	spin_lock_irq(&hw->job_lock);
+	KUNIT_ASSERT_PTR_EQ(test,
+			    rk_rga_hw_take_active_locked(hw, &hw->timeout_ref),
+			    replacement.current_exec);
+	spin_unlock_irq(&hw->job_lock);
+	KUNIT_EXPECT_TRUE(test,
+			  rk_rga_task_exec_retire(replacement.current_exec));
+	KUNIT_EXPECT_TRUE(test,
+			  rk_rga_task_exec_ref_put(&hw->timeout_ref));
+	KUNIT_EXPECT_TRUE(test, rk_rga_job_release_exec_storage(&target));
+	KUNIT_EXPECT_TRUE(test,
+			  rk_rga_job_release_exec_storage(&replacement));
 	kunit_release_action(test, rk_rga_kunit_cancel_delayed_work,
 			     &hw->timeout_work);
 }
@@ -16686,14 +17259,14 @@ static void rk_rga_gstreamer_legacy_convert_profiles_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = rga3_cmd,
-		.cmd_size = sizeof(rga3_cmd),
+		.exec_storage.cmd_vaddr = rga3_cmd,
+		.exec_storage.cmd_size = sizeof(rga3_cmd),
 	};
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	ctrl = rga3_cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
 	KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WIN0_R2Y_EN);
 	KUNIT_EXPECT_FALSE(test, ctrl & RK_RGA3_WIN0_Y2R_EN);
@@ -16716,14 +17289,14 @@ static void rk_rga_gstreamer_legacy_convert_profiles_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = rga3_cmd,
-		.cmd_size = sizeof(rga3_cmd),
+		.exec_storage.cmd_vaddr = rga3_cmd,
+		.exec_storage.cmd_size = sizeof(rga3_cmd),
 	};
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	ctrl = rga3_cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
 	KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WIN0_Y2R_EN);
 	KUNIT_EXPECT_FALSE(test, ctrl & RK_RGA3_WIN0_R2Y_EN);
@@ -16741,14 +17314,14 @@ static void rk_rga_gstreamer_legacy_convert_profiles_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = rga2_cmd,
-		.cmd_size = sizeof(rga2_cmd),
+		.exec_storage.cmd_vaddr = rga2_cmd,
+		.exec_storage.cmd_size = sizeof(rga2_cmd),
 	};
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 }
 
 struct rk_rga_gstreamer_format_case {
@@ -16821,9 +17394,9 @@ rk_rga_gstreamer_legacy_convert_matrix_case(struct kunit *test,
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = profile->expected_type == RK_RGA_HW_RGA3 ?
+		.exec_storage.cmd_vaddr = profile->expected_type == RK_RGA_HW_RGA3 ?
 			     rga3_cmd : rga2_cmd,
-		.cmd_size = profile->expected_type == RK_RGA_HW_RGA3 ?
+		.exec_storage.cmd_size = profile->expected_type == RK_RGA_HW_RGA3 ?
 			    sizeof(rga3_cmd) : sizeof(rga2_cmd),
 	};
 
@@ -16836,7 +17409,7 @@ rk_rga_gstreamer_legacy_convert_matrix_case(struct kunit *test,
 		ret = rk_rga2_emit_simple_bitblt(&job);
 
 	KUNIT_EXPECT_EQ(test, ret, 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	if (profile->expected_type != RK_RGA_HW_RGA3)
 		return;
@@ -17021,8 +17594,8 @@ rk_rga_rknn_preprocess_profile_case(struct kunit *test,
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u16 src_w = profile->src_w ?: 80;
 	u16 src_h = profile->src_h ?: 80;
@@ -17051,7 +17624,7 @@ rk_rga_rknn_preprocess_profile_case(struct kunit *test,
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
 	KUNIT_EXPECT_EQ(test, !!(ctrl & RK_RGA3_WIN0_Y2R_EN),
@@ -17142,8 +17715,8 @@ static void rk_rga_gstreamer_legacy_rotation_extrema_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 ctrl;
 
@@ -17158,7 +17731,7 @@ static void rk_rga_gstreamer_legacy_rotation_extrema_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
 	KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WIN0_R2Y_EN);
 	KUNIT_EXPECT_FALSE(test, ctrl & RK_RGA3_WIN0_ROT);
@@ -17177,13 +17750,13 @@ static void rk_rga_gstreamer_legacy_rotation_extrema_kunit(struct kunit *test)
 	task.cosa = 0;
 	/* librga submits the 270-degree destination window pre-swapped. */
 	swap(task.dst.act_w, task.dst.act_h);
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	type = 0;
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
 	KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WIN0_Y2R_EN);
 	KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WIN0_ROT);
@@ -17194,7 +17767,9 @@ static void rk_rga_gstreamer_legacy_rotation_extrema_kunit(struct kunit *test)
 static void rk_rga3_librga_resize_interp_emit_kunit(struct kunit *test)
 {
 	u32 cmd[RK_RGA3_CMD_REG_COUNT] = { };
+	const struct rk_rga_task_plan *plan;
 	enum rk_rga_hw_type type = 0;
+	struct rk_rga_hw *hw;
 	struct rga_req task =
 		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
 					  RK_RGA_FORMAT_RGBA_8888);
@@ -17202,11 +17777,13 @@ static void rk_rga3_librga_resize_interp_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 ctrl;
 
+	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
 	task.yuv2rgb_mode = 0;
 	task.interp.horiz = RK_RGA2_INTERP_LINEAR;
 	task.interp.verti = RK_RGA2_INTERP_LINEAR;
@@ -17214,7 +17791,7 @@ static void rk_rga3_librga_resize_interp_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
 	KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WIN0_ENABLE);
@@ -17222,6 +17799,30 @@ static void rk_rga3_librga_resize_interp_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, ctrl & RK_RGA3_WIN0_HOR_UP);
 	KUNIT_EXPECT_FALSE(test, ctrl & RK_RGA3_WIN0_VER_BY);
 	KUNIT_EXPECT_FALSE(test, ctrl & RK_RGA3_WIN0_VER_UP);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
+			1280U | (720U << 16));
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_SCL_FAC_OFFSET / 4],
+			0xaa97aaa0U);
+
+	/*
+	 * The exact command words above are an independent golden.  Pin the
+	 * execution as a scheduled fixture, mutate the raw request, and prove a
+	 * second emission still consumes the already-published immutable plan.
+	 */
+	plan = rk_rga_task_exec_plan(&job.exec_storage);
+	KUNIT_ASSERT_NOT_NULL(test, plan);
+	KUNIT_EXPECT_EQ(test, plan->hw_type,
+			(enum rk_rga_hw_type)RK_RGA_HW_RGA3);
+	KUNIT_EXPECT_EQ(test, plan->src.act_w, (__u16)1920);
+	KUNIT_EXPECT_EQ(test, plan->dst.act_w, (__u16)1280);
+	job.exec_storage.hw = hw;
+	task.src.act_w = 640;
+	task.interp.horiz = RK_RGA2_INTERP_BICUBIC;
+	memset(cmd, 0, sizeof(cmd));
+	job.exec_storage.cmd_ready = false;
+	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
+	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_ACT_SIZE_OFFSET / 4],
+			1920U | (1080U << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
 			1280U | (720U << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_SCL_FAC_OFFSET / 4],
@@ -17239,8 +17840,8 @@ static void rk_rga3_librga_drm_abgr_copy_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 ctrl;
 
@@ -17253,7 +17854,7 @@ static void rk_rga3_librga_drm_abgr_copy_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
 	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WIN0_PIC_FORMAT,
@@ -17285,8 +17886,8 @@ static void rk_rga3_librga_copy_splice_task_kunit(struct kunit *test)
 	struct rk_rga_job job = {
 		.task_count = 2,
 		.import_count = 3,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	enum rk_rga_hw_type type = 0;
 
@@ -17300,7 +17901,7 @@ static void rk_rga3_librga_copy_splice_task_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_Y_BASE_OFFSET / 4],
 			lower_32_bits(0x10000000));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
@@ -17311,13 +17912,13 @@ static void rk_rga3_librga_copy_splice_task_kunit(struct kunit *test)
 			2560U);
 
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
-	KUNIT_EXPECT_TRUE(test, rk_rga_job_advance_task(&job, 0));
+	job.exec_storage.cmd_ready = false;
+	KUNIT_EXPECT_TRUE(test, rk_rga_kunit_advance_task(&job, 0));
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_Y_BASE_OFFSET / 4],
 			lower_32_bits(0x30000000));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
@@ -17326,7 +17927,7 @@ static void rk_rga3_librga_copy_splice_task_kunit(struct kunit *test)
 			lower_32_bits(0x20000000 + 1280 * 4));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4],
 			2560U);
-	KUNIT_EXPECT_FALSE(test, rk_rga_job_advance_task(&job, 0));
+	KUNIT_EXPECT_FALSE(test, rk_rga_kunit_advance_task(&job, 0));
 }
 
 static void rk_rga3_multitask_emit_clears_stale_regs_kunit(struct kunit *test)
@@ -17337,8 +17938,8 @@ static void rk_rga3_multitask_emit_clears_stale_regs_kunit(struct kunit *test)
 	struct rk_rga_job job = {
 		.task_count = 2,
 		.import_count = 3,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 
 	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
@@ -17368,14 +17969,14 @@ static void rk_rga3_multitask_emit_clears_stale_regs_kunit(struct kunit *test)
 	tasks[0].yuv2rgb_mode = 0;
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_emit_cmd(hw, &job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_NE(test, cmd[RK_RGA3_OVLP_TOP_CTRL_OFFSET / 4], 0U);
 	KUNIT_EXPECT_NE(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4], 0U);
 
-	KUNIT_EXPECT_TRUE(test, rk_rga_job_advance_task(&job, 0));
-	job.cmd_ready = true;
+	KUNIT_EXPECT_TRUE(test, rk_rga_kunit_advance_task(&job, 0));
+	job.exec_storage.cmd_ready = true;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_emit_cmd(hw, &job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_TOP_CTRL_OFFSET / 4], 0U);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4], 0U);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_Y_BASE_OFFSET / 4],
@@ -17393,8 +17994,8 @@ static void rk_rga3_librga_translate_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 stride_bytes;
 
@@ -17413,7 +18014,7 @@ static void rk_rga3_librga_translate_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	stride_bytes = cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4] << 2;
 	KUNIT_EXPECT_EQ(test, stride_bytes, 1920U * 4U);
@@ -17436,13 +18037,13 @@ static void rk_rga3_librga_translate_emit_kunit(struct kunit *test)
 	task.dst.act_h = 360;
 	task.dst.x_offset = 320;
 	task.dst.y_offset = 180;
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	type = 0;
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_VIR_STRIDE_OFFSET / 4] << 2,
 			640U * 4U);
@@ -17470,8 +18071,8 @@ static void rk_rga3_librga_rotate_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 ctrl;
 
@@ -17489,7 +18090,7 @@ static void rk_rga3_librga_rotate_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
 	KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WIN0_ENABLE);
@@ -17516,8 +18117,8 @@ static void rk_rga3_librga_rotate_flip_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 ctrl;
 
@@ -17535,7 +18136,7 @@ static void rk_rga3_librga_rotate_flip_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
 	KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WIN0_ENABLE);
@@ -17562,8 +18163,8 @@ static void rk_rga3_librga_center_rotate_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 stride_bytes;
 	u32 ctrl;
@@ -17584,7 +18185,7 @@ static void rk_rga3_librga_center_rotate_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
 	stride_bytes = cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4] << 2;
@@ -17628,8 +18229,8 @@ static void rk_rga3_overlap_copy_rotate_emit_kunit(struct kunit *test)
 			.tasks = &task,
 			.task_count = 1,
 			.import_count = 2,
-			.cmd_vaddr = cmd,
-			.cmd_size = sizeof(cmd),
+			.exec_storage.cmd_vaddr = cmd,
+			.exec_storage.cmd_size = sizeof(cmd),
 		};
 
 		/* Source is the rotated rectangle: 600 wide, 1000 tall. */
@@ -17657,7 +18258,7 @@ static void rk_rga3_overlap_copy_rotate_emit_kunit(struct kunit *test)
 				    orientations[i].name);
 		KUNIT_EXPECT_EQ_MSG(test, rk_rga3_emit_simple_bitblt(&job), 0,
 				    "%s", orientations[i].name);
-		KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+		KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 		/*
 		 * Canvas orientation: 1000 wide by 600 tall.  The pre-fix
@@ -17688,8 +18289,8 @@ static void rk_rga3_librga_flip_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 ctrl;
 
@@ -17703,7 +18304,7 @@ static void rk_rga3_librga_flip_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
 	KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WIN0_ENABLE);
@@ -17757,8 +18358,8 @@ static void rk_rga3_librga_side_border_kunit(struct kunit *test)
 	struct rk_rga_job job = {
 		.task_count = 4,
 		.import_count = 2,
-		.cmd_vaddr = rga3_cmd,
-		.cmd_size = sizeof(rga3_cmd),
+		.exec_storage.cmd_vaddr = rga3_cmd,
+		.exec_storage.cmd_size = sizeof(rga3_cmd),
 	};
 	struct rga_req *task;
 	struct rk_rga_job *single_job;
@@ -17786,13 +18387,13 @@ static void rk_rga3_librga_side_border_kunit(struct kunit *test)
 		bool reflect = tasks[i].rotate_mode == 2;
 
 		memset(rga3_cmd, 0, sizeof(rga3_cmd));
-		job.cmd_ready = false;
+		job.exec_storage.cmd_ready = false;
 		type = 0;
 
 		KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 		KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 		KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-		KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+		KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 		KUNIT_EXPECT_TRUE(test,
 				  rga3_cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
 				  RK_RGA3_WIN0_ENABLE);
@@ -17822,10 +18423,10 @@ static void rk_rga3_librga_side_border_kunit(struct kunit *test)
 				lower_32_bits(tasks[i].dst.yrgb_addr));
 
 		if (i + 1 < job.task_count)
-			KUNIT_EXPECT_TRUE(test, rk_rga_job_advance_task(&job,
+			KUNIT_EXPECT_TRUE(test, rk_rga_kunit_advance_task(&job,
 									0));
 		else
-			KUNIT_EXPECT_FALSE(test, rk_rga_job_advance_task(&job,
+			KUNIT_EXPECT_FALSE(test, rk_rga_kunit_advance_task(&job,
 									 0));
 	}
 
@@ -17833,13 +18434,13 @@ static void rk_rga3_librga_side_border_kunit(struct kunit *test)
 	single_job->tasks = task;
 	single_job->task_count = 1;
 	single_job->import_count = 2;
-	single_job->cmd_vaddr = cmd;
-	single_job->cmd_size = sizeof(cmd);
+	single_job->exec_storage.cmd_vaddr = cmd;
+	single_job->exec_storage.cmd_size = sizeof(cmd);
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(single_job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(single_job), 0);
-	KUNIT_EXPECT_TRUE(test, single_job->cmd_ready);
+	KUNIT_EXPECT_TRUE(test, single_job->exec_storage.cmd_ready);
 
 	task->core = BIT(0);
 	type = 0;
@@ -17848,7 +18449,7 @@ static void rk_rga3_librga_side_border_kunit(struct kunit *test)
 
 	/* Overlapping in-place source and destination windows stay rejected. */
 	*task = rk_rga_librga_side_border_task(80, 100, 80, true, 0);
-	single_job->cmd_ready = false;
+	single_job->exec_storage.cmd_ready = false;
 	task->dst.x_offset = 100;
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(single_job, &type),
@@ -17868,8 +18469,8 @@ static void rk_rga3_librga_padding_kunit(struct kunit *test)
 	struct rk_rga_job job = {
 		.task_count = 4,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 stride_bytes;
 
@@ -17889,12 +18490,12 @@ static void rk_rga3_librga_padding_kunit(struct kunit *test)
 		bool reflect = tasks[i].rotate_mode == 3;
 
 		memset(cmd, 0, sizeof(cmd));
-		job.cmd_ready = false;
+		job.exec_storage.cmd_ready = false;
 
 		KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 		KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 		KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-		KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+		KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 		ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
 		KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WIN0_ENABLE);
@@ -17920,10 +18521,10 @@ static void rk_rga3_librga_padding_kunit(struct kunit *test)
 				expected_wr_base);
 
 		if (i + 1 < job.task_count)
-			KUNIT_EXPECT_TRUE(test, rk_rga_job_advance_task(&job,
+			KUNIT_EXPECT_TRUE(test, rk_rga_kunit_advance_task(&job,
 									0));
 		else
-			KUNIT_EXPECT_FALSE(test, rk_rga_job_advance_task(&job,
+			KUNIT_EXPECT_FALSE(test, rk_rga_kunit_advance_task(&job,
 									 0));
 	}
 }
@@ -17939,8 +18540,8 @@ static void rk_rga2_compact_10bit_profile_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 src_info;
 
@@ -17949,7 +18550,7 @@ static void rk_rga2_compact_10bit_profile_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	src_info = cmd[RK_RGA2_SRC_INFO_OFFSET / 4];
 	KUNIT_EXPECT_EQ(test, src_info & RK_RGA2_SRC_FORMAT, 0xa);
@@ -17959,9 +18560,9 @@ static void rk_rga2_compact_10bit_profile_kunit(struct kunit *test)
 	memset(cmd, 0, sizeof(cmd));
 	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_YCBCR_420_SP,
 				    1920, 1080);
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	src_info = cmd[RK_RGA2_SRC_INFO_OFFSET / 4];
 	KUNIT_EXPECT_EQ(test, src_info & RK_RGA2_SRC_HSCL_MODE,
 			FIELD_PREP(RK_RGA2_SRC_HSCL_MODE,
@@ -17972,7 +18573,7 @@ static void rk_rga2_compact_10bit_profile_kunit(struct kunit *test)
 
 	task.src.compact_mode = RK_RGA_10BIT_INCOMPACT;
 	task.src.vir_w = 3840; /* 1920 incompact pixels, byte stride */
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type),
 			-EOPNOTSUPP);
@@ -17998,8 +18599,8 @@ static void rk_rga2_librga_interp_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 src_info;
 
@@ -18011,7 +18612,7 @@ static void rk_rga2_librga_interp_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	src_info = cmd[RK_RGA2_SRC_INFO_OFFSET / 4];
 	KUNIT_EXPECT_EQ(test, src_info & RK_RGA2_SRC_HSCL_MODE,
@@ -18030,12 +18631,12 @@ static void rk_rga2_librga_interp_emit_kunit(struct kunit *test)
 			1919U | (1079U << 16));
 
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	task.interp.horiz = RK_RGA2_INTERP_BICUBIC;
 	task.interp.verti = RK_RGA2_INTERP_BICUBIC;
 
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	src_info = cmd[RK_RGA2_SRC_INFO_OFFSET / 4];
 	KUNIT_EXPECT_FALSE(test, src_info & RK_RGA2_SRC_HSD_MODE_SEL);
 	KUNIT_EXPECT_FALSE(test, src_info & RK_RGA2_SRC_VSD_MODE_SEL);
@@ -18061,8 +18662,8 @@ static void rk_rga2_librga_y400_uv_downsample_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 expected_src_base;
 	u32 expected_dst_base;
@@ -18077,7 +18678,7 @@ static void rk_rga2_librga_y400_uv_downsample_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	expected_src_base = lower_32_bits(task.src.yrgb_addr +
 					  (u64)task.src.y_offset *
@@ -18140,8 +18741,8 @@ static void rk_rga2_librga_gray256_cvtcolor_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 src_info;
 	u32 dst_info;
@@ -18149,7 +18750,7 @@ static void rk_rga2_librga_gray256_cvtcolor_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	src_info = cmd[RK_RGA2_SRC_INFO_OFFSET / 4];
 	dst_info = cmd[RK_RGA2_DST_INFO_OFFSET / 4];
@@ -18197,8 +18798,8 @@ static void rk_rga2_librga_y4_dither_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 dst_info;
 
@@ -18210,7 +18811,7 @@ static void rk_rga2_librga_y4_dither_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	dst_info = cmd[RK_RGA2_DST_INFO_OFFSET / 4];
 	KUNIT_EXPECT_EQ(test, dst_info & RK_RGA2_DST_FORMAT,
@@ -18232,19 +18833,19 @@ static void rk_rga2_librga_y4_dither_emit_kunit(struct kunit *test)
 			0xfedcba98U);
 
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	task.dst.format = RK_RGA_FORMAT_Y8;
 	task.alpha_rop_flag = 0;
 	task.dither_mode = 0;
 
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	dst_info = cmd[RK_RGA2_DST_INFO_OFFSET / 4];
 	KUNIT_EXPECT_TRUE(test, dst_info & RK_RGA2_DST_YUV400_EN);
 	KUNIT_EXPECT_FALSE(test, dst_info & RK_RGA2_DST_Y4_EN);
 	KUNIT_EXPECT_FALSE(test, dst_info & RK_RGA2_DST_DITHER_DOWN_EN);
 
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	memset(cmd, 0, sizeof(cmd));
 	task.full_csc.flag = RK_RGA_FULL_CSC_ENABLE;
 	task.yuv2rgb_mode = 3 << 2;
@@ -18252,7 +18853,7 @@ static void rk_rga2_librga_y4_dither_emit_kunit(struct kunit *test)
 			      RK_RGA2_ALPHA_FLAG_DST_DITHER_DOWN;
 
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	dst_info = cmd[RK_RGA2_DST_INFO_OFFSET / 4];
 	KUNIT_EXPECT_TRUE(test, dst_info & RK_RGA2_DST_FULL_CSC_EN);
 	KUNIT_EXPECT_EQ(test, dst_info & RK_RGA2_DST_CSC_MODE,
@@ -18264,12 +18865,12 @@ static void rk_rga2_librga_y4_dither_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_DST_Y4MAP_LUT1_OFFSET / 4],
 			0xfedcba98U);
 
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	memset(cmd, 0, sizeof(cmd));
 	task.dst.format = RK_RGA_FORMAT_Y4;
 
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	dst_info = cmd[RK_RGA2_DST_INFO_OFFSET / 4];
 	KUNIT_EXPECT_TRUE(test, dst_info & RK_RGA2_DST_FULL_CSC_EN);
 	KUNIT_EXPECT_TRUE(test, dst_info & RK_RGA2_DST_Y4_EN);
@@ -18287,8 +18888,8 @@ static void rk_rga2_librga_full_csc_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 dst_info;
 	u32 rd_ctrl;
@@ -18321,7 +18922,7 @@ static void rk_rga2_librga_full_csc_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	dst_info = cmd[RK_RGA2_DST_INFO_OFFSET / 4];
 	KUNIT_EXPECT_TRUE(test, dst_info & RK_RGA2_DST_FULL_CSC_EN);
@@ -18336,9 +18937,9 @@ static void rk_rga2_librga_full_csc_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	rd_ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
 	KUNIT_EXPECT_TRUE(test, rd_ctrl & RK_RGA3_WIN0_R2Y_EN);
 	KUNIT_EXPECT_EQ(test, rd_ctrl & RK_RGA3_WIN0_CSC_MODE,
@@ -18361,8 +18962,8 @@ static void rk_rga2_src_crop_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 expected_uv_base;
 	u32 expected_y_base;
@@ -18378,7 +18979,7 @@ static void rk_rga2_src_crop_emit_kunit(struct kunit *test)
 	task.dst.act_h = 180;
 
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	stride_bytes = ALIGN((u32)task.src.vir_w, 4);
 	uv_stride_bytes = ALIGN((u32)task.src.vir_w, 4);
@@ -18463,8 +19064,8 @@ static void rk_rga3_librga_afbc_copy_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 aligned_w;
 	u32 aligned_h;
@@ -18491,7 +19092,7 @@ static void rk_rga3_librga_afbc_copy_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
 	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WIN0_RD_MODE, 0U);
@@ -18521,7 +19122,7 @@ static void rk_rga3_librga_afbc_copy_emit_kunit(struct kunit *test)
 				    RK_RGA_FORMAT_YCBCR_420_SP_10B,
 				    1280, 720);
 	task.dst.rd_mode = RK_RGA_FBC_MODE;
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	type = 0;
 
 	fbc_payload_stride = aligned_w >> 1;
@@ -18532,7 +19133,7 @@ static void rk_rga3_librga_afbc_copy_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
 	KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WIN0_YUV10_COMPACT);
@@ -18561,7 +19162,7 @@ static void rk_rga3_librga_afbc_copy_emit_kunit(struct kunit *test)
 	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_RGBA_8888,
 				    1280, 720);
 	task.dst.rd_mode = RK_RGA_FBC_MODE;
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	type = 0;
 
 	fbc_payload_stride = aligned_w;
@@ -18571,7 +19172,7 @@ static void rk_rga3_librga_afbc_copy_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	ctrl = cmd[RK_RGA3_WR_CTRL_OFFSET / 4];
 	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WR_MODE,
@@ -18597,7 +19198,7 @@ static void rk_rga3_librga_afbc_copy_emit_kunit(struct kunit *test)
 				    1280, 720);
 	task.src.rd_mode = RK_RGA_FBC_MODE;
 	task.dst.rd_mode = RK_RGA_RASTER_MODE;
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	type = 0;
 
 	fbc_payload_stride = (aligned_w >> 3) * 3;
@@ -18606,7 +19207,7 @@ static void rk_rga3_librga_afbc_copy_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
 	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WIN0_RD_MODE,
@@ -18634,13 +19235,13 @@ static void rk_rga3_librga_afbc_copy_emit_kunit(struct kunit *test)
 	task.src.x_offset = 0;
 	task.src.y_offset = 32;
 	task.src.vir_h = 752;
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	type = 0;
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_SRC_SIZE_OFFSET / 4],
 			1280U | (752U << 16));
@@ -18653,13 +19254,13 @@ static void rk_rga3_librga_afbc_copy_emit_kunit(struct kunit *test)
 
 	memset(cmd, 0, sizeof(cmd));
 	task.dst.rd_mode = RK_RGA_FBC_MODE;
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	type = 0;
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
 	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WIN0_RD_MODE,
@@ -18701,7 +19302,7 @@ static void rk_rga3_librga_afbc_copy_emit_kunit(struct kunit *test)
 	task.src.rd_mode = RK_RGA_FBC_MODE;
 	task.dst.rd_mode = RK_RGA_RASTER_MODE;
 	rk_rga_kunit_img_10b_stride(&task.dst);
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	type = 0;
 
 	/* Raster 10-bit vir_w is the byte stride: programmed literally. */
@@ -18710,7 +19311,7 @@ static void rk_rga3_librga_afbc_copy_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
 	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WIN0_RD_MODE,
@@ -18744,8 +19345,8 @@ static void rk_rga3_tile8x8_profile_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 dst_tile_stride = ALIGN((u32)task.dst.vir_w * 8, 16) >> 2;
 	u32 dst_tile_uv_stride = ALIGN((u32)task.dst.vir_w * 8, 16) >> 3;
@@ -18759,7 +19360,7 @@ static void rk_rga3_tile8x8_profile_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	ctrl = cmd[RK_RGA3_WR_CTRL_OFFSET / 4];
 	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WR_MODE,
@@ -18772,9 +19373,9 @@ static void rk_rga3_tile8x8_profile_kunit(struct kunit *test)
 	memset(cmd, 0, sizeof(cmd));
 	task.src.rd_mode = RK_RGA_TILE_MODE;
 	task.dst.rd_mode = RK_RGA_RASTER_MODE;
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
 	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WIN0_RD_MODE,
@@ -18786,12 +19387,12 @@ static void rk_rga3_tile8x8_profile_kunit(struct kunit *test)
 
 	memset(cmd, 0, sizeof(cmd));
 	task.dst.rd_mode = RK_RGA_TILE_MODE;
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
 	KUNIT_EXPECT_EQ(test, ctrl & RK_RGA3_WIN0_RD_MODE,
@@ -19143,8 +19744,8 @@ static void rk_rga3_librga_alpha_yuv_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 3,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 
 	task.src.x_offset = 100;
@@ -19159,7 +19760,7 @@ static void rk_rga3_librga_alpha_yuv_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
 			  RK_RGA3_WIN0_R2Y_EN);
 	KUNIT_EXPECT_FALSE(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4] &
@@ -19182,13 +19783,13 @@ static void rk_rga3_librga_alpha_yuv_emit_kunit(struct kunit *test)
 	task.pat = rk_rga_kunit_img(0x30000000, RK_RGA_FORMAT_RGBA_8888,
 				    1280, 720);
 	task.dst.rd_mode = RK_RGA_FBC_MODE;
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	type = 0;
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
 			  RK_RGA3_WIN0_R2Y_EN);
 	KUNIT_EXPECT_FALSE(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4] &
@@ -19215,13 +19816,13 @@ static void rk_rga3_librga_alpha_yuv_emit_kunit(struct kunit *test)
 	task.bsfilter_flag = 0;
 	task.core = BIT(0);
 	job.import_count = 2;
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	type = 0;
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_CTRL_OFFSET / 4],
 			FIELD_PREP(RK_RGA3_OVLP_MODE, 1) |
 			RK_RGA3_OVLP_FIELD | RK_RGA3_OVLP_TOP_ALPHA_EN);
@@ -19266,8 +19867,8 @@ static void rk_rga3_librga_slt_alpha_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 3,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 win0_ctrl;
 	u32 win1_ctrl;
@@ -19288,7 +19889,7 @@ static void rk_rga3_librga_slt_alpha_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	win0_ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
 	win1_ctrl = cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4];
@@ -19346,8 +19947,8 @@ static void rk_rga3_librga_global_alpha_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 expected_top_ctrl;
 	u32 expected_bottom_ctrl;
@@ -19366,7 +19967,7 @@ static void rk_rga3_librga_global_alpha_emit_kunit(struct kunit *test)
 	task.yuv2rgb_mode = 0;
 
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_CTRL_OFFSET / 4],
 			FIELD_PREP(RK_RGA3_OVLP_MODE, 1) |
 			RK_RGA3_OVLP_TOP_ALPHA_EN);
@@ -19417,8 +20018,8 @@ static void rk_rga3_librga_rgb_composite_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 3,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 expected_top_ctrl;
 	u32 expected_bottom_ctrl;
@@ -19442,7 +20043,7 @@ static void rk_rga3_librga_rgb_composite_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_Y_BASE_OFFSET / 4],
 			lower_32_bits(task.pat.yrgb_addr));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN1_Y_BASE_OFFSET / 4],
@@ -19509,8 +20110,8 @@ static void rk_rga3_display_partial_alpha_blend_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 expected_top_ctrl;
 	u32 expected_bottom_ctrl;
@@ -19530,7 +20131,7 @@ static void rk_rga3_display_partial_alpha_blend_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_Y_BASE_OFFSET / 4],
 			lower_32_bits(task.dst.yrgb_addr));
@@ -19618,8 +20219,8 @@ static void rk_rga3_display_rgb565_rotate_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 rd_ctrl;
 	u32 wr_ctrl;
@@ -19627,7 +20228,7 @@ static void rk_rga3_display_rgb565_rotate_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	rd_ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
 	KUNIT_EXPECT_TRUE(test, rd_ctrl & RK_RGA3_WIN0_ENABLE);
@@ -19681,8 +20282,8 @@ static void rk_rga2_display_xrgb_rotate_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 mode_ctrl;
 	u32 src_info;
@@ -19694,7 +20295,7 @@ static void rk_rga2_display_xrgb_rotate_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 	KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	mode_ctrl = cmd[RK_RGA2_MODE_CTRL_OFFSET / 4];
 	KUNIT_EXPECT_EQ(test, mode_ctrl & RK_RGA2_MODE_RENDER_MODE,
@@ -19839,8 +20440,8 @@ static void rk_rga3_librga_blend_modes_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	enum rk_rga_hw_type type;
 	u32 top_factor;
@@ -19875,9 +20476,9 @@ static void rk_rga3_librga_blend_modes_kunit(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 
 		memset(cmd, 0, sizeof(cmd));
-		job.cmd_ready = false;
+		job.exec_storage.cmd_ready = false;
 		KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-		KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+		KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 		KUNIT_EXPECT_EQ(test,
 				cmd[RK_RGA3_OVLP_TOP_CTRL_OFFSET / 4] &
 				RK_RGA3_ALPHA_FACTOR,
@@ -19923,8 +20524,8 @@ static void rk_rga3_alpha_yuv10_overlay_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 3,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 
 	rk_rga_kunit_img_10b_stride(&task.src);
@@ -19942,7 +20543,7 @@ static void rk_rga3_alpha_yuv10_overlay_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
 			  RK_RGA3_WIN0_R2Y_EN);
 	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4] &
@@ -19956,13 +20557,13 @@ static void rk_rga3_alpha_yuv10_overlay_emit_kunit(struct kunit *test)
 	memset(cmd, 0, sizeof(cmd));
 	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_YCBCR_420_SP,
 				    1280, 720);
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	type = 0;
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
 			  RK_RGA3_WIN0_R2Y_EN);
 	KUNIT_EXPECT_FALSE(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4] &
@@ -19979,13 +20580,13 @@ static void rk_rga3_alpha_yuv10_overlay_emit_kunit(struct kunit *test)
 	rk_rga_kunit_img_10b_stride(&task.src);
 	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_YCBCR_420_SP,
 				    1280, 720);
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	type = 0;
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
 			  RK_RGA3_WIN0_R2Y_EN);
 	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4] &
@@ -20003,13 +20604,13 @@ static void rk_rga3_alpha_yuv10_overlay_emit_kunit(struct kunit *test)
 	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_YCBCR_420_SP_10B,
 				    1280, 720);
 	task.dst.rd_mode = RK_RGA_FBC_MODE;
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	type = 0;
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
 			  RK_RGA3_WIN0_R2Y_EN);
 	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4] &
@@ -20033,13 +20634,13 @@ static void rk_rga3_alpha_yuv10_overlay_emit_kunit(struct kunit *test)
 	memset(&task.pat, 0, sizeof(task.pat));
 	task.bsfilter_flag = 0;
 	job.import_count = 2;
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	type = 0;
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
 			  RK_RGA3_WIN0_YUV10_COMPACT);
 	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4] &
@@ -20053,13 +20654,13 @@ static void rk_rga3_alpha_yuv10_overlay_emit_kunit(struct kunit *test)
 	memset(cmd, 0, sizeof(cmd));
 	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_YCBCR_420_SP,
 				    1280, 720);
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	type = 0;
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
 			  RK_RGA3_WIN0_YUV10_COMPACT);
 	KUNIT_EXPECT_FALSE(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4] &
@@ -20073,13 +20674,13 @@ static void rk_rga3_alpha_yuv10_overlay_emit_kunit(struct kunit *test)
 	rk_rga_kunit_img_10b_stride(&task.src);
 	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_YCBCR_420_SP,
 				    1280, 720);
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	type = 0;
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_FALSE(test, cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
 			   RK_RGA3_WIN0_YUV10_COMPACT);
 	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4] &
@@ -20099,8 +20700,8 @@ static void rk_rga3_colorkey_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 expected_ctrl;
 	u32 expected_min;
@@ -20121,7 +20722,7 @@ static void rk_rga3_colorkey_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	expected_ctrl = FIELD_PREP(RK_RGA3_OVLP_MODE, 1) |
 			RK_RGA3_OVLP_TOP_ALPHA_EN |
@@ -20136,13 +20737,13 @@ static void rk_rga3_colorkey_emit_kunit(struct kunit *test)
 			expected_max);
 
 	memset(cmd, 0, sizeof(cmd));
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	task.src_trans_mode = 0x1f;
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_CTRL_OFFSET / 4],
 			expected_ctrl);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_TOP_KEY_MIN_OFFSET / 4],
@@ -20165,8 +20766,8 @@ static void rk_rga3_alpha_rotate_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 3,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 
 	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
@@ -20184,13 +20785,13 @@ static void rk_rga3_alpha_rotate_emit_kunit(struct kunit *test)
 
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job),
 			-EOPNOTSUPP);
-	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+	KUNIT_EXPECT_FALSE(test, job.exec_storage.cmd_ready);
 
 	memset(cmd, 0, sizeof(cmd));
 	memset(&task.pat, 0, sizeof(task.pat));
 	task.bsfilter_flag = 0;
 	job.import_count = 2;
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	/*
 	 * The no-pattern A+B->B path models real librga traffic, which
 	 * submits the 90-degree destination window pre-swapped; the
@@ -20199,7 +20800,7 @@ static void rk_rga3_alpha_rotate_emit_kunit(struct kunit *test)
 	swap(task.dst.act_w, task.dst.act_h);
 
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_ACT_SIZE_OFFSET / 4],
 			1280 | (720 << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
@@ -20219,8 +20820,8 @@ static void rk_rga3_dst_offset_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 uv_stride_bytes;
 	u32 y_stride_bytes;
@@ -20232,7 +20833,7 @@ static void rk_rga3_dst_offset_emit_kunit(struct kunit *test)
 	task.dst.y_offset = 4;
 
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 
 	y_stride_bytes = cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4] << 2;
 	uv_stride_bytes = cmd[RK_RGA3_WR_PL_VIR_STRIDE_OFFSET / 4] << 2;
@@ -20248,14 +20849,14 @@ static void rk_rga3_dst_offset_emit_kunit(struct kunit *test)
 	memset(cmd, 0, sizeof(cmd));
 	task.dst.x_offset = 1;
 	task.dst.y_offset = 4;
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), -EINVAL);
-	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+	KUNIT_EXPECT_FALSE(test, job.exec_storage.cmd_ready);
 
 	task.dst.x_offset = 2;
 	task.dst.y_offset = 3;
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), -EINVAL);
-	KUNIT_EXPECT_FALSE(test, job.cmd_ready);
+	KUNIT_EXPECT_FALSE(test, job.exec_storage.cmd_ready);
 
 	memset(cmd, 0, sizeof(cmd));
 	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
@@ -20267,13 +20868,13 @@ static void rk_rga3_dst_offset_emit_kunit(struct kunit *test)
 	task.dst.compact_mode = RK_RGA_10BIT_INCOMPACT;
 	task.dst.is_10b_endian = 1;
 	rk_rga_kunit_img_10b_stride(&task.dst); /* 1280 px -> 2560 bytes */
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	type = 0;
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_FALSE(test, cmd[RK_RGA3_WR_CTRL_OFFSET / 4] &
 			   RK_RGA3_WR_YUV10_COMPACT);
 	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WR_CTRL_OFFSET / 4] &
@@ -20295,13 +20896,13 @@ static void rk_rga3_dst_offset_emit_kunit(struct kunit *test)
 	task.dst.compact_mode = 0;
 	task.dst.is_10b_endian = 0;
 	task.dst.vir_w = 1600; /* 1280 compact pixels, byte stride */
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	type = 0;
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WR_CTRL_OFFSET / 4] &
 			  RK_RGA3_WR_YUV10_COMPACT);
 	KUNIT_EXPECT_FALSE(test, cmd[RK_RGA3_WR_CTRL_OFFSET / 4] &
@@ -20327,7 +20928,7 @@ static void rk_rga3_dst_offset_emit_kunit(struct kunit *test)
 	task.dst.y_offset = 16;
 	task.dst.act_w -= task.dst.x_offset;
 	task.dst.act_h -= task.dst.y_offset;
-	job.cmd_ready = false;
+	job.exec_storage.cmd_ready = false;
 	type = 0;
 
 	afbc_header_size = ((ALIGN((u32)task.dst.vir_w, 16) >> 2) *
@@ -20336,7 +20937,7 @@ static void rk_rga3_dst_offset_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
 			RK_RGA3_WIN0_RD_MODE,
 			FIELD_PREP(RK_RGA3_WIN0_RD_MODE, 1));
@@ -20364,8 +20965,8 @@ static void rk_rga3_ffmpeg_p210_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 	u32 uv_stride_bytes;
 	u32 y_stride_bytes;
@@ -20384,7 +20985,7 @@ static void rk_rga3_ffmpeg_p210_emit_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_FALSE(test, cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
 			   RK_RGA3_WIN0_YUV10_COMPACT);
 	KUNIT_EXPECT_TRUE(test, cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
@@ -20417,8 +21018,8 @@ static void rk_rga3_src_crop_emit_kunit(struct kunit *test)
 		.tasks = &task,
 		.task_count = 1,
 		.import_count = 2,
-		.cmd_vaddr = cmd,
-		.cmd_size = sizeof(cmd),
+		.exec_storage.cmd_vaddr = cmd,
+		.exec_storage.cmd_size = sizeof(cmd),
 	};
 
 	task.src.act_w = 640;
@@ -20429,7 +21030,7 @@ static void rk_rga3_src_crop_emit_kunit(struct kunit *test)
 	task.dst.act_h = 180;
 
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_Y_BASE_OFFSET / 4],
 			lower_32_bits(task.src.yrgb_addr));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_U_BASE_OFFSET / 4],
@@ -21352,6 +21953,160 @@ static int rk_rga3_validate_bitblt(const struct rga_req *task,
 	return 0;
 }
 
+static void rk_rga_task_plan_copy_semantics(struct rk_rga_task_plan *plan,
+					    const struct rga_req *task)
+{
+	plan->render_mode = task->render_mode;
+	plan->src = task->src;
+	plan->dst = task->dst;
+	plan->pat = task->pat;
+	plan->alpha_rop_flag = task->alpha_rop_flag;
+	plan->interp = task->interp;
+	plan->color_key_max = task->color_key_max;
+	plan->color_key_min = task->color_key_min;
+	plan->fg_color = task->fg_color;
+	plan->bg_color = task->bg_color;
+	plan->gr_color = task->gr_color;
+	plan->fading = task->fading;
+	plan->PD_mode = task->PD_mode;
+	plan->rop_code = task->rop_code;
+	plan->bsfilter_flag = task->bsfilter_flag;
+	plan->palette_mode = task->palette_mode;
+	plan->yuv2rgb_mode = task->yuv2rgb_mode;
+	plan->endian_mode = task->endian_mode;
+	plan->alpha_rop_mode = task->alpha_rop_mode;
+	plan->src_trans_mode = task->src_trans_mode;
+	plan->dither_mode = task->dither_mode;
+	plan->full_csc = task->full_csc;
+	plan->mosaic_info = task->mosaic_info;
+	plan->osd_info = task->osd_info;
+	plan->pre_intr_info = task->pre_intr_info;
+	plan->fg_global_alpha = task->fg_global_alpha;
+	plan->bg_global_alpha = task->bg_global_alpha;
+	plan->feature = task->feature;
+	plan->full_csc_clip = task->full_csc_clip;
+	plan->rgba5551_alpha = task->rgba5551_alpha;
+	plan->gauss_config = task->gauss_config;
+}
+
+static int rk_rga_task_plan_build(struct rk_rga_job *job,
+				  enum rk_rga_hw_type hw_type)
+{
+	struct rk_rga_task_exec *exec = rk_rga_job_current_exec(job);
+	struct rga_req validation_task;
+	const struct rga_req *validate_task;
+	const struct rga_req *task;
+	struct rk_rga_task_plan *plan;
+	int ret;
+
+	if (!exec || !job->tasks || job->current_task >= job->task_count)
+		return -EINVAL;
+	if (exec->plan)
+		return exec->plan->hw_type == hw_type ? 0 : -EXDEV;
+
+	task = &job->tasks[job->current_task];
+	validate_task = rk_rga_job_validation_task(job, job->current_task,
+						   &validation_task);
+	plan = kzalloc(sizeof(*plan), GFP_KERNEL);
+	if (!plan)
+		return -ENOMEM;
+	plan->hw_type = hw_type;
+	rk_rga_task_plan_copy_semantics(plan, task);
+
+	if (hw_type == RK_RGA_HW_RGA3) {
+		if (task->render_mode != RK_RGA_RENDER_BITBLT) {
+			ret = -EOPNOTSUPP;
+			goto err_free;
+		}
+		ret = rk_rga3_validate_bitblt(validate_task,
+					      &plan->profile.rga3_bitblt);
+	} else if (hw_type == RK_RGA_HW_RGA2) {
+		switch (task->render_mode) {
+		case RK_RGA_RENDER_BITBLT:
+			ret = rk_rga2_validate_bitblt(
+				validate_task, &plan->profile.rga2_bitblt);
+			plan->uses_rop = rk_rga2_task_uses_rop(validate_task);
+			plan->uses_color_key =
+				rk_rga2_task_uses_color_key(validate_task);
+			plan->uses_quantize =
+				rk_rga2_task_uses_quantize(validate_task);
+			break;
+		case RK_RGA_RENDER_COLOR_FILL:
+			ret = rk_rga2_validate_color_fill(
+				validate_task, &plan->profile.rga2_fill);
+			break;
+		case RK_RGA_RENDER_COLOR_PALETTE:
+			ret = rk_rga2_validate_color_palette(
+				validate_task, &plan->profile.rga2_palette);
+			if (!ret)
+				ret = rk_rga2_palette_shift(validate_task,
+							&plan->palette_shift);
+			break;
+		case RK_RGA_RENDER_UPDATE_PALETTE:
+			ret = rk_rga2_validate_update_palette(validate_task);
+			break;
+		default:
+			ret = -EOPNOTSUPP;
+			break;
+		}
+	} else {
+		ret = -EOPNOTSUPP;
+	}
+	if (ret)
+		goto err_free;
+
+	/* A fully validated immutable plan becomes visible as one publication. */
+	smp_store_release(&exec->plan, plan);
+	return 0;
+
+err_free:
+	kfree(plan);
+	return ret;
+}
+
+static const struct rk_rga_task_plan *
+rk_rga_task_exec_plan(const struct rk_rga_task_exec *exec)
+{
+	/* Pair with task-plan release publication after validation completes. */
+	return exec ? smp_load_acquire(&exec->plan) : NULL;
+}
+
+static int rk_rga_emitter_require_plan(struct rk_rga_job *job,
+				       enum rk_rga_hw_type hw_type,
+				       const struct rk_rga_task_plan **plan)
+{
+	struct rk_rga_task_exec *exec = rk_rga_job_current_exec(job);
+	int ret;
+
+	if (!exec)
+		return -EINVAL;
+#if IS_ENABLED(CONFIG_ROCKCHIP_RGA_REWRITE_KUNIT_TEST)
+	/*
+	 * Direct emitter fixtures deliberately mutate one synthetic request
+	 * between calls and never install the execution record on hardware.
+	 * Rebuild only those fixture plans; a scheduled execution keeps the
+	 * single immutable plan published by backend_prepare().
+	 */
+	if (!exec->hw) {
+		struct rk_rga_task_plan *old_plan;
+
+		old_plan = xchg(&exec->plan, NULL);
+		kfree(old_plan);
+	}
+#endif
+	*plan = rk_rga_task_exec_plan(exec);
+	if (!*plan) {
+		ret = rk_rga_task_plan_build(job, hw_type);
+		if (ret)
+			return ret;
+		*plan = rk_rga_task_exec_plan(exec);
+	}
+	if (!*plan || (*plan)->hw_type != hw_type)
+		return -EUCLEAN;
+
+	return 0;
+}
+
 static int rk_rga3_emit_read_window(struct rk_rga_job *job,
 				    const struct rga_img_info_t *img,
 				    const struct rk_rga3_format_info *rd_fmt,
@@ -21486,7 +22241,7 @@ static int rk_rga3_emit_read_window(struct rk_rga_job *job,
 }
 
 static int rk_rga3_emit_win0(struct rk_rga_job *job,
-			     const struct rga_req *task,
+			     const struct rk_rga_task_plan *task,
 			     const struct rk_rga3_format_info *src_fmt,
 			     const struct rk_rga3_format_info *dst_fmt,
 			     u32 rd_mode, u32 rotate_flags)
@@ -21499,7 +22254,7 @@ static int rk_rga3_emit_win0(struct rk_rga_job *job,
 }
 
 static int rk_rga3_emit_wr(struct rk_rga_job *job,
-			   const struct rga_req *task,
+			   const struct rk_rga_task_plan *task,
 			   const struct rk_rga3_format_info *dst_fmt,
 			   u32 wr_mode, bool apply_dst_offset)
 {
@@ -22015,7 +22770,7 @@ static bool rk_rga2_format_needs_force_tile(u32 format)
 	}
 }
 
-static bool rk_rga2_needs_force_tile(const struct rga_req *task,
+static bool rk_rga2_plan_needs_force_tile(const struct rk_rga_task_plan *task,
 				     const struct rk_rga2_transform *transform,
 				     u32 dst_w, u32 dst_h)
 {
@@ -22029,7 +22784,7 @@ static bool rk_rga2_needs_force_tile(const struct rga_req *task,
 }
 
 static int rk_rga2_emit_src(struct rk_rga_job *job,
-			    const struct rga_req *task,
+			    const struct rk_rga_task_plan *task,
 			    const struct rk_rga2_format_info *src_fmt,
 			    const struct rk_rga2_transform *transform)
 {
@@ -22072,7 +22827,7 @@ static int rk_rga2_emit_src(struct rk_rga_job *job,
 				   &v_filter, &active_h);
 	if (ret)
 		return ret;
-	if (rk_rga2_needs_force_tile(task, transform, dst_w, dst_h)) {
+	if (rk_rga2_plan_needs_force_tile(task, transform, dst_w, dst_h)) {
 		h_mode = RK_RGA2_SCALE_FORCE_TILE;
 		v_mode = RK_RGA2_SCALE_FORCE_TILE;
 		x_factor = 0;
@@ -22124,7 +22879,7 @@ static int rk_rga2_emit_src(struct rk_rga_job *job,
 	if (src_fmt->yuv10)
 		src_info |= RK_RGA2_SRC_YUV10_EN |
 			    RK_RGA2_SRC_YUV10_ROUND_EN;
-	if (rk_rga2_task_uses_color_key(task))
+	if (task->uses_color_key)
 		src_info |= FIELD_PREP(RK_RGA2_SRC_TRANS_MODE,
 				       task->src_trans_mode) |
 			    FIELD_PREP(RK_RGA2_SRC_TRANS_ENABLE,
@@ -22164,17 +22919,17 @@ static int rk_rga2_emit_src(struct rk_rga_job *job,
 	rk_rga_cmd_write(job, RK_RGA2_SRC_BG_COLOR_OFFSET, 0);
 	rk_rga_cmd_write(job, RK_RGA2_SRC_FG_COLOR_OFFSET, 0);
 	rk_rga_cmd_write(job, RK_RGA2_SRC_TR_COLOR0_OFFSET,
-			 rk_rga2_task_uses_color_key(task) ?
+			 task->uses_color_key ?
 			 task->color_key_min : 0);
 	rk_rga_cmd_write(job, RK_RGA2_SRC_TR_COLOR1_OFFSET,
-			 rk_rga2_task_uses_color_key(task) ?
+			 task->uses_color_key ?
 			 task->color_key_max : 0);
 
 	return 0;
 }
 
 static int rk_rga2_emit_dst(struct rk_rga_job *job,
-			    const struct rga_req *task,
+			    const struct rk_rga_task_plan *task,
 			    const struct rk_rga2_format_info *dst_fmt,
 			    const struct rk_rga2_format_info *pat_fmt,
 			    bool src1_a1555_alpha,
@@ -22193,7 +22948,9 @@ static int rk_rga2_emit_dst(struct rk_rga_job *job,
 	__u64 v_addr = 0;
 	int ret;
 
-	rk_rga2_normalized_dst(task, transform, &dst);
+	dst = task->dst;
+	dst.act_w = transform->dst_act_w;
+	dst.act_h = transform->dst_act_h;
 
 	ret = rk_rga2_stride(&dst, dst_fmt, &stride, &uv_stride);
 	if (ret)
@@ -22238,7 +22995,7 @@ static int rk_rga2_emit_dst(struct rk_rga_job *job,
 				   task->alpha_rop_flag >> 5) |
 			FIELD_PREP(RK_RGA2_DST_DITHER_MODE,
 				   task->dither_mode);
-	if (rk_rga2_task_uses_quantize(task))
+	if (task->uses_quantize)
 		dst_info |= RK_RGA2_DST_NN_QUANTIZE_EN;
 	if (pat_fmt) {
 		ret = rk_rga2_stride(&task->pat, pat_fmt, &src1_stride,
@@ -22293,17 +23050,13 @@ static u32 rk_rga2_pack_nn_quantize(__s16 r, __s16 g, __s16 b)
 	       (((u32)b & RK_RGA2_NN_QUANTIZE_MASK) << 20);
 }
 
-static int rk_rga2_palette_src_stride(const struct rga_req *task,
+static int rk_rga2_palette_src_stride(const struct rk_rga_task_plan *task,
 				      u32 *stride)
 {
-	u8 shift;
 	u32 bytes;
-	int ret;
 
-	ret = rk_rga2_palette_shift(task, &shift);
-	if (ret)
-		return ret;
-	bytes = DIV_ROUND_UP((u32)task->src.vir_w, 1U << shift);
+	bytes = DIV_ROUND_UP((u32)task->src.vir_w,
+			     1U << task->palette_shift);
 	*stride = ALIGN(bytes, 4);
 	if (!*stride)
 		return -EINVAL;
@@ -22313,13 +23066,11 @@ static int rk_rga2_palette_src_stride(const struct rga_req *task,
 
 static int rk_rga2_emit_color_palette(struct rk_rga_job *job)
 {
-	struct rga_req *task = &job->tasks[job->current_task];
-	struct rga_req validation_task;
-	const struct rga_req *validate_task;
-	struct rk_rga2_palette_profile profile;
+	const struct rk_rga_task_plan *task;
+	const struct rk_rga2_palette_profile *profile;
 	struct rk_rga2_transform transform = {
-		.dst_act_w = task->dst.act_w,
-		.dst_act_h = task->dst.act_h,
+		.dst_act_w = 0,
+		.dst_act_h = 0,
 	};
 	u32 src_stride;
 	u32 src_offset;
@@ -22327,11 +23078,14 @@ static int rk_rga2_emit_color_palette(struct rk_rga_job *job)
 	u32 src_info;
 	int ret;
 
-	validate_task = rk_rga_job_validation_task(job, job->current_task,
-						   &validation_task);
-	ret = rk_rga2_validate_color_palette(validate_task, &profile);
+	ret = rk_rga_emitter_require_plan(job, RK_RGA_HW_RGA2, &task);
 	if (ret)
 		return ret;
+	if (task->render_mode != RK_RGA_RENDER_COLOR_PALETTE)
+		return -EUCLEAN;
+	profile = &task->profile.rga2_palette;
+	transform.dst_act_w = task->dst.act_w;
+	transform.dst_act_h = task->dst.act_h;
 	ret = rk_rga2_palette_src_stride(task, &src_stride);
 	if (ret)
 		return ret;
@@ -22366,28 +23120,26 @@ static int rk_rga2_emit_color_palette(struct rk_rga_job *job)
 	rk_rga_cmd_write(job, RK_RGA2_SRC_FG_COLOR_OFFSET, task->fg_color);
 	rk_rga_cmd_write(job, RK_RGA2_SRC_BG_COLOR_OFFSET, task->bg_color);
 
-	ret = rk_rga2_emit_dst(job, task, &profile.dst_fmt, NULL, false,
+	ret = rk_rga2_emit_dst(job, task, &profile->dst_fmt, NULL, false,
 			       &transform);
 	if (ret)
 		return ret;
 
-	job->cmd_ready = true;
+	rk_rga_job_current_exec(job)->cmd_ready = true;
 
 	return 0;
 }
 
 static int rk_rga2_emit_update_palette(struct rk_rga_job *job)
 {
-	struct rga_req *task = &job->tasks[job->current_task];
-	struct rga_req validation_task;
-	const struct rga_req *validate_task;
+	const struct rk_rga_task_plan *task;
 	int ret;
 
-	validate_task = rk_rga_job_validation_task(job, job->current_task,
-						   &validation_task);
-	ret = rk_rga2_validate_update_palette(validate_task);
+	ret = rk_rga_emitter_require_plan(job, RK_RGA_HW_RGA2, &task);
 	if (ret)
 		return ret;
+	if (task->render_mode != RK_RGA_RENDER_UPDATE_PALETTE)
+		return -EUCLEAN;
 
 	rk_rga_cmd_write(job, RK_RGA2_MODE_CTRL_OFFSET,
 			 FIELD_PREP(RK_RGA2_MODE_RENDER_MODE,
@@ -22398,7 +23150,7 @@ static int rk_rga2_emit_update_palette(struct rk_rga_job *job)
 	rk_rga_cmd_write(job, RK_RGA2_MASK_BASE_OFFSET,
 			 lower_32_bits(task->pat.yrgb_addr));
 
-	job->cmd_ready = true;
+	rk_rga_job_current_exec(job)->cmd_ready = true;
 
 	return 0;
 }
@@ -22521,7 +23273,8 @@ static int rk_rga2_emit_src1_base(struct rk_rga_job *job,
 }
 
 static void
-rk_rga2_emit_color_key(struct rk_rga_job *job, const struct rga_req *task,
+rk_rga2_emit_color_key(struct rk_rga_job *job,
+		       const struct rk_rga_task_plan *task,
 		       const struct rk_rga2_bitblt_profile *profile)
 {
 	rk_rga_cmd_write(job, RK_RGA2_ALPHA_CTRL0_OFFSET,
@@ -22536,7 +23289,7 @@ rk_rga2_emit_color_key(struct rk_rga_job *job, const struct rga_req *task,
 }
 
 static int rk_rga2_emit_alpha_bitmap(struct rk_rga_job *job,
-				     const struct rga_req *task,
+				     const struct rk_rga_task_plan *task,
 				     const struct rk_rga2_format_info *pat_fmt)
 {
 	int ret;
@@ -22563,7 +23316,7 @@ static int rk_rga2_emit_alpha_bitmap(struct rk_rga_job *job,
 }
 
 static int rk_rga2_emit_osd(struct rk_rga_job *job,
-			    const struct rga_req *task,
+			    const struct rk_rga_task_plan *task,
 			    const struct rk_rga2_format_info *pat_fmt)
 {
 	const struct rga_osd_mode_ctrl *mode = &task->osd_info.mode_ctrl;
@@ -22642,20 +23395,19 @@ static int rk_rga2_emit_osd(struct rk_rga_job *job,
 
 static int rk_rga2_emit_simple_bitblt(struct rk_rga_job *job)
 {
-	struct rga_req *task = &job->tasks[job->current_task];
-	struct rga_req validation_task;
-	const struct rga_req *validate_task;
-	struct rk_rga2_bitblt_profile profile;
+	const struct rk_rga_task_plan *task;
+	const struct rk_rga2_bitblt_profile *profile;
 	u32 quant_offset;
 	u32 quant_scale;
 	u32 rop_ctrl;
 	int ret;
 
-	validate_task = rk_rga_job_validation_task(job, job->current_task,
-						   &validation_task);
-	ret = rk_rga2_validate_bitblt(validate_task, &profile);
+	ret = rk_rga_emitter_require_plan(job, RK_RGA_HW_RGA2, &task);
 	if (ret)
 		return ret;
+	if (task->render_mode != RK_RGA_RENDER_BITBLT)
+		return -EUCLEAN;
+	profile = &task->profile.rga2_bitblt;
 
 	rk_rga_cmd_write(job, RK_RGA2_MODE_CTRL_OFFSET,
 			 FIELD_PREP(RK_RGA2_MODE_RENDER_MODE,
@@ -22673,34 +23425,34 @@ static int rk_rga2_emit_simple_bitblt(struct rk_rga_job *job)
 			 FIELD_PREP(RK_RGA2_MODE_ALPHA_ZERO_KEY,
 				    (task->alpha_rop_mode >> 4) & 0x1) |
 			 RK_RGA2_MODE_INTR_CF_E |
-			 FIELD_PREP(RK_RGA2_MODE_OSD_EN, profile.osd) |
+			 FIELD_PREP(RK_RGA2_MODE_OSD_EN, profile->osd) |
 			 FIELD_PREP(RK_RGA2_MODE_MOSAIC_EN,
 				    !!task->mosaic_info.enable) |
 			 FIELD_PREP(RK_RGA2_MODE_SRC_GAUSS_EN,
 				    !!task->gauss_config.size));
 
-	ret = rk_rga2_emit_src(job, task, &profile.src_fmt,
-			       &profile.transform);
+	ret = rk_rga2_emit_src(job, task, &profile->src_fmt,
+			       &profile->transform);
 	if (ret)
 		return ret;
-	ret = rk_rga2_emit_dst(job, task, &profile.dst_fmt,
-			       (profile.alpha_bitmap || profile.osd) ?
-			       &profile.pat_fmt : NULL,
-			       profile.alpha_bitmap, &profile.transform);
+	ret = rk_rga2_emit_dst(job, task, &profile->dst_fmt,
+			       (profile->alpha_bitmap || profile->osd) ?
+			       &profile->pat_fmt : NULL,
+			       profile->alpha_bitmap, &profile->transform);
 	if (ret)
 		return ret;
 
-	if (profile.alpha_bitmap) {
-		ret = rk_rga2_emit_alpha_bitmap(job, task, &profile.pat_fmt);
+	if (profile->alpha_bitmap) {
+		ret = rk_rga2_emit_alpha_bitmap(job, task, &profile->pat_fmt);
 		if (ret)
 			return ret;
-	} else if (profile.osd) {
-		ret = rk_rga2_emit_osd(job, task, &profile.pat_fmt);
+	} else if (profile->osd) {
+		ret = rk_rga2_emit_osd(job, task, &profile->pat_fmt);
 		if (ret)
 			return ret;
-	} else if (profile.color_key) {
-		rk_rga2_emit_color_key(job, task, &profile);
-	} else if (rk_rga2_task_uses_rop(task)) {
+	} else if (profile->color_key) {
+		rk_rga2_emit_color_key(job, task, profile);
+	} else if (task->uses_rop) {
 		ret = rk_rga2_rop_ctrl(task->rop_code, &rop_ctrl);
 		if (ret)
 			return ret;
@@ -22742,7 +23494,7 @@ static int rk_rga2_emit_simple_bitblt(struct rk_rga_job *job)
 		rk_rga_cmd_write(job, RK_RGA2_GAUSS_COE_OFFSET,
 				 job->gauss_coeffs[job->current_task]);
 	}
-	if (rk_rga2_task_uses_quantize(task)) {
+	if (task->uses_quantize) {
 		quant_scale = rk_rga2_pack_nn_quantize(task->gr_color.gr_x_r,
 						       task->gr_color.gr_x_g,
 						       task->gr_color.gr_x_b);
@@ -22755,7 +23507,7 @@ static int rk_rga2_emit_simple_bitblt(struct rk_rga_job *job)
 				 quant_offset);
 	}
 
-	job->cmd_ready = true;
+	rk_rga_job_current_exec(job)->cmd_ready = true;
 
 	return 0;
 }
@@ -22767,22 +23519,23 @@ static u32 rk_rga2_pack_gr(__s16 x, __s16 y)
 
 static int rk_rga2_emit_color_fill(struct rk_rga_job *job)
 {
-	struct rga_req *task = &job->tasks[job->current_task];
-	struct rga_req validation_task;
-	const struct rga_req *validate_task;
-	struct rk_rga2_fill_profile profile;
+	const struct rk_rga_task_plan *task;
+	const struct rk_rga2_fill_profile *profile;
 	struct rk_rga2_transform transform = {
-		.dst_act_w = task->dst.act_w,
-		.dst_act_h = task->dst.act_h,
+		.dst_act_w = 0,
+		.dst_act_h = 0,
 	};
 	u32 mode;
 	int ret;
 
-	validate_task = rk_rga_job_validation_task(job, job->current_task,
-						   &validation_task);
-	ret = rk_rga2_validate_color_fill(validate_task, &profile);
+	ret = rk_rga_emitter_require_plan(job, RK_RGA_HW_RGA2, &task);
 	if (ret)
 		return ret;
+	if (task->render_mode != RK_RGA_RENDER_COLOR_FILL)
+		return -EUCLEAN;
+	profile = &task->profile.rga2_fill;
+	transform.dst_act_w = task->dst.act_w;
+	transform.dst_act_h = task->dst.act_h;
 
 	mode = FIELD_PREP(RK_RGA2_MODE_RENDER_MODE,
 			  RK_RGA_RENDER_COLOR_FILL) |
@@ -22803,7 +23556,7 @@ static int rk_rga2_emit_color_fill(struct rk_rga_job *job)
 			 rk_rga2_pack_gr(task->gr_color.gr_x_r,
 					 task->gr_color.gr_y_r));
 
-	ret = rk_rga2_emit_dst(job, task, &profile.dst_fmt, NULL, false,
+	ret = rk_rga2_emit_dst(job, task, &profile->dst_fmt, NULL, false,
 			       &transform);
 	if (ret)
 		return ret;
@@ -22811,7 +23564,7 @@ static int rk_rga2_emit_color_fill(struct rk_rga_job *job)
 	rk_rga_cmd_write(job, RK_RGA2_ALPHA_CTRL0_OFFSET, 0);
 	rk_rga_cmd_write(job, RK_RGA2_ALPHA_CTRL1_OFFSET, 0);
 
-	job->cmd_ready = true;
+	rk_rga_job_current_exec(job)->cmd_ready = true;
 
 	return 0;
 }
@@ -22931,7 +23684,7 @@ static u32 rk_rga3_color_key_8_to_10(u32 color)
 }
 
 static int rk_rga3_emit_alpha_overlap(struct rk_rga_job *job,
-				      const struct rga_req *task,
+				      const struct rk_rga_task_plan *task,
 				      const struct rk_rga3_bitblt_profile *profile)
 {
 	bool fg_global_en = false;
@@ -23038,27 +23791,8 @@ static void rk_rga3_emit_overlap(struct rk_rga_job *job,
 	rk_rga_cmd_write(job, RK_RGA3_OVLP_BOT_ALPHA_OFFSET, bottom_alpha);
 }
 
-static int rk_rga3_prepare_bitblt(struct rk_rga_job *job,
-				  struct rk_rga3_bitblt_profile *profile)
-{
-	struct rga_req validation_task;
-	const struct rga_req *task;
-
-	if (!job->tasks)
-		return -EINVAL;
-	if (!job->task_count || job->current_task >= job->task_count)
-		return -EINVAL;
-	if (job->import_count < 2)
-		return -EOPNOTSUPP;
-
-	task = rk_rga_job_validation_task(job, job->current_task,
-					  &validation_task);
-
-	return rk_rga3_validate_bitblt(task, profile);
-}
-
 static int rk_rga3_emit_alpha_bitblt(struct rk_rga_job *job,
-				     const struct rga_req *task,
+				     const struct rk_rga_task_plan *task,
 				     const struct rk_rga3_bitblt_profile *profile)
 {
 	const struct rga_img_info_t *bg;
@@ -23103,7 +23837,7 @@ static int rk_rga3_emit_alpha_bitblt(struct rk_rga_job *job,
 }
 
 static void rk_rga3_emit_no_blend_overlap(struct rk_rga_job *job,
-					  const struct rga_req *task,
+					  const struct rk_rga_task_plan *task,
 					  const struct rk_rga3_bitblt_profile *profile)
 {
 	u32 top_ctrl;
@@ -23133,7 +23867,7 @@ static void rk_rga3_emit_no_blend_overlap(struct rk_rga_job *job,
 }
 
 static int rk_rga3_emit_overlap_bitblt(struct rk_rga_job *job,
-				       const struct rga_req *task,
+				       const struct rk_rga_task_plan *task,
 				       const struct rk_rga3_bitblt_profile *profile)
 {
 	const struct rga_img_info_t *bg = &task->dst;
@@ -23184,56 +23918,60 @@ static int rk_rga3_emit_overlap_bitblt(struct rk_rga_job *job,
 
 static int rk_rga3_emit_simple_bitblt(struct rk_rga_job *job)
 {
-	struct rga_req *task = &job->tasks[job->current_task];
-	struct rk_rga3_bitblt_profile profile;
+	const struct rk_rga_task_plan *task;
+	const struct rk_rga3_bitblt_profile *profile;
 	int ret;
 
-	ret = rk_rga3_prepare_bitblt(job, &profile);
+	ret = rk_rga_emitter_require_plan(job, RK_RGA_HW_RGA3, &task);
 	if (ret)
 		return ret;
+	if (task->render_mode != RK_RGA_RENDER_BITBLT)
+		return -EUCLEAN;
+	profile = &task->profile.rga3_bitblt;
 
-	if (profile.alpha_blend) {
-		ret = rk_rga3_emit_alpha_bitblt(job, task, &profile);
+	if (profile->alpha_blend) {
+		ret = rk_rga3_emit_alpha_bitblt(job, task, profile);
 		if (ret)
 			return ret;
-	} else if (profile.overlap_copy) {
-		ret = rk_rga3_emit_overlap_bitblt(job, task, &profile);
+	} else if (profile->overlap_copy) {
+		ret = rk_rga3_emit_overlap_bitblt(job, task, profile);
 		if (ret)
 			return ret;
 	} else {
-		ret = rk_rga3_emit_win0(job, task, &profile.src_fmt,
-					&profile.dst_fmt, profile.src_mode,
-					profile.rotate_flags);
+		ret = rk_rga3_emit_win0(job, task, &profile->src_fmt,
+					&profile->dst_fmt, profile->src_mode,
+					profile->rotate_flags);
 		if (ret)
 			return ret;
-		rk_rga3_emit_overlap(job, &profile.src_fmt,
-				     &profile.dst_fmt);
-		ret = rk_rga3_emit_wr(job, task, &profile.dst_fmt,
-				      profile.dst_mode, true);
+		rk_rga3_emit_overlap(job, &profile->src_fmt,
+				     &profile->dst_fmt);
+		ret = rk_rga3_emit_wr(job, task, &profile->dst_fmt,
+				      profile->dst_mode, true);
 		if (ret)
 			return ret;
 	}
 
-	job->cmd_ready = true;
+	rk_rga_job_current_exec(job)->cmd_ready = true;
 
 	return 0;
 }
 
 static void rk_rga2_emit_mmu(struct rk_rga_job *job)
 {
-	struct rga_req *task = &job->tasks[job->current_task];
+	struct rk_rga_task_exec *exec = rk_rga_job_current_exec(job);
+	const struct rk_rga_task_plan *task = rk_rga_task_exec_plan(exec);
 	struct rk_rga2_mmu_table *src0;
 	struct rk_rga2_mmu_table *src1;
 	struct rk_rga2_mmu_table *dst;
 	struct rk_rga2_mmu_table *els;
 	u32 ctrl = 0;
 
-	if (!job->rga2_mmu)
+	if (!exec->rga2_mmu || !task)
 		return;
-	src0 = &job->rga2_mmu[RK_RGA2_MMU_SRC0];
-	src1 = &job->rga2_mmu[RK_RGA2_MMU_SRC1];
-	dst = &job->rga2_mmu[RK_RGA2_MMU_DST];
-	els = &job->rga2_mmu[RK_RGA2_MMU_ELS];
+	src0 = &exec->rga2_mmu[RK_RGA2_MMU_SRC0];
+	src1 = &exec->rga2_mmu[RK_RGA2_MMU_SRC1];
+	dst = &exec->rga2_mmu[RK_RGA2_MMU_DST];
+	els = &exec->rga2_mmu[RK_RGA2_MMU_ELS];
 
 	/* RGA2 alpha mode reads destination through the src1 MMU channel. */
 	if (dst->vaddr && (task->alpha_rop_flag & BIT(0)) &&
@@ -23264,23 +24002,25 @@ static void rk_rga2_emit_mmu(struct rk_rga_job *job)
 
 static int rk_rga_job_emit_cmd(struct rk_rga_hw *hw, struct rk_rga_job *job)
 {
+	struct rk_rga_task_exec *exec = rk_rga_job_current_exec(job);
+	const struct rk_rga_task_plan *plan = rk_rga_task_exec_plan(exec);
 	int ret;
 
-	memset(job->cmd_vaddr, 0, job->cmd_size);
-	job->cmd_ready = false;
+	if (!plan || plan->hw_type != hw->type)
+		return -EUCLEAN;
+	memset(exec->cmd_vaddr, 0, exec->cmd_size);
+	exec->cmd_ready = false;
 
 	if (hw->type == RK_RGA_HW_RGA3)
 		return rk_rga3_emit_simple_bitblt(job);
 	if (hw->type == RK_RGA_HW_RGA2) {
-		struct rga_req *task = &job->tasks[job->current_task];
-
-		if (task->render_mode == RK_RGA_RENDER_BITBLT)
+		if (plan->render_mode == RK_RGA_RENDER_BITBLT)
 			ret = rk_rga2_emit_simple_bitblt(job);
-		else if (task->render_mode == RK_RGA_RENDER_COLOR_FILL)
+		else if (plan->render_mode == RK_RGA_RENDER_COLOR_FILL)
 			ret = rk_rga2_emit_color_fill(job);
-		else if (task->render_mode == RK_RGA_RENDER_COLOR_PALETTE)
+		else if (plan->render_mode == RK_RGA_RENDER_COLOR_PALETTE)
 			ret = rk_rga2_emit_color_palette(job);
-		else if (task->render_mode == RK_RGA_RENDER_UPDATE_PALETTE)
+		else if (plan->render_mode == RK_RGA_RENDER_UPDATE_PALETTE)
 			ret = rk_rga2_emit_update_palette(job);
 		else
 			return -EOPNOTSUPP;
@@ -23700,9 +24440,12 @@ static struct rk_rga_hw *rk_rga_hw_get_for_job(struct rk_rga_job *job,
 
 static int rk_rga_backend_start(struct rk_rga_hw *hw, struct rk_rga_job *job)
 {
+	struct rk_rga_task_exec *exec = READ_ONCE(job->current_exec);
 	int ret;
 
 	lockdep_assert_held(&hw->run_lock);
+	if (WARN_ON_ONCE(!exec || exec->hw != hw))
+		return -EUCLEAN;
 
 	/*
 	 * Power the core before establishing its IOMMU mappings, and keep it
@@ -23716,49 +24459,48 @@ static int rk_rga_backend_start(struct rk_rga_hw *hw, struct rk_rga_job *job)
 	ret = rk_rga_hw_power_on(hw);
 	if (ret)
 		return ret;
+	exec->power_owned = true;
 
 	ret = rk_rga_job_prepare_hw_mappings(hw, job);
 	if (ret)
-		goto err_release;
-
-	rk_rga_job_sync_userptr_for_device(job, hw->dev);
-	job->userptr_device_owned = true;
-
-	ret = rk_rga_job_alloc_cmd(job, hw);
+		return ret;
+	ret = rk_rga_task_plan_build(job, hw->type);
 	if (ret)
-		goto err_release;
+		return ret;
+
+	rk_rga_task_exec_sync_userptr_for_device(exec, hw->dev);
+	exec->userptr_device_owned = true;
+
+	ret = rk_rga_task_exec_alloc_cmd(exec, hw);
+	if (ret)
+		return ret;
 
 	ret = rk_rga_job_emit_cmd(hw, job);
 	if (ret) {
 		atomic_inc(&hw->rga->unsupported_count);
 		rk_rga_debug_record(hw->rga, RK_RGA_DEBUG_REJECT_EMIT, job,
 				    job->current_task, ret, 0, 0);
-		goto err_release;
+		return ret;
 	}
-	if (!job->cmd_ready) {
+	if (!exec->cmd_ready) {
 		atomic_inc(&hw->rga->unsupported_count);
-		ret = -EOPNOTSUPP;
-		goto err_release;
+		return -EOPNOTSUPP;
 	}
 
-	ret = rk_rga_publish_and_start(hw, job);
+	if (hw->type == RK_RGA_HW_RGA3)
+		ret = rk_rga3_execution_publish_and_start(hw, exec);
+	else
+		ret = rk_rga2_execution_publish_and_start(hw, exec);
 	if (ret)
-		goto err_release;
+		return ret;
 
 	return RK_RGA_BACKEND_QUEUED;
-
-err_release:
-	/* Nothing was started, so unwind the mappings before gating the core. */
-	rk_rga_job_release_execution_mappings_powered(job, hw);
-	rk_rga_hw_power_off(hw);
-
-	return ret;
 }
 
 static irqreturn_t rk_rga_irq_handler(int irq, void *data)
 {
 	struct rk_rga_hw *hw = data;
-	struct rk_rga_job *job;
+	struct rk_rga_task_exec *exec;
 	irqreturn_t ret = IRQ_NONE;
 	unsigned long flags;
 
@@ -23777,11 +24519,23 @@ static irqreturn_t rk_rga_irq_handler(int irq, void *data)
 		spin_unlock_irqrestore(&hw->job_lock, flags);
 		return IRQ_NONE;
 	}
-	job = rk_rga_hw_active_job_locked(hw);
-	if (job)
-		ret = rk_rga_hw_irq_status(hw, job);
+	exec = rk_rga_hw_active_exec_locked(hw);
+	if (exec)
+		ret = rk_rga_hw_irq_status(hw, exec);
 	else
 		ret = rk_rga_hw_clear_spurious_irq(hw);
+	if (ret == IRQ_WAKE_THREAD) {
+		if (rk_rga_task_exec_ref_empty(&hw->irq_ref)) {
+			if (WARN_ON_ONCE(!rk_rga_task_exec_ref_clone(
+						&hw->irq_ref, &hw->active_ref)))
+				ret = IRQ_HANDLED;
+		} else if (WARN_ON_ONCE(
+			   hw->irq_ref.exec != hw->active_ref.exec ||
+			   hw->irq_ref.generation !=
+				hw->active_ref.generation)) {
+			ret = IRQ_HANDLED;
+		}
+	}
 	spin_unlock_irqrestore(&hw->job_lock, flags);
 
 	if (ret == IRQ_WAKE_THREAD)
@@ -23806,6 +24560,7 @@ static void rk_rga_hw_finish_job_locked(struct rk_rga_hw *hw,
 	struct rk_rga_session *dispatch_session = NULL;
 	bool pending_tasks = job->current_task + 1 < job->task_count;
 	bool requeued = false;
+	int advance_ret;
 
 	/*
 	 * A failed recovery reset quarantines the core, so the remaining tasks
@@ -23817,11 +24572,15 @@ static void rk_rga_hw_finish_job_locked(struct rk_rga_hw *hw,
 	if (reset_ret && pending_tasks && !result)
 		result = -EIO;
 
-	if (!reset_ret && rk_rga_job_advance_task(job, result)) {
+	if (!reset_ret && !result && pending_tasks)
+		rk_rga_job_release_hw(job);
+	advance_ret = reset_ret ? 0 : rk_rga_job_advance_task(job, result);
+	if (advance_ret < 0)
+		result = advance_ret;
+	if (advance_ret > 0) {
 		dispatch_session = READ_ONCE(job->session);
 		if (dispatch_session &&
 		    rk_rga_session_begin_job_dispatch(dispatch_session)) {
-			rk_rga_job_release_hw(job);
 			requeued = true;
 		} else {
 			result = -EFAULT;
@@ -23846,23 +24605,36 @@ static void rk_rga_hw_finish_job_locked(struct rk_rga_hw *hw,
 static irqreturn_t rk_rga_irq_thread(int irq, void *data)
 {
 	struct rk_rga_hw *hw = data;
-	struct rk_rga_job *job;
+	struct rk_rga_retirement retirement = {};
+	struct rk_rga_task_exec_ref claim = {};
+	struct rk_rga_task_exec_ref trigger = {};
+	struct rk_rga_task_exec *exec;
+	unsigned long flags;
 	int reset_ret = 0;
 	int result;
 
 	atomic_inc(&hw->rga->irq_thread_count);
+	if (!rk_rga_hw_take_irq_ref(hw, &trigger))
+		return IRQ_HANDLED;
 	mutex_lock(&hw->run_lock);
-	job = rk_rga_hw_take_active(hw);
-	if (!job) {
+	spin_lock_irqsave(&hw->job_lock, flags);
+	if (hw->active_ref.generation == trigger.generation)
+		exec = rk_rga_hw_take_active_if_locked(hw, trigger.exec,
+						    &claim);
+	else
+		exec = NULL;
+	spin_unlock_irqrestore(&hw->job_lock, flags);
+	if (!exec) {
 		mutex_unlock(&hw->run_lock);
+		WARN_ON_ONCE(!rk_rga_task_exec_ref_put(&trigger));
 		return IRQ_HANDLED;
 	}
-
+	WARN_ON_ONCE(!rk_rga_task_exec_ref_put(&trigger));
 	rk_rga_hw_cancel_timeout(hw);
-	result = job->irq_result;
+	result = exec->irq_result;
 	if (hw->type == RK_RGA_HW_RGA2 &&
-	    (job->intr_status & RK_RGA2_INT_CONFIG_ERR))
-		rk_rga2_log_parse_error(hw, job);
+	    (exec->intr_status & RK_RGA2_INT_CONFIG_ERR))
+		rk_rga2_log_parse_error(hw, exec);
 	if (result) {
 		reset_ret = rk_rga_hw_reset_for_recovery(hw);
 		/* Prevent a failed reset from retriggering on powered-off MMIO. */
@@ -23870,98 +24642,93 @@ static irqreturn_t rk_rga_irq_thread(int irq, void *data)
 			rk_rga_hw_quarantine_irq(hw);
 	}
 	if (reset_ret) {
-		WARN_ON_ONCE(!rk_rga_hw_restore_active_after_reset_failure(
-				      hw, job, false));
+		WARN_ON_ONCE(!rk_rga_task_exec_retire_engine(
+			      hw, &claim, result, false, &retirement));
 		mutex_unlock(&hw->run_lock);
 		rk_rga_hw_abort_queued_jobs(hw, -EIO);
 		rk_rga_abort_incompatible_pending_acquire_jobs(hw->rga, -EIO);
 		return IRQ_HANDLED;
 	}
-	rk_rga_job_note_hw_done(job);
-	/*
-	 * Each task gets fresh role-specific DMA-BUF mappings. This makes
-	 * source/destination bounce-buffer copyback ordering match task
-	 * execution even when distinct DMA-BUF objects alias logical memory.
-	 * They are released before the power drop; any recovery reset above
-	 * has already stopped the engine.
-	 */
-	rk_rga_job_release_execution_mappings_powered(job, hw);
-	rk_rga_hw_power_off(hw);
-	rk_rga_hw_finish_job_locked(hw, job, result, reset_ret);
+	WARN_ON_ONCE(!rk_rga_task_exec_retire_engine(
+			      hw, &claim, result, true, &retirement));
+	rk_rga_hw_finish_job_locked(hw, retirement.job, retirement.result,
+				    reset_ret);
 
 	return IRQ_HANDLED;
 }
 
-static struct rk_rga_job *rk_rga_hw_take_active(struct rk_rga_hw *hw)
-{
-	struct rk_rga_job *job;
-	unsigned long flags;
-
-	spin_lock_irqsave(&hw->job_lock, flags);
-	job = rk_rga_hw_take_active_locked(hw);
-	spin_unlock_irqrestore(&hw->job_lock, flags);
-
-	return job;
-}
-
-/*
- * A failed reset does not prove that the DMA master stopped.  Hand ownership
- * back to the active slot so the job, its mappings, command buffer and power
- * reference remain pinned until a later reset succeeds.  This is the same
- * fail-stop rule used by the MPP rewrite: quarantine is not permission to
- * tear down DMA-visible storage.
- */
-static bool rk_rga_hw_restore_active_after_reset_failure(
-	struct rk_rga_hw *hw, struct rk_rga_job *job, bool iommu_fault)
-{
-	unsigned long flags;
-	bool restored = false;
-
-	spin_lock_irqsave(&hw->job_lock, flags);
-	restored = rk_rga_hw_restore_active_locked(hw, job, iommu_fault);
-	spin_unlock_irqrestore(&hw->job_lock, flags);
-
-	/*
-	 * A collision is impossible while run_lock is held.  If corruption ever
-	 * violates that invariant, the caller deliberately retains its local
-	 * reference and DMA state; completing or putting it would be unsafe.
-	 */
-	return restored;
-}
-
 static bool rk_rga_hw_mark_iommu_fault(struct rk_rga_hw *hw)
 {
+	struct rk_rga_fault_event *event;
+	struct rk_rga_fault_event *pos;
 	unsigned long flags;
-	u64 generation;
 	bool marked = false;
 
+	event = kzalloc(sizeof(*event), GFP_ATOMIC);
+	if (!event)
+		return false;
+	INIT_LIST_HEAD(&event->node);
 	spin_lock_irqsave(&hw->job_lock, flags);
-	generation = rk_rga_hw_active_generation_locked(hw);
-	if (rk_rga_hw_active_job_locked(hw) && generation) {
-		hw->iommu_fault_generation = generation;
-		marked = true;
+	if (rk_rga_task_exec_ref_valid(&hw->active_ref)) {
+		list_for_each_entry(pos, &hw->iommu_fault_events, node) {
+			if (pos->ref.exec == hw->active_ref.exec &&
+			    pos->ref.generation == hw->active_ref.generation) {
+				marked = true;
+				goto unlock;
+			}
+		}
+		if (rk_rga_task_exec_ref_clone(&event->ref, &hw->active_ref)) {
+			list_add_tail(&event->node, &hw->iommu_fault_events);
+			marked = true;
+			event = NULL;
+		}
 	}
+unlock:
 	spin_unlock_irqrestore(&hw->job_lock, flags);
+	kfree(event);
 
 	return marked;
 }
 
-static bool rk_rga_hw_iommu_fault_matches_locked(struct rk_rga_hw *hw)
+static bool
+rk_rga_hw_iommu_fault_matches_locked(
+	struct rk_rga_hw *hw, const struct rk_rga_task_exec_ref *fault)
 {
-	u64 generation;
+	lockdep_assert_held(&hw->job_lock);
 
-	generation = hw->iommu_fault_generation;
-	hw->iommu_fault_generation = 0;
-
-	return generation && rk_rga_hw_active_job_locked(hw) &&
-	       generation == rk_rga_hw_active_generation_locked(hw);
+	return rk_rga_task_exec_ref_valid(fault) &&
+	       hw->active_ref.exec == fault->exec &&
+	       hw->active_ref.generation == fault->generation;
 }
 
-static void rk_rga_hw_recover_active(struct rk_rga_hw *hw, bool iommu_fault,
-				     struct rk_rga_job *timeout_job,
-				     u64 timeout_generation)
+static bool
+rk_rga_hw_take_iommu_fault_ref(struct rk_rga_hw *hw,
+			       struct rk_rga_task_exec_ref *fault)
 {
-	struct rk_rga_job *job;
+	struct rk_rga_fault_event *event = NULL;
+	unsigned long flags;
+	bool taken = false;
+
+	spin_lock_irqsave(&hw->job_lock, flags);
+	if (!list_empty(&hw->iommu_fault_events)) {
+		event = list_first_entry(&hw->iommu_fault_events,
+					 struct rk_rga_fault_event, node);
+		list_del_init(&event->node);
+		taken = rk_rga_task_exec_ref_move(fault, &event->ref);
+	}
+	spin_unlock_irqrestore(&hw->job_lock, flags);
+	kfree(event);
+
+	return taken;
+}
+
+static void
+rk_rga_hw_recover_active(struct rk_rga_hw *hw, bool iommu_fault,
+			 const struct rk_rga_task_exec_ref *trigger)
+{
+	struct rk_rga_retirement retirement = {};
+	struct rk_rga_task_exec_ref claim = {};
+	struct rk_rga_task_exec *exec;
 	unsigned long flags;
 	bool irq_disabled;
 	bool recover;
@@ -23971,9 +24738,9 @@ static void rk_rga_hw_recover_active(struct rk_rga_hw *hw, bool iommu_fault,
 	irq_disabled = rk_rga_hw_disable_irq(hw);
 	mutex_lock(&hw->run_lock);
 	spin_lock_irqsave(&hw->job_lock, flags);
-	job = rk_rga_hw_active_job_locked(hw);
+	exec = rk_rga_hw_active_exec_locked(hw);
 	if (iommu_fault)
-		recover = rk_rga_hw_iommu_fault_matches_locked(hw);
+		recover = rk_rga_hw_iommu_fault_matches_locked(hw, trigger);
 	else
 		/*
 		 * A multi-task job is re-dispatched under the same pointer, so
@@ -23981,10 +24748,11 @@ static void rk_rga_hw_recover_active(struct rk_rga_hw *hw, bool iommu_fault,
 		 * Without the generation test a worker that lost the race with
 		 * the completion IRQ would reset the job's *next* task.
 		 */
-		recover = job && job == timeout_job && timeout_generation &&
-			  timeout_generation ==
-				rk_rga_hw_active_generation_locked(hw) &&
-			  !job->irq_seen;
+		recover = rk_rga_task_exec_ref_valid(trigger) &&
+			  exec == trigger->exec &&
+			  rk_rga_hw_active_generation_locked(hw) ==
+				trigger->generation &&
+			  !exec->irq_seen;
 	if (!recover) {
 		spin_unlock_irqrestore(&hw->job_lock, flags);
 		rk_rga_hw_enable_irq(hw, irq_disabled);
@@ -23993,11 +24761,16 @@ static void rk_rga_hw_recover_active(struct rk_rga_hw *hw, bool iommu_fault,
 	}
 
 	if (hw->type == RK_RGA_HW_RGA3)
-		rk_rga3_read_irq_status(hw, job);
+		rk_rga3_read_irq_status(hw, exec);
 	else
-		rk_rga2_read_irq_status(hw, job);
+		rk_rga2_read_irq_status(hw, exec);
 
-	rk_rga_hw_take_active_locked(hw);
+	if (WARN_ON_ONCE(rk_rga_hw_take_active_locked(hw, &claim) != exec)) {
+		spin_unlock_irqrestore(&hw->job_lock, flags);
+		rk_rga_hw_enable_irq(hw, irq_disabled);
+		mutex_unlock(&hw->run_lock);
+		return;
+	}
 	spin_unlock_irqrestore(&hw->job_lock, flags);
 	if (iommu_fault)
 		rk_rga_hw_cancel_timeout(hw);
@@ -24007,8 +24780,8 @@ static void rk_rga_hw_recover_active(struct rk_rga_hw *hw, bool iommu_fault,
 		dev_err(hw->dev, "job failed on IOMMU fault\n");
 	} else {
 		bool done = hw->type == RK_RGA_HW_RGA3 ?
-			    !!(job->intr_status & RK_RGA3_INT_DONE_MASK) :
-			    !!(job->intr_status & RK_RGA2_INT_DONE_MASK);
+			    !!(exec->intr_status & RK_RGA3_INT_DONE_MASK) :
+			    !!(exec->intr_status & RK_RGA2_INT_DONE_MASK);
 
 		atomic_inc(&hw->rga->timeout_count);
 		if (done) {
@@ -24018,7 +24791,7 @@ static void rk_rga_hw_recover_active(struct rk_rga_hw *hw, bool iommu_fault,
 			 * delivered.  Report what the hardware actually did;
 			 * the recovery reset below still clears the latch.
 			 */
-			result = rk_rga_irq_completion_result(hw->type, job);
+			result = rk_rga_irq_completion_result(hw->type, exec);
 		} else {
 			result = -EBUSY;
 		}
@@ -24026,22 +24799,16 @@ static void rk_rga_hw_recover_active(struct rk_rga_hw *hw, bool iommu_fault,
 
 	reset_ret = rk_rga_hw_reset_for_recovery(hw);
 	if (reset_ret) {
-		WARN_ON_ONCE(!rk_rga_hw_restore_active_after_reset_failure(
-				      hw, job, iommu_fault));
+		WARN_ON_ONCE(!rk_rga_task_exec_retire_engine(
+			      hw, &claim, result, false, &retirement));
 		rk_rga_hw_enable_irq(hw, irq_disabled);
 		mutex_unlock(&hw->run_lock);
 		rk_rga_hw_abort_queued_jobs(hw, -EIO);
 		rk_rga_abort_incompatible_pending_acquire_jobs(hw->rga, -EIO);
 		return;
 	}
-	rk_rga_job_note_hw_done(job);
-	/*
-	 * The reset above stopped the engine, so drop the mappings here rather
-	 * than letting rk_rga_job_complete_queued() unmap with the domain
-	 * already gated.
-	 */
-	rk_rga_job_release_execution_mappings_powered(job, hw);
-	rk_rga_hw_power_off(hw);
+	WARN_ON_ONCE(!rk_rga_task_exec_retire_engine(
+			      hw, &claim, result, true, &retirement));
 	rk_rga_hw_enable_irq(hw, irq_disabled);
 	/*
 	 * Completion moves after the unlock, matching the IRQ thread. The
@@ -24049,7 +24816,8 @@ static void rk_rga_hw_recover_active(struct rk_rga_hw *hw, bool iommu_fault,
 	 * it, and it must do that before dropping run_lock so the requeued job
 	 * cannot be dispatched underneath this function.
 	 */
-	rk_rga_hw_finish_job_locked(hw, job, result, reset_ret);
+	rk_rga_hw_finish_job_locked(hw, retirement.job, retirement.result,
+				    reset_ret);
 }
 
 static void rk_rga_hw_timeout_work(struct work_struct *work)
@@ -24057,22 +24825,24 @@ static void rk_rga_hw_timeout_work(struct work_struct *work)
 	struct delayed_work *delayed = to_delayed_work(work);
 	struct rk_rga_hw *hw = container_of(delayed, struct rk_rga_hw,
 					    timeout_work);
-	struct rk_rga_job *job;
-	u64 generation;
+	struct rk_rga_task_exec_ref timeout = {};
 
-	job = rk_rga_hw_take_timeout_job(hw, &generation);
-	if (!job)
+	if (!rk_rga_hw_take_timeout_ref(hw, &timeout))
 		return;
-	rk_rga_hw_recover_active(hw, false, job, generation);
-	rk_rga_job_put(job);
+	rk_rga_hw_recover_active(hw, false, &timeout);
+	WARN_ON_ONCE(!rk_rga_task_exec_ref_put(&timeout));
 }
 
 static void rk_rga_hw_iommu_fault_work(struct work_struct *work)
 {
 	struct rk_rga_hw *hw =
 		container_of(work, struct rk_rga_hw, iommu_fault_work);
+	struct rk_rga_task_exec_ref fault = {};
 
-	rk_rga_hw_recover_active(hw, true, NULL, 0);
+	while (rk_rga_hw_take_iommu_fault_ref(hw, &fault)) {
+		rk_rga_hw_recover_active(hw, true, &fault);
+		WARN_ON_ONCE(!rk_rga_task_exec_ref_put(&fault));
+	}
 }
 
 static struct rk_rga_hw *
@@ -24214,6 +24984,9 @@ static void rk_rga_hw_dispatch(struct rk_rga_hw *hw)
 	struct rk_rga_service *rga = hw->rga;
 
 	for (;;) {
+		struct rk_rga_retirement retirement = {};
+		struct rk_rga_task_exec_ref claim = {};
+		struct rk_rga_task_exec *exec;
 		struct rk_rga_job *job;
 		struct rk_rga_hw *fallback_hw;
 		struct rk_rga_session *dispatch_session;
@@ -24237,9 +25010,10 @@ static void rk_rga_hw_dispatch(struct rk_rga_hw *hw)
 		job->queued = false;
 		hw->queued_jobs--;
 		recovery_failed = hw->recovery_failed;
-		if (!recovery_failed) {
-			rk_rga_hw_install_active_locked(hw, job);
-		}
+		exec = READ_ONCE(job->current_exec);
+		if (!recovery_failed &&
+		    !rk_rga_hw_install_active_locked(hw, exec))
+			recovery_failed = true;
 		spin_unlock_irqrestore(&hw->job_lock, flags);
 		if (recovery_failed) {
 			rk_rga_job_complete_queued(job, -EIO);
@@ -24256,8 +25030,19 @@ static void rk_rga_hw_dispatch(struct rk_rga_hw *hw)
 		}
 
 		spin_lock_irqsave(&hw->job_lock, flags);
-		rk_rga_hw_take_active_if_locked(hw, job);
+		exec = rk_rga_hw_take_active_if_locked(hw, exec, &claim);
 		spin_unlock_irqrestore(&hw->job_lock, flags);
+		if (WARN_ON_ONCE(!exec)) {
+			mutex_unlock(&hw->run_lock);
+			return;
+		}
+		if (WARN_ON_ONCE(!rk_rga_task_exec_retire_engine(
+				      hw, &claim, ret, true, &retirement))) {
+			mutex_unlock(&hw->run_lock);
+			return;
+		}
+		job = retirement.job;
+		ret = retirement.result;
 
 		if (ret == -EIO && hw->type == RK_RGA_HW_RGA2 &&
 		    (job->dmabuf_incompatible_hw_type_mask &
@@ -24268,12 +25053,25 @@ static void rk_rga_hw_dispatch(struct rk_rga_hw *hw)
 				fallback_hw =
 					rk_rga_hw_get_for_job(job, &fallback_error);
 				if (fallback_hw) {
+					int replace_ret;
+
 					rk_rga_debug_record(rga,
 							    RK_RGA_DEBUG_JOB_REROUTE,
 							    job, job->current_task,
 							    ret, 0, ret);
 					atomic_inc(&rga->dmabuf_rga2_reroute_count);
 					rk_rga_job_release_hw(job);
+					replace_ret = rk_rga_job_replace_exec(
+						job, job->current_task);
+					if (replace_ret) {
+						rk_rga_hw_put(fallback_hw);
+						rk_rga_session_end_job_dispatch(
+							dispatch_session);
+						rk_rga_job_complete_queued(
+							job, replace_ret);
+						mutex_unlock(&hw->run_lock);
+						return;
+					}
 					mutex_unlock(&hw->run_lock);
 					rk_rga_job_queue_on_hw(job, fallback_hw, false);
 					rk_rga_session_end_job_dispatch(dispatch_session);
@@ -24355,10 +25153,15 @@ static int rk_rga_job_queue_ref(struct rk_rga_job *job, bool take_ref)
 static int rk_rga_job_queue_on_hw(struct rk_rga_job *job, struct rk_rga_hw *hw,
 				  bool take_ref)
 {
+	struct rk_rga_task_exec *exec = READ_ONCE(job->current_exec);
 	unsigned long flags;
 	int ret;
 
-	job->hw = hw;
+	if (WARN_ON_ONCE(!exec)) {
+		rk_rga_hw_put(hw);
+		return -EINVAL;
+	}
+	exec->hw = hw;
 	if (!job->rga)
 		job->rga = hw->rga;
 	if (take_ref)
@@ -24424,8 +25227,11 @@ static void rk_rga_hw_abort_queued_jobs(struct rk_rga_hw *hw, int result)
 
 static int rk_rga_hw_abort_jobs(struct rk_rga_hw *hw, int result)
 {
+	struct rk_rga_retirement retirement = {};
+	struct rk_rga_task_exec_ref claim = {};
+	struct rk_rga_task_exec *active_exec = NULL;
 	struct rk_rga_job *job, *tmp;
-	struct rk_rga_job *active;
+	struct rk_rga_job *active = NULL;
 	unsigned long flags;
 	bool irq_disabled;
 	int reset_ret = 0;
@@ -24436,7 +25242,9 @@ static int rk_rga_hw_abort_jobs(struct rk_rga_hw *hw, int result)
 
 	mutex_lock(&hw->run_lock);
 	spin_lock_irqsave(&hw->job_lock, flags);
-	active = rk_rga_hw_take_active_locked(hw);
+	active_exec = rk_rga_hw_take_active_locked(hw, &claim);
+	if (active_exec)
+		active = active_exec->job;
 	list_for_each_entry_safe(job, tmp, &hw->job_queue, node) {
 		list_del_init(&job->node);
 		job->queued = false;
@@ -24448,13 +25256,11 @@ static int rk_rga_hw_abort_jobs(struct rk_rga_hw *hw, int result)
 	if (active) {
 		reset_ret = rk_rga_hw_reset_for_recovery(hw);
 		if (reset_ret) {
-			WARN_ON_ONCE(
-				!rk_rga_hw_restore_active_after_reset_failure(
-					hw, active, false));
+			WARN_ON_ONCE(!rk_rga_task_exec_retire_engine(
+				      hw, &claim, result, false, &retirement));
 		} else {
-			rk_rga_job_note_hw_done(active);
-			rk_rga_job_release_execution_mappings_powered(active, hw);
-			rk_rga_hw_power_off(hw);
+			WARN_ON_ONCE(!rk_rga_task_exec_retire_engine(
+				      hw, &claim, result, true, &retirement));
 		}
 	}
 	rk_rga_hw_enable_irq(hw, irq_disabled);
@@ -24476,6 +25282,9 @@ static bool rk_rga_hw_abort_session_jobs(struct rk_rga_hw *hw,
 					 struct rk_rga_session *session,
 					 int result, int *stop_ret)
 {
+	struct rk_rga_retirement retirement = {};
+	struct rk_rga_task_exec_ref claim = {};
+	struct rk_rga_task_exec *active_exec = NULL;
 	struct rk_rga_job *job, *tmp;
 	struct rk_rga_job *active = NULL;
 	unsigned long flags;
@@ -24491,10 +25300,12 @@ static bool rk_rga_hw_abort_session_jobs(struct rk_rga_hw *hw,
 	mutex_lock(&hw->run_lock);
 	spin_lock_irqsave(&hw->job_lock, flags);
 	active = rk_rga_hw_active_job_locked(hw);
-	if (active && active->session == session)
-		active = rk_rga_hw_take_active_locked(hw);
-	else
+	if (active && active->session == session) {
+		active_exec = rk_rga_hw_take_active_locked(hw, &claim);
+		active = active_exec ? active_exec->job : NULL;
+	} else {
 		active = NULL;
+	}
 
 	list_for_each_entry_safe(job, tmp, &hw->job_queue, node) {
 		if (job->session != session)
@@ -24511,13 +25322,11 @@ static bool rk_rga_hw_abort_session_jobs(struct rk_rga_hw *hw,
 		rk_rga_hw_cancel_timeout(hw);
 		reset_ret = rk_rga_hw_reset_for_recovery(hw);
 		if (reset_ret) {
-			WARN_ON_ONCE(
-				!rk_rga_hw_restore_active_after_reset_failure(
-					hw, active, false));
+			WARN_ON_ONCE(!rk_rga_task_exec_retire_engine(
+				      hw, &claim, result, false, &retirement));
 		} else {
-			rk_rga_job_note_hw_done(active);
-			rk_rga_job_release_execution_mappings_powered(active, hw);
-			rk_rga_hw_power_off(hw);
+			WARN_ON_ONCE(!rk_rga_task_exec_retire_engine(
+				      hw, &claim, result, true, &retirement));
 		}
 	}
 	rk_rga_hw_enable_irq(hw, irq_disabled);
@@ -24585,11 +25394,12 @@ static void rk_rga_session_abort_hw_jobs(struct rk_rga_session *session,
 
 static void rk_rga_job_acquire_work(struct work_struct *work)
 {
-	struct rk_rga_job *job = container_of(work, struct rk_rga_job,
-					      acquire_work);
+	struct rk_rga_acquire_set *set =
+		container_of(work, struct rk_rga_acquire_set, work);
+	struct rk_rga_job *job = READ_ONCE(set->job);
 	struct rk_rga_session *session = READ_ONCE(job->session);
 	bool dispatching = false;
-	int ret = READ_ONCE(job->result);
+	int ret = READ_ONCE(set->result);
 
 	if (!ret && session)
 		dispatching =
@@ -24599,7 +25409,7 @@ static void rk_rga_job_acquire_work(struct work_struct *work)
 	if (!ret && !dispatching) {
 		rk_rga_job_set_waiting_acquire(job, false);
 		rk_rga_job_set_acquire_result(job, -EFAULT);
-		ret = READ_ONCE(job->result);
+		ret = READ_ONCE(set->result);
 	}
 
 	if (ret)
@@ -25944,6 +26754,7 @@ static int rk_rga_hw_probe(struct platform_device *pdev)
 	mutex_init(&hw->run_lock);
 	INIT_DELAYED_WORK(&hw->timeout_work, rk_rga_hw_timeout_work);
 	INIT_WORK(&hw->iommu_fault_work, rk_rga_hw_iommu_fault_work);
+	INIT_LIST_HEAD(&hw->iommu_fault_events);
 	INIT_LIST_HEAD(&hw->fault_node);
 	INIT_LIST_HEAD(&hw->job_queue);
 	platform_set_drvdata(pdev, hw);
