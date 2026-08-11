@@ -1643,14 +1643,13 @@ int rga_mm_lookup_rga2_support(struct rga_mm *mm_session, uint64_t handle,
 		return buffer->dma_buffer && buffer->dma_buffer->dma_buf ?
 		       RGA2_BUFFER_STAGEABLE : RGA2_BUFFER_UNSUPPORTED;
 
-	/* Over-4G contiguous non-DMA-BUF memory bypasses the RGA2 MMU. */
-	if (buffer->mm_flag & RGA_MEM_PHYSICAL_CONTIGUOUS)
-		return RGA2_BUFFER_UNSUPPORTED;
-
 	/*
 	 * Over-4G memory is servable through the RGA2 MMU when a transient
 	 * per-job DMA mapping of the 32-bit RGA2 device can bounce it below
 	 * 4G: dma-buf imports re-attach, virtual imports re-map their pages.
+	 * A virtual import can be physically contiguous at import time (for
+	 * example when malloc() is backed by a transparent huge page), but it
+	 * must still take this remap path rather than bypassing the RGA2 MMU.
 	 */
 	switch (buffer->type) {
 	case RGA_DMA_BUFFER:
@@ -1659,6 +1658,8 @@ int rga_mm_lookup_rga2_support(struct rga_mm *mm_session, uint64_t handle,
 	case RGA_VIRTUAL_ADDRESS:
 		return buffer->virt_addr && buffer->virt_addr->pages ?
 		       RGA2_BUFFER_DIRECT : RGA2_BUFFER_UNSUPPORTED;
+	case RGA_PHYSICAL_ADDRESS:
+		return RGA2_BUFFER_UNSUPPORTED;
 	default:
 		return RGA2_BUFFER_UNSUPPORTED;
 	}
@@ -1800,14 +1801,16 @@ static bool rga_mm_is_need_mmu(struct rga_job *job, struct rga_internal_buffer *
 		return false;
 
 	/*
-	 * High DMA-BUFs that look physically contiguous still need the RGA2
-	 * MMU: their direct address is outside the 32-bit aperture and the
-	 * per-job path may replace them with DMA32 staging pages.
+	 * High DMA-BUFs and USERPTRs that look physically contiguous still need
+	 * the RGA2 MMU: their direct address is outside the 32-bit aperture and
+	 * the per-job path may replace or remap them below 4G. Raw physical
+	 * imports remain direct-address-only.
 	 */
 	if (buffer->mm_flag & RGA_MEM_PHYSICAL_CONTIGUOUS) {
 		if (!(buffer->mm_flag & RGA_MEM_UNDER_4G) &&
 		    (buffer->type == RGA_DMA_BUFFER ||
-		     buffer->type == RGA_DMA_BUFFER_PTR))
+		     buffer->type == RGA_DMA_BUFFER_PTR ||
+		     buffer->type == RGA_VIRTUAL_ADDRESS))
 			return true;
 
 		return false;
@@ -2805,7 +2808,9 @@ static int rga_mm_get_buffer_info(struct rga_job *job,
 		break;
 	case RGA_MMU:
 	default:
-		if (internal_buffer->mm_flag & RGA_MEM_PHYSICAL_CONTIGUOUS) {
+		if ((internal_buffer->mm_flag & RGA_MEM_PHYSICAL_CONTIGUOUS) &&
+		    ((internal_buffer->mm_flag & RGA_MEM_UNDER_4G) ||
+		     internal_buffer->type == RGA_PHYSICAL_ADDRESS)) {
 			addr = internal_buffer->phys_addr;
 			break;
 		}
