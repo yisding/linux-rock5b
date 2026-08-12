@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0
 config ROCKCHIP_RGA_REWRITE
 	tristate "Rockchip RGA compatibility rewrite"
-	depends on ARCH_ROCKCHIP
+	depends on ARCH_ROCKCHIP && ROCKCHIP_IOMMU
 	depends on !ROCKCHIP_MULTI_RGA
 	depends on !VIDEO_ROCKCHIP_RGA
 	select SYNC_FILE

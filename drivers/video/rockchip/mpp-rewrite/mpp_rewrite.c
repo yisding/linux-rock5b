@@ -62,6 +62,20 @@
 #include <soc/rockchip/vsi_iommu.h>
 #include <uapi/linux/rk-mpp.h>
 
+static_assert(sizeof(struct mpp_request) == 24);
+static_assert(offsetof(struct mpp_request, data_ptr) == 16);
+
+/* Kernel-private decoded request; the installed UAPI keeps a fixed u64. */
+struct rk_mpp_request {
+	u32 cmd;
+	u32 flags;
+	u32 size;
+	u32 offset;
+	void __user *data;
+};
+
+#define mpp_request rk_mpp_request
+
 #if IS_ENABLED(CONFIG_ROCKCHIP_MPP_REWRITE_KUNIT_TEST)
 #include <linux/fdtable.h>
 #include <linux/mm.h>
