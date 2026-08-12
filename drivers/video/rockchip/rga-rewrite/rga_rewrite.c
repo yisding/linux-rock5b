@@ -1000,6 +1000,8 @@ struct rga_req {
 	__u8 reservr[24];
 };
 
+static int rk_rga_task_validate_ignored_semantics(const struct rga_req *task);
+
 #define RGA_IOC_GET_DRVIER_VERSION	RGA_IOR(0x1, struct rga_version_t)
 #define RGA_IOC_GET_HW_VERSION		RGA_IOR(0x2, struct rga_hw_versions_t)
 #define RGA_IOC_IMPORT_BUFFER		RGA_IOWR(0x3, struct rga_buffer_pool)
@@ -1133,6 +1135,7 @@ struct rk_rga_import {
 	unsigned int page_offset;
 	bool counted;
 	bool service_linked;
+	bool userptr_pages_charged;
 	bool userptr_anon_backed;
 };
 
@@ -1300,6 +1303,8 @@ struct rk_rga_task_exec {
 	enum rk_rga_task_exec_state state;
 	bool cmd_ready;
 	bool irq_seen;
+	bool iommu_fault_seen;
+	bool iommu_fault_work_pending;
 	bool userptr_device_owned;
 	bool power_owned;
 };
@@ -1440,26 +1445,22 @@ static bool rk_rga_task_exec_ref_move(struct rk_rga_task_exec_ref *dst,
 
 static bool rk_rga_task_exec_try_reclaim(struct rk_rga_task_exec *exec)
 {
-	struct rk_rga_job *job = exec ? exec->job : NULL;
-	bool free_exec = false;
+	enum rk_rga_task_exec_state state;
 
-	if (!job || refcount_read(&exec->refs) != 1 ||
-	    (exec->state != RK_RGA_TASK_EXEC_RETIRED &&
-	     exec->state != RK_RGA_TASK_EXEC_RECLAIMABLE))
+	if (!exec || refcount_read(&exec->refs) != 1)
 		return false;
-	if (exec->state == RK_RGA_TASK_EXEC_RETIRED)
-		exec->state = RK_RGA_TASK_EXEC_RECLAIMABLE;
-	if (exec == READ_ONCE(job->current_exec) ||
-	    exec == &job->exec_storage)
-		return true;
-	list_del_init(&exec->job_link);
-	if (WARN_ON_ONCE(!refcount_dec_and_test(&exec->refs)))
+	state = READ_ONCE(exec->state);
+	if (state != RK_RGA_TASK_EXEC_RETIRED &&
+	    state != RK_RGA_TASK_EXEC_RECLAIMABLE)
 		return false;
-	kfree(exec->plan);
-	exec->plan = NULL;
-	free_exec = true;
-	if (free_exec)
-		kfree(exec);
+
+	/*
+	 * A timeout, fault event and threaded IRQ can all retain the same retired
+	 * execution.  Their final puts are deliberately lockless and can observe
+	 * the base reference concurrently.  Keep the bounded per-task storage on
+	 * the job list until final job release so no put can race an eager free.
+	 */
+	WRITE_ONCE(exec->state, RK_RGA_TASK_EXEC_RECLAIMABLE);
 
 	return true;
 }
@@ -1577,6 +1578,9 @@ struct rk_rga_hw {
 	bool irq_registered;
 	bool recovery_failed;
 	bool removing;
+	bool suspended;
+	bool suspend_fault_handler_unregistered;
+	bool suspend_irq_disabled;
 };
 
 static struct rk_rga_task_exec *
@@ -1776,6 +1780,7 @@ struct rk_rga_service {
 	spinlock_t fence_lock;
 	atomic_t ioctl_count;
 	atomic_t import_count;
+	atomic_long_t pinned_userptr_pages;
 	atomic_t prepared_job_count;
 	atomic_t release_fence_count;
 	atomic_t completed_job_count;
@@ -1822,6 +1827,11 @@ struct rk_rga_service {
 
 static struct rk_rga_service rk_rga;
 static bool rk_rga_runtime_registered;
+static unsigned int rk_rga_userptr_pin_limit_mb = 1024;
+module_param_named(userptr_pin_limit_mb, rk_rga_userptr_pin_limit_mb,
+		   uint, 0644);
+MODULE_PARM_DESC(userptr_pin_limit_mb,
+		 "service-wide USERPTR long-term pin limit in MiB");
 static int rk_rga_runtime_register(void);
 static void rk_rga_runtime_unregister(void);
 
@@ -1838,7 +1848,47 @@ static void rk_rga_service_state_init(struct rk_rga_service *rga)
 	INIT_LIST_HEAD(&rga->fault_hws);
 	spin_lock_init(&rga->fence_lock);
 	raw_spin_lock_init(&rga->debug_lock);
+	atomic_long_set(&rga->pinned_userptr_pages, 0);
 	rga->debug_trace_mask = RK_RGA_DEBUG_TRACE_DEFAULT;
+}
+
+static unsigned long rk_rga_userptr_pin_limit_pages(void)
+{
+	u64 bytes;
+
+	if (check_mul_overflow((u64)READ_ONCE(rk_rga_userptr_pin_limit_mb),
+			       (u64)SZ_1M, &bytes))
+		return LONG_MAX;
+
+	return min_t(u64, bytes >> PAGE_SHIFT, LONG_MAX);
+}
+
+static bool rk_rga_charge_userptr_pages(struct rk_rga_service *rga,
+					unsigned int pages)
+{
+	unsigned long limit = rk_rga_userptr_pin_limit_pages();
+	long old;
+
+	if (!pages || pages > limit)
+		return false;
+
+	old = atomic_long_read(&rga->pinned_userptr_pages);
+	for (;;) {
+		if (old < 0 || old > limit || pages > limit - old)
+			return false;
+		if (atomic_long_try_cmpxchg(&rga->pinned_userptr_pages,
+					    &old, old + pages))
+			return true;
+	}
+}
+
+static void rk_rga_uncharge_userptr_pages(struct rk_rga_service *rga,
+					  unsigned int pages)
+{
+	long left;
+
+	left = atomic_long_sub_return(pages, &rga->pinned_userptr_pages);
+	WARN_ON_ONCE(left < 0);
 }
 
 static const char *rk_rga_debug_event_name(enum rk_rga_debug_event_type type)
@@ -2406,6 +2456,7 @@ rk_rga_hw_min_dma_align_mask(enum rk_rga_hw_type type)
 static bool rk_rga_hw_accepting_jobs(const struct rk_rga_hw *hw)
 {
 	return !READ_ONCE(hw->removing) &&
+	       !READ_ONCE(hw->suspended) &&
 	       !READ_ONCE(hw->recovery_failed);
 }
 
@@ -3067,6 +3118,9 @@ static void rk_rga_import_destroy(struct rk_rga_import *import)
 						    true);
 			kvfree(import->pages);
 		}
+		if (import->userptr_pages_charged)
+			rk_rga_uncharge_userptr_pages(rga,
+						      import->pinned_pages);
 		kvfree(import->userptr_extents);
 	}
 	if (import->counted)
@@ -4337,6 +4391,68 @@ rk_rga_classify_direct_img(const struct rga_req *task,
 		return RK_RGA_DIRECT_IMG_USERPTR;
 
 	return RK_RGA_DIRECT_IMG_INVALID;
+}
+
+static int rk_rga_preflight_direct_img(const struct rga_req *task,
+				       const struct rga_img_info_t *img,
+				       bool required)
+{
+	struct rk_rga_img_layout layout;
+	u32 right;
+	u32 bottom;
+	int ret;
+
+	switch (rk_rga_classify_direct_img(task, img)) {
+	case RK_RGA_DIRECT_IMG_INVALID:
+		return required ? -EINVAL : 0;
+	case RK_RGA_DIRECT_IMG_UNSUPPORTED_PHYS:
+		return -EOPNOTSUPP;
+	case RK_RGA_DIRECT_IMG_DMABUF:
+	case RK_RGA_DIRECT_IMG_USERPTR:
+		break;
+	}
+
+	if (!img->act_w || !img->act_h || !img->vir_w || !img->vir_h ||
+	    img->vir_w > 8192 || img->vir_h > 8192 ||
+	    check_add_overflow((u32)img->x_offset, (u32)img->act_w,
+			       &right) ||
+	    check_add_overflow((u32)img->y_offset, (u32)img->act_h,
+			       &bottom) ||
+	    right > img->vir_w || bottom > img->vir_h ||
+	    right > 8192 || bottom > 8192)
+		return -EINVAL;
+	ret = rk_rga_validate_virtual_row_strides(img);
+	if (ret)
+		return ret;
+
+	return rk_rga_img_layout(img, &layout);
+}
+
+static int rk_rga_preflight_direct_task(const struct rga_req *task)
+{
+	int ret;
+
+	ret = rk_rga_task_validate_ignored_semantics(task);
+	if (ret)
+		return ret;
+	switch (task->render_mode) {
+	case RK_RGA_RENDER_BITBLT:
+	case RK_RGA_RENDER_COLOR_PALETTE:
+		ret = rk_rga_preflight_direct_img(task, &task->src, true);
+		if (ret)
+			return ret;
+		ret = rk_rga_preflight_direct_img(task, &task->dst, true);
+		if (ret || !task->bsfilter_flag)
+			return ret;
+		return rk_rga_preflight_direct_img(task, &task->pat, true);
+	case RK_RGA_RENDER_COLOR_FILL:
+		return rk_rga_preflight_direct_img(task, &task->dst, true);
+	case RK_RGA_RENDER_UPDATE_PALETTE:
+	case RK_RGA_RENDER_UPDATE_PATTERN:
+		return rk_rga_preflight_direct_img(task, &task->pat, true);
+	default:
+		return -EINVAL;
+	}
 }
 
 static int rk_rga_resolve_direct_img(struct rk_rga_service *rga,
@@ -6208,6 +6324,14 @@ static int rk_rga_prepare_tasks_locked(struct rk_rga_session *session,
 	size_t task_import_bytes;
 	int ret;
 
+	for (u32 i = 0; i < task_count; i++) {
+		if (tasks[i].handle_flag & 1)
+			continue;
+		ret = rk_rga_preflight_direct_task(&tasks[i]);
+		if (ret)
+			return ret;
+	}
+
 	import_bytes = array_size(task_count, 9 * sizeof(*imports));
 	if (import_bytes == SIZE_MAX)
 		return -EOVERFLOW;
@@ -7453,6 +7577,13 @@ static int rk_rga_irq_completion_result(enum rk_rga_hw_type type,
 		       rk_rga2_irq_result(exec) : 0;
 
 	return -EINVAL;
+}
+
+static int
+rk_rga_task_exec_terminal_result(const struct rk_rga_task_exec *exec,
+				 int result)
+{
+	return exec->iommu_fault_seen ? -EIO : result;
 }
 
 static irqreturn_t rk_rga_hw_irq_status(struct rk_rga_hw *hw,
@@ -9528,6 +9659,7 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 				   struct rk_rga2_bitblt_profile *profile);
 static int rk_rga3_validate_bitblt(const struct rga_req *task,
 				   struct rk_rga3_bitblt_profile *profile);
+static int rk_rga_task_validate_ignored_semantics(const struct rga_req *task);
 static int rk_rga_request_check(const struct rga_user_request *user);
 static int rk_rga_request_ioctl_ret(int ret);
 static int rk_rga_request_config(struct rk_rga_session *session,
@@ -11423,6 +11555,7 @@ static void rk_rga_request_check_kunit(struct kunit *test)
 		.task_ptr = 0x1000,
 		.task_num = 1,
 		.id = 1,
+		.sync_mode = RGA_BLIT_SYNC,
 	};
 
 	KUNIT_EXPECT_EQ(test, rk_rga_request_check(&user), 0);
@@ -11443,6 +11576,14 @@ static void rk_rga_request_check_kunit(struct kunit *test)
 
 	user.task_num = RGA_TASK_NUM_MAX;
 	KUNIT_EXPECT_EQ(test, rk_rga_request_check(&user), 0);
+
+	user.sync_mode = RGA_BLIT_ASYNC;
+	KUNIT_EXPECT_EQ(test, rk_rga_request_check(&user), 0);
+
+	user.sync_mode = 0;
+	KUNIT_EXPECT_EQ(test, rk_rga_request_check(&user), -EINVAL);
+	user.sync_mode = U32_MAX;
+	KUNIT_EXPECT_EQ(test, rk_rga_request_check(&user), -EINVAL);
 }
 
 static void rk_rga_debug_event_ring_kunit(struct kunit *test)
@@ -11712,6 +11853,16 @@ static void rk_rga_direct_img_mem_type_kunit(struct kunit *test)
 	task.pat.uv_addr = 0x2000;
 	KUNIT_EXPECT_EQ(test, rk_rga_classify_direct_img(&task, &task.pat),
 			RK_RGA_DIRECT_IMG_USERPTR);
+
+	task = rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					 RK_RGA_FORMAT_RGBA_8888);
+	task.mmu_info.mmu_flag = RK_RGA_MMU_SRC0 | RK_RGA_MMU_DST;
+	task.src.yrgb_addr = (u64)INT_MAX + 1;
+	task.dst.yrgb_addr = (u64)INT_MAX + PAGE_SIZE + 1;
+	KUNIT_EXPECT_EQ(test, rk_rga_preflight_direct_task(&task), 0);
+	task.src.vir_w = U16_MAX;
+	task.src.vir_h = U16_MAX;
+	KUNIT_EXPECT_EQ(test, rk_rga_preflight_direct_task(&task), -EINVAL);
 }
 
 static void rk_rga_request_config_direct_phys_reject_kunit(struct kunit *test)
@@ -13582,6 +13733,7 @@ static void rk_rga_request_remove_free_kunit(struct kunit *test)
 
 static void rk_rga_import_buffer_size_kunit(struct kunit *test)
 {
+	struct rk_rga_service *rga;
 	struct rga_external_buffer buffer = {
 		.type = RGA_VIRTUAL_ADDRESS,
 		.memory = 0x100000,
@@ -13589,7 +13741,26 @@ static void rk_rga_import_buffer_size_kunit(struct kunit *test)
 			.size = 4096,
 		},
 	};
+	unsigned long pin_limit;
 	size_t size = 0;
+
+	rga = rk_rga_kunit_alloc_service(test);
+	KUNIT_ASSERT_NOT_NULL(test, rga);
+	pin_limit = rk_rga_userptr_pin_limit_pages();
+	KUNIT_ASSERT_GT(test, pin_limit, 0UL);
+	atomic_long_set(&rga->pinned_userptr_pages, pin_limit - 1);
+	KUNIT_EXPECT_TRUE(test, rk_rga_charge_userptr_pages(rga, 1));
+	KUNIT_EXPECT_FALSE(test, rk_rga_charge_userptr_pages(rga, 1));
+	rk_rga_uncharge_userptr_pages(rga, 1);
+	KUNIT_EXPECT_EQ(test,
+			atomic_long_read(&rga->pinned_userptr_pages),
+			(long)pin_limit - 1);
+	if (pin_limit < LONG_MAX) {
+		atomic_long_set(&rga->pinned_userptr_pages, pin_limit + 1);
+		KUNIT_EXPECT_FALSE(test, rk_rga_charge_userptr_pages(rga, 1));
+	}
+	atomic_long_set(&rga->pinned_userptr_pages, 0);
+	KUNIT_EXPECT_FALSE(test, rk_rga_charge_userptr_pages(rga, 0));
 
 	KUNIT_EXPECT_EQ(test, rk_rga_import_buffer_size(&buffer, &size), 0);
 	KUNIT_EXPECT_EQ(test, size, (size_t)4096);
@@ -15967,6 +16138,29 @@ static void rk_rga_queue_on_removing_hw_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&hw.refs), 1);
 	KUNIT_EXPECT_EQ(test, dma_fence_get_status(fence), -ENODEV);
 
+	dma_fence_put(job->release_fence);
+	job->release_fence = NULL;
+	kunit_release_action(test, rk_rga_kunit_fence_put, fence);
+	job->done = false;
+	job->result = 0;
+
+	/* System sleep closes admission without masquerading as hot-unplug. */
+	hw.removing = false;
+	hw.suspended = true;
+	refcount_set(&hw.refs, 2);
+	fence = rk_rga_kunit_alloc_fence(test);
+	KUNIT_EXPECT_NOT_NULL(test, fence);
+	if (!fence) {
+		rk_rga_job_put(job);
+		return;
+	}
+	dma_fence_get(fence);
+	job->release_fence = fence;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_queue_on_hw(job, &hw, true),
+			-EBUSY);
+	KUNIT_EXPECT_TRUE(test, job->done);
+	KUNIT_EXPECT_EQ(test, job->result, -EBUSY);
+	KUNIT_EXPECT_EQ(test, refcount_read(&hw.refs), 1);
 	rk_rga_job_put(job);
 	kunit_release_action(test, rk_rga_kunit_fence_put, fence);
 }
@@ -16222,6 +16416,10 @@ static void rk_rga_irq_completion_result_kunit(struct kunit *test)
 			rk_rga_irq_completion_result((enum rk_rga_hw_type)-1,
 						     &job.exec_storage),
 			-EINVAL);
+	job.exec_storage.iommu_fault_seen = true;
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_task_exec_terminal_result(&job.exec_storage, 0),
+			-EIO);
 }
 
 static void rk_rga_pending_multitask_core_mask_kunit(struct kunit *test)
@@ -16315,6 +16513,7 @@ static void rk_rga_mixed_task_core_handoff_kunit(struct kunit *test)
 	struct rk_rga_hw *rga3;
 	struct rk_rga_hw *rga2;
 	struct rk_rga_hw *selected;
+	struct rk_rga_task_exec *old_exec;
 	LIST_HEAD(hw_list);
 
 	rga3 = kunit_kzalloc(test, sizeof(*rga3), GFP_KERNEL);
@@ -16340,6 +16539,7 @@ static void rk_rga_mixed_task_core_handoff_kunit(struct kunit *test)
 	KUNIT_ASSERT_PTR_EQ(test, selected, rga3);
 
 	rk_rga_job_init_first_exec(&job);
+	old_exec = job.current_exec;
 	job.current_exec->hw = selected;
 	job.current_exec->state = RK_RGA_TASK_EXEC_RECLAIMABLE;
 	job.dmabuf_incompatible_hw_type_mask = RK_RGA_HW_TYPE_MASK_RGA2;
@@ -16349,6 +16549,11 @@ static void rk_rga_mixed_task_core_handoff_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&rga3->refs), 1);
 	KUNIT_EXPECT_EQ(test, job.current_task, 1U);
 	KUNIT_EXPECT_EQ(test, job.dmabuf_incompatible_hw_type_mask, 0U);
+	KUNIT_EXPECT_PTR_NE(test, job.current_exec, old_exec);
+	KUNIT_EXPECT_EQ(test, old_exec->state,
+			RK_RGA_TASK_EXEC_RECLAIMABLE);
+	KUNIT_EXPECT_EQ(test, refcount_read(&old_exec->refs), 1);
+	KUNIT_EXPECT_FALSE(test, list_empty(&old_exec->job_link));
 
 	tasks[1].core = BIT(2);
 	type_mask = 0;
@@ -16375,6 +16580,30 @@ static void rk_rga_bitblt_hw_type_mask_kunit(struct kunit *test)
 
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask), 0);
 	KUNIT_EXPECT_EQ(test, type_mask, RK_RGA_HW_TYPE_MASK_ALL);
+	KUNIT_EXPECT_EQ(test, rk_rga_task_validate_ignored_semantics(&task), 0);
+	task.alpha_global_value = 1;
+	KUNIT_EXPECT_EQ(test, rk_rga_task_validate_ignored_semantics(&task),
+			-EOPNOTSUPP);
+	task.alpha_global_value = 0;
+	task.uvhds_mode = 1;
+	KUNIT_EXPECT_EQ(test, rk_rga_task_validate_ignored_semantics(&task),
+			-EOPNOTSUPP);
+	task.uvhds_mode = 0;
+	task.uvvds_mode = 1;
+	KUNIT_EXPECT_EQ(test, rk_rga_task_validate_ignored_semantics(&task),
+			-EOPNOTSUPP);
+	task.uvvds_mode = 0;
+	task.line_draw_info.flag = 1;
+	KUNIT_EXPECT_EQ(test, rk_rga_task_validate_ignored_semantics(&task),
+			-EOPNOTSUPP);
+	memset(&task.line_draw_info, 0, sizeof(task.line_draw_info));
+	task.clip.xmax = task.dst.x_offset + task.dst.act_w - 1;
+	task.clip.ymax = task.dst.y_offset + task.dst.act_h - 1;
+	KUNIT_EXPECT_EQ(test, rk_rga_task_validate_ignored_semantics(&task), 0);
+	task.clip.xmin = 1;
+	KUNIT_EXPECT_EQ(test, rk_rga_task_validate_ignored_semantics(&task),
+			-EOPNOTSUPP);
+	memset(&task.clip, 0, sizeof(task.clip));
 	job.dmabuf_incompatible_hw_type_mask = RK_RGA_HW_TYPE_MASK_RGA2;
 	type_mask = 0;
 	KUNIT_EXPECT_EQ(test,
@@ -16857,7 +17086,13 @@ static void rk_rga_iommu_fault_generation_kunit(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, hw->active_ref.exec, target.current_exec);
 	KUNIT_EXPECT_EQ(test, hw->active_ref.generation, 1ULL);
 	KUNIT_ASSERT_TRUE(test, rk_rga_hw_mark_iommu_fault(hw));
+	KUNIT_EXPECT_TRUE(test, target.current_exec->iommu_fault_seen);
+	KUNIT_EXPECT_TRUE(test, target.current_exec->iommu_fault_work_pending);
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_task_exec_terminal_result(target.current_exec, 0),
+			-EIO);
 	KUNIT_ASSERT_TRUE(test, rk_rga_hw_take_iommu_fault_ref(hw, &fault));
+	KUNIT_EXPECT_FALSE(test, target.current_exec->iommu_fault_work_pending);
 	spin_lock_irqsave(&hw->job_lock, flags);
 	matches = rk_rga_hw_iommu_fault_matches_locked(hw, &fault);
 	taken = rk_rga_hw_take_active_locked(hw, &claim);
@@ -16892,6 +17127,7 @@ static void rk_rga_iommu_fault_generation_kunit(struct kunit *test)
 static void rk_rga_reset_failure_retains_active_kunit(struct kunit *test)
 {
 	struct rk_rga_task_exec_ref claim = {};
+	struct rk_rga_task_exec_ref fault = {};
 	struct rk_rga_retirement retirement = {};
 	struct rk_rga_task_exec *taken;
 	struct rk_rga_hw *hw;
@@ -16910,6 +17146,13 @@ static void rk_rga_reset_failure_retains_active_kunit(struct kunit *test)
 	spin_lock_irqsave(&hw->job_lock, flags);
 	KUNIT_ASSERT_TRUE(test, rk_rga_hw_install_active_locked(
 					hw, target.current_exec));
+	spin_unlock_irqrestore(&hw->job_lock, flags);
+	mutex_unlock(&hw->run_lock);
+	KUNIT_ASSERT_TRUE(test, rk_rga_hw_mark_iommu_fault(hw));
+	KUNIT_ASSERT_TRUE(test, rk_rga_hw_take_iommu_fault_ref(hw, &fault));
+	KUNIT_EXPECT_FALSE(test, target.current_exec->iommu_fault_work_pending);
+	mutex_lock(&hw->run_lock);
+	spin_lock_irqsave(&hw->job_lock, flags);
 	taken = rk_rga_hw_take_active_locked(hw, &claim);
 	spin_unlock_irqrestore(&hw->job_lock, flags);
 	if (taken == target.current_exec)
@@ -16927,6 +17170,7 @@ static void rk_rga_reset_failure_retains_active_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, retirement.disposition,
 			RK_RGA_RETIRE_QUARANTINED);
 	KUNIT_EXPECT_TRUE(test, rk_rga_task_exec_ref_empty(&claim));
+	KUNIT_EXPECT_FALSE(test, rk_rga_hw_take_iommu_fault_ref(hw, &claim));
 
 	spin_lock_irqsave(&hw->job_lock, flags);
 	taken = rk_rga_hw_take_active_locked(hw, &claim);
@@ -16934,6 +17178,7 @@ static void rk_rga_reset_failure_retains_active_kunit(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, taken);
 	KUNIT_EXPECT_TRUE(test, rk_rga_task_exec_retire(taken));
 	KUNIT_EXPECT_TRUE(test, rk_rga_task_exec_ref_put(&claim));
+	KUNIT_EXPECT_TRUE(test, rk_rga_task_exec_ref_put(&fault));
 	KUNIT_EXPECT_TRUE(test, rk_rga_job_release_exec_storage(&target));
 }
 
@@ -24218,6 +24463,37 @@ static int rk_rga_select_default_hw_type(u32 type_mask,
 	return -EOPNOTSUPP;
 }
 
+static bool rk_rga_task_clip_is_default(const struct rga_req *task)
+{
+	u32 right;
+	u32 bottom;
+
+	if (!memchr_inv(&task->clip, 0, sizeof(task->clip)))
+		return true;
+	if (task->clip.xmin || task->clip.ymin ||
+	    check_add_overflow((u32)task->dst.x_offset,
+			       (u32)task->dst.act_w, &right) ||
+	    check_add_overflow((u32)task->dst.y_offset,
+			       (u32)task->dst.act_h, &bottom) ||
+	    !right || !bottom)
+		return false;
+
+	/* Ignoring a full-canvas clip is equivalent for the emitted window. */
+	return task->clip.xmax >= right - 1 &&
+	       task->clip.ymax >= bottom - 1;
+}
+
+static int rk_rga_task_validate_ignored_semantics(const struct rga_req *task)
+{
+	if (!rk_rga_task_clip_is_default(task) ||
+	    memchr_inv(&task->line_draw_info, 0,
+		       sizeof(task->line_draw_info)) ||
+	    task->alpha_global_value || task->uvhds_mode || task->uvvds_mode)
+		return -EOPNOTSUPP;
+
+	return 0;
+}
+
 static int rk_rga_task_hw_type_mask(struct rk_rga_job *job, u32 task_index,
 				    u32 *type_mask)
 {
@@ -24234,6 +24510,9 @@ static int rk_rga_task_hw_type_mask(struct rk_rga_job *job, u32 task_index,
 
 	*type_mask = 0;
 	task = rk_rga_job_validation_task(job, task_index, &validation_task);
+	ret = rk_rga_task_validate_ignored_semantics(task);
+	if (ret)
+		return ret;
 
 	switch (task->render_mode) {
 	case RK_RGA_RENDER_BITBLT:
@@ -24631,7 +24910,7 @@ static irqreturn_t rk_rga_irq_thread(int irq, void *data)
 	}
 	WARN_ON_ONCE(!rk_rga_task_exec_ref_put(&trigger));
 	rk_rga_hw_cancel_timeout(hw);
-	result = exec->irq_result;
+	result = rk_rga_task_exec_terminal_result(exec, exec->irq_result);
 	if (hw->type == RK_RGA_HW_RGA2 &&
 	    (exec->intr_status & RK_RGA2_INT_CONFIG_ERR))
 		rk_rga2_log_parse_error(hw, exec);
@@ -24661,25 +24940,29 @@ static bool rk_rga_hw_mark_iommu_fault(struct rk_rga_hw *hw)
 {
 	struct rk_rga_fault_event *event;
 	struct rk_rga_fault_event *pos;
+	struct rk_rga_task_exec *exec;
 	unsigned long flags;
 	bool marked = false;
 
 	event = kzalloc(sizeof(*event), GFP_ATOMIC);
-	if (!event)
-		return false;
-	INIT_LIST_HEAD(&event->node);
+	if (event)
+		INIT_LIST_HEAD(&event->node);
 	spin_lock_irqsave(&hw->job_lock, flags);
 	if (rk_rga_task_exec_ref_valid(&hw->active_ref)) {
+		exec = hw->active_ref.exec;
+		exec->iommu_fault_seen = true;
+		exec->iommu_fault_work_pending = true;
+		marked = true;
+		if (!event)
+			goto unlock;
 		list_for_each_entry(pos, &hw->iommu_fault_events, node) {
 			if (pos->ref.exec == hw->active_ref.exec &&
 			    pos->ref.generation == hw->active_ref.generation) {
-				marked = true;
 				goto unlock;
 			}
 		}
 		if (rk_rga_task_exec_ref_clone(&event->ref, &hw->active_ref)) {
 			list_add_tail(&event->node, &hw->iommu_fault_events);
-			marked = true;
 			event = NULL;
 		}
 	}
@@ -24706,6 +24989,7 @@ rk_rga_hw_take_iommu_fault_ref(struct rk_rga_hw *hw,
 			       struct rk_rga_task_exec_ref *fault)
 {
 	struct rk_rga_fault_event *event = NULL;
+	struct rk_rga_task_exec *exec;
 	unsigned long flags;
 	bool taken = false;
 
@@ -24715,6 +24999,16 @@ rk_rga_hw_take_iommu_fault_ref(struct rk_rga_hw *hw,
 					 struct rk_rga_fault_event, node);
 		list_del_init(&event->node);
 		taken = rk_rga_task_exec_ref_move(fault, &event->ref);
+		if (taken)
+			fault->exec->iommu_fault_work_pending = false;
+	} else {
+		/* The provider's atomic fault path may have failed allocation. */
+		exec = rk_rga_hw_active_exec_locked(hw);
+		if (exec && exec->iommu_fault_work_pending) {
+			taken = rk_rga_task_exec_ref_get(fault, exec);
+			if (taken)
+				fault->exec->iommu_fault_work_pending = false;
+		}
 	}
 	spin_unlock_irqrestore(&hw->job_lock, flags);
 	kfree(event);
@@ -24739,6 +25033,8 @@ rk_rga_hw_recover_active(struct rk_rga_hw *hw, bool iommu_fault,
 	mutex_lock(&hw->run_lock);
 	spin_lock_irqsave(&hw->job_lock, flags);
 	exec = rk_rga_hw_active_exec_locked(hw);
+	if (exec && exec->iommu_fault_seen)
+		iommu_fault = true;
 	if (iommu_fault)
 		recover = rk_rga_hw_iommu_fault_matches_locked(hw, trigger);
 	else
@@ -24997,7 +25293,8 @@ static void rk_rga_hw_dispatch(struct rk_rga_hw *hw)
 
 		mutex_lock(&hw->run_lock);
 		spin_lock_irqsave(&hw->job_lock, flags);
-		if (hw->removing || rk_rga_hw_active_job_locked(hw) ||
+		if (hw->removing || hw->suspended ||
+		    rk_rga_hw_active_job_locked(hw) ||
 		    list_empty(&hw->job_queue)) {
 			spin_unlock_irqrestore(&hw->job_lock, flags);
 			mutex_unlock(&hw->run_lock);
@@ -25168,8 +25465,9 @@ static int rk_rga_job_queue_on_hw(struct rk_rga_job *job, struct rk_rga_hw *hw,
 		rk_rga_job_get(job);
 
 	spin_lock_irqsave(&hw->job_lock, flags);
-	if (hw->removing || hw->recovery_failed) {
-		ret = hw->removing ? -ENODEV : -EIO;
+	if (hw->removing || hw->suspended || hw->recovery_failed) {
+		ret = hw->removing ? -ENODEV :
+		      hw->suspended ? -EBUSY : -EIO;
 		spin_unlock_irqrestore(&hw->job_lock, flags);
 		rk_rga_job_complete_queued(job, ret);
 		return ret;
@@ -26018,6 +26316,8 @@ static int rk_rga_import_userptr(struct rk_rga_service *rga,
 	if (!nr_pages || nr_pages > INT_MAX)
 		return -EOVERFLOW;
 	page_count = nr_pages;
+	if (!rk_rga_charge_userptr_pages(rga, page_count))
+		return -ENOMEM;
 
 	/*
 	 * The page count comes from an unbounded u32 buffer size and is sized
@@ -26027,8 +26327,10 @@ static int rk_rga_import_userptr(struct rk_rga_service *rga,
 	 * would warn rather than fail cleanly.  Let it fall back to vmalloc.
 	 */
 	pages = kvcalloc(page_count, sizeof(*pages), GFP_KERNEL);
-	if (!pages)
+	if (!pages) {
+		rk_rga_uncharge_userptr_pages(rga, page_count);
 		return -ENOMEM;
+	}
 
 	pinned = pin_user_pages_fast(start, page_count,
 				     FOLL_WRITE | FOLL_LONGTERM, pages);
@@ -26036,6 +26338,7 @@ static int rk_rga_import_userptr(struct rk_rga_service *rga,
 		if (pinned > 0)
 			unpin_user_pages(pages, pinned);
 		kvfree(pages);
+		rk_rga_uncharge_userptr_pages(rga, page_count);
 		return pinned < 0 ? pinned : -EFAULT;
 	}
 	anon_backed = rk_rga_userptr_pages_are_anon(pages, page_count);
@@ -26044,6 +26347,7 @@ static int rk_rga_import_userptr(struct rk_rga_service *rga,
 	if (!import) {
 		unpin_user_pages(pages, page_count);
 		kvfree(pages);
+		rk_rga_uncharge_userptr_pages(rga, page_count);
 		return -ENOMEM;
 	}
 
@@ -26052,6 +26356,7 @@ static int rk_rga_import_userptr(struct rk_rga_service *rga,
 	import->size = size;
 	import->page_count = page_count;
 	import->pinned_pages = page_count;
+	import->userptr_pages_charged = true;
 	import->page_offset = page_offset;
 	import->userptr_anon_backed = anon_backed;
 
@@ -26102,6 +26407,8 @@ static int rk_rga_import_one(struct rk_rga_session *session,
 	if (handle >= 0) {
 		import->counted = true;
 		atomic_inc(&session->rga->import_count);
+		/* Keep rollback identity stable even if another thread releases it. */
+		refcount_inc(&import->refs);
 	}
 	mutex_unlock(&session->lock);
 	if (handle < 0) {
@@ -26152,6 +26459,8 @@ static long rk_rga_ioctl_import_buffer(unsigned long arg,
 		ret = -EFAULT;
 		goto rollback;
 	}
+	while (imported_count)
+		rk_rga_import_put(imported_obj[--imported_count]);
 
 out:
 	kfree(buffers);
@@ -26179,6 +26488,7 @@ rollback:
 		mutex_unlock(&session->lock);
 		if (ptr)
 			rk_rga_import_put(ptr);
+		rk_rga_import_put(imported_obj[imported_count]);
 	}
 	goto out;
 }
@@ -26266,6 +26576,9 @@ static int rk_rga_request_check(const struct rga_user_request *user)
 		return -EINVAL;
 	if (user->task_num > RGA_TASK_NUM_MAX)
 		return -EFBIG;
+	if (user->sync_mode != RGA_BLIT_SYNC &&
+	    user->sync_mode != RGA_BLIT_ASYNC)
+		return -EINVAL;
 
 	return 0;
 }
@@ -26872,6 +27185,108 @@ static void rk_rga_hw_remove(struct platform_device *pdev)
 	pm_runtime_disable(&pdev->dev);
 }
 
+static bool rk_rga_hw_suspend_busy(struct rk_rga_hw *hw)
+{
+	unsigned long flags;
+	bool busy;
+
+	mutex_lock(&hw->run_lock);
+	spin_lock_irqsave(&hw->job_lock, flags);
+	busy = rk_rga_hw_active_job_locked(hw) || hw->queued_jobs ||
+	       hw->regs_live_count;
+	spin_unlock_irqrestore(&hw->job_lock, flags);
+	mutex_unlock(&hw->run_lock);
+
+	return busy;
+}
+
+static int rk_rga_hw_suspend(struct device *dev)
+{
+	struct rk_rga_hw *hw = dev_get_drvdata(dev);
+	int ret;
+
+	if (!hw)
+		return 0;
+
+	/* Close both scheduler selection and the selected-before-suspend race. */
+	WRITE_ONCE(hw->suspended, true);
+	if (rk_rga_hw_suspend_busy(hw)) {
+		ret = -EBUSY;
+		goto restore_admission;
+	}
+
+	rk_rga_hw_cancel_timeout_sync(hw);
+	flush_work(&hw->iommu_fault_work);
+	if (hw->iommu_fault_handler_registered) {
+		ret = rockchip_iommu_sync_fault_handler(hw->dev);
+		if (ret)
+			goto restore_admission;
+		flush_work(&hw->iommu_fault_work);
+	}
+	/* A callback already in flight may have published work after snapshot 1. */
+	if (rk_rga_hw_suspend_busy(hw)) {
+		ret = -EBUSY;
+		goto restore_admission;
+	}
+
+	ret = rk_rga_iommu_unregister_fault_handler(hw);
+	if (ret) {
+		rk_rga_hw_mark_recovery_failed(hw, ret);
+		goto restore_admission;
+	}
+	hw->suspend_fault_handler_unregistered = true;
+	hw->suspend_irq_disabled = rk_rga_hw_disable_irq(hw);
+	ret = pm_runtime_force_suspend(dev);
+	if (ret) {
+		int register_ret;
+
+		rk_rga_hw_enable_irq(hw, hw->suspend_irq_disabled);
+		hw->suspend_irq_disabled = false;
+		register_ret = rk_rga_iommu_register_fault_handler(hw);
+		if (!register_ret)
+			hw->suspend_fault_handler_unregistered = false;
+		else
+			rk_rga_hw_mark_recovery_failed(hw, register_ret);
+		goto restore_admission;
+	}
+
+	return 0;
+
+restore_admission:
+	WRITE_ONCE(hw->suspended, false);
+	if (!READ_ONCE(hw->recovery_failed))
+		rk_rga_hw_dispatch(hw);
+	return ret;
+}
+
+static int rk_rga_hw_resume(struct device *dev)
+{
+	struct rk_rga_hw *hw = dev_get_drvdata(dev);
+	int ret;
+
+	if (!hw)
+		return 0;
+
+	ret = pm_runtime_force_resume(dev);
+	if (ret)
+		return ret;
+	if (hw->suspend_fault_handler_unregistered) {
+		ret = rk_rga_iommu_register_fault_handler(hw);
+		if (ret) {
+			rk_rga_hw_mark_recovery_failed(hw, ret);
+			return ret;
+		}
+		hw->suspend_fault_handler_unregistered = false;
+	}
+	rk_rga_hw_enable_irq(hw, hw->suspend_irq_disabled);
+	hw->suspend_irq_disabled = false;
+	WRITE_ONCE(hw->suspended, false);
+	if (!READ_ONCE(hw->recovery_failed))
+		rk_rga_hw_dispatch(hw);
+
+	return 0;
+}
+
 static void rk_rga_hw_shutdown(struct platform_device *pdev)
 {
 	struct rk_rga_hw *hw = platform_get_drvdata(pdev);
@@ -26909,6 +27324,9 @@ static void rk_rga_hw_shutdown(struct platform_device *pdev)
 	cancel_work_sync(&hw->iommu_fault_work);
 }
 
+static DEFINE_SIMPLE_DEV_PM_OPS(rk_rga_hw_pm_ops,
+				rk_rga_hw_suspend, rk_rga_hw_resume);
+
 static struct platform_driver rk_rga_platform_driver = {
 	.probe = rk_rga_hw_probe,
 	.remove = rk_rga_hw_remove,
@@ -26916,6 +27334,7 @@ static struct platform_driver rk_rga_platform_driver = {
 	.driver = {
 		.name = "rockchip-rga-rewrite",
 		.of_match_table = rk_rga_of_match,
+		.pm = pm_ptr(&rk_rga_hw_pm_ops),
 	},
 };
 
