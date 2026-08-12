@@ -7,6 +7,7 @@
 #ifndef _UAPI_RK_MPP_H
 #define _UAPI_RK_MPP_H
 
+#include <linux/ioctl.h>
 #include <linux/types.h>
 
 /* Use 'v' as magic number */
@@ -71,7 +72,11 @@ struct mpp_request {
 	__u32 flags;
 	__u32 size;
 	__u32 offset;
-	void __user *data;
+	union {
+		__u64 data_ptr;
+		/* Source-compatible alias; data_ptr owns the wire width. */
+		void *data;
+	};
 };
 
 #define MPP_BAT_MSG_DONE		(0x00000001)
