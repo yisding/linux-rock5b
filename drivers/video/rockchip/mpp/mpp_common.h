@@ -29,6 +29,17 @@
 #include "compat/rockchip_pmu_idle.h"
 #include <uapi/linux/rk-mpp.h>
 
+/* Kernel-private decoded request; the installed UAPI keeps a fixed u64. */
+struct mpp_request_kern {
+	u32 cmd;
+	u32 flags;
+	u32 size;
+	u32 offset;
+	void __user *data;
+};
+
+#define mpp_request mpp_request_kern
+
 #define MHZ				(1000 * 1000)
 #define MPP_WORK_TIMEOUT_DELAY		(500)
 

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0
 config ROCKCHIP_MPP_REWRITE
 	tristate "Rockchip MPP service compatibility rewrite"
-	depends on ARCH_ROCKCHIP
+	depends on ARCH_ROCKCHIP && ROCKCHIP_IOMMU
 	depends on !ROCKCHIP_MPP_SERVICE
 	select DMA_SHARED_BUFFER
 	select VSI_IOMMU if IOMMU_SUPPORT && (ARM64 || COMPILE_TEST)
