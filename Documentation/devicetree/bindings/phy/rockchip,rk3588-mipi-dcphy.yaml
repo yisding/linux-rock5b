@@ -20,11 +20,25 @@ properties:
     maxItems: 1
 
   "#phy-cells":
-    const: 1
+    enum: [1, 2]
     description: |
-      Argument is mode to operate in. Supported modes are:
+      A single cell selects the mode to operate in and refers to the
+      transmitter:
         - PHY_TYPE_DPHY
         - PHY_TYPE_CPHY
+
+      Two cells select the mode and then the transmitter (DSI) or the
+      receiver (CSI), so that both can be described as independent
+      consumers of the same PHY:
+        - PHY_TYPE_DPHY PHY_TYPE_DSI
+        - PHY_TYPE_DPHY PHY_TYPE_CSI
+        - PHY_TYPE_CPHY PHY_TYPE_DSI
+        - PHY_TYPE_CPHY PHY_TYPE_CSI
+
+      The transmitter (DSI) and the receiver (CSI) cannot operate in
+      different modes, so when both are described, the first cell must
+      match in both consumers.
+
       See include/dt-bindings/phy/phy.h for constants.
 
   clocks:
@@ -82,6 +96,6 @@ examples:
                  <&cru SRST_S_MIPI_DCPHY0>;
         reset-names = "m_phy", "apb", "grf", "s_phy";
         rockchip,grf = <&mipidcphy0_grf>;
-        #phy-cells = <1>;
+        #phy-cells = <2>;
       };
     };
