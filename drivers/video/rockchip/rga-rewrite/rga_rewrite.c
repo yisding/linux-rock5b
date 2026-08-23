@@ -24611,20 +24611,6 @@ static int rk_rga_task_hw_type_mask(struct rk_rga_job *job, u32 task_index,
 	}
 }
 
-static int __maybe_unused rk_rga_task_hw_type(struct rk_rga_job *job,
-					      u32 task_index,
-					      enum rk_rga_hw_type *type)
-{
-	u32 type_mask;
-	int ret;
-
-	ret = rk_rga_task_hw_type_mask(job, task_index, &type_mask);
-	if (ret)
-		return ret;
-
-	return rk_rga_select_default_hw_type(type_mask, type);
-}
-
 static int rk_rga_job_validate_tasks(struct rk_rga_job *job)
 {
 	u32 type_mask;
