@@ -9659,7 +9659,6 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 				   struct rk_rga2_bitblt_profile *profile);
 static int rk_rga3_validate_bitblt(const struct rga_req *task,
 				   struct rk_rga3_bitblt_profile *profile);
-static int rk_rga_task_validate_ignored_semantics(const struct rga_req *task);
 static int rk_rga_request_check(const struct rga_user_request *user);
 static int rk_rga_request_ioctl_ret(int ret);
 static int rk_rga_request_config(struct rk_rga_session *session,
