@@ -2055,7 +2055,6 @@ static struct rk_mpp_service rk_mpp_srv;
 static struct rk_mpp_debug_event
 	rk_mpp_debug_events[RK_MPP_DEBUG_EVENT_COUNT];
 static bool rk_mpp_runtime_registered;
-static int rk_mpp_runtime_register(void);
 static void rk_mpp_runtime_unregister(void);
 
 static void rk_mpp_service_state_init(struct rk_mpp_service *srv)
