@@ -799,6 +799,7 @@ struct rk_mpp_hw {
 	u32 rcb_count;
 	void *rkvdec_link_vaddr;
 	dma_addr_t rkvdec_link_iova;
+	size_t rkvdec_link_size;
 	unsigned long *rkvdec_link_used;
 	u32 rkvdec_link_node_size;
 	u32 rkvdec_link_capacity;
@@ -4618,7 +4619,7 @@ rk_mpp_rkvdec2_fill_link_table(const struct rk_mpp_reg_image *image,
 	return 0;
 }
 
-static int
+static int __maybe_unused
 rk_mpp_rkvdec2_read_link_table(struct rk_mpp_reg_result *result,
 			       const struct rk_mpp_reg_image *image,
 			       const struct rk_mpp_rkvdec2_link_info *info,
@@ -24754,6 +24755,7 @@ static int rk_mpp_hw_alloc_rkvdec_link(struct rk_mpp_hw *hw)
 	if (!hw->rkvdec_link_used)
 		return -ENOMEM;
 
+	hw->rkvdec_link_size = size;
 	hw->rkvdec_link_node_size = node_size;
 	hw->rkvdec_link_capacity = capacity;
 
