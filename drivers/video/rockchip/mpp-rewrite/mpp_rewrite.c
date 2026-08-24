@@ -5684,9 +5684,6 @@ static int rk_mpp_switch_session(struct rk_mpp_session **session,
 static bool
 rk_mpp_is_batch_server_wait_ioctl(void __user *msg_base,
 				  const struct rk_mpp_msg_v1 *first);
-static int rk_mpp_process_request(struct rk_mpp_session *session,
-				  struct mpp_request *req,
-				  struct rk_mpp_batch_state *batch);
 static int rk_mpp_collect_msgs(struct rk_mpp_session *session,
 			       unsigned int cmd, void __user *arg);
 static int rk_mpp_execute_jobs(struct rk_mpp_batch_state *batch);
