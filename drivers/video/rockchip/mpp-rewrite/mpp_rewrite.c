@@ -884,8 +884,6 @@ static u64 rk_mpp_hw_advance_active_generation_locked(struct rk_mpp_hw *hw)
 	return hw->activation_generation_seq;
 }
 
-static u64 rk_mpp_hw_install_active_locked(struct rk_mpp_hw *hw,
-					   struct rk_mpp_job *job);
 static struct rk_mpp_activation *
 rk_mpp_hw_claim_active_locked(struct rk_mpp_hw *hw,
 			      struct rk_mpp_activation *match,
