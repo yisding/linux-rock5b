@@ -1291,7 +1291,6 @@ struct rk_rga_task_exec {
 	refcount_t refs;
 	u64 generation;
 	u64 hw_start_ns;
-	u64 hw_elapsed_ns;
 	u32 task_index;
 	u32 mapping_count;
 	u32 intr_status;
@@ -2083,7 +2082,6 @@ static void rk_rga_task_exec_note_hw_done(struct rk_rga_task_exec *exec)
 		return;
 
 	elapsed = ktime_get_ns() - start;
-	exec->hw_elapsed_ns += elapsed;
 	exec->hw_start_ns = 0;
 	job->total_hw_elapsed_ns += elapsed;
 	if (!rga)
