@@ -1291,7 +1291,6 @@ struct rk_rga_task_exec {
 	refcount_t refs;
 	u64 generation;
 	u64 hw_start_ns;
-	u64 hw_elapsed_ns;
 	u32 task_index;
 	u32 mapping_count;
 	u32 intr_status;
@@ -2083,7 +2082,6 @@ static void rk_rga_task_exec_note_hw_done(struct rk_rga_task_exec *exec)
 		return;
 
 	elapsed = ktime_get_ns() - start;
-	exec->hw_elapsed_ns += elapsed;
 	exec->hw_start_ns = 0;
 	job->total_hw_elapsed_ns += elapsed;
 	if (!rga)
@@ -9638,8 +9636,6 @@ static int rk_rga2_select_dst_addresses(const struct rga_img_info_t *dst,
 					__u64 y_lt, __u64 u_lt, __u64 v_lt,
 					__u64 *y_addr, __u64 *u_addr,
 					__u64 *v_addr);
-static int __maybe_unused rk_rga_job_hw_type(struct rk_rga_job *job,
-					     enum rk_rga_hw_type *type);
 static int rk_rga_job_hw_type_mask(struct rk_rga_job *job, u32 *type_mask);
 static int rk_rga_job_sched_hw_type_mask(struct rk_rga_job *job,
 					 u32 *type_mask);
@@ -24652,19 +24648,6 @@ static int rk_rga_job_sched_hw_type_mask(struct rk_rga_job *job,
 	*type_mask &= ~job->dmabuf_incompatible_hw_type_mask;
 
 	return *type_mask ? 0 : -EOPNOTSUPP;
-}
-
-static int __maybe_unused rk_rga_job_hw_type(struct rk_rga_job *job,
-					     enum rk_rga_hw_type *type)
-{
-	u32 type_mask;
-	int ret;
-
-	ret = rk_rga_job_hw_type_mask(job, &type_mask);
-	if (ret)
-		return ret;
-
-	return rk_rga_select_default_hw_type(type_mask, type);
 }
 
 static struct rk_rga_hw *rk_rga_hw_get_for_job(struct rk_rga_job *job,
