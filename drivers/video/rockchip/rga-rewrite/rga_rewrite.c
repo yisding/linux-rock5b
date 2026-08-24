@@ -9662,8 +9662,6 @@ static int rk_rga_request_ioctl_ret(int ret);
 static int rk_rga_request_config(struct rk_rga_session *session,
 				 const struct rga_user_request *user,
 				 struct rk_rga_job **job_out);
-static int rk_rga_import_buffer_size(const struct rga_external_buffer *buffer,
-				     size_t *size);
 static int rk_rga_import_one(struct rk_rga_session *session,
 			     struct rga_external_buffer *buffer,
 			     struct rk_rga_import **import_out);
