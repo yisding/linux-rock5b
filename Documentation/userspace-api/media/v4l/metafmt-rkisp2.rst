@@ -1,10 +1,11 @@
 .. SPDX-License-Identifier: GPL-2.0
 
 .. _v4l2-meta-fmt-rkisp2-params:
+.. _v4l2-meta-fmt-rkisp2-stats:
 
-************************************
-V4L2_META_FMT_RKISP2_PARAMS ('RK2P')
-************************************
+*************************************************************************
+V4L2_META_FMT_RKISP2_PARAMS ('RK2P'), V4L2_META_FMT_RKISP2_STATS ('RK2S')
+*************************************************************************
 
 Configuration Parameters
 ========================
@@ -63,6 +64,47 @@ first member and userspace must populate the type member with a value from
         bls->bls_fixed_val.d = 256;
 
 	params->data_size += sizeof(struct rkisp2_params_bls);
+
+3A Statistics
+=============
+
+The ISP device collects different statistics over an input bayer frame. Those
+statistics can be obtained by userspace from the
+:ref:`rkisp2_stats <rkisp2_stats>` metadata capture video node, using
+the :c:type:`v4l2_meta_format` interface. Rather than a single struct containing
+sub-structs for each statistics area of the ISP, statistics for the RkISP2 use
+the v4l2-isp statistics system, through which groups of statistics are defined
+as distinct members or "blocks" which may be added to the data member of type
+:c:type:`v4l2_isp_buffer`. Userspace is responsible for parsing the buffer and
+extracting the blocks of statistics. Each block-specific struct embeds
+:c:type:`v4l2_isp_block_header` as its first member and userspace must
+interpret the type member with a value from :c:type:`rkisp2_stats_block_type`.
+
+.. code-block:: C
+
+        const struct v4l2_isp_buffer *stats =
+                (struct v4l2_isp_buffer *)buf;
+        size_t block_offset = 0;
+
+        while (block_offset < stats->data_size) {
+                const struct v4l2_isp_stats_block_header *block =
+                        (void*)(stats->data + block_offset);
+
+                block_offset += block->size;
+
+                switch (block->type) {
+                case RKISP2_STATS_BLOCK_AE_LITE:
+                        const struct rkisp2_stats_ae_lite *ae_lite =
+                                (struct rkisp2_stats_ae_lite *)block;
+                        for (unsigned int i = 0; i < RKISP2_ISP_AE_MEAN_MAX_LITE; i++)
+                                printf("ae_lite.exp_mean_r[%u] = 0x%08x\n",
+                                        i, ae_lite.exp_mean_r[%i]);
+                        break;
+                default:
+                        printf("Unknown block type 0x%04x", block->type);
+                        break;
+                }
+        }
 
 rkisp2 uAPI data types
 ======================
