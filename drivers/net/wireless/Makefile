@@ -25,3 +25,8 @@ obj-$(CONFIG_WLAN_VENDOR_TI) += ti/
 obj-$(CONFIG_WLAN_VENDOR_ZYDAS) += zydas/
 
 obj-$(CONFIG_WLAN) += virtual/
+obj-$(CONFIG_RTL8189ES) += rtl8189es/
+obj-$(CONFIG_RTL8189FS) += rtl8189fs/
+obj-$(CONFIG_RTL8192EU) += rtl8192eu/
+obj-$(CONFIG_RTL8723DS) += rtl8723ds/
+obj-$(CONFIG_SPARD_WLAN_SUPPORT) += uwe5622/
