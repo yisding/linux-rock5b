@@ -144,7 +144,7 @@ static int rkisp2_create_links(struct rkisp2_device *rkisp2)
 
 	ret = media_device_shared_join_link_sink(rkisp2->media_dev, rkisp2->dev,
 						 &rkisp2->isp.sd.entity,
-						 RKISP2_ISP_PAD_SINK_VIDEO, 0);
+						 RKISP2_ISP_PAD_SINK_VIDEO_CIF, 0);
 	if (ret)
 		return ret;
 
