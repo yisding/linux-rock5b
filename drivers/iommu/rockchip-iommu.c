@@ -1402,6 +1402,27 @@ bool rockchip_iommu_is_enabled(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(rockchip_iommu_is_enabled);
 
+/*
+ * True when @dev's MMU is attached to a paging domain but translation is not
+ * enabled, for example after an enable that timed out on stall or paging.
+ * Disabled paging is bypass on this IP, so a master started in that state
+ * DMAs to physical addresses equal to the IOVAs it was programmed with.
+ * Only meaningful while the master, and so its MMU, is runtime-active.
+ */
+bool rockchip_iommu_translation_lost(struct device *dev)
+{
+	struct rk_iommu *iommu = rk_iommu_from_dev_checked(dev);
+	struct iommu_domain *domain;
+
+	if (!iommu)
+		return false;
+	domain = READ_ONCE(iommu->domain);
+
+	return domain && domain != &rk_identity_domain &&
+	       !READ_ONCE(iommu->iommu_enabled);
+}
+EXPORT_SYMBOL_GPL(rockchip_iommu_translation_lost);
+
 int rockchip_iommu_force_reset(struct device *dev)
 {
 	struct rk_iommu *iommu = rk_iommu_from_dev_checked(dev);
