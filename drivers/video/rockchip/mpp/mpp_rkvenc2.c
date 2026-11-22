@@ -3775,5 +3775,7 @@ struct platform_driver rockchip_rkvenc2_driver = {
 		.name = RKVENC_DRIVER_NAME,
 		.of_match_table = of_match_ptr(mpp_rkvenc_dt_match),
 		.pm = &mpp_common_pm_ops,
+		/* Common MPP lacks a safe per-subdevice hot-unbind contract. */
+		.suppress_bind_attrs = true,
 	},
 };

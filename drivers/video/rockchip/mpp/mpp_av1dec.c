@@ -1184,5 +1184,7 @@ struct platform_driver rockchip_av1dec_driver = {
 	.driver = {
 		.name = AV1DEC_DRIVER_NAME,
 		.of_match_table = of_match_ptr(mpp_av1dec_dt_match),
+		/* Common MPP lacks a safe per-subdevice hot-unbind contract. */
+		.suppress_bind_attrs = true,
 	},
 };

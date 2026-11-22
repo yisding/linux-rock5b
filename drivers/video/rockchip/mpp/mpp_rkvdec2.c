@@ -2332,6 +2332,8 @@ struct platform_driver rockchip_rkvdec2_driver = {
 		.name = RKVDEC_DRIVER_NAME,
 		.of_match_table = of_match_ptr(mpp_rkvdec2_dt_match),
 		.pm = &rkvdec2_pm_ops,
+		/* Common MPP lacks a safe per-subdevice hot-unbind contract. */
+		.suppress_bind_attrs = true,
 	},
 };
 EXPORT_SYMBOL(rockchip_rkvdec2_driver);
