@@ -2875,7 +2875,12 @@ static int rk_rga_add_userptr_shadow(struct rk_rga_userptr_view *view,
 		return -EINVAL;
 
 	shadow = &view->shadows[view->shadow_count];
-	shadow->shadow = alloc_page(gfp);
+	/*
+	 * Only [offset, offset + length) is ever filled from the user page, but
+	 * the mapping exposes the whole shadow page to the engine.  Zero it so
+	 * the slack is never stale kernel memory, whatever init_on_alloc says.
+	 */
+	shadow->shadow = alloc_page(gfp | __GFP_ZERO);
 	if (!shadow->shadow)
 		return -ENOMEM;
 
@@ -16638,6 +16643,47 @@ static void rk_rga_userptr_shadow_copy_kunit(struct kunit *test)
 	__free_page(shadow->original);
 }
 
+static void rk_rga_userptr_shadow_zeroed_kunit(struct kunit *test)
+{
+	struct rk_rga_userptr_view view = { .page_count = 1 };
+	struct page *pages[1];
+	struct page *original;
+	struct page *stale;
+	u8 *addr;
+
+	original = alloc_page(GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, original);
+	pages[0] = original;
+	view.pages = pages;
+
+	/*
+	 * Best effort: leave a recognisable pattern in the page the allocator
+	 * is most likely to hand out next, so a missing clear is visible even
+	 * without init_on_alloc.
+	 */
+	stale = alloc_page(GFP_KERNEL);
+	if (stale) {
+		addr = kmap_local_page(stale);
+		memset(addr, 0x5a, PAGE_SIZE);
+		kunmap_local(addr);
+		__free_page(stale);
+	}
+
+	KUNIT_EXPECT_EQ(test,
+			rk_rga_add_userptr_shadow(&view, 0, 17, 31, GFP_KERNEL),
+			0);
+	KUNIT_EXPECT_EQ(test, view.shadow_count, (u8)1);
+	if (view.shadow_count == 1) {
+		KUNIT_EXPECT_PTR_EQ(test, view.shadows[0].original, original);
+		KUNIT_EXPECT_PTR_EQ(test, pages[0], view.shadows[0].shadow);
+		addr = kmap_local_page(view.shadows[0].shadow);
+		KUNIT_EXPECT_NULL(test, memchr_inv(addr, 0, PAGE_SIZE));
+		kunmap_local(addr);
+		__free_page(view.shadows[0].shadow);
+	}
+	__free_page(original);
+}
+
 static void rk_rga_irq_completion_result_kunit(struct kunit *test)
 {
 	struct rk_rga_job job = { };
@@ -21678,6 +21724,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_start_quirks_kunit),
 	KUNIT_CASE(rk_rga_userptr_shadow_layout_kunit),
 	KUNIT_CASE(rk_rga_userptr_shadow_copy_kunit),
+	KUNIT_CASE(rk_rga_userptr_shadow_zeroed_kunit),
 	KUNIT_CASE(rk_rga_irq_completion_result_kunit),
 	KUNIT_CASE(rk_rga_pending_multitask_core_mask_kunit),
 	KUNIT_CASE(rk_rga_mixed_task_hw_type_kunit),
