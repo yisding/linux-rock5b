@@ -124,8 +124,8 @@ struct rk_mpp_request {
 #define RK_MPP_WORK_TIMEOUT_MS		500
 /*
  * Bound on how long a session close or reset lets an in-flight frame retire
- * on a core whose reset is terminal.  It exceeds the watchdog window, so a
- * wedged frame is recovered and accounted by the watchdog, not by this wait.
+ * before it resets the core.  It exceeds the watchdog window, so a wedged
+ * frame is recovered and accounted by the watchdog, not by this wait.
  */
 #define RK_MPP_ABORT_FRAME_WAIT_MS	(2 * RK_MPP_WORK_TIMEOUT_MS)
 #define RK_MPP_CCU_STOP_TIMEOUT_US	1000
@@ -2890,11 +2890,14 @@ static bool rk_mpp_hw_usable(const struct rk_mpp_hw *hw)
 
 /*
  * Session close and RESET_SESSION cancel a healthy frame for administrative
- * reasons.  On a core whose reset pulse cannot be proven to retire DMA, the
- * preempting reset ends in terminal isolation, which costs every user that
- * engine until reboot.  Such an abort therefore lets the frame retire by
- * itself first.  A core that is already offline or quarantined has nothing
- * left to preserve.
+ * reasons.  Preempting it means pulsing the reset lines of an engine that is
+ * still issuing bus transactions: no backend has an engine-level stop to run
+ * in front of the pulse, and nothing idles the core's bus port around it.  On
+ * a core whose pulse cannot be proven to retire DMA the reset also ends in
+ * terminal isolation, which costs every user that engine until reboot.  Such
+ * an abort therefore lets the frame retire by itself first, on every core, so
+ * that only a frame which is already overdue is ever reset.  A core that is
+ * already offline or quarantined has nothing left to preserve.
  */
 static bool
 rk_mpp_hw_abort_defers_to_frame(const struct rk_mpp_hw *hw,
@@ -2904,8 +2907,7 @@ rk_mpp_hw_abort_defers_to_frame(const struct rk_mpp_hw *hw,
 	    reason != RK_MPP_TRANSITION_SESSION_RESET)
 		return false;
 
-	return hw->match && hw->match->reset_requires_terminal_isolation &&
-	       rk_mpp_hw_usable(hw);
+	return rk_mpp_hw_usable(hw);
 }
 
 /*
@@ -13405,21 +13407,28 @@ static void rk_mpp_hw_abort_defers_to_frame_kunit(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, hw);
 	hw->online = true;
 
-	/* Fixtures without match data must never be dereferenced. */
-	KUNIT_EXPECT_FALSE(test,
-			   rk_mpp_hw_abort_defers_to_frame(hw,
-							   RK_MPP_TRANSITION_SESSION_CLOSE));
+	/* The verdict never depends on match data a fixture may lack. */
+	KUNIT_EXPECT_TRUE(test,
+			  rk_mpp_hw_abort_defers_to_frame(hw,
+							  RK_MPP_TRANSITION_SESSION_CLOSE));
 
-	/* A core whose reset stays reusable is preempted as before. */
+	/* No core has an engine stop, so a reusable reset defers as well. */
 	hw->match = &rk_mpp_rkvdec2_core;
-	KUNIT_EXPECT_FALSE(test,
-			   rk_mpp_hw_abort_defers_to_frame(hw,
-							   RK_MPP_TRANSITION_SESSION_CLOSE));
-	KUNIT_EXPECT_FALSE(test,
-			   rk_mpp_hw_abort_defers_to_frame(hw,
-							   RK_MPP_TRANSITION_SESSION_RESET));
+	KUNIT_EXPECT_TRUE(test,
+			  rk_mpp_hw_abort_defers_to_frame(hw,
+							  RK_MPP_TRANSITION_SESSION_CLOSE));
+	KUNIT_EXPECT_TRUE(test,
+			  rk_mpp_hw_abort_defers_to_frame(hw,
+							  RK_MPP_TRANSITION_SESSION_RESET));
+	hw->match = &rk_mpp_rkvenc2_core;
+	KUNIT_EXPECT_TRUE(test,
+			  rk_mpp_hw_abort_defers_to_frame(hw,
+							  RK_MPP_TRANSITION_SESSION_CLOSE));
+	KUNIT_EXPECT_TRUE(test,
+			  rk_mpp_hw_abort_defers_to_frame(hw,
+							  RK_MPP_TRANSITION_SESSION_RESET));
 
-	/* Only administrative cancels spare a terminal-reset core's frame. */
+	/* Only administrative cancels spare the frame. */
 	hw->match = &rk_mpp_av1_core;
 	KUNIT_EXPECT_TRUE(test,
 			  rk_mpp_hw_abort_defers_to_frame(hw,
@@ -13427,6 +13436,7 @@ static void rk_mpp_hw_abort_defers_to_frame_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test,
 			  rk_mpp_hw_abort_defers_to_frame(hw,
 							  RK_MPP_TRANSITION_SESSION_RESET));
+	hw->match = &rk_mpp_rkvdec2_core;
 	KUNIT_EXPECT_FALSE(test,
 			   rk_mpp_hw_abort_defers_to_frame(hw,
 							   RK_MPP_TRANSITION_TIMEOUT));
@@ -19640,8 +19650,8 @@ rk_mpp_hw_abort_job(struct rk_mpp_job *job,
 	 * anew, and its IRQ or watchdog completes it and wakes the session;
 	 * arbitration still reports the cancellation over a clean completion.
 	 * Wait here, before the drain below takes the watchdog and the IRQ
-	 * away from the frame.  If the wait expires, the reset path below
-	 * fails closed exactly as before.
+	 * away from the frame.  If the wait expires, the frame is overdue and
+	 * the reset path below takes the core exactly as before.
 	 */
 	if (!queue_owner && rk_mpp_hw_abort_defers_to_frame(hw, reason))
 		wait_event_timeout(job->session->wait,
