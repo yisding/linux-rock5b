@@ -1243,7 +1243,7 @@ static void *rkvenc_alloc_task(struct mpp_session *session,
 	/* get format */
 	ret = rkvenc_task_get_format(mpp, task);
 	if (ret)
-		goto free_task;
+		goto free_class;
 	/* process fd in register */
 	if (!(msgs->flags & MPP_FLAGS_REG_FD_NO_TRANS)) {
 		u32 i, j;
@@ -1342,6 +1342,7 @@ fail:
 	mpp_task_dump_mem_region(mpp, mpp_task);
 	mpp_task_dump_reg(mpp, mpp_task);
 	mpp_task_finalize(session, mpp_task);
+free_class:
 	/* free class register buffer */
 	rkvenc_free_class_msg(task);
 free_task:
