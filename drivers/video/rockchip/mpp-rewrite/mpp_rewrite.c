@@ -14431,6 +14431,8 @@ static void rk_mpp_cluster_recovery_result_kunit(struct kunit *test)
 	hw->online = true;
 	INIT_LIST_HEAD(&hw->reset_domain_link);
 	mutex_init(&hw->run_lock);
+	/* The recovery pulse revokes the register lease under regs_lock. */
+	raw_spin_lock_init(&hw->regs_lock);
 	trace->fail_at = U32_MAX;
 	ret = rk_mpp_reset_domain_register_member(domain, hw);
 	KUNIT_ASSERT_EQ(test, ret, 0);
@@ -14452,6 +14454,7 @@ static void rk_mpp_cluster_recovery_result_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, result.quiesced);
 	KUNIT_EXPECT_TRUE(test, result.reusable);
 	KUNIT_EXPECT_EQ(test, trace->count, 2U);
+	KUNIT_EXPECT_EQ(test, hw->register_reset_epoch, 1ULL);
 
 	WRITE_ONCE(hw->terminally_stopped, true);
 	mutex_lock(&hw->run_lock);
@@ -14518,6 +14521,7 @@ static void rk_mpp_cluster_reset_group_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&core0->link);
 	INIT_LIST_HEAD(&core0->reset_domain_link);
 	INIT_LIST_HEAD(&core0->cluster_link);
+	raw_spin_lock_init(&core0->regs_lock);
 	core1->srv = srv;
 	core1->match = &rk_mpp_rkvdec2_core;
 	core1->ccu_node = identity;
@@ -14525,6 +14529,7 @@ static void rk_mpp_cluster_reset_group_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&core1->link);
 	INIT_LIST_HEAD(&core1->reset_domain_link);
 	INIT_LIST_HEAD(&core1->cluster_link);
+	raw_spin_lock_init(&core1->regs_lock);
 	ccu->srv = srv;
 	ccu->dev = ccu_dev;
 	ccu->match = &rk_mpp_rkvdec2_ccu;
@@ -14532,6 +14537,8 @@ static void rk_mpp_cluster_reset_group_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&ccu->link);
 	INIT_LIST_HEAD(&ccu->reset_domain_link);
 	INIT_LIST_HEAD(&ccu->cluster_link);
+	/* The group reset revokes every member's lease under its regs_lock. */
+	raw_spin_lock_init(&ccu->regs_lock);
 	mutex_init(&ccu->ccu_recovery_lock);
 	mutex_init(&ccu->run_lock);
 
@@ -14583,6 +14590,9 @@ static void rk_mpp_cluster_reset_group_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&core0->reset_pulse_active), 0);
 	KUNIT_EXPECT_EQ(test, atomic_read(&core1->reset_pulse_active), 0);
 	KUNIT_EXPECT_EQ(test, atomic_read(&ccu->reset_pulse_active), 0);
+	KUNIT_EXPECT_EQ(test, core0->register_reset_epoch, 1ULL);
+	KUNIT_EXPECT_EQ(test, core1->register_reset_epoch, 1ULL);
+	KUNIT_EXPECT_EQ(test, ccu->register_reset_epoch, 1ULL);
 
 	memset(cores, 0, sizeof(cores));
 	cores[0].hw = core0;
@@ -14610,6 +14620,9 @@ static void rk_mpp_cluster_reset_group_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&core0->reset_pulse_active), 0);
 	KUNIT_EXPECT_EQ(test, atomic_read(&core1->reset_pulse_active), 0);
 	KUNIT_EXPECT_EQ(test, atomic_read(&ccu->reset_pulse_active), 0);
+	KUNIT_EXPECT_EQ(test, core0->register_reset_epoch, 2ULL);
+	KUNIT_EXPECT_EQ(test, core1->register_reset_epoch, 2ULL);
+	KUNIT_EXPECT_EQ(test, ccu->register_reset_epoch, 2ULL);
 
 	WRITE_ONCE(core1->cluster, NULL);
 	memset(trace, 0, sizeof(*trace));
