@@ -713,7 +713,7 @@ static void vsi_iommu_disable(struct vsi_iommu *iommu)
 }
 
 static int vsi_iommu_identity_attach(struct iommu_domain *domain,
-				     struct device *dev)
+				     struct device *dev, struct iommu_domain *old)
 {
 	struct vsi_iommu *iommu = dev_iommu_priv_get(dev);
 	struct iommu_domain *old_domain;
@@ -804,7 +804,7 @@ static void vsi_iommu_enable(struct vsi_iommu *iommu, struct iommu_domain *domai
 }
 
 static int vsi_iommu_attach_device(struct iommu_domain *domain,
-				   struct device *dev)
+				   struct device *dev, struct iommu_domain *old)
 {
 	struct vsi_iommu *iommu = dev_iommu_priv_get(dev);
 	struct vsi_iommu_domain *vsi_domain = to_vsi_domain(domain);
