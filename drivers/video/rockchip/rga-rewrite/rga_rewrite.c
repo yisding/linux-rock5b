@@ -364,6 +364,14 @@
 #define RK_RGA2_INTERP_LINEAR			1
 #define RK_RGA2_INTERP_BICUBIC			2
 #define RK_RGA2_INTERP_AVERAGE			3
+/*
+ * RK3588 RGA2E envelope (BSP rga_hw_config.c rga2e_data): 2x2 minimum active
+ * window on every channel, 4096x4096 maximum written window, and a per-axis
+ * scale range of 1/16x..16x (max_upscale_factor = max_downscale_factor = 4).
+ */
+#define RK_RGA2_MIN_ACT_SIZE			2
+#define RK_RGA2_OUTPUT_MAX_SIZE			4096
+#define RK_RGA2_SCALE_SHIFT			4
 
 #define RK_RGA3_SYS_CTRL	0x000
 #define RK_RGA3_CMD_CTRL	0x004
@@ -14902,6 +14910,166 @@ static void rk_rga_raster_stride_backend_mask_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, type_mask, 0U);
 }
 
+/*
+ * RGA2E is the fallback for everything RGA3 refuses, and its emitters program
+ * whatever geometry validation lets through.  Pin the BSP rga2e_data envelope
+ * (2x2 floor, 4096x4096 written window, 1/16x..16x per axis) as a type-mask
+ * verdict, so an out-of-range request never selects an RGA2 core.
+ */
+static void rk_rga2_envelope_backend_mask_kunit(struct kunit *test)
+{
+	struct rga_req task =
+		rk_rga_ffmpeg_bitblt_task(RK_RGA_FORMAT_RGBA_8888,
+					  RK_RGA_FORMAT_RGBA_8888);
+	struct rk_rga_job job = {
+		.tasks = &task,
+		.task_count = 1,
+		.import_count = 2,
+	};
+	u32 type_mask = 0;
+
+	task.yuv2rgb_mode = 0;
+	task.src = rk_rga_kunit_img(0x10000000, RK_RGA_FORMAT_RGBA_8888,
+				    80, 16);
+	task.dst = rk_rga_kunit_img(0x20000000, RK_RGA_FORMAT_RGBA_8888,
+				    80, 16);
+	task.src.vir_w = 8192;
+	task.dst.vir_w = 8192;
+
+	/* A 4096-wide written window reaches both backends ... */
+	task.src.act_w = 4096;
+	task.dst.act_w = 4096;
+	KUNIT_ASSERT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask), 0);
+	KUNIT_EXPECT_EQ(test, type_mask, RK_RGA_HW_TYPE_MASK_ALL);
+
+	/* ... a wider one is RGA3-only instead of being load-balanced. */
+	task.src.act_w = 4112;
+	task.dst.act_w = 4112;
+	type_mask = 0;
+	KUNIT_ASSERT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask), 0);
+	KUNIT_EXPECT_EQ(test, type_mask, RK_RGA_HW_TYPE_MASK_RGA3);
+
+	task.core = BIT(2);
+	type_mask = U32_MAX;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, type_mask, 0U);
+	task.core = 0;
+
+	/* 2x2 is below RGA3's 68x2 floor and exactly on RGA2E's. */
+	task.src.act_w = 2;
+	task.src.act_h = 2;
+	task.dst.act_w = 2;
+	task.dst.act_h = 2;
+	type_mask = 0;
+	KUNIT_ASSERT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask), 0);
+	KUNIT_EXPECT_EQ(test, type_mask, RK_RGA_HW_TYPE_MASK_RGA2);
+
+	task.dst.act_h = 1;
+	type_mask = U32_MAX;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, type_mask, 0U);
+
+	task.dst.act_h = 2;
+	task.src.act_w = 1;
+	type_mask = U32_MAX;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, type_mask, 0U);
+
+	/* Horizontal: exactly 16x down and up stay on RGA2E, more does not. */
+	task.src.act_w = 1280;
+	task.src.act_h = 16;
+	task.dst.act_w = 80;
+	task.dst.act_h = 16;
+	type_mask = 0;
+	KUNIT_ASSERT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask), 0);
+	KUNIT_EXPECT_EQ(test, type_mask, RK_RGA_HW_TYPE_MASK_RGA2);
+
+	task.dst.act_w = 79;
+	type_mask = U32_MAX;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, type_mask, 0U);
+
+	task.src.act_w = 80;
+	task.dst.act_w = 1280;
+	type_mask = 0;
+	KUNIT_ASSERT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask), 0);
+	KUNIT_EXPECT_EQ(test, type_mask, RK_RGA_HW_TYPE_MASK_RGA2);
+
+	task.dst.act_w = 1281;
+	type_mask = U32_MAX;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, type_mask, 0U);
+
+	/* Vertical: 32 -> 2 is 16x, 48 -> 2 is not. */
+	task.dst.act_w = 80;
+	task.src.vir_h = 48;
+	task.src.act_h = 32;
+	task.dst.act_h = 2;
+	type_mask = 0;
+	KUNIT_ASSERT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask), 0);
+	KUNIT_EXPECT_EQ(test, type_mask, RK_RGA_HW_TYPE_MASK_RGA2);
+
+	task.src.act_h = 48;
+	type_mask = U32_MAX;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, type_mask, 0U);
+
+	/*
+	 * librga submits a 90-degree destination window pre-swapped, and the
+	 * scaler pairs the source with that wire form: 1280 -> 80 is 16x here
+	 * even though the canvas-oriented destination is 16 pixels wide.
+	 */
+	task.rotate_mode = 1;
+	task.sina = 65536;
+	task.cosa = 0;
+	task.src.act_w = 1280;
+	task.src.act_h = 16;
+	task.dst.vir_h = 80;
+	task.dst.act_w = 80;
+	task.dst.act_h = 16;
+	type_mask = 0;
+	KUNIT_ASSERT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask), 0);
+	KUNIT_EXPECT_EQ(test, type_mask, RK_RGA_HW_TYPE_MASK_RGA2);
+
+	task.dst.act_w = 79;
+	type_mask = U32_MAX;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, type_mask, 0U);
+
+	/*
+	 * Color fill has no RGA3 fallback.  Only the active window is capped:
+	 * a 4096-wide fill may still end at the 8192 canvas edge.
+	 */
+	task = rk_rga_fill_task(0);
+	task.dst.vir_w = 8192;
+	task.dst.x_offset = 4096;
+	task.dst.act_w = 4096;
+	type_mask = 0;
+	KUNIT_ASSERT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask), 0);
+	KUNIT_EXPECT_EQ(test, type_mask, RK_RGA_HW_TYPE_MASK_RGA2);
+
+	task.dst.x_offset = 0;
+	task.dst.act_w = 4100;
+	type_mask = U32_MAX;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, type_mask, 0U);
+
+	task.dst.act_w = 64;
+	task.dst.act_h = 1;
+	type_mask = U32_MAX;
+	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type_mask(&job, &type_mask),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, type_mask, 0U);
+}
+
 static void rk_rga_direct_import_identity_kunit(struct kunit *test)
 {
 	struct rk_rga_service *rga;
@@ -21408,6 +21576,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_layout_yuv10_kunit),
 	KUNIT_CASE(rk_rga_raster_row_layout_kunit),
 	KUNIT_CASE(rk_rga_raster_stride_backend_mask_kunit),
+	KUNIT_CASE(rk_rga2_envelope_backend_mask_kunit),
 	KUNIT_CASE(rk_rga_direct_import_identity_kunit),
 	KUNIT_CASE(rk_rga_userptr_backing_identity_kunit),
 	KUNIT_CASE(rk_rga_cross_type_alias_kunit),
@@ -21507,7 +21676,8 @@ kunit_test_suite(rk_rga_rewrite_test_suite);
 #endif
 
 static int rk_rga2_validate_image(const struct rga_img_info_t *img,
-				  const struct rk_rga2_format_info *fmt);
+				  const struct rk_rga2_format_info *fmt,
+				  bool write);
 static int rk_rga2_stride(const struct rga_img_info_t *img,
 			  const struct rk_rga2_format_info *fmt,
 			  u32 *stride, u32 *uv_stride);
@@ -21565,7 +21735,7 @@ static int rk_rga2_validate_color_fill(const struct rga_req *task,
 	if (ret)
 		return ret;
 
-	return rk_rga2_validate_image(&task->dst, &profile->dst_fmt);
+	return rk_rga2_validate_image(&task->dst, &profile->dst_fmt, true);
 }
 
 static int rk_rga2_palette_source_mode(const struct rga_req *task)
@@ -21688,11 +21858,11 @@ static int rk_rga2_validate_color_palette(const struct rga_req *task,
 		.pixel_width = 1,
 		.x_div = 1,
 		.y_div = 1,
-	});
+	}, false);
 	if (ret)
 		return ret;
 
-	return rk_rga2_validate_image(&task->dst, &profile->dst_fmt);
+	return rk_rga2_validate_image(&task->dst, &profile->dst_fmt, true);
 }
 
 static int rk_rga2_validate_update_palette(const struct rga_req *task)
@@ -21788,7 +21958,8 @@ rk_rga2_validate_virtual_row_strides(
 }
 
 static int rk_rga2_validate_image(const struct rga_img_info_t *img,
-				  const struct rk_rga2_format_info *fmt)
+				  const struct rk_rga2_format_info *fmt,
+				  bool write)
 {
 	u32 width;
 	u32 height;
@@ -21805,6 +21976,22 @@ static int rk_rga2_validate_image(const struct rga_img_info_t *img,
 		return -EINVAL;
 	if (width > 8192 || height > 8192)
 		return -EINVAL;
+
+	/*
+	 * Mirror the BSP rga_check_channel() gate for rga2e_data: every active
+	 * window is at least 2x2 and the written window at most 4096x4096.
+	 * Like the BSP, only the active size is bounded; the offset is folded
+	 * into the base address and stays under the 8192 canvas bound above.
+	 * These are capability verdicts, so report them as unsupported rather
+	 * than invalid: a wide destination then stays eligible for RGA3, and
+	 * RGA3's own verdict wins when both backends refuse.
+	 */
+	if (img->act_w < RK_RGA2_MIN_ACT_SIZE ||
+	    img->act_h < RK_RGA2_MIN_ACT_SIZE)
+		return -EOPNOTSUPP;
+	if (write && (img->act_w > RK_RGA2_OUTPUT_MAX_SIZE ||
+		      img->act_h > RK_RGA2_OUTPUT_MAX_SIZE))
+		return -EOPNOTSUPP;
 
 	if (fmt->y4_lut &&
 	    ((img->x_offset | img->y_offset | img->act_w | img->act_h |
@@ -21831,6 +22018,42 @@ static int rk_rga2_validate_image(const struct rga_img_info_t *img,
 		return ret;
 
 	return 0;
+}
+
+/*
+ * RGA2E's scaler covers 1/16x..16x per axis.  Mirror the BSP
+ * rga_check_scale() policy gate so an out-of-range request drops the RGA2
+ * bit from the eligible type mask instead of reaching rk_rga2_scale_factor(),
+ * which programs X/Y_FACTOR for any ratio except a bilinear downscale.  The
+ * comparisons are strict so an exact 16x ratio stays accepted, matching the
+ * BSP.
+ */
+static int rk_rga2_check_scale_axis(u32 src, u32 dst)
+{
+	if (src > dst && (src >> RK_RGA2_SCALE_SHIFT) > dst)
+		return -EOPNOTSUPP;
+	if (dst > src && (src << RK_RGA2_SCALE_SHIFT) < dst)
+		return -EOPNOTSUPP;
+
+	return 0;
+}
+
+/*
+ * Match the pairing rk_rga2_emit_src() uses.  Its 90/270-degree swap undoes
+ * the one rk_rga2_decode_transform() applied, so the scaler always pairs the
+ * source window with the raw wire destination window (librga submits that
+ * window pre-swapped), exactly as the BSP check does.  The canvas-oriented
+ * destination from rk_rga2_normalized_dst() is the wrong operand here.
+ */
+static int rk_rga2_check_scale(const struct rga_req *task)
+{
+	int ret;
+
+	ret = rk_rga2_check_scale_axis(task->src.act_w, task->dst.act_w);
+	if (ret)
+		return ret;
+
+	return rk_rga2_check_scale_axis(task->src.act_h, task->dst.act_h);
 }
 
 static int rk_rga2_validate_bitblt(const struct rga_req *task,
@@ -21954,7 +22177,7 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 	if (profile->src_fmt.yuv10 &&
 	    !rk_rga_img_yuv10_compact(&task->src))
 		return -EOPNOTSUPP;
-	ret = rk_rga2_validate_image(&task->src, &profile->src_fmt);
+	ret = rk_rga2_validate_image(&task->src, &profile->src_fmt, false);
 	if (ret)
 		return ret;
 	/*
@@ -21965,11 +22188,15 @@ static int rk_rga2_validate_bitblt(const struct rga_req *task,
 	 * fail that bound for every genuine portrait rotate.
 	 */
 	rk_rga2_normalized_dst(task, &profile->transform, &dst);
-	ret = rk_rga2_validate_image(&dst, &profile->dst_fmt);
+	ret = rk_rga2_validate_image(&dst, &profile->dst_fmt, true);
+	if (ret)
+		return ret;
+	ret = rk_rga2_check_scale(task);
 	if (ret)
 		return ret;
 	if (uses_alpha_bitmap || uses_osd) {
-		ret = rk_rga2_validate_image(&task->pat, &profile->pat_fmt);
+		ret = rk_rga2_validate_image(&task->pat, &profile->pat_fmt,
+					     false);
 		if (ret)
 			return ret;
 	}
