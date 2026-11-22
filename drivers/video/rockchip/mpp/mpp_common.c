@@ -1078,6 +1078,14 @@ static void try_process_running_task(struct mpp_dev *mpp)
 		if (test_bit(TASK_STATE_TIMEOUT, &mpp_task->state)) {
 			atomic_inc(&mpp->reset_request);
 			mpp_iommu_dev_deactivate(mpp->iommu_info, mpp);
+			/*
+			 * No completion IRQ arrived for this task.  irq_status
+			 * still holds whatever the last hard IRQ on this core
+			 * latched, usually the previous frame's success, and
+			 * the backend ISR below would report that as this
+			 * task's result.
+			 */
+			mpp->irq_status = 0;
 		}
 
 		if (mpp->auto_freq_en && mpp->hw_ops->reduce_freq &&
