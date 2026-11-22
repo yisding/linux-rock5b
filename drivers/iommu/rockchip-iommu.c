@@ -1149,6 +1149,55 @@ out_disable_clocks:
 	return ret;
 }
 
+/*
+ * Reprogram the MMU serving @dev after the media driver reset @dev.
+ *
+ * The MMU register bank sits inside the block it serves, so a reset of that
+ * block can return DTE_ADDR, INT_MASK and the paging enable to their reset
+ * values while the MMU stays runtime-active, in which case no resume callback
+ * programs them again and an IOTLB flush restores nothing.  Run the hardware
+ * sequence of a runtime suspend followed by a runtime resume without the
+ * power cycle: quiesce whatever state survived the reset, then program the
+ * directory of the attached domain, unmask the fault interrupts and enable
+ * paging.  The MMU's own clocks are enabled here.
+ *
+ * Only the MMU serving @dev is touched.  An MMU that shares its domain through
+ * rockchip,shared-domain-owner needs its own call when its master was reset.
+ *
+ * Sleeps.  The caller must have stopped @dev's DMA, must have released @dev's
+ * reset lines, and must serialize the call against other restores of @dev and
+ * against attaching a domain to, or detaching one from, @dev's IOMMU group.
+ *
+ * Returns 0 when translation was restored and also when there was nothing to
+ * program: the MMU is not runtime-active (resume programs it) or @dev is
+ * attached to the identity domain.  Returns -ENODEV when @dev is not served by
+ * this driver.  Any other error means the MMU could not be re-enabled and must
+ * be assumed not to translate, so @dev must not be started.
+ */
+int rockchip_iommu_restore(struct device *dev)
+{
+	struct rk_iommu *iommu = rk_iommu_from_dev_checked(dev);
+	int ret;
+
+	might_sleep();
+
+	if (!iommu)
+		return -ENODEV;
+	if (iommu->domain == &rk_identity_domain)
+		return 0;
+
+	ret = pm_runtime_get_if_in_use(iommu->dev);
+	if (ret <= 0)
+		return ret;
+
+	rk_iommu_disable(iommu);
+	ret = rk_iommu_enable(iommu);
+	pm_runtime_put(iommu->dev);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(rockchip_iommu_restore);
+
 static int rk_iommu_identity_attach(struct iommu_domain *identity_domain,
 				    struct device *dev,
 				    struct iommu_domain *old)
