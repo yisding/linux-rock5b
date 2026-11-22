@@ -15359,22 +15359,33 @@ static int rk_mpp_rkvenc_dchs_find_id(u32 valid)
 	return -ENOSPC;
 }
 
-static bool rk_mpp_rkvenc2_dchs_lifecycle_lock(struct rk_mpp_job *job)
+/*
+ * Returns the mutex it took, or NULL when @job needs no DCHS serialization.
+ * Most holders complete the job before unlocking, and completion can drop
+ * the last job reference: once RK_MPP_JOB_DONE is published a poll, session
+ * reset or close releases the session-list reference without taking any lock
+ * held here, leaving the completing claim's put as the final one.  Unlock
+ * through the returned pointer, which lives in the service, never through
+ * @job.
+ */
+static struct mutex *rk_mpp_rkvenc2_dchs_lifecycle_lock(struct rk_mpp_job *job)
 {
+	struct rk_mpp_service *srv;
+
 	if (job->client_type != RK_MPP_DEVICE_RKVENC || !job->current_activation->selected_hw ||
 	    !job->current_activation->selected_hw->ccu_node)
-		return false;
+		return NULL;
 
-	mutex_lock(&job->session->srv->rkvenc_dchs_lifecycle_lock);
+	srv = job->session->srv;
+	mutex_lock(&srv->rkvenc_dchs_lifecycle_lock);
 
-	return true;
+	return &srv->rkvenc_dchs_lifecycle_lock;
 }
 
-static void
-rk_mpp_rkvenc2_dchs_lifecycle_unlock(struct rk_mpp_job *job, bool locked)
+static void rk_mpp_rkvenc2_dchs_lifecycle_unlock(struct mutex *lock)
 {
-	if (locked)
-		mutex_unlock(&job->session->srv->rkvenc_dchs_lifecycle_lock);
+	if (lock)
+		mutex_unlock(lock);
 }
 
 static int rk_mpp_rkvenc2_dchs_patch(struct rk_mpp_job *job)
@@ -19196,7 +19207,7 @@ rk_mpp_hw_abort_job(struct rk_mpp_job *job,
 	struct rk_mpp_activation_claim_token claim = {};
 	struct rk_mpp_hw *ccu;
 	bool active_owned;
-	bool dchs_lifecycle_locked = false;
+	struct mutex *dchs_lock = NULL;
 	bool hard_ccu_abort = false;
 	bool irq_disabled;
 	bool dispatch_retired = false;
@@ -19245,8 +19256,7 @@ rk_mpp_hw_abort_job(struct rk_mpp_job *job,
 	}
 	if (active_owned && rk_mpp_hw_clear_active_job(hw, job, reason, NULL,
 						       &claim)) {
-		dchs_lifecycle_locked =
-			rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
+		dchs_lock = rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
 		/*
 		 * Resetting a soft-CCU core behind its coordinator's back
 		 * leaves the coordinator holding this core registered as
@@ -19312,7 +19322,7 @@ rk_mpp_hw_abort_job(struct rk_mpp_job *job,
 		WARN_ON_ONCE(!dispatch_retired);
 	}
 out_unlock_core:
-	rk_mpp_rkvenc2_dchs_lifecycle_unlock(job, dchs_lifecycle_locked);
+	rk_mpp_rkvenc2_dchs_lifecycle_unlock(dchs_lock);
 	rk_mpp_hw_enable_irq(hw, irq_disabled);
 	mutex_unlock(&hw->run_lock);
 	if (hard_ccu_abort && !ccu_stop_ret) {
@@ -19872,7 +19882,7 @@ rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 	struct rk_mpp_cluster_recovery_result idle_recovery;
 	bool irq_disabled;
 	bool hard_ccu_recovery;
-	bool dchs_lifecycle_locked = false;
+	struct mutex *dchs_lock = NULL;
 	bool fault_consumed = true;
 	bool ccu_done = false;
 	bool ccu_error = false;
@@ -19935,7 +19945,7 @@ rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 	}
 	if (iommu_fault)
 		rk_mpp_hw_cancel_timeout(hw);
-	dchs_lifecycle_locked = rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
+	dchs_lock = rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
 	hard_ccu_recovery = ccu && rk_mpp_job_resources(job)->rkvdec_ccu_started &&
 			    rk_mpp_job_resources(job)->rkvdec_ccu == ccu;
 	if (hard_ccu_recovery) {
@@ -20005,8 +20015,7 @@ rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 						reset_ret, reset_ret, &recovery,
 						0, NULL);
 		rk_mpp_hw_handle_reset_failure(hw, reset_ret);
-		rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
-						     dchs_lifecycle_locked);
+		rk_mpp_rkvenc2_dchs_lifecycle_unlock(dchs_lock);
 		rk_mpp_hw_enable_irq(hw, irq_disabled);
 		mutex_unlock(&hw->run_lock);
 		if (ccu)
@@ -20032,8 +20041,7 @@ rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 							reset_ret, &recovery,
 							ccu_stop_ret,
 							&ccu_recovery);
-			rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
-							     dchs_lifecycle_locked);
+			rk_mpp_rkvenc2_dchs_lifecycle_unlock(dchs_lock);
 			rk_mpp_hw_enable_irq(hw, irq_disabled);
 			mutex_unlock(&hw->run_lock);
 			mutex_unlock(&ccu->ccu_recovery_lock);
@@ -20045,8 +20053,7 @@ rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 		rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, iommu_fault,
 						-EUCLEAN, reset_ret, &recovery,
 						0, NULL);
-		rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
-						     dchs_lifecycle_locked);
+		rk_mpp_rkvenc2_dchs_lifecycle_unlock(dchs_lock);
 		rk_mpp_hw_enable_irq(hw, irq_disabled);
 		mutex_unlock(&hw->run_lock);
 		if (ccu)
@@ -20056,7 +20063,7 @@ rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 	}
 	rk_mpp_hw_power_off(hw);
 	WARN_ON_ONCE(!rk_mpp_activation_complete_claim(job, &claim, result));
-	rk_mpp_rkvenc2_dchs_lifecycle_unlock(job, dchs_lifecycle_locked);
+	rk_mpp_rkvenc2_dchs_lifecycle_unlock(dchs_lock);
 	rk_mpp_hw_enable_irq(hw, irq_disabled);
 	mutex_unlock(&hw->run_lock);
 	if (hard_ccu_recovery) {
@@ -20110,7 +20117,7 @@ rk_mpp_hw_abort_active(struct rk_mpp_hw *hw, int result,
 	struct rk_mpp_activation_claim_token claim = {};
 	struct rk_mpp_job *job;
 	struct rk_mpp_cluster_recovery_result recovery;
-	bool dchs_lifecycle_locked;
+	struct mutex *dchs_lock = NULL;
 	bool irq_disabled;
 	int stop_ret;
 
@@ -20126,13 +20133,12 @@ rk_mpp_hw_abort_active(struct rk_mpp_hw *hw, int result,
 		return 0;
 	}
 
-	dchs_lifecycle_locked = rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
+	dchs_lock = rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
 	stop_ret = rk_mpp_hw_stop_and_recover(hw, job, &recovery);
 	if (stop_ret) {
 		rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, false, stop_ret,
 						stop_ret, &recovery, 0, NULL);
-		rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
-						     dchs_lifecycle_locked);
+		rk_mpp_rkvenc2_dchs_lifecycle_unlock(dchs_lock);
 		rk_mpp_hw_enable_irq(hw, irq_disabled);
 		mutex_unlock(&hw->run_lock);
 		return stop_ret;
@@ -20142,15 +20148,14 @@ rk_mpp_hw_abort_active(struct rk_mpp_hw *hw, int result,
 							      0, NULL))) {
 		rk_mpp_hw_restore_or_quarantine(hw, NULL, &claim, false, -EUCLEAN,
 						stop_ret, &recovery, 0, NULL);
-		rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
-						     dchs_lifecycle_locked);
+		rk_mpp_rkvenc2_dchs_lifecycle_unlock(dchs_lock);
 		rk_mpp_hw_enable_irq(hw, irq_disabled);
 		mutex_unlock(&hw->run_lock);
 		return -EUCLEAN;
 	}
 	rk_mpp_hw_power_off(hw);
 	WARN_ON_ONCE(!rk_mpp_activation_complete_claim(job, &claim, result));
-	rk_mpp_rkvenc2_dchs_lifecycle_unlock(job, dchs_lifecycle_locked);
+	rk_mpp_rkvenc2_dchs_lifecycle_unlock(dchs_lock);
 	rk_mpp_hw_enable_irq(hw, irq_disabled);
 	mutex_unlock(&hw->run_lock);
 	return 0;
@@ -20172,12 +20177,7 @@ rk_mpp_hw_abort_active_recovery_locked(struct rk_mpp_hw *hw,
 	struct rk_mpp_activation_claim_token claim = {};
 	struct rk_mpp_job *job;
 	struct rk_mpp_cluster_recovery_result recovery;
-	/*
-	 * Held separately because job is cleared once the active slot takes
-	 * its reference back, and the unlock still needs the job it locked.
-	 */
-	struct rk_mpp_job *dchs_job = NULL;
-	bool dchs_lifecycle_locked = false;
+	struct mutex *dchs_lock = NULL;
 	bool irq_disabled;
 	int stop_ret = 0;
 
@@ -20203,8 +20203,7 @@ rk_mpp_hw_abort_active_recovery_locked(struct rk_mpp_hw *hw,
 		 * This path runs for every dependent of the coordinator, so on
 		 * RK3588 unbinding one encoder core reaches the other one too.
 		 */
-		dchs_lifecycle_locked = rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
-		dchs_job = job;
+		dchs_lock = rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
 		stop_ret = rk_mpp_hw_stop_and_recover(hw, job, &recovery);
 		if (stop_ret) {
 			rk_mpp_hw_restore_or_quarantine(hw, group ? ccu : NULL,
@@ -20230,7 +20229,7 @@ rk_mpp_hw_abort_active_recovery_locked(struct rk_mpp_hw *hw,
 		WARN_ON_ONCE(!rk_mpp_activation_complete_claim(job, &claim, result));
 	}
 out_unlock:
-	rk_mpp_rkvenc2_dchs_lifecycle_unlock(dchs_job, dchs_lifecycle_locked);
+	rk_mpp_rkvenc2_dchs_lifecycle_unlock(dchs_lock);
 	rk_mpp_hw_enable_irq(hw, irq_disabled);
 	mutex_unlock(&hw->run_lock);
 	return stop_ret;
@@ -21486,7 +21485,7 @@ static int rk_mpp_rkvenc2_submit(
 	struct rk_mpp_hw *hw = rk_mpp_job_get_hw(job);
 	u32 start_value = 0;
 	bool cleared;
-	bool dchs_lifecycle_locked = false;
+	struct mutex *dchs_lock = NULL;
 	bool finished;
 	bool start_seen;
 	bool irq_disabled;
@@ -21568,7 +21567,7 @@ static int rk_mpp_rkvenc2_submit(
 	 * DCHS release, reset, and power-off outside the interval in which this
 	 * consumer copies the producer's TX id and makes RXE live in hardware.
 	 */
-	dchs_lifecycle_locked = rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
+	dchs_lock = rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
 	ret = rk_mpp_rkvenc2_dchs_patch(job);
 	if (ret)
 		goto err_power_off;
@@ -21593,7 +21592,7 @@ static int rk_mpp_rkvenc2_submit(
 	if (ret)
 		goto err_power_off;
 	rk_mpp_count_started_core(job);
-	rk_mpp_rkvenc2_dchs_lifecycle_unlock(job, dchs_lifecycle_locked);
+	rk_mpp_rkvenc2_dchs_lifecycle_unlock(dchs_lock);
 	mutex_unlock(&hw->run_lock);
 	rk_mpp_hw_put(hw);
 
@@ -21635,7 +21634,7 @@ err_power_off:
 		}
 	}
 	rk_mpp_hw_enable_irq(hw, irq_disabled);
-	rk_mpp_rkvenc2_dchs_lifecycle_unlock(job, dchs_lifecycle_locked);
+	rk_mpp_rkvenc2_dchs_lifecycle_unlock(dchs_lock);
 	mutex_unlock(&hw->run_lock);
 	rk_mpp_hw_put(hw);
 	return ret;
@@ -21867,7 +21866,7 @@ static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 	struct rk_mpp_cluster_recovery_result recovery;
 	enum rk_mpp_activation_terminal_observation observation =
 		RK_MPP_ACTIVATION_OBSERVATION_IRQ_ACCEPTED;
-	bool dchs_lifecycle_locked;
+	struct mutex *dchs_lock = NULL;
 	bool fault_pending = false;
 	bool finished;
 	bool quarantined;
@@ -21930,7 +21929,7 @@ static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 						   RK_MPP_RKVENC_INT_STA_BASE,
 						   irq_status);
 
-	dchs_lifecycle_locked = rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
+	dchs_lock = rk_mpp_rkvenc2_dchs_lifecycle_lock(job);
 	if (rk_mpp_rkvenc2_irq_needs_reset(irq_status)) {
 		reset_ret = rk_mpp_hw_stop_and_recover(hw, job, &recovery);
 		if (reset_ret) {
@@ -21938,8 +21937,7 @@ static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 							reset_ret, reset_ret,
 							&recovery, 0,
 							NULL);
-			rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
-							     dchs_lifecycle_locked);
+			rk_mpp_rkvenc2_dchs_lifecycle_unlock(dchs_lock);
 			mutex_unlock(&hw->run_lock);
 			return IRQ_HANDLED;
 		}
@@ -21952,8 +21950,7 @@ static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 							-EUCLEAN, reset_ret,
 							&recovery, 0,
 							NULL);
-			rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
-							     dchs_lifecycle_locked);
+			rk_mpp_rkvenc2_dchs_lifecycle_unlock(dchs_lock);
 			mutex_unlock(&hw->run_lock);
 			return IRQ_HANDLED;
 		}
@@ -21970,14 +21967,13 @@ static irqreturn_t rk_mpp_rkvenc2_thread(struct rk_mpp_hw *hw)
 			rk_mpp_activation_claim_quarantine(hw, NULL, &claim,
 							   -EUCLEAN, 0, NULL, 0, NULL);
 		WARN_ON_ONCE(!quarantined);
-		rk_mpp_rkvenc2_dchs_lifecycle_unlock(job,
-						     dchs_lifecycle_locked);
+		rk_mpp_rkvenc2_dchs_lifecycle_unlock(dchs_lock);
 		mutex_unlock(&hw->run_lock);
 		return IRQ_HANDLED;
 	}
 	rk_mpp_hw_power_off(hw);
 	WARN_ON_ONCE(!rk_mpp_activation_complete_claim(job, &claim, ret));
-	rk_mpp_rkvenc2_dchs_lifecycle_unlock(job, dchs_lifecycle_locked);
+	rk_mpp_rkvenc2_dchs_lifecycle_unlock(dchs_lock);
 	mutex_unlock(&hw->run_lock);
 
 	return IRQ_HANDLED;
