@@ -1586,6 +1586,7 @@ struct rk_rga_hw {
 	bool recovery_failed;
 	bool removing;
 	bool suspended;
+	bool resume_failed;
 	bool suspend_fault_handler_unregistered;
 	bool suspend_irq_disabled;
 };
@@ -2461,8 +2462,12 @@ rk_rga_hw_min_dma_align_mask(enum rk_rga_hw_type type)
 
 static bool rk_rga_hw_accepting_jobs(const struct rk_rga_hw *hw)
 {
+	/*
+	 * A core suspended for system sleep is paused, not lost: it still
+	 * takes work, which rk_rga_hw_dispatch() holds queued until resume.
+	 */
 	return !READ_ONCE(hw->removing) &&
-	       !READ_ONCE(hw->suspended) &&
+	       !READ_ONCE(hw->resume_failed) &&
 	       !READ_ONCE(hw->recovery_failed);
 }
 
@@ -7115,6 +7120,7 @@ static bool
 rk_rga_hw_iommu_fault_matches_locked(
 	struct rk_rga_hw *hw, const struct rk_rga_task_exec_ref *fault);
 static void rk_rga_hw_abort_queued_jobs(struct rk_rga_hw *hw, int result);
+static void rk_rga_hw_fail_resume(struct rk_rga_hw *hw);
 static int rk_rga_hw_abort_jobs(struct rk_rga_hw *hw, int result);
 static int rk_rga_job_queue_ref(struct rk_rga_job *job, bool take_ref);
 static int rk_rga_job_queue_on_hw(struct rk_rga_job *job, struct rk_rga_hw *hw,
@@ -16343,16 +16349,70 @@ static void rk_rga_queue_on_removing_hw_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, refcount_read(&hw.refs), 1);
 	KUNIT_EXPECT_EQ(test, dma_fence_get_status(fence), -ENODEV);
 
+	rk_rga_job_put(job);
+	kunit_release_action(test, rk_rga_kunit_fence_put, fence);
+}
+
+static void rk_rga_queue_on_suspended_hw_kunit(struct kunit *test)
+{
+	struct rk_rga_service *rga;
+	struct rk_rga_hw *hw;
+	struct rk_rga_job *job;
+	struct dma_fence *fence;
+
+	rga = kunit_kzalloc(test, sizeof(*rga), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, rga);
+	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
+	hw->rga = rga;
+	mutex_init(&hw->run_lock);
+	spin_lock_init(&hw->job_lock);
+	INIT_LIST_HEAD(&hw->job_queue);
+	init_waitqueue_head(&hw->idle);
+	refcount_set(&hw->refs, 2);
+	hw->suspended = true;
+
+	job = kzalloc_obj(*job, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+	rk_rga_job_init(job);
+
+	fence = rk_rga_kunit_alloc_fence(test);
+	KUNIT_ASSERT_NOT_NULL(test, fence);
+	dma_fence_get(fence);
+	job->release_fence = fence;
+
+	/* System sleep pauses the core: runnable work parks until resume. */
+	KUNIT_EXPECT_TRUE(test, rk_rga_hw_accepting_jobs(hw));
+	KUNIT_EXPECT_EQ(test, rk_rga_job_queue_on_hw(job, hw, true), 0);
+	KUNIT_EXPECT_EQ(test, hw->queued_jobs, 1U);
+	KUNIT_EXPECT_TRUE(test, job->queued);
+	KUNIT_EXPECT_FALSE(test, job->done);
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_ref.exec, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, rk_rga_job_hw(job), hw);
+	KUNIT_EXPECT_EQ(test, refcount_read(&job->refs), 2);
+	KUNIT_EXPECT_EQ(test, refcount_read(&hw->refs), 2);
+	KUNIT_EXPECT_EQ(test, dma_fence_get_status(fence), 0);
+
+	/* A core that does not come back fails what it parked. */
+	rk_rga_hw_fail_resume(hw);
+	KUNIT_EXPECT_TRUE(test, list_empty(&hw->job_queue));
+	KUNIT_EXPECT_EQ(test, hw->queued_jobs, 0U);
+	KUNIT_EXPECT_FALSE(test, job->queued);
+	KUNIT_EXPECT_TRUE(test, job->done);
+	KUNIT_EXPECT_EQ(test, job->result, -EIO);
+	KUNIT_EXPECT_PTR_EQ(test, rk_rga_job_hw(job), NULL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&job->refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&hw->refs), 1);
+	KUNIT_EXPECT_EQ(test, dma_fence_get_status(fence), -EIO);
+
 	dma_fence_put(job->release_fence);
 	job->release_fence = NULL;
 	kunit_release_action(test, rk_rga_kunit_fence_put, fence);
 	job->done = false;
 	job->result = 0;
 
-	/* System sleep closes admission without masquerading as hot-unplug. */
-	hw.removing = false;
-	hw.suspended = true;
-	refcount_set(&hw.refs, 2);
+	/* It parks nothing more until a later resume succeeds. */
+	refcount_set(&hw->refs, 2);
 	fence = rk_rga_kunit_alloc_fence(test);
 	KUNIT_EXPECT_NOT_NULL(test, fence);
 	if (!fence) {
@@ -16361,11 +16421,12 @@ static void rk_rga_queue_on_removing_hw_kunit(struct kunit *test)
 	}
 	dma_fence_get(fence);
 	job->release_fence = fence;
-	KUNIT_EXPECT_EQ(test, rk_rga_job_queue_on_hw(job, &hw, true),
-			-EBUSY);
+	KUNIT_EXPECT_FALSE(test, rk_rga_hw_accepting_jobs(hw));
+	KUNIT_EXPECT_EQ(test, rk_rga_job_queue_on_hw(job, hw, true), -EIO);
+	KUNIT_EXPECT_EQ(test, hw->queued_jobs, 0U);
 	KUNIT_EXPECT_TRUE(test, job->done);
-	KUNIT_EXPECT_EQ(test, job->result, -EBUSY);
-	KUNIT_EXPECT_EQ(test, refcount_read(&hw.refs), 1);
+	KUNIT_EXPECT_EQ(test, job->result, -EIO);
+	KUNIT_EXPECT_EQ(test, refcount_read(&hw->refs), 1);
 	rk_rga_job_put(job);
 	kunit_release_action(test, rk_rga_kunit_fence_put, fence);
 }
@@ -17034,6 +17095,22 @@ static void rk_rga_find_best_hw_for_job_kunit(struct kunit *test)
 							RK_RGA_HW_TYPE_MASK_ALL,
 							0),
 			    NULL);
+	/* A core paused for system sleep still takes work, to park it. */
+	busy->recovery_failed = false;
+	busy->suspended = true;
+	KUNIT_EXPECT_PTR_EQ(test,
+			    rk_rga_find_best_hw_for_job(&hw_list, job,
+							RK_RGA_HW_TYPE_MASK_ALL,
+							0),
+			    busy);
+	busy->resume_failed = true;
+	KUNIT_EXPECT_PTR_EQ(test,
+			    rk_rga_find_best_hw_for_job(&hw_list, job,
+							RK_RGA_HW_TYPE_MASK_ALL,
+							0),
+			    NULL);
+	busy->suspended = false;
+	busy->resume_failed = false;
 
 	tasks[0] = *task;
 	tasks[0].core = BIT(0);
@@ -21595,6 +21672,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_release_fence_fd_state_kunit),
 	KUNIT_CASE(rk_rga_hw_abort_queued_jobs_kunit),
 	KUNIT_CASE(rk_rga_queue_on_removing_hw_kunit),
+	KUNIT_CASE(rk_rga_queue_on_suspended_hw_kunit),
 	KUNIT_CASE(rk_rga_queue_on_recovery_failed_hw_kunit),
 	KUNIT_CASE(rk_rga_recovery_failed_dispatch_kunit),
 	KUNIT_CASE(rk_rga_start_quirks_kunit),
@@ -25736,10 +25814,15 @@ static int rk_rga_job_queue_on_hw(struct rk_rga_job *job, struct rk_rga_hw *hw,
 	if (take_ref)
 		rk_rga_job_get(job);
 
+	/*
+	 * A suspended core is not refused here.  Userspace is frozen while it
+	 * sleeps, so this is already admitted work (the next task of a request,
+	 * or a job whose acquire fence just signalled) that must wait for
+	 * resume, not fail: rk_rga_hw_dispatch() leaves it queued.
+	 */
 	spin_lock_irqsave(&hw->job_lock, flags);
-	if (hw->removing || hw->suspended || hw->recovery_failed) {
-		ret = hw->removing ? -ENODEV :
-		      hw->suspended ? -EBUSY : -EIO;
+	if (hw->removing || hw->resume_failed || hw->recovery_failed) {
+		ret = hw->removing ? -ENODEV : -EIO;
 		spin_unlock_irqrestore(&hw->job_lock, flags);
 		rk_rga_job_complete_queued(job, ret);
 		return ret;
@@ -25793,6 +25876,22 @@ static void rk_rga_hw_abort_queued_jobs(struct rk_rga_hw *hw, int result)
 		list_del_init(&job->node);
 		rk_rga_job_complete_queued(job, result);
 	}
+}
+
+/*
+ * A core that did not come back from system sleep keeps its dispatch gate
+ * closed until a later resume succeeds.  Work parked on it while it slept
+ * would wait behind that gate forever, so stop parking and fail what is
+ * queued.
+ */
+static void rk_rga_hw_fail_resume(struct rk_rga_hw *hw)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&hw->job_lock, flags);
+	hw->resume_failed = true;
+	spin_unlock_irqrestore(&hw->job_lock, flags);
+	rk_rga_hw_abort_queued_jobs(hw, -EIO);
 }
 
 static int rk_rga_hw_abort_jobs(struct rk_rga_hw *hw, int result)
@@ -27480,7 +27579,11 @@ static int rk_rga_hw_suspend(struct device *dev)
 	if (!hw)
 		return 0;
 
-	/* Close both scheduler selection and the selected-before-suspend race. */
+	/*
+	 * Close the dispatch gate before proving the core idle.  Work that
+	 * becomes runnable from here on parks on the queue: it either turns
+	 * a busy check below into -EBUSY or waits for resume.
+	 */
 	WRITE_ONCE(hw->suspended, true);
 	if (rk_rga_hw_suspend_busy(hw)) {
 		ret = -EBUSY;
@@ -27526,35 +27629,42 @@ static int rk_rga_hw_suspend(struct device *dev)
 
 restore_admission:
 	WRITE_ONCE(hw->suspended, false);
-	if (!READ_ONCE(hw->recovery_failed))
-		rk_rga_hw_dispatch(hw);
+	/* Starts parked work; a core quarantined above fails it instead. */
+	rk_rga_hw_dispatch(hw);
 	return ret;
 }
 
 static int rk_rga_hw_resume(struct device *dev)
 {
 	struct rk_rga_hw *hw = dev_get_drvdata(dev);
+	unsigned long flags;
 	int ret;
 
 	if (!hw)
 		return 0;
 
 	ret = pm_runtime_force_resume(dev);
-	if (ret)
+	if (ret) {
+		rk_rga_hw_fail_resume(hw);
 		return ret;
+	}
 	if (hw->suspend_fault_handler_unregistered) {
 		ret = rk_rga_iommu_register_fault_handler(hw);
 		if (ret) {
 			rk_rga_hw_mark_recovery_failed(hw, ret);
+			rk_rga_hw_fail_resume(hw);
 			return ret;
 		}
 		hw->suspend_fault_handler_unregistered = false;
 	}
 	rk_rga_hw_enable_irq(hw, hw->suspend_irq_disabled);
 	hw->suspend_irq_disabled = false;
+	spin_lock_irqsave(&hw->job_lock, flags);
+	hw->resume_failed = false;
+	spin_unlock_irqrestore(&hw->job_lock, flags);
 	WRITE_ONCE(hw->suspended, false);
-	if (!READ_ONCE(hw->recovery_failed))
-		rk_rga_hw_dispatch(hw);
+	/* Starts the work that parked while the core slept. */
+	rk_rga_hw_dispatch(hw);
 
 	return 0;
 }

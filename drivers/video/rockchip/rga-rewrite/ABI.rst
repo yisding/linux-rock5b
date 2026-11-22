@@ -208,6 +208,13 @@ and acquire-blocked work that no longer has a compatible core complete with
 new admission, aborts queued/active work after proving DMA quiescence, and
 allows reprobe to reuse the vacant public core bit.
 
+System sleep pauses a core without removing it.  Already admitted asynchronous
+work that becomes runnable while a compatible core is suspended, such as the
+next task of a multi-task request or a job whose acquire fence signals, stays
+queued on that core and starts when the core resumes.  If the core fails to
+resume, the work queued on it completes with ``-EIO`` and the core takes no
+further work until a later resume succeeds.
+
 Supported operation profiles
 ----------------------------
 
