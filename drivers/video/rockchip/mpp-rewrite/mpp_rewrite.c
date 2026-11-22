@@ -13233,6 +13233,136 @@ static void rk_mpp_session_poll_nonblock_pending_kunit(struct kunit *test)
 	list_del_init(&job->session_link);
 }
 
+struct rk_mpp_kunit_poll_slice_buf {
+	struct rk_mpp_rkvenc_poll_slice_cfg cfg;
+	/* One more than the fifo holds, so a full drain finds it empty. */
+	u32 slice_info[RK_MPP_RKVENC_MAX_SLICE_FIFO + 1];
+};
+
+static void rk_mpp_session_poll_irq_nonblock_last_kunit(struct kunit *test)
+{
+	struct rk_mpp_session session = {
+		.active_job_count = 1,
+	};
+	struct mpp_request req = {
+		.cmd = MPP_CMD_POLL_HW_IRQ,
+		.size = sizeof(struct rk_mpp_kunit_poll_slice_buf),
+	};
+	struct rk_mpp_kunit_poll_slice_buf *buf;
+	struct rk_mpp_job *job;
+	u32 value;
+	int i;
+
+	mutex_init(&session.lock);
+	INIT_LIST_HEAD(&session.active_jobs);
+	init_waitqueue_head(&session.wait);
+
+	buf = kunit_kzalloc(test, sizeof(*buf), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	buf->cfg.count_max = ARRAY_SIZE(buf->slice_info);
+	req.data = rk_mpp_kunit_user_payload(test, buf, sizeof(*buf));
+	KUNIT_ASSERT_NOT_NULL(test, req.data);
+
+	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+
+	job->session = &session;
+	job->state = RK_MPP_JOB_ACTIVE;
+	job->result = -EINPROGRESS;
+	job->rkvenc_slice_mode = true;
+	/* The completion poll copies readback from the sealed image. */
+	job->reg_builder.state = RK_MPP_REG_BUILDER_SEALED;
+	refcount_set(&job->refs, 2);
+	spin_lock_init(&job->rkvenc_slice_lock);
+	INIT_KFIFO(job->rkvenc_slice_fifo);
+	INIT_LIST_HEAD(&job->session_link);
+	list_add_tail(&job->session_link, &session.active_jobs);
+
+	/*
+	 * The final record is queued before the job completes.  A buffered
+	 * nonblocking poll returns what precedes it and leaves it queued...
+	 */
+	rk_mpp_job_push_rkvenc_slice(job, 0x100);
+	rk_mpp_job_push_rkvenc_slice(job, RK_MPP_RKVENC_SLICE_LAST | 0x200);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_session_poll_irq(&session, &req,
+						MPP_FLAGS_POLL_NON_BLOCK), 0);
+	KUNIT_ASSERT_EQ(test, copy_from_user(buf, req.data, sizeof(*buf)),
+			0UL);
+	KUNIT_EXPECT_EQ(test, buf->cfg.count_ret, 1);
+	KUNIT_EXPECT_EQ(test, buf->slice_info[0], 0x100U);
+	KUNIT_EXPECT_TRUE(test, rk_mpp_job_rkvenc_slice_ready(job));
+
+	/* ...and -EAGAIN means that nothing at all was handed over. */
+	memset(buf, 0, sizeof(*buf));
+	buf->cfg.count_max = ARRAY_SIZE(buf->slice_info);
+	KUNIT_ASSERT_EQ(test, copy_to_user(req.data, buf, sizeof(*buf)), 0UL);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_session_poll_irq(&session, &req,
+						MPP_FLAGS_POLL_NON_BLOCK),
+			-EAGAIN);
+	KUNIT_ASSERT_EQ(test, copy_from_user(buf, req.data, sizeof(*buf)),
+			0UL);
+	KUNIT_EXPECT_EQ(test, buf->cfg.count_ret, 0);
+	KUNIT_EXPECT_EQ(test, buf->slice_info[0], 0U);
+	KUNIT_EXPECT_TRUE(test, rk_mpp_job_rkvenc_slice_ready(job));
+	KUNIT_EXPECT_FALSE(test, list_empty(&session.active_jobs));
+	KUNIT_EXPECT_EQ(test, refcount_read(&job->refs), 2);
+
+	/* The final record arrives with the completion it announces. */
+	job->state = RK_MPP_JOB_DONE;
+	job->result = 0;
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_session_poll_irq(&session, &req,
+						MPP_FLAGS_POLL_NON_BLOCK), 0);
+	KUNIT_ASSERT_EQ(test, copy_from_user(buf, req.data, sizeof(*buf)),
+			0UL);
+	KUNIT_EXPECT_EQ(test, buf->cfg.count_ret, 1);
+	KUNIT_EXPECT_EQ(test, buf->slice_info[0],
+			RK_MPP_RKVENC_SLICE_LAST | 0x200);
+	KUNIT_EXPECT_TRUE(test, list_empty(&session.active_jobs));
+	KUNIT_EXPECT_EQ(test, session.active_job_count, 0U);
+	KUNIT_EXPECT_EQ(test, refcount_read(&job->refs), 1);
+
+	/*
+	 * A final record dropped by fifo overflow ends the stream without
+	 * bit 31.  Draining the retained records while the job is still
+	 * running must report them, not the pending completion.
+	 */
+	job->state = RK_MPP_JOB_ACTIVE;
+	job->result = -EINPROGRESS;
+	job->rkvenc_slice_done = false;
+	list_add_tail(&job->session_link, &session.active_jobs);
+	session.active_job_count = 1;
+	for (i = 0; i < RK_MPP_RKVENC_MAX_SLICE_FIFO; i++)
+		rk_mpp_job_push_rkvenc_slice(job, i);
+	rk_mpp_job_push_rkvenc_slice(job, RK_MPP_RKVENC_SLICE_LAST);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_session_poll_irq(&session, &req,
+						MPP_FLAGS_POLL_NON_BLOCK),
+			-EOVERFLOW);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_session_poll_irq(&session, &req,
+						MPP_FLAGS_POLL_NON_BLOCK), 0);
+	KUNIT_ASSERT_EQ(test, copy_from_user(buf, req.data, sizeof(*buf)),
+			0UL);
+	KUNIT_EXPECT_EQ(test, buf->cfg.count_ret,
+			RK_MPP_RKVENC_MAX_SLICE_FIFO);
+	KUNIT_EXPECT_EQ(test,
+			buf->slice_info[RK_MPP_RKVENC_MAX_SLICE_FIFO - 1],
+			(u32)RK_MPP_RKVENC_MAX_SLICE_FIFO - 1);
+	KUNIT_EXPECT_EQ(test, rk_mpp_job_pop_rkvenc_slice(job, &value),
+			-ENODATA);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_session_poll_irq(&session, &req,
+						MPP_FLAGS_POLL_NON_BLOCK),
+			-EAGAIN);
+	KUNIT_EXPECT_FALSE(test, list_empty(&session.active_jobs));
+	KUNIT_EXPECT_EQ(test, refcount_read(&job->refs), 1);
+
+	list_del_init(&job->session_link);
+}
+
 static void rk_mpp_session_poll_irq_nonslice_kunit(struct kunit *test)
 {
 	struct rk_mpp_session session = {
@@ -14706,6 +14836,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_import_cache_identity_kunit),
 	KUNIT_CASE(rk_mpp_release_fd_all_devices_kunit),
 	KUNIT_CASE(rk_mpp_session_poll_nonblock_pending_kunit),
+	KUNIT_CASE(rk_mpp_session_poll_irq_nonblock_last_kunit),
 	KUNIT_CASE(rk_mpp_session_poll_irq_nonslice_kunit),
 	KUNIT_CASE(rk_mpp_session_abort_jobs_kunit),
 	KUNIT_CASE(rk_mpp_hw_abort_defers_to_frame_kunit),
@@ -24127,16 +24258,24 @@ static bool rk_mpp_job_rkvenc_slice_done(struct rk_mpp_job *job)
  * then checked rkvenc_slice_done separately would race with the IRQ pushing
  * the remaining slices in between, and conclude the stream ended while
  * undelivered records sit in the fifo.
+ *
+ * With @hold_last a final record at the head of the fifo is left queued and
+ * reported as -EAGAIN, for a caller that may not take it yet.
  */
-static int rk_mpp_job_pop_rkvenc_slice(struct rk_mpp_job *job, u32 *value)
+static int rk_mpp_job_take_rkvenc_slice(struct rk_mpp_job *job, u32 *value,
+					bool hold_last)
 {
 	unsigned long flags;
 	int ret = -EAGAIN;
+	u32 head;
 
 	spin_lock_irqsave(&job->rkvenc_slice_lock, flags);
 	if (job->rkvenc_slice_overflow) {
 		job->rkvenc_slice_overflow = false;
 		ret = -EOVERFLOW;
+	} else if (hold_last && kfifo_peek(&job->rkvenc_slice_fifo, &head) &&
+		   (head & RK_MPP_RKVENC_SLICE_LAST)) {
+		ret = -EAGAIN;
 	} else if (kfifo_out(&job->rkvenc_slice_fifo, value, 1) == 1) {
 		ret = 0;
 	} else if (job->rkvenc_slice_done) {
@@ -24145,6 +24284,11 @@ static int rk_mpp_job_pop_rkvenc_slice(struct rk_mpp_job *job, u32 *value)
 	spin_unlock_irqrestore(&job->rkvenc_slice_lock, flags);
 
 	return ret;
+}
+
+static int rk_mpp_job_pop_rkvenc_slice(struct rk_mpp_job *job, u32 *value)
+{
+	return rk_mpp_job_take_rkvenc_slice(job, value, false);
 }
 
 /*
@@ -24248,6 +24392,23 @@ static int rk_mpp_poll_irq_put_slice(const struct mpp_request *req,
 	return 0;
 }
 
+/*
+ * End a slice poll with the completion poll.  -EAGAIN tells the caller that
+ * this call handed it nothing, so a non-blocking call that already copied
+ * records out reports those instead and leaves the pending completion to the
+ * next poll, like every other exit of rk_mpp_session_poll_irq().
+ */
+static int rk_mpp_poll_irq_finish(struct rk_mpp_session *session, u32 flags,
+				  bool progressed, bool delivered)
+{
+	int ret = rk_mpp_session_poll_job(session, flags);
+
+	if (ret == -EAGAIN && delivered)
+		return 0;
+
+	return rk_mpp_poll_interrupt_result(ret, progressed);
+}
+
 static int rk_mpp_session_poll_irq(struct rk_mpp_session *session,
 				   const struct mpp_request *req,
 				   u32 flags)
@@ -24261,6 +24422,7 @@ static int rk_mpp_session_poll_irq(struct rk_mpp_session *session,
 	for (;;) {
 		struct rk_mpp_job *job;
 		bool done_before_pop;
+		bool hold_last;
 		u32 slice_info = 0;
 		u64 seq;
 
@@ -24304,7 +24466,20 @@ static int rk_mpp_session_poll_irq(struct rk_mpp_session *session,
 		 */
 		done_before_pop = rk_mpp_job_is_done(job);
 
-		ret = rk_mpp_job_pop_rkvenc_slice(job, &slice_info);
+		/*
+		 * The final record and the completion go to the caller in one
+		 * call: success with bit 31 set means the job was reaped and
+		 * its readback copied.  A blocking caller gets that by waiting
+		 * below.  A non-blocking caller with a result buffer cannot
+		 * wait, and the final record is queued before the job is
+		 * marked done, so until then leave that record in the fifo
+		 * rather than copy it out and fail the completion poll with
+		 * -EAGAIN.  Discarding callers have no record to lose.
+		 */
+		hold_last = copy_slices && !done_before_pop &&
+			    (flags & MPP_FLAGS_POLL_NON_BLOCK);
+
+		ret = rk_mpp_job_take_rkvenc_slice(job, &slice_info, hold_last);
 		if (!ret) {
 			bool last = slice_info & RK_MPP_RKVENC_SLICE_LAST;
 
@@ -24323,10 +24498,11 @@ static int rk_mpp_session_poll_irq(struct rk_mpp_session *session,
 
 			rk_mpp_job_put(job);
 
-			if (last) {
-				ret = rk_mpp_session_poll_job(session, flags);
-				return rk_mpp_poll_interrupt_result(ret, progressed);
-			}
+			if (last)
+				return rk_mpp_poll_irq_finish(session, flags,
+							      progressed,
+							      copy_slices &&
+							      cfg.count_ret > 0);
 			if (copy_slices && cfg.count_ret >= cfg.count_max)
 				return 0;
 			continue;
@@ -24334,8 +24510,10 @@ static int rk_mpp_session_poll_irq(struct rk_mpp_session *session,
 
 		if (ret == -ENODATA || (ret == -EAGAIN && done_before_pop)) {
 			rk_mpp_job_put(job);
-			ret = rk_mpp_session_poll_job(session, flags);
-			return rk_mpp_poll_interrupt_result(ret, progressed);
+			return rk_mpp_poll_irq_finish(session, flags,
+						      progressed,
+						      copy_slices &&
+						      cfg.count_ret > 0);
 		}
 
 		/*

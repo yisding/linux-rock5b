@@ -326,13 +326,24 @@ A zero-size or null-data request is also accepted in slice mode as an explicit
 discard operation: slice records are removed without copying them.  A blocking
 call continues toward final completion.  A nonblocking call may discard all
 currently queued non-final records and then return ``-EAGAIN``; a final record
-is likewise removed before the completion poll.  Nonblocking buffered poll
-returns ``-EAGAIN`` only when no record is available.  FIFO overflow is reported once as
-``-EOVERFLOW``; retained entries may be drained on retry, and overflow is
-deferred when the same call already returned records.  For a non-slice job the
-command behaves like ``POLL_HW_FINISH`` and does not parse the flexible buffer.
-Each slice record is removed before userspace copyout; a copy fault therefore
-loses that record.
+is likewise removed before the completion poll.
+
+Nonblocking buffered poll returns ``-EAGAIN`` only when the call copied no
+record.  The hardware reports the final slice before the job completes, so
+while the job is incomplete a nonblocking buffered poll leaves the bit 31
+record queued: it returns the non-final records it copied, or ``-EAGAIN`` if
+there were none, and a later poll returns the bit 31 record together with the
+completion.  Success with bit 31 set therefore always means that the
+completion was consumed.  When a FIFO overflow dropped the final record and
+the job is still incomplete, the call that drains the last retained entries
+returns them, and a later poll consumes the completion without copying a
+record.
+
+FIFO overflow is reported once as ``-EOVERFLOW``; retained entries may be
+drained on retry, and overflow is deferred when the same call already returned
+records.  For a non-slice job the command behaves like ``POLL_HW_FINISH`` and
+does not parse the flexible buffer.  Each slice record is removed before
+userspace copyout; a copy fault therefore loses that record.
 
 Scheduling and hardware modes
 -----------------------------
