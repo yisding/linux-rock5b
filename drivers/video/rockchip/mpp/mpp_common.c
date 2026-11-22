@@ -49,16 +49,6 @@ struct mpp_msg_v1 {
 	__u64 data_ptr;
 };
 
-#ifdef CONFIG_COMPAT
-struct mpp_msg_v1_compat {
-	__u32 cmd;
-	__u32 flags;
-	__u32 size;
-	__u32 offset;
-	compat_uptr_t data_ptr;
-};
-#endif
-
 #ifdef CONFIG_ROCKCHIP_MPP_PROC_FS
 const char *mpp_device_name[MPP_DEVICE_BUTT] = {
 	[MPP_DEVICE_VDPU1]		= "VDPU1",
@@ -1855,26 +1845,19 @@ static void task_msgs_add(struct mpp_task_msgs *msgs, struct list_head *head)
 static int mpp_copy_msg_v1(struct mpp_msg_v1 *msg_v1, void __user **msg,
 				   bool compat_ioctl)
 {
-#ifdef CONFIG_COMPAT
-	if (compat_ioctl) {
-		struct mpp_msg_v1_compat msg_v1_compat;
-
-		if (copy_from_user(&msg_v1_compat, *msg, sizeof(msg_v1_compat)))
-			return -EFAULT;
-
-		msg_v1->cmd = msg_v1_compat.cmd;
-		msg_v1->flags = msg_v1_compat.flags;
-		msg_v1->size = msg_v1_compat.size;
-		msg_v1->offset = msg_v1_compat.offset;
-		msg_v1->data_ptr = (unsigned long)compat_ptr(msg_v1_compat.data_ptr);
-		*msg = (void __user *)((u8 __user *)*msg + sizeof(msg_v1_compat));
-
-		return 0;
-	}
-#endif
-
+	/*
+	 * libmpp's MppReqV1 declares data_ptr as RK_U64 on every ABI, so a
+	 * 32-bit caller sends the same 24-byte record as a 64-bit one. Only
+	 * the pointer value needs converting; the record stride does not.
+	 */
 	if (copy_from_user(msg_v1, *msg, sizeof(*msg_v1)))
 		return -EFAULT;
+
+#ifdef CONFIG_COMPAT
+	if (compat_ioctl)
+		msg_v1->data_ptr = (unsigned long)
+			compat_ptr((compat_uptr_t)msg_v1->data_ptr);
+#endif
 
 	*msg = (void __user *)((u8 __user *)*msg + sizeof(*msg_v1));
 
