@@ -48,6 +48,8 @@
 #define RK_MMU_POLL_PERIOD_US		100
 #define RK_MMU_FORCE_RESET_TIMEOUT_US	100000
 #define RK_MMU_POLL_TIMEOUT_US		1000
+/* Passes of the restore sequence before the master is told to fail closed */
+#define RK_MMU_RESTORE_TRIES		2
 
 /* RK_MMU_STATUS fields */
 #define RK_MMU_STATUS_PAGING_ENABLED       BIT(0)
@@ -1168,6 +1170,14 @@ out_disable_clocks:
  * reset lines, and must serialize the call against other restores of @dev and
  * against attaching a domain to, or detaching one from, @dev's IOMMU group.
  *
+ * A failed enable is not final at once.  Each handshake in the sequence is a
+ * single poll of RK_MMU_POLL_TIMEOUT_US, here issued right behind the master's
+ * reset pulse, and a caller that fails closed may have no way back short of a
+ * reboot, whereas the same miss in runtime resume costs one power-on.  Every
+ * pass begins by quiescing the MMU and @dev's DMA is stopped, so the sequence
+ * can be replayed: RK_MMU_RESTORE_TRIES passes are made before the error is
+ * returned.
+ *
  * Returns 0 when translation was restored and also when there was nothing to
  * program: the MMU is not runtime-active (resume programs it) or @dev is
  * attached to the identity domain.  Returns -ENODEV when @dev is not served by
@@ -1177,6 +1187,7 @@ out_disable_clocks:
 int rockchip_iommu_restore(struct device *dev)
 {
 	struct rk_iommu *iommu = rk_iommu_from_dev_checked(dev);
+	int tries;
 	int ret;
 
 	might_sleep();
@@ -1190,8 +1201,14 @@ int rockchip_iommu_restore(struct device *dev)
 	if (ret <= 0)
 		return ret;
 
-	rk_iommu_disable(iommu);
-	ret = rk_iommu_enable(iommu);
+	for (tries = 1; tries <= RK_MMU_RESTORE_TRIES; tries++) {
+		rk_iommu_disable(iommu);
+		ret = rk_iommu_enable(iommu);
+		if (!ret)
+			break;
+		dev_warn(iommu->dev, "MMU restore pass %d of %d failed: %d\n",
+			 tries, RK_MMU_RESTORE_TRIES, ret);
+	}
 	pm_runtime_put(iommu->dev);
 
 	return ret;
