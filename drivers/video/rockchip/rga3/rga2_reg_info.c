@@ -2776,6 +2776,16 @@ static void rga2_soft_reset_print(struct rga_scheduler_t *scheduler)
 static int rga2_check_param(struct rga_job *job,
 			    const struct rga_hw_data *data, const struct rga2_req *req)
 {
+	/*
+	 * RGA2_set_reg_color_palette() shifts by 3 - palette_mode; only the
+	 * 1/2/4/8 bpp modes 0..3 exist.
+	 */
+	if (unlikely(req->render_mode == COLOR_PALETTE_MODE &&
+		     req->palette_mode > 3)) {
+		rga_job_err(job, "invalid palette_mode %u\n", req->palette_mode);
+		return -EINVAL;
+	}
+
 	if (!((req->render_mode == COLOR_FILL_MODE) ||
 	      (req->render_mode == UPDATE_PALETTE_TABLE_MODE))) {
 		if (unlikely(rga_hw_out_of_range(&data->input_range,
