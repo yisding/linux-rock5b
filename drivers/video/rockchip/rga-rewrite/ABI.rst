@@ -284,6 +284,11 @@ Format rules
 - RGA3 active windows must meet the RK3588 68x2 floor and per-axis 1/8x..8x
   scale range.  Eligible jobs may fall back to RGA2E, whose floor is 2x2 and
   range is 1/16x..16x.
+- An RGA2E destination active window is at most 4096x4096; its offset may
+  still place it anywhere inside the 8192x8192 canvas.  A larger BITBLT
+  destination is eligible for RGA3 only.  RGA2E-only operations (color fill,
+  palette, and any request pinned to an RGA2 core) outside the RGA2E floor,
+  destination, or scale limits are rejected rather than programmed.
 - In-place work is limited to explicitly supported nonoverlapping mirror/border
   copies, RGA2 mosaic, and destination-update blend/color-key profiles.
 
