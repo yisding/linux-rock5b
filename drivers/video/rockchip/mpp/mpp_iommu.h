@@ -204,6 +204,7 @@ void mpp_iommu_shared_domain_unreserve_window(struct mpp_iommu_shared_domain *sh
 					      dma_addr_t iova, size_t size);
 
 int mpp_iommu_refresh(struct mpp_iommu_info *info, struct device *dev);
+int mpp_iommu_ensure_translating(struct mpp_iommu_info *info);
 int mpp_iommu_flush_tlb(struct mpp_iommu_info *info);
 
 int mpp_iommu_dev_activate(struct mpp_iommu_info *info, struct mpp_dev *dev);

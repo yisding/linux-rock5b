@@ -1233,6 +1233,30 @@ int mpp_iommu_dev_activate_task(struct mpp_iommu_info *info,
 	return ret;
 }
 
+/*
+ * Refuse to start hardware behind a Rockchip MMU whose paging domain is not
+ * translating.  Callers log a failed refresh and carry on, and the MMU then
+ * bypasses translation.  Retry the enable once; if translation is still off,
+ * fail the task rather than let the codec DMA to raw physical addresses.
+ * Must be called from sleepable context with the master powered.
+ */
+int mpp_iommu_ensure_translating(struct mpp_iommu_info *info)
+{
+	int ret;
+
+	if (!info || !rockchip_iommu_translation_lost(info->dev))
+		return 0;
+
+	dev_warn(info->dev, "iommu translation lost, re-enabling\n");
+	ret = rockchip_iommu_enable(info->dev);
+	if (!ret && rockchip_iommu_translation_lost(info->dev))
+		ret = -EIO;
+	if (ret)
+		dev_err(info->dev, "refusing task: iommu not translating: %d\n", ret);
+
+	return ret;
+}
+
 int mpp_iommu_dev_prepare_task(struct mpp_iommu_info *info,
 			       struct mpp_dev *dev)
 {
@@ -1255,6 +1279,15 @@ int mpp_iommu_dev_prepare_task(struct mpp_iommu_info *info,
 	spin_unlock_irqrestore(&info->dev_lock, flags);
 	if (ret)
 		return ret;
+
+	ret = mpp_iommu_ensure_translating(info);
+	if (ret) {
+		spin_lock_irqsave(&info->dev_lock, flags);
+		if (info->task_admission_owner == dev && !info->dev_active)
+			info->task_admission_owner = NULL;
+		spin_unlock_irqrestore(&info->dev_lock, flags);
+		return ret;
+	}
 
 	/*
 	 * Provider prepare masks delivery, synchronizes an in-flight IRQ and

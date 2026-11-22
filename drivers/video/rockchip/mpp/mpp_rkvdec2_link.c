@@ -2498,6 +2498,15 @@ void rkvdec2_soft_ccu_worker(struct kthread_work *work_s)
 						       rkvdec2_link_free_task);
 			continue;
 		}
+		ret = mpp_iommu_ensure_translating(mpp->iommu_info);
+		if (ret) {
+			clear_bit(TASK_TIMING_RUN, &mpp_task->state);
+			mpp_task->on_run = 0;
+			rkvdec2_put_idle_core(queue, mpp_task);
+			rkvdec2_complete_pending_abort(queue, mpp_task, NULL,
+						       rkvdec2_link_free_task);
+			continue;
+		}
 		rkvdec2_soft_ccu_enqueue(mpp, mpp_task);
 		/* pending to running */
 		mpp_taskqueue_pending_to_run(queue, mpp_task);
