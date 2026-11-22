@@ -25413,8 +25413,12 @@ static void rk_rga_hw_dispatch(struct rk_rga_hw *hw)
 					mutex_unlock(&hw->run_lock);
 					rk_rga_job_queue_on_hw(job, fallback_hw, false);
 					rk_rga_session_end_job_dispatch(dispatch_session);
-					rk_rga_hw_dispatch(hw);
-					return;
+					/*
+					 * Loop, never recurse: every queued job
+					 * can take this path, and the queue
+					 * length is set by userspace.
+					 */
+					continue;
 				}
 				rk_rga_session_end_job_dispatch(dispatch_session);
 			}
