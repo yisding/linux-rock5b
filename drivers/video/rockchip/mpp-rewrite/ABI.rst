@@ -267,8 +267,10 @@ core's register file is not cleared between jobs, so an ordinary register that
 no span carries keeps its previous hardware value.  The registers the driver
 validates are the exception and always follow the job's own image: the format
 selector (RKVDEC2 word 9, RKVENC2 word 192), every register of the built-in
-address table that selector chooses and of the custom table, and the RKVENC2
-dual-core handshake word 193.  One that no write span carries is programmed
+address table that selector chooses and of the custom table, the RKVENC2
+dual-core handshake word 193, and the AV1 post-processor word 321 that selects
+AFBC output together with, when it does, the geometry words 4, 8 and 503 the
+AFBC output is sized from.  One that no write span carries is programmed
 from the validated image, as zero when the image does not reach it, so a job
 cannot inherit an earlier job's buffer address or codec format by leaving the
 register out.  This applies per register block the job writes; an AV1 job with
