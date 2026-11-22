@@ -13688,9 +13688,18 @@ static const struct rk_mpp_reset_backend_ops rk_mpp_kunit_reset_ops = {
 	.deassert = rk_mpp_kunit_reset_deassert,
 };
 
+static atomic_t rk_mpp_kunit_iotlb_flush_count;
+
+static void rk_mpp_kunit_count_iotlb_flush(struct iommu_domain *domain)
+{
+	atomic_inc(&rk_mpp_kunit_iotlb_flush_count);
+}
+
 static void rk_mpp_cluster_dma_recovery_kunit(struct kunit *test)
 {
-	static const struct iommu_domain_ops iommu_ops;
+	static const struct iommu_domain_ops iommu_ops = {
+		.flush_iotlb_all = rk_mpp_kunit_count_iotlb_flush,
+	};
 	struct rk_mpp_rkvdec2_stop_core cores[3] = {};
 	struct rk_mpp_cluster_recovery_result result;
 	struct rk_mpp_cluster_reset_request request;
@@ -13726,6 +13735,12 @@ static void rk_mpp_cluster_dma_recovery_kunit(struct kunit *test)
 	ccu = kunit_kzalloc(test, sizeof(*ccu), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, ccu);
 
+	/*
+	 * The fixture cores have no struct device, so the real providers
+	 * cannot serve them. Providerless cores take the generic flush, which
+	 * the fixture ops count once per refreshed participant.
+	 */
+	atomic_set(&rk_mpp_kunit_iotlb_flush_count, 0);
 	domain0->ops = &iommu_ops;
 	domain1->ops = &iommu_ops;
 	mutex_init(&srv->dma_group_lock);
@@ -13734,15 +13749,15 @@ static void rk_mpp_cluster_dma_recovery_kunit(struct kunit *test)
 	core0->srv = srv;
 	core0->dma_group = group0;
 	core0->iommu_domain = domain0;
-	core0->iommu_provider = RK_MPP_IOMMU_ROCKCHIP;
+	core0->iommu_provider = RK_MPP_IOMMU_NONE;
 	core1->srv = srv;
 	core1->dma_group = group0;
 	core1->iommu_domain = domain0;
-	core1->iommu_provider = RK_MPP_IOMMU_ROCKCHIP;
+	core1->iommu_provider = RK_MPP_IOMMU_NONE;
 	core2->srv = srv;
 	core2->dma_group = group1;
 	core2->iommu_domain = domain1;
-	core2->iommu_provider = RK_MPP_IOMMU_ROCKCHIP;
+	core2->iommu_provider = RK_MPP_IOMMU_NONE;
 	ccu->srv = srv;
 	mutex_init(&ccu->ccu_recovery_lock);
 	mutex_init(&ccu->run_lock);
@@ -13768,6 +13783,8 @@ static void rk_mpp_cluster_dma_recovery_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, result.dma_group_count, 2U);
 	KUNIT_EXPECT_EQ(test, result.dma_group_refresh_count, 2U);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->iommu_refresh_count), 2);
+	/* core1 shares group0 with core0 but owns a separately reset MMU. */
+	KUNIT_EXPECT_EQ(test, atomic_read(&rk_mpp_kunit_iotlb_flush_count), 3);
 	KUNIT_EXPECT_PTR_EQ(test, failed_hw, NULL);
 
 	WRITE_ONCE(group1->isolated, true);
@@ -13785,8 +13802,33 @@ static void rk_mpp_cluster_dma_recovery_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, result.dma_group_count, 2U);
 	KUNIT_EXPECT_EQ(test, result.dma_group_refresh_count, 1U);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->iommu_refresh_count), 3);
+	KUNIT_EXPECT_EQ(test, atomic_read(&rk_mpp_kunit_iotlb_flush_count), 5);
 	KUNIT_EXPECT_PTR_EQ(test, failed_hw, core2);
 	KUNIT_EXPECT_EQ(test, rk_mpp_cluster_isolated_dma_count(&set), 1U);
+
+	/*
+	 * A Rockchip restore can fail where the flush it replaced could not,
+	 * and a sibling's failure must fail the group its owner already
+	 * refreshed. The provider rejects the device-less core with -ENODEV.
+	 */
+	WRITE_ONCE(group1->isolated, false);
+	rk_mpp_recovery_result_init(&result);
+	mutex_lock(&ccu->ccu_recovery_lock);
+	mutex_lock(&ccu->run_lock);
+	ret = rk_mpp_cluster_collect_dma(&request, &set);
+	result.dma_group_count = set.count;
+	core1->iommu_provider = RK_MPP_IOMMU_ROCKCHIP;
+	if (!ret)
+		ret = rk_mpp_cluster_refresh_dma(&request, &set, &result,
+						 &failed_hw);
+	mutex_unlock(&ccu->run_lock);
+	mutex_unlock(&ccu->ccu_recovery_lock);
+	KUNIT_EXPECT_EQ(test, ret, -ENODEV);
+	KUNIT_EXPECT_EQ(test, result.dma_group_count, 2U);
+	KUNIT_EXPECT_EQ(test, result.dma_group_refresh_count, 0U);
+	KUNIT_EXPECT_EQ(test, atomic_read(&srv->iommu_refresh_count), 4);
+	KUNIT_EXPECT_EQ(test, atomic_read(&rk_mpp_kunit_iotlb_flush_count), 6);
+	KUNIT_EXPECT_PTR_EQ(test, failed_hw, core1);
 }
 
 static void rk_mpp_cluster_recovery_result_kunit(struct kunit *test)
@@ -18776,6 +18818,14 @@ rk_mpp_activation_finish_retry(struct rk_mpp_hw *hw,
 	return false;
 }
 
+/*
+ * Put the MMU serving @hw back into translation after @hw's reset. The reset
+ * pulses the block that embeds the MMU, so this has to be a per-device
+ * reprogram of directory address, fault interrupts and paging; a domain-wide
+ * IOTLB flush restores none of those and cannot fail. The Rockchip restore
+ * replays the provider's enable sequence, so its callers hold dma_group_lock
+ * to keep the group-wide isolation attach out.
+ */
 static int
 __rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw, struct rk_mpp_service *srv)
 {
@@ -18784,10 +18834,17 @@ __rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw, struct rk_mpp_service *srv)
 	if (!hw->iommu_domain)
 		return 0;
 
-	if (hw->iommu_provider == RK_MPP_IOMMU_VSI)
+	switch (hw->iommu_provider) {
+	case RK_MPP_IOMMU_VSI:
 		ret = vsi_iommu_refresh(hw->dev);
-	else
+		break;
+	case RK_MPP_IOMMU_ROCKCHIP:
+		ret = rockchip_iommu_restore(hw->dev);
+		break;
+	default:
 		iommu_flush_iotlb_all(hw->iommu_domain);
+		break;
+	}
 	if (ret)
 		return ret;
 	if (srv)
@@ -18801,13 +18858,27 @@ static int rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw,
 {
 	struct rk_mpp_service *srv = job && job->session ?
 					     job->session->srv : hw->srv;
+	int ret = 0;
 
 	lockdep_assert_held(&hw->run_lock);
 	if (READ_ONCE(hw->terminally_stopped) ||
 	    READ_ONCE(hw->terminal_power_drained))
 		return 0;
+	if (hw->iommu_provider != RK_MPP_IOMMU_ROCKCHIP)
+		return __rk_mpp_hw_refresh_iommu(hw, srv);
 
-	return __rk_mpp_hw_refresh_iommu(hw, srv);
+	/*
+	 * A sibling sharing this core's IOMMU group can attach the isolation
+	 * domain to every member while holding only dma_group_lock, which
+	 * reprograms this core's MMU too. Never interleave the restore with
+	 * that attach; once it has run there is nothing left to restore.
+	 */
+	mutex_lock(&hw->srv->dma_group_lock);
+	if (!READ_ONCE(hw->terminally_stopped))
+		ret = __rk_mpp_hw_refresh_iommu(hw, srv);
+	mutex_unlock(&hw->srv->dma_group_lock);
+
+	return ret;
 }
 
 static int
@@ -18863,6 +18934,42 @@ rk_mpp_cluster_collect_dma(const struct rk_mpp_cluster_reset_request *request,
 	return 0;
 }
 
+/*
+ * Refresh every reset participant attached to @group. The members share one
+ * domain, but each one's MMU was reset with its own core and has to be
+ * reprogrammed individually; refreshing the group owner alone leaves its
+ * siblings without translation. The group still counts as one refresh.
+ */
+static int
+rk_mpp_cluster_refresh_dma_group(const struct rk_mpp_cluster_reset_request *request,
+				 const struct rk_mpp_dma_group *group,
+				 struct rk_mpp_hw *owner,
+				 struct rk_mpp_hw **failed_hw)
+{
+	int ret;
+	u32 i;
+
+	lockdep_assert_held(&owner->srv->dma_group_lock);
+	ret = __rk_mpp_hw_refresh_iommu(owner, owner->srv);
+	if (ret) {
+		*failed_hw = owner;
+		return ret;
+	}
+	for (i = 0; i < request->count; i++) {
+		struct rk_mpp_hw *hw = request->cores[i].hw;
+
+		if (hw == owner || READ_ONCE(hw->dma_group) != group)
+			continue;
+		ret = __rk_mpp_hw_refresh_iommu(hw, NULL);
+		if (ret) {
+			*failed_hw = hw;
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
 static int
 rk_mpp_cluster_refresh_dma(const struct rk_mpp_cluster_reset_request *request,
 			   const struct rk_mpp_cluster_dma_set *set,
@@ -18898,12 +19005,11 @@ rk_mpp_cluster_refresh_dma(const struct rk_mpp_cluster_reset_request *request,
 			return -EBUSY;
 		}
 
-		ret = __rk_mpp_hw_refresh_iommu(owner, owner->srv);
+		ret = rk_mpp_cluster_refresh_dma_group(request, group, owner,
+						       failed_hw);
 		mutex_unlock(&owner->srv->dma_group_lock);
-		if (ret) {
-			*failed_hw = owner;
+		if (ret)
 			return ret;
-		}
 		result->dma_group_refresh_count++;
 	}
 
