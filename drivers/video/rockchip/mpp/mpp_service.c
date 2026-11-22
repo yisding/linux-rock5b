@@ -463,13 +463,14 @@ static int mpp_service_probe(struct platform_device *pdev)
 	of_property_read_u32(np, "rockchip,iommu-shared-mask",
 			     &srv->iommu_shared_mask);
 
+	/* open() takes session_lock as soon as cdev_add() publishes the node. */
+	mutex_init(&srv->session_lock);
+	INIT_LIST_HEAD(&srv->session_list);
 	ret = mpp_register_service(srv, MPP_SERVICE_NAME);
 	if (ret) {
 		dev_err(dev, "register %s device\n", MPP_SERVICE_NAME);
 		goto fail_register;
 	}
-	mutex_init(&srv->session_lock);
-	INIT_LIST_HEAD(&srv->session_list);
 	mpp_procfs_init(srv);
 
 	/* register sub drivers */
