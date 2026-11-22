@@ -381,6 +381,12 @@ coordinator for the bound instance; terminal IOMMU-group isolation may require
 a reboot before reprobe can succeed.  Removal returns ``-ENODEV`` to work that
 can no longer execute.
 
+Only resets the driver issues are followed by that IOMMU restore.  A decoder
+interrupt status outside the error mask, such as the bus-error bit, completes
+the job without a reset, so a hardware self-reset signalled that way is not
+followed by one.  Whether such a self-reset clears the IOMMU has not been
+measured.
+
 The driver does not export or import sync-file fences.  The RK3588 MPP UAPI has
 no fence command; userspace orders work through submission and poll.
 

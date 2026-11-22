@@ -5701,7 +5701,7 @@ rk_mpp_activation_finalize_result(struct rk_mpp_job *job, int result,
 				  int *final_result);
 static bool rk_mpp_job_complete(struct rk_mpp_job *job, int result);
 static int rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw,
-				   struct rk_mpp_job *job);
+				   struct rk_mpp_job *job, bool core_reset);
 static bool rk_mpp_job_rkvdec_rcb_enabled(struct rk_mpp_job *job);
 static int rk_mpp_cluster_arm_soft_ccu(struct rk_mpp_job *job);
 static int rk_mpp_rkvenc2_dchs_patch(struct rk_mpp_job *job);
@@ -10451,15 +10451,33 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 			  rk_mpp_activation_ref_put(&successor_inspection));
 
 	mutex_lock(&hw->run_lock);
-	rk_mpp_hw_refresh_iommu(hw, job0);
+	rk_mpp_hw_refresh_iommu(hw, job0, true);
 	mutex_unlock(&hw->run_lock);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->iommu_refresh_count), 1);
 
+	/*
+	 * Only a reset of the core may replay the Rockchip enable sequence,
+	 * which takes the MMU through paging off. The provider rejects the
+	 * device-less core, so the restore shows as -ENODEV and its absence
+	 * as the counted flush.
+	 */
+	hw->srv = srv;
+	mutex_init(&srv->dma_group_lock);
+	hw->iommu_provider = RK_MPP_IOMMU_ROCKCHIP;
+	mutex_lock(&hw->run_lock);
+	KUNIT_EXPECT_EQ(test, rk_mpp_hw_refresh_iommu(hw, job0, true), -ENODEV);
+	KUNIT_EXPECT_EQ(test, atomic_read(&srv->iommu_refresh_count), 1);
+	KUNIT_EXPECT_EQ(test, rk_mpp_hw_refresh_iommu(hw, job0, false), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&srv->iommu_refresh_count), 2);
+	mutex_unlock(&hw->run_lock);
+	hw->iommu_provider = RK_MPP_IOMMU_NONE;
+	hw->srv = NULL;
+
 	hw->iommu_domain = NULL;
 	mutex_lock(&hw->run_lock);
-	rk_mpp_hw_refresh_iommu(hw, job0);
+	rk_mpp_hw_refresh_iommu(hw, job0, true);
 	mutex_unlock(&hw->run_lock);
-	KUNIT_EXPECT_EQ(test, atomic_read(&srv->iommu_refresh_count), 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&srv->iommu_refresh_count), 2);
 
 	rk_mpp_scheduler_release_session(job0);
 	KUNIT_EXPECT_PTR_EQ(test, session.rkvdec_dispatch_owner, NULL);
@@ -19377,9 +19395,24 @@ rk_mpp_activation_finish_retry(struct rk_mpp_hw *hw,
  * IOTLB flush restores none of those and cannot fail. The Rockchip restore
  * replays the provider's enable sequence, so its callers hold dma_group_lock
  * to keep the group-wide isolation attach out.
+ *
+ * That sequence takes the MMU through paging off, which is bypass on this IP,
+ * so it may run only behind a reset this driver issued on @hw (@core_reset):
+ * the pulse is what proves the core's DMA stopped, and what makes a reprogram
+ * necessary. A refresh that no reset of @hw precedes keeps the flush. Whoever
+ * retired the job in that case either reset and restored the core or never
+ * started it, and in HARD-CCU mode the coordinator may already be running a
+ * peer's descriptor on the core.
+ *
+ * Only a reset issued by this driver is followed by the restore. A core that
+ * resets itself on a status its backend does not treat as an error, as RKVDEC2
+ * does for a bus error outside err_mask, completes its job without a reset
+ * pulse and so without a restore. Whether such a self-reset reaches the MMU
+ * is not known.
  */
 static int
-__rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw, struct rk_mpp_service *srv)
+__rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw, struct rk_mpp_service *srv,
+			  bool core_reset)
 {
 	int ret = 0;
 
@@ -19391,8 +19424,11 @@ __rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw, struct rk_mpp_service *srv)
 		ret = vsi_iommu_refresh(hw->dev);
 		break;
 	case RK_MPP_IOMMU_ROCKCHIP:
-		ret = rockchip_iommu_restore(hw->dev);
-		break;
+		if (core_reset) {
+			ret = rockchip_iommu_restore(hw->dev);
+			break;
+		}
+		fallthrough;
 	default:
 		iommu_flush_iotlb_all(hw->iommu_domain);
 		break;
@@ -19406,7 +19442,7 @@ __rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw, struct rk_mpp_service *srv)
 }
 
 static int rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw,
-				   struct rk_mpp_job *job)
+				   struct rk_mpp_job *job, bool core_reset)
 {
 	struct rk_mpp_service *srv = job && job->session ?
 					     job->session->srv : hw->srv;
@@ -19416,8 +19452,8 @@ static int rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw,
 	if (READ_ONCE(hw->terminally_stopped) ||
 	    READ_ONCE(hw->terminal_power_drained))
 		return 0;
-	if (hw->iommu_provider != RK_MPP_IOMMU_ROCKCHIP)
-		return __rk_mpp_hw_refresh_iommu(hw, srv);
+	if (!core_reset || hw->iommu_provider != RK_MPP_IOMMU_ROCKCHIP)
+		return __rk_mpp_hw_refresh_iommu(hw, srv, core_reset);
 
 	/*
 	 * A sibling sharing this core's IOMMU group can attach the isolation
@@ -19427,7 +19463,7 @@ static int rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw,
 	 */
 	mutex_lock(&hw->srv->dma_group_lock);
 	if (!READ_ONCE(hw->terminally_stopped))
-		ret = __rk_mpp_hw_refresh_iommu(hw, srv);
+		ret = __rk_mpp_hw_refresh_iommu(hw, srv, true);
 	mutex_unlock(&hw->srv->dma_group_lock);
 
 	return ret;
@@ -19502,7 +19538,7 @@ rk_mpp_cluster_refresh_dma_group(const struct rk_mpp_cluster_reset_request *requ
 	u32 i;
 
 	lockdep_assert_held(&owner->srv->dma_group_lock);
-	ret = __rk_mpp_hw_refresh_iommu(owner, owner->srv);
+	ret = __rk_mpp_hw_refresh_iommu(owner, owner->srv, true);
 	if (ret) {
 		*failed_hw = owner;
 		return ret;
@@ -19512,7 +19548,7 @@ rk_mpp_cluster_refresh_dma_group(const struct rk_mpp_cluster_reset_request *requ
 
 		if (hw == owner || READ_ONCE(hw->dma_group) != group)
 			continue;
-		ret = __rk_mpp_hw_refresh_iommu(hw, NULL);
+		ret = __rk_mpp_hw_refresh_iommu(hw, NULL, true);
 		if (ret) {
 			*failed_hw = hw;
 			return ret;
@@ -19602,10 +19638,12 @@ rk_mpp_cluster_reset_usable(const struct rk_mpp_cluster_reset_request *request)
  * reusable. A failed refresh permanently closes admission and attempts
  * terminal isolation, but a successful physical reset remains sufficient to
  * retire the current job even when that final isolation proof also fails.
+ * @core_reset says whether this recovery pulsed @hw's reset lines itself.
  */
 static int
 rk_mpp_hw_finish_recovery(struct rk_mpp_hw *hw, struct rk_mpp_job *job,
-			  struct rk_mpp_cluster_recovery_result *result)
+			  struct rk_mpp_cluster_recovery_result *result,
+			  bool core_reset)
 {
 	int isolate_ret;
 	int ret;
@@ -19618,7 +19656,7 @@ rk_mpp_hw_finish_recovery(struct rk_mpp_hw *hw, struct rk_mpp_job *job,
 			 !result->quiesced))
 		return -EIO;
 
-	ret = rk_mpp_hw_refresh_iommu(hw, job);
+	ret = rk_mpp_hw_refresh_iommu(hw, job, core_reset);
 	if (!ret) {
 		result->reusable = rk_mpp_hw_usable(hw);
 		return 0;
@@ -19644,9 +19682,14 @@ rk_mpp_hw_stop_and_recover(struct rk_mpp_hw *hw, struct rk_mpp_job *job,
 	if (ret)
 		return ret;
 
-	return rk_mpp_hw_finish_recovery(hw, job, result);
+	return rk_mpp_hw_finish_recovery(hw, job, result, true);
 }
 
+/*
+ * Refresh for a provider fault whose job was retired before the fault worker
+ * could claim it. No reset is issued here; the effect is recorded only so the
+ * common refresh and failure handling apply.
+ */
 static int
 rk_mpp_hw_recover_iommu_fault(struct rk_mpp_hw *hw,
 			      struct rk_mpp_cluster_recovery_result *result)
@@ -19655,7 +19698,7 @@ rk_mpp_hw_recover_iommu_fault(struct rk_mpp_hw *hw,
 	result->reset_effect = RK_MPP_RESET_TRANSLATIONS_LOST;
 	result->quiesced = true;
 
-	return rk_mpp_hw_finish_recovery(hw, NULL, result);
+	return rk_mpp_hw_finish_recovery(hw, NULL, result, false);
 }
 
 static bool
@@ -20499,7 +20542,10 @@ rk_mpp_hw_recover_active(struct rk_mpp_hw *hw, bool iommu_fault,
 		 * Completion or abort may have stopped the marked generation
 		 * before this worker acquired run_lock.  VSI masks its fault
 		 * source in the provider IRQ, so refresh even without a job
-		 * before allowing another generation onto the core.
+		 * before allowing another generation onto the core.  Nothing
+		 * resets the core here, so the Rockchip provider only gets
+		 * its IOTLB flushed: whoever retired the job has either reset
+		 * the core and restored its MMU or never started it.
 		 */
 		if (iommu_fault) {
 			refresh_ret =
