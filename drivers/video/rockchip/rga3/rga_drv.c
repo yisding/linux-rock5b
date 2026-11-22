@@ -1108,7 +1108,7 @@ static long rga_ioctl(struct file *file, uint32_t cmd, unsigned long arg)
 	int major_version = 0, minor_version = 0;
 	char version[16] = { 0 };
 	struct rga_version_t driver_version;
-	struct rga_hw_versions_t hw_versions;
+	struct rga_hw_versions_t hw_versions = { 0 };
 	struct rga_drvdata_t *rga = rga_drvdata;
 	struct rga_session *session = file->private_data;
 
