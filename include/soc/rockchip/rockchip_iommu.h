@@ -29,6 +29,16 @@ int rockchip_iommu_set_fault_handler(struct device *dev,
 				     iommu_fault_handler_t handler, void *token);
 /* Waits (sleeps) until no in-flight provider IRQ callback can be running. */
 int rockchip_iommu_sync_fault_handler(struct device *dev);
+/*
+ * Reprograms the MMU serving @dev (directory address, fault interrupt mask,
+ * paging enable) after the caller reset @dev; an IOTLB flush does not. Sleeps.
+ * The caller has stopped @dev's DMA and released its reset lines, and
+ * serializes the call against other restores of @dev and against domain
+ * attach/detach on @dev's IOMMU group. Returns 0 when translation is restored,
+ * or when the MMU is not runtime-active (resume programs it) or @dev is on the
+ * identity domain. On any other error @dev must not be started.
+ */
+int rockchip_iommu_restore(struct device *dev);
 #else
 static inline int rockchip_iommu_enable(struct device *dev)
 {
@@ -71,6 +81,11 @@ static inline int rockchip_iommu_set_fault_handler(struct device *dev,
 }
 
 static inline int rockchip_iommu_sync_fault_handler(struct device *dev)
+{
+	return -ENODEV;
+}
+
+static inline int rockchip_iommu_restore(struct device *dev)
 {
 	return -ENODEV;
 }
