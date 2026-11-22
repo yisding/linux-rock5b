@@ -24392,7 +24392,9 @@ static int rk_mpp_job_take_rkvenc_slice(struct rk_mpp_job *job, u32 *value,
 	return ret;
 }
 
-static int rk_mpp_job_pop_rkvenc_slice(struct rk_mpp_job *job, u32 *value)
+/* Unconditional pop; only the KUnit suite still takes records this way. */
+static int __maybe_unused
+rk_mpp_job_pop_rkvenc_slice(struct rk_mpp_job *job, u32 *value)
 {
 	return rk_mpp_job_take_rkvenc_slice(job, value, false);
 }
