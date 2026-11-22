@@ -252,6 +252,18 @@ logical side window above and return the three selected value words; that range
 is not ordinary writable MMIO.  AV1 AFBC request bytes may be retained for
 readback but are not written directly to the driver-owned AFBC block.
 
+Only the words inside a write span are programmed from userspace data, and a
+core's register file is not cleared between jobs, so an ordinary register that
+no span carries keeps its previous hardware value.  The registers the driver
+validates are the exception and always follow the job's own image: the format
+selector (RKVDEC2 word 9, RKVENC2 word 192), every register of the built-in
+address table that selector chooses and of the custom table, and the RKVENC2
+dual-core handshake word 193.  One that no write span carries is programmed
+from the validated image, as zero when the image does not reach it, so a job
+cannot inherit an earlier job's buffer address or codec format by leaving the
+register out.  This applies per register block the job writes; an AV1 job with
+no write span in the cache class leaves that block untouched.
+
 RCB scratch
 -----------
 

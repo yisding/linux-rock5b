@@ -5705,6 +5705,10 @@ static int rk_mpp_job_ensure_reg_bytes(struct rk_mpp_job *job, u32 reg_bytes);
 static int rk_mpp_job_validate_explicit_iovas(struct rk_mpp_job *job);
 static int rk_mpp_rkvdec2_validate(
 	struct rk_mpp_job *job, const struct rk_mpp_reg_image *image);
+static int rk_mpp_job_write_regs(struct rk_mpp_job *job,
+				 const struct rk_mpp_reg_image *image,
+				 u32 start_offset, u32 *start_value,
+				 bool *start_seen);
 static int
 rk_mpp_av1_build_afbc_config(struct rk_mpp_job *job,
 			     const struct rk_mpp_reg_image *image,
@@ -7736,6 +7740,211 @@ static void rk_mpp_rkvdec2_vp9_translate_validate_kunit(struct kunit *test)
 
 	kunit_release_action(test, rk_mpp_kunit_vp9_cleanup, cleanup);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->import_count), 0);
+}
+
+static u32 rk_mpp_kunit_hw_word(const struct rk_mpp_hw *hw, u32 region,
+				u32 word)
+{
+	return readl(hw->regs[region] + word * sizeof(u32));
+}
+
+/*
+ * A register file that still holds another job's values must not leak them
+ * into the words the kernel validated: whatever the write spans leave out is
+ * programmed from the image instead.
+ */
+static void rk_mpp_job_write_regs_owned_words_kunit(struct kunit *test)
+{
+	const u32 mmio_words = RK_MPP_RKVENC2_MIN_REG_SIZE / sizeof(u32);
+	const u32 cache_words = RK_MPP_AV1_CACHE_MIN_REG_SIZE / sizeof(u32);
+	const u32 image_words = 512;
+	const u32 stale = 0xdeadbeef;
+	const struct rk_mpp_trans_table *table;
+	struct rk_mpp_reg_image *image;
+	struct rk_mpp_hw *hw;
+	struct rk_mpp_job *job;
+	u32 *cache_image;
+	u32 *cache_mmio;
+	u32 *regs;
+	u32 *mmio;
+	u32 start_value = 0;
+	bool start_seen = false;
+	u32 i;
+
+	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
+	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, job);
+	mmio = kunit_kcalloc(test, mmio_words, sizeof(u32), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, mmio);
+	cache_mmio = kunit_kcalloc(test, cache_words, sizeof(u32), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, cache_mmio);
+	regs = kunit_kcalloc(test, image_words, sizeof(u32), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, regs);
+	cache_image = kunit_kcalloc(test, cache_words, sizeof(u32),
+				    GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, cache_image);
+
+	rk_mpp_activation_init(job);
+	job->current_activation->selected_hw = hw;
+	image = &job->reg_builder.image;
+	image->regs = regs;
+	hw->regs[0] = (void __iomem *)mmio;
+	atomic_set(&hw->power_count, 1);
+
+	/* RKVDEC2: only the start word is sent, and the image ends there. */
+	job->client_type = RK_MPP_DEVICE_RKVDEC;
+	hw->reg_size[0] = RK_MPP_RKVDEC2_MIN_REG_SIZE;
+	memset32(mmio, stale, mmio_words);
+	image->reg_words = RK_MPP_RKVDEC_START_BASE / sizeof(u32) + 1;
+	image->reg_bytes = image->reg_words * sizeof(u32);
+	regs[RK_MPP_RKVDEC_START_BASE / sizeof(u32)] = RK_MPP_RKVDEC_START_EN;
+	job->req_cnt = 1;
+	job->reqs[0].req.cmd = MPP_CMD_SET_REG_WRITE;
+	job->reqs[0].req.offset = RK_MPP_RKVDEC_START_BASE;
+	job->reqs[0].req.size = sizeof(u32);
+
+	KUNIT_ASSERT_EQ(test,
+			rk_mpp_job_write_regs(job, image,
+					      RK_MPP_RKVDEC_START_BASE,
+					      &start_value, &start_seen), 0);
+	KUNIT_EXPECT_TRUE(test, start_seen);
+	KUNIT_EXPECT_EQ(test, start_value, (u32)RK_MPP_RKVDEC_START_EN);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_kunit_hw_word(hw, 0, RK_MPP_RKVDEC_START_BASE /
+					     sizeof(u32)), stale);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_kunit_hw_word(hw, 0, RK_MPP_RKVDEC_REG_FMT), 0U);
+	table = &rk_mpp_rkvdec_tables[RK_MPP_RKVDEC_FMT_H265D];
+	for (i = 0; i < table->count; i++)
+		KUNIT_EXPECT_EQ(test,
+				rk_mpp_kunit_hw_word(hw, 0, table->regs[i]),
+				0U);
+	/* Neither a VP9-only address word nor a plain parameter is scrubbed. */
+	KUNIT_EXPECT_EQ(test, rk_mpp_kunit_hw_word(hw, 0, 160), stale);
+	KUNIT_EXPECT_EQ(test, rk_mpp_kunit_hw_word(hw, 0, 64), stale);
+
+	/*
+	 * RKVDEC2: the selector, a validated address and a custom-table word
+	 * sit in the image but outside every span; one address is sent.
+	 */
+	memset32(mmio, stale, mmio_words);
+	image->reg_words = 200;
+	image->reg_bytes = image->reg_words * sizeof(u32);
+	regs[RK_MPP_RKVDEC_REG_FMT] = RK_MPP_RKVDEC_FMT_VP9D;
+	regs[64] = 0x80002000;
+	regs[160] = 0x80000004;
+	regs[164] = 0x80001000;
+	job->trans_table[0] = 64;
+	job->trans_count = 1;
+	job->req_cnt = 2;
+	job->reqs[1].req.cmd = MPP_CMD_SET_REG_WRITE;
+	job->reqs[1].req.offset = 164 * sizeof(u32);
+	job->reqs[1].req.size = sizeof(u32);
+
+	KUNIT_ASSERT_EQ(test,
+			rk_mpp_job_write_regs(job, image,
+					      RK_MPP_RKVDEC_START_BASE,
+					      &start_value, &start_seen), 0);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_kunit_hw_word(hw, 0, RK_MPP_RKVDEC_REG_FMT),
+			(u32)RK_MPP_RKVDEC_FMT_VP9D);
+	KUNIT_EXPECT_EQ(test, rk_mpp_kunit_hw_word(hw, 0, 64), 0x80002000U);
+	KUNIT_EXPECT_EQ(test, rk_mpp_kunit_hw_word(hw, 0, 160), 0x80000004U);
+	KUNIT_EXPECT_EQ(test, rk_mpp_kunit_hw_word(hw, 0, 162), 0U);
+	KUNIT_EXPECT_EQ(test, rk_mpp_kunit_hw_word(hw, 0, 164), 0x80001000U);
+	/* 161 and 173 are address words of the other codecs only. */
+	KUNIT_EXPECT_EQ(test, rk_mpp_kunit_hw_word(hw, 0, 161), stale);
+	KUNIT_EXPECT_EQ(test, rk_mpp_kunit_hw_word(hw, 0, 173), stale);
+
+	/* RKVENC2: the handshake word takes the kernel's patched value. */
+	job->client_type = RK_MPP_DEVICE_RKVENC;
+	job->trans_count = 0;
+	job->req_cnt = 1;
+	job->reqs[0].req.offset = RK_MPP_RKVENC_START_BASE;
+	hw->reg_size[0] = RK_MPP_RKVENC2_MIN_REG_SIZE;
+	memset32(mmio, stale, mmio_words);
+	memset(regs, 0, image_words * sizeof(u32));
+	image->reg_words = RK_MPP_RKVENC_DCHS_WORD + 1;
+	image->reg_bytes = image->reg_words * sizeof(u32);
+	regs[RK_MPP_RKVENC_PIC_BASE_WORDS + 3] = 0x80003000;
+	regs[RK_MPP_RKVENC_FMT_WORD] = RK_MPP_RKVENC_ENC_PIC_STND;
+	regs[RK_MPP_RKVENC_DCHS_WORD] = RK_MPP_RKVENC_DCHS_RXE;
+	rk_mpp_job_resources(job)->rkvenc_dchs_value = RK_MPP_RKVENC_DCHS_TXE;
+	rk_mpp_job_resources(job)->rkvenc_dchs_override_valid = true;
+
+	KUNIT_ASSERT_EQ(test,
+			rk_mpp_job_write_regs(job, image,
+					      RK_MPP_RKVENC_START_BASE,
+					      &start_value, &start_seen), 0);
+	KUNIT_EXPECT_TRUE(test, start_seen);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_kunit_hw_word(hw, 0, RK_MPP_RKVENC_FMT_WORD),
+			(u32)RK_MPP_RKVENC_ENC_PIC_STND);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_kunit_hw_word(hw, 0, RK_MPP_RKVENC_DCHS_WORD),
+			(u32)RK_MPP_RKVENC_DCHS_TXE);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_kunit_hw_word(hw, 0,
+					     RK_MPP_RKVENC_PIC_BASE_WORDS + 3),
+			0x80003000U);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_kunit_hw_word(hw, 0,
+					     RK_MPP_RKVENC_PIC_BASE_WORDS + 23),
+			0U);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_kunit_hw_word(hw, 0,
+					     RK_MPP_RKVENC_PIC_BASE_WORDS + 24),
+			stale);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_kunit_hw_word(hw, 0,
+					     RK_MPP_RKVENC_OSD_BASE_WORDS + 20),
+			0U);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_kunit_hw_word(hw, 0,
+					     RK_MPP_RKVENC_OSD_BASE_WORDS + 19),
+			stale);
+	rk_mpp_job_resources(job)->rkvenc_dchs_override_valid = false;
+
+	/* AV1: a block no span programs is left alone altogether. */
+	job->client_type = RK_MPP_DEVICE_AV1DEC;
+	job->reqs[0].req.offset = RK_MPP_AV1_IRQ_BASE;
+	hw->reg_size[0] = RK_MPP_AV1_VCD_MIN_REG_SIZE;
+	hw->regs[1] = (void __iomem *)cache_mmio;
+	hw->reg_size[1] = RK_MPP_AV1_CACHE_MIN_REG_SIZE;
+	memset32(mmio, stale, mmio_words);
+	memset32(cache_mmio, stale, cache_words);
+	memset(regs, 0, image_words * sizeof(u32));
+	image->reg_words = image_words;
+	image->reg_bytes = image->reg_words * sizeof(u32);
+	regs[505] = 0x80004000;
+	image->regions[1].regs = cache_image;
+	image->regions[1].reg_words = cache_words;
+	image->regions[1].reg_bytes = cache_words * sizeof(u32);
+	cache_image[8] = 0x1;
+
+	KUNIT_ASSERT_EQ(test,
+			rk_mpp_job_write_regs(job, image, RK_MPP_AV1_IRQ_BASE,
+					      &start_value, &start_seen), 0);
+	KUNIT_EXPECT_TRUE(test, start_seen);
+	KUNIT_EXPECT_EQ(test, rk_mpp_kunit_hw_word(hw, 0, 505), 0x80004000U);
+	KUNIT_EXPECT_EQ(test, rk_mpp_kunit_hw_word(hw, 0, 507), 0U);
+	KUNIT_EXPECT_EQ(test, rk_mpp_kunit_hw_word(hw, 0, 506), stale);
+	KUNIT_EXPECT_EQ(test, rk_mpp_kunit_hw_word(hw, 1, 13), stale);
+
+	/* Once the job programs the cache block, its addresses follow. */
+	job->req_cnt = 2;
+	job->reqs[1].req.offset = RK_MPP_AV1_CACHE_ABI_OFFSET +
+				  RK_MPP_AV1_CACHE_STATUS0;
+	job->reqs[1].req.size = sizeof(u32);
+
+	KUNIT_ASSERT_EQ(test,
+			rk_mpp_job_write_regs(job, image, RK_MPP_AV1_IRQ_BASE,
+					      &start_value, &start_seen), 0);
+	KUNIT_EXPECT_EQ(test, rk_mpp_kunit_hw_word(hw, 1, 8), 0x1U);
+	KUNIT_EXPECT_EQ(test, rk_mpp_kunit_hw_word(hw, 1, 13), 0U);
+	KUNIT_EXPECT_EQ(test, rk_mpp_kunit_hw_word(hw, 1, 147), 0U);
+	KUNIT_EXPECT_EQ(test, rk_mpp_kunit_hw_word(hw, 1, 14), stale);
 }
 
 static void rk_mpp_rkvdec2_link_irq_decode_kunit(struct kunit *test)
@@ -14343,6 +14552,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_rkvdec2_hard_ccu_dma_domain_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_link_info_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_vp9_translate_validate_kunit),
+	KUNIT_CASE(rk_mpp_job_write_regs_owned_words_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_link_irq_decode_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_fill_link_table_kunit),
 	KUNIT_CASE(rk_mpp_rkvdec2_link_table_ownership_kunit),
@@ -21333,11 +21543,174 @@ static int rk_mpp_job_validate_write_regs(
 	return start_seen ? 0 : -EINVAL;
 }
 
+static bool rk_mpp_job_write_span_covers(const struct rk_mpp_job *job,
+					 u32 offset)
+{
+	u32 i;
+
+	for (i = 0; i < job->req_cnt; i++) {
+		const struct mpp_request *req = &job->reqs[i].req;
+
+		if (req->cmd != MPP_CMD_SET_REG_WRITE)
+			continue;
+		if (offset >= req->offset && offset - req->offset < req->size)
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * Program one kernel-answered word from the validated image when no
+ * SET_REG_WRITE span carries it.  A word the image does not reach is the
+ * validated empty value, zero.  @written has one bit per register block the
+ * job's spans program; a block the job leaves alone altogether (only the AV1
+ * L2 cache can be, the start word pins the others) is not touched here
+ * either.
+ */
+static void rk_mpp_job_write_owned_word(struct rk_mpp_job *job,
+					const struct rk_mpp_reg_image *image,
+					u32 index, u32 start_offset,
+					u32 written)
+{
+	struct rk_mpp_activation_resources *resources =
+		rk_mpp_job_resources(job);
+	struct rk_mpp_hw *hw = job->current_activation->selected_hw;
+	const struct mpp_request req = {
+		.offset = index * sizeof(u32),
+		.size = sizeof(u32),
+	};
+	const struct rk_mpp_reg_region *region;
+	u32 region_index;
+	u32 region_offset;
+	u32 value = 0;
+
+	/* The span loop wrote it, or holds it back as the start value. */
+	if (req.offset == start_offset ||
+	    rk_mpp_job_write_span_covers(job, req.offset))
+		return;
+	if (rk_mpp_job_request_reg_region(job, &req, &region_index,
+					  &region_offset))
+		return;
+	if (!(written & BIT(region_index)))
+		return;
+	/* The AV1 AFBC block is programmed from the kernel's own config. */
+	if (job->client_type == RK_MPP_DEVICE_AV1DEC &&
+	    region_index == RK_MPP_AV1_AFBC_REGION)
+		return;
+	if (!rk_mpp_hw_reg_range_valid(hw, region_index, region_offset,
+				       sizeof(u32)))
+		return;
+
+	region = &image->regions[region_index];
+	if (region_offset + sizeof(u32) <= region->reg_bytes)
+		value = region->regs[region_offset / sizeof(u32)];
+	if (job->client_type == RK_MPP_DEVICE_RKVENC &&
+	    index == RK_MPP_RKVENC_DCHS_WORD &&
+	    resources->rkvenc_dchs_override_valid)
+		value = resources->rkvenc_dchs_value;
+
+	writel_relaxed(value, hw->regs[region_index] + region_offset);
+}
+
+static void rk_mpp_job_write_owned_table(struct rk_mpp_job *job,
+					 const struct rk_mpp_reg_image *image,
+					 const struct rk_mpp_trans_table *table,
+					 u32 base_words, u32 start_offset,
+					 u32 written)
+{
+	u32 i;
+
+	for (i = 0; i < table->count; i++)
+		rk_mpp_job_write_owned_word(job, image,
+					    base_words + table->regs[i],
+					    start_offset, written);
+}
+
+/*
+ * Translation and provenance checks run on the job-private image, while the
+ * span loop in rk_mpp_job_write_regs() programs only the words userspace
+ * chose to send, and nothing scrubs a core's register file between jobs.  A
+ * word left out of every span would therefore keep what the previous job on
+ * this core programmed: an IOVA this job neither validated nor retains,
+ * possibly of another session's still-mapped buffer.
+ *
+ * Close that by making the words the kernel answers for a function of the
+ * image alone: the format selector that chose the address table (a stale
+ * selector would make the hardware consult a table that was never checked),
+ * every register of that table and of the custom table, and the encoder's
+ * dual-core handshake word.  Other registers a job omits keep their previous
+ * value, as in the BSP; they carry no address.
+ */
+static int rk_mpp_job_write_owned_regs(struct rk_mpp_job *job,
+				       const struct rk_mpp_reg_image *image,
+				       u32 start_offset, u32 written)
+{
+	const struct rk_mpp_trans_table custom = {
+		.regs = job->trans_table,
+		.count = min_t(u32, job->trans_count,
+			       ARRAY_SIZE(job->trans_table)),
+	};
+	u32 fmt = 0;
+	u32 i;
+
+	rk_mpp_job_write_owned_table(job, image, &custom, 0, start_offset,
+				     written);
+
+	switch (job->client_type) {
+	case RK_MPP_DEVICE_AV1DEC:
+		for (i = 0; i < ARRAY_SIZE(rk_mpp_av1_tables); i++) {
+			const struct rk_mpp_reg_region_desc *region =
+				&rk_mpp_av1_reg_layout.regions[i];
+
+			rk_mpp_job_write_owned_table(job, image,
+						     &rk_mpp_av1_tables[i],
+						     region->abi_offset /
+						     sizeof(u32),
+						     start_offset, written);
+		}
+		return 0;
+	case RK_MPP_DEVICE_RKVDEC:
+		if (image->reg_words > RK_MPP_RKVDEC_REG_FMT)
+			fmt = image->regs[RK_MPP_RKVDEC_REG_FMT] & 0x3ff;
+		if (fmt >= ARRAY_SIZE(rk_mpp_rkvdec_tables))
+			return -EINVAL;
+
+		rk_mpp_job_write_owned_word(job, image, RK_MPP_RKVDEC_REG_FMT,
+					    start_offset, written);
+		rk_mpp_job_write_owned_table(job, image,
+					     &rk_mpp_rkvdec_tables[fmt], 0,
+					     start_offset, written);
+		return 0;
+	case RK_MPP_DEVICE_RKVENC:
+		if (image->reg_words > RK_MPP_RKVENC_FMT_WORD)
+			fmt = image->regs[RK_MPP_RKVENC_FMT_WORD] &
+			      RK_MPP_RKVENC_FMT_MASK;
+
+		rk_mpp_job_write_owned_word(job, image, RK_MPP_RKVENC_FMT_WORD,
+					    start_offset, written);
+		rk_mpp_job_write_owned_word(job, image, RK_MPP_RKVENC_DCHS_WORD,
+					    start_offset, written);
+		rk_mpp_job_write_owned_table(job, image,
+					     &rk_mpp_rkvenc_pic_tables[fmt],
+					     RK_MPP_RKVENC_PIC_BASE_WORDS,
+					     start_offset, written);
+		rk_mpp_job_write_owned_table(job, image,
+					     &rk_mpp_rkvenc_osd_tables[fmt],
+					     RK_MPP_RKVENC_OSD_BASE_WORDS,
+					     start_offset, written);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
 static int rk_mpp_job_write_regs(
 	struct rk_mpp_job *job, const struct rk_mpp_reg_image *image,
 	u32 start_offset, u32 *start_value, bool *start_seen)
 {
 	struct rk_mpp_hw *hw = job->current_activation->selected_hw;
+	u32 written = 0;
 	u32 i;
 
 	*start_seen = false;
@@ -21366,6 +21739,7 @@ static int rk_mpp_job_write_regs(
 		if (!rk_mpp_hw_reg_range_valid(hw, region_index,
 					       region_offset, req->size))
 			return -EINVAL;
+		written |= BIT(region_index);
 
 		end = req->offset + req->size;
 		for (offset = req->offset; offset < end; offset += sizeof(u32)) {
@@ -21397,7 +21771,7 @@ static int rk_mpp_job_write_regs(
 		}
 	}
 
-	return 0;
+	return rk_mpp_job_write_owned_regs(job, image, start_offset, written);
 }
 
 static void rk_mpp_rkvdec2_read_perf_sel(struct rk_mpp_job *job,
