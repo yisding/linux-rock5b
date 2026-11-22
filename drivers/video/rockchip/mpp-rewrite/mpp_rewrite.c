@@ -2018,7 +2018,10 @@ static int rk_mpp_rkvdec2_publish_and_start_core(struct rk_mpp_job *job,
 						 u32 start_value);
 static int
 rk_mpp_hw_abort_ccu_dependents(struct rk_mpp_hw *ccu,
-			       const struct rk_mpp_cluster_recovery_result *group);
+			       const struct rk_mpp_cluster_recovery_result *group,
+			       int result,
+			       enum rk_mpp_activation_transition_reason reason);
+static int rk_mpp_hw_shutdown_hard_ccu(struct rk_mpp_hw *hw);
 static void
 rk_mpp_hw_abort_ccu_active_dependents(struct rk_mpp_hw *ccu,
 				      struct rk_mpp_hw *skip, int result,
@@ -10796,6 +10799,7 @@ static void rk_mpp_kunit_device_release(struct device *dev)
 static void rk_mpp_hw_abort_ccu_dependents_kunit(struct kunit *test)
 {
 	struct rk_mpp_service *srv;
+	struct rk_mpp_cluster *cluster;
 	struct device_node *ccu_node;
 	struct rk_mpp_session *session;
 	struct device *ccu_dev;
@@ -10810,6 +10814,8 @@ static void rk_mpp_hw_abort_ccu_dependents_kunit(struct kunit *test)
 
 	srv = rk_mpp_kunit_alloc_service(test);
 	KUNIT_ASSERT_NOT_NULL(test, srv);
+	cluster = kunit_kzalloc(test, sizeof(*cluster), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, cluster);
 	ccu_node = kunit_kzalloc(test, sizeof(*ccu_node), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, ccu_node);
 	session = kunit_kzalloc(test, sizeof(*session), GFP_KERNEL);
@@ -10954,8 +10960,38 @@ static void rk_mpp_hw_abort_ccu_dependents_kunit(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, active->current_activation->selected_hw, NULL);
 	KUNIT_EXPECT_EQ(test, refcount_read(&active->refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&core1->refs), 1);
+	mutex_unlock(&ccu->ccu_recovery_lock);
 
-	ret = rk_mpp_hw_abort_ccu_dependents(ccu, NULL);
+	/*
+	 * Shutdown ends a HARD-CCU chain only while the coordinator lists a
+	 * job.  An idle coordinator, like a SOFT or direct core, is left to the
+	 * plain per-core abort and its peers keep their queued work.
+	 */
+	cluster->coordinator = ccu;
+	cluster->member_type = RK_MPP_DEVICE_RKVDEC;
+	WRITE_ONCE(ccu->cluster, cluster);
+	mutex_lock(&srv->hw_lock);
+	ccu->online = true;
+	list_add_tail(&ccu->link, &srv->hw_list);
+	mutex_unlock(&srv->hw_lock);
+	KUNIT_EXPECT_EQ(test, rk_mpp_hw_shutdown_hard_ccu(core1), 0);
+	core1->rkvdec_ccu_mode = RK_MPP_RKVDEC_CCU_MODE_HARD;
+	KUNIT_EXPECT_EQ(test, rk_mpp_hw_shutdown_hard_ccu(core1), 0);
+	core1->rkvdec_ccu_mode = 0;
+	KUNIT_EXPECT_EQ(test, rk_mpp_hw_shutdown_hard_ccu(ccu), 0);
+	mutex_lock(&srv->hw_lock);
+	list_del_init(&ccu->link);
+	ccu->online = false;
+	mutex_unlock(&srv->hw_lock);
+	WRITE_ONCE(ccu->cluster, NULL);
+	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&ccu->ccu_recovery_lock));
+	KUNIT_EXPECT_EQ(test, refcount_read(&ccu->refs), 1);
+	KUNIT_EXPECT_FALSE(test, list_empty(&queued->sched_link));
+	KUNIT_EXPECT_EQ(test, queued->result, -EINPROGRESS);
+
+	mutex_lock(&ccu->ccu_recovery_lock);
+	ret = rk_mpp_hw_abort_ccu_dependents(ccu, NULL, -ENODEV,
+					     RK_MPP_TRANSITION_REMOVE);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 	mutex_unlock(&ccu->ccu_recovery_lock);
 	flush_work(&srv->sched_work);
@@ -21474,7 +21510,9 @@ rk_mpp_hw_collect_ccu_dependents(struct rk_mpp_hw *ccu,
 
 static int
 rk_mpp_hw_abort_ccu_dependents(struct rk_mpp_hw *ccu,
-			       const struct rk_mpp_cluster_recovery_result *group)
+			       const struct rk_mpp_cluster_recovery_result *group,
+			       int result,
+			       enum rk_mpp_activation_transition_reason reason)
 {
 	struct rk_mpp_hw *deps[RK_MPP_CORE_COUNTER_COUNT];
 	u32 count;
@@ -21488,13 +21526,10 @@ rk_mpp_hw_abort_ccu_dependents(struct rk_mpp_hw *ccu,
 	for (i = 0; i < count; i++) {
 		int abort_ret;
 
-		rk_mpp_hw_abort_queued(deps[i], -ENODEV,
-				       RK_MPP_TRANSITION_REMOVE);
+		rk_mpp_hw_abort_queued(deps[i], result, reason);
 		abort_ret =
-			rk_mpp_hw_abort_active_recovery_locked(deps[i],
-							       ccu,
-							       -ENODEV,
-							       RK_MPP_TRANSITION_REMOVE,
+			rk_mpp_hw_abort_active_recovery_locked(deps[i], ccu,
+							       result, reason,
 							       group);
 		if (abort_ret && !ret)
 			ret = abort_ret;
@@ -26114,7 +26149,8 @@ retry_stop:
 		if (!stop_ret)
 			stop_ret = rk_mpp_hw_abort_ccu_dependents(ccu,
 								  hard_ccu ? &ccu_recovery :
-								  NULL);
+								  NULL, -ENODEV,
+								  RK_MPP_TRANSITION_REMOVE);
 		if (stop_ret) {
 			dma_unquiesced = true;
 			rk_mpp_hw_handle_reset_failure(hw, stop_ret);
@@ -26126,7 +26162,9 @@ retry_stop:
 			rk_mpp_rkvdec2_force_stop_ccu(hw, &ccu_recovery);
 		if (!stop_ret)
 			stop_ret = rk_mpp_hw_abort_ccu_dependents(hw,
-								  &ccu_recovery);
+								  &ccu_recovery,
+								  -ENODEV,
+								  RK_MPP_TRANSITION_REMOVE);
 		if (stop_ret)
 			dma_unquiesced = true;
 		mutex_unlock(&hw->ccu_recovery_lock);
@@ -26349,6 +26387,62 @@ static int rk_mpp_hw_resume(struct device *dev)
 	return 0;
 }
 
+/*
+ * A HARD-CCU chain is one DMA engine spanning every core its coordinator may
+ * dispatch to, including a peer whose software active slot is empty.  The
+ * per-core abort only pulses the owner core's reset, which proves nothing
+ * about the peer executing the descriptor, so shutting down any member has to
+ * end the whole chain first: stop the coordinator and reset the group as
+ * remove and recovery do, then retire every listed job on that group proof.
+ *
+ * Only HARD jobs are ever listed on a coordinator and a job stays listed
+ * until it has been retired, so an empty list means no chain is in flight.
+ * Nothing is touched then: with @hw already offline no later chain can start
+ * on it or include it in a work mask, and the remaining members repeat this
+ * from their own shutdown.  SOFT and direct cores never list a job and keep
+ * the plain per-core abort.
+ */
+static int rk_mpp_hw_shutdown_hard_ccu(struct rk_mpp_hw *hw)
+{
+	struct rk_mpp_cluster_recovery_result group;
+	struct rk_mpp_cluster *cluster;
+	struct rk_mpp_hw *ccu = NULL;
+	int ret = 0;
+
+	if (!hw->match->contributes_support) {
+		ccu = hw;
+		rk_mpp_hw_get(ccu);
+	} else if (rk_mpp_rkvdec2_hard_ccu_enabled(hw)) {
+		/* An active job pins its exact coordinator even once offline. */
+		ccu = rk_mpp_hw_get_active_ccu_if(hw, NULL, 0);
+		if (!ccu)
+			ccu = rk_mpp_hw_get_ccu_for_core(hw->srv, hw);
+	}
+	if (!ccu)
+		return 0;
+
+	mutex_lock(&ccu->ccu_recovery_lock);
+	cluster = READ_ONCE(ccu->cluster);
+	if (!rk_mpp_cluster_validate_ccu(cluster, ccu) &&
+	    rk_mpp_cluster_ccu_has_jobs(cluster, ccu)) {
+		ret = rk_mpp_rkvdec2_force_stop_ccu(ccu, &group);
+		if (!ret)
+			ret = rk_mpp_hw_abort_ccu_dependents(ccu, &group,
+							     -ESHUTDOWN,
+							     RK_MPP_TRANSITION_SHUTDOWN);
+		/* @hw is offline, so it is not among those dependents. */
+		if (!ret && ccu != hw)
+			ret = rk_mpp_hw_abort_active_recovery_locked(hw, ccu,
+								     -ESHUTDOWN,
+								     RK_MPP_TRANSITION_SHUTDOWN,
+								     &group);
+	}
+	mutex_unlock(&ccu->ccu_recovery_lock);
+	rk_mpp_hw_put(ccu);
+
+	return ret;
+}
+
 static void rk_mpp_hw_shutdown(struct platform_device *pdev)
 {
 	struct rk_mpp_hw *hw = platform_get_drvdata(pdev);
@@ -26362,8 +26456,14 @@ static void rk_mpp_hw_shutdown(struct platform_device *pdev)
 	rk_mpp_hw_abort_queued(hw, -ESHUTDOWN,
 			       RK_MPP_TRANSITION_SHUTDOWN);
 retry_stop:
-	stop_ret = rk_mpp_hw_abort_active(hw, -ESHUTDOWN,
-					  RK_MPP_TRANSITION_SHUTDOWN);
+	/*
+	 * A failed coordinator stop leaves its jobs in their slots.  Do not let
+	 * the per-core abort retire one of them on a core-only proof.
+	 */
+	stop_ret = rk_mpp_hw_shutdown_hard_ccu(hw);
+	if (!stop_ret)
+		stop_ret = rk_mpp_hw_abort_active(hw, -ESHUTDOWN,
+						  RK_MPP_TRANSITION_SHUTDOWN);
 	rk_mpp_hw_cancel_timeout_sync(hw);
 	if (rk_mpp_service_has_quarantined_activation(hw->srv)) {
 		dev_crit(hw->dev,
