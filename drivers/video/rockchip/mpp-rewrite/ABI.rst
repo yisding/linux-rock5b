@@ -157,6 +157,14 @@ ioctl.
 cancels queued/active work, and empties the import cache.  Work racing the reset
 is rejected with ``-ECANCELED``.  Closing the file performs the same cleanup.
 
+Reset and close normally stop an executing frame with a core reset.  The AV1
+decoder's reset cannot be proven to retire its DMA, so recovery from it is
+terminal for that core.  There, reset and close instead wait up to 1 s for an
+executing frame to retire through its interrupt or the software timeout, and
+fall back to the fail-closed reset only if it does neither.  A client that
+exits or is killed mid-frame therefore does not cost other users the AV1
+decoder.
+
 There is no aggregate per-session byte/count quota beyond the per-request and
 per-ioctl caps above.  Cached imports and pending unconsumed jobs can grow until
 release, consuming poll, reset, or close.
