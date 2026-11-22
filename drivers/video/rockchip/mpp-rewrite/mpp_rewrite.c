@@ -5668,6 +5668,10 @@ static bool rk_mpp_rkvenc2_irq_needs_reset(u32 irq_status);
 static u32 rk_mpp_rkvdec2_decoded_length(u32 dec_get, u32 stream_addr);
 static struct rk_mpp_job *
 rk_mpp_scheduler_take_job(struct rk_mpp_service *srv);
+static bool
+rk_mpp_activation_finalize_result(struct rk_mpp_job *job, int result,
+				  int *final_result);
+static bool rk_mpp_job_complete(struct rk_mpp_job *job, int result);
 static int rk_mpp_hw_refresh_iommu(struct rk_mpp_hw *hw,
 				   struct rk_mpp_job *job);
 static bool rk_mpp_job_rkvdec_rcb_enabled(struct rk_mpp_job *job);
@@ -13038,6 +13042,7 @@ static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 	struct rk_mpp_hw *hw;
 	struct rk_mpp_job *queued;
 	struct rk_mpp_job *active;
+	int ret;
 
 	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, srv);
@@ -13045,7 +13050,14 @@ static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, hw);
 	mutex_init(&srv->sched_lock);
+	spin_lock_init(&srv->rkvenc_dchs_lock);
 	INIT_LIST_HEAD(&srv->queued_jobs);
+	/* Every completion kicks the scheduler; it finds the queue empty. */
+	INIT_WORK(&srv->sched_work, rk_mpp_scheduler_work);
+	ret = kunit_add_action_or_reset(test,
+					rk_mpp_kunit_cancel_service_work,
+					srv);
+	KUNIT_ASSERT_EQ(test, ret, 0);
 	mutex_init(&session.lock);
 	INIT_LIST_HEAD(&session.imports);
 	INIT_LIST_HEAD(&session.active_jobs);
@@ -13055,7 +13067,8 @@ static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 	raw_spin_lock_init(&hw->regs_lock);
 	mutex_init(&hw->run_lock);
 	INIT_DELAYED_WORK(&hw->timeout_work, rk_mpp_hw_timeout_work);
-	refcount_set(&hw->refs, 1);
+	/* One selected-core reference per job. */
+	refcount_set(&hw->refs, 2);
 	init_completion(&hw->released);
 
 	queued = kunit_kzalloc(test, sizeof(*queued), GFP_KERNEL);
@@ -13078,12 +13091,18 @@ static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 	atomic_set(&hw->queued_job_count, 1);
 	atomic_set(&srv->queued_job_count, 1);
 
+	/*
+	 * The scheduler worker has unqueued this job and holds its dispatch
+	 * lease, but has not yet installed it on the core: it is neither
+	 * queued nor active, and the worker's reference keeps it alive.
+	 */
 	active->session = &session;
 	active->client_type = RK_MPP_DEVICE_RKVDEC;
 	rk_mpp_activation_init(active);
+	active->current_activation->selected_hw = hw;
 	active->state = RK_MPP_JOB_ACTIVE;
 	active->result = -EINPROGRESS;
-	refcount_set(&active->refs, 1);
+	refcount_set(&active->refs, 2);
 	INIT_LIST_HEAD(&active->link);
 	INIT_LIST_HEAD(&active->session_link);
 	INIT_LIST_HEAD(&active->sched_link);
@@ -13102,21 +13121,41 @@ static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, list_empty(&active->session_link));
 	KUNIT_EXPECT_TRUE(test, list_empty(&active->sched_link));
 	KUNIT_EXPECT_EQ(test, queued->result, -ECANCELED);
-	KUNIT_EXPECT_EQ(test, active->result, -ECANCELED);
 	KUNIT_EXPECT_EQ(test, queued->state,
 			(enum rk_mpp_job_state)RK_MPP_JOB_DONE);
-	KUNIT_EXPECT_EQ(test, active->state,
-			(enum rk_mpp_job_state)RK_MPP_JOB_DONE);
 	KUNIT_EXPECT_EQ(test, refcount_read(&queued->refs), 1);
-	KUNIT_EXPECT_EQ(test, refcount_read(&active->refs), 1);
 	KUNIT_EXPECT_PTR_EQ(test, queued->current_activation->selected_hw,
 			    NULL);
-	KUNIT_EXPECT_EQ(test, refcount_read(&hw->refs), 0);
-	KUNIT_EXPECT_TRUE(test, completion_done(&hw->released));
 	KUNIT_EXPECT_EQ(test, atomic_read(&hw->queued_job_count), 0);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->queued_job_count), 0);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->aborted_job_count), 2);
+
+	/*
+	 * The abort unqueued only the first job, so it completed only that
+	 * one.  The job the scheduler worker took is canceled and left
+	 * intact for the worker, which still owns its completion.
+	 */
+	KUNIT_EXPECT_TRUE(test, active->canceled);
+	KUNIT_EXPECT_EQ(test, active->result, -EINPROGRESS);
+	KUNIT_EXPECT_EQ(test, active->state,
+			(enum rk_mpp_job_state)RK_MPP_JOB_ACTIVE);
+	KUNIT_EXPECT_EQ(test, refcount_read(&active->refs), 1);
+	KUNIT_EXPECT_PTR_EQ(test, active->current_activation->selected_hw, hw);
+	KUNIT_EXPECT_PTR_EQ(test, session.rkvdec_dispatch_owner,
+			    active->current_activation);
+	KUNIT_EXPECT_EQ(test, refcount_read(&hw->refs), 1);
+	KUNIT_EXPECT_FALSE(test, completion_done(&hw->released));
+
+	/* The worker's submit fails on the canceled job; it completes it. */
+	KUNIT_EXPECT_TRUE(test, rk_mpp_job_complete(active, -ECANCELED));
+	KUNIT_EXPECT_EQ(test, active->result, -ECANCELED);
+	KUNIT_EXPECT_EQ(test, active->state,
+			(enum rk_mpp_job_state)RK_MPP_JOB_DONE);
+	KUNIT_EXPECT_PTR_EQ(test, active->current_activation->selected_hw,
+			    NULL);
 	KUNIT_EXPECT_PTR_EQ(test, session.rkvdec_dispatch_owner, NULL);
+	KUNIT_EXPECT_EQ(test, refcount_read(&hw->refs), 0);
+	KUNIT_EXPECT_TRUE(test, completion_done(&hw->released));
 	KUNIT_EXPECT_EQ(test,
 			rk_mpp_session_poll_job(&session,
 						MPP_FLAGS_POLL_NON_BLOCK),
@@ -13138,6 +13177,7 @@ static void rk_mpp_reset_session_public_cleanup_kunit(struct kunit *test)
 	struct rk_mpp_hw *hw;
 	struct rk_mpp_job *queued;
 	struct rk_mpp_job *active;
+	int ret;
 
 	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, srv);
@@ -13145,7 +13185,14 @@ static void rk_mpp_reset_session_public_cleanup_kunit(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, hw);
 	session.srv = srv;
 	mutex_init(&srv->sched_lock);
+	spin_lock_init(&srv->rkvenc_dchs_lock);
 	INIT_LIST_HEAD(&srv->queued_jobs);
+	/* Every completion kicks the scheduler; it finds the queue empty. */
+	INIT_WORK(&srv->sched_work, rk_mpp_scheduler_work);
+	ret = kunit_add_action_or_reset(test,
+					rk_mpp_kunit_cancel_service_work,
+					srv);
+	KUNIT_ASSERT_EQ(test, ret, 0);
 	mutex_init(&session.lock);
 	mutex_init(&session.explicit_map_lock);
 	INIT_LIST_HEAD(&session.imports);
@@ -13188,10 +13235,14 @@ static void rk_mpp_reset_session_public_cleanup_kunit(struct kunit *test)
 	atomic_set(&hw->queued_job_count, 1);
 	atomic_set(&srv->queued_job_count, 1);
 
+	/*
+	 * Unqueued by the scheduler worker and not yet on hardware: the
+	 * worker holds the second reference and owns the completion.
+	 */
 	active->session = &session;
 	active->state = RK_MPP_JOB_ACTIVE;
 	active->result = -EINPROGRESS;
-	refcount_set(&active->refs, 1);
+	refcount_set(&active->refs, 2);
 	INIT_LIST_HEAD(&active->link);
 	INIT_LIST_HEAD(&active->session_link);
 	INIT_LIST_HEAD(&active->sched_link);
@@ -13210,12 +13261,21 @@ static void rk_mpp_reset_session_public_cleanup_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, list_empty(&queued->sched_link));
 	KUNIT_EXPECT_TRUE(test, list_empty(&active->session_link));
 	KUNIT_EXPECT_EQ(test, queued->result, -ECANCELED);
-	KUNIT_EXPECT_EQ(test, active->result, -ECANCELED);
 	KUNIT_EXPECT_EQ(test, refcount_read(&queued->refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&active->refs), 1);
 	KUNIT_EXPECT_EQ(test, atomic_read(&hw->queued_job_count), 0);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->queued_job_count), 0);
 	KUNIT_EXPECT_EQ(test, atomic_read(&srv->aborted_job_count), 2);
+
+	/* The reset cancels the worker's job but leaves it to the worker. */
+	KUNIT_EXPECT_TRUE(test, active->canceled);
+	KUNIT_EXPECT_EQ(test, active->result, -EINPROGRESS);
+	KUNIT_EXPECT_EQ(test, active->state,
+			(enum rk_mpp_job_state)RK_MPP_JOB_ACTIVE);
+	KUNIT_EXPECT_TRUE(test, rk_mpp_job_complete(active, -ECANCELED));
+	KUNIT_EXPECT_EQ(test, active->result, -ECANCELED);
+	KUNIT_EXPECT_EQ(test, active->state,
+			(enum rk_mpp_job_state)RK_MPP_JOB_DONE);
 
 	rk_mpp_import_put(import);
 }
@@ -13340,6 +13400,7 @@ static void rk_mpp_file_release_public_cleanup_kunit(struct kunit *test)
 	struct rk_mpp_import *import;
 	struct rk_mpp_job *active;
 	struct file file = {};
+	int final_result = -EINPROGRESS;
 
 	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, srv);
@@ -13355,7 +13416,8 @@ static void rk_mpp_file_release_public_cleanup_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&session->imports);
 	INIT_LIST_HEAD(&session->active_jobs);
 	init_waitqueue_head(&session->wait);
-	refcount_set(&session->refs, 1);
+	/* One reference for the open file and one for the job below. */
+	refcount_set(&session->refs, 2);
 	file.private_data = session;
 
 	import = kzalloc(sizeof(*import), GFP_KERNEL);
@@ -13368,6 +13430,7 @@ static void rk_mpp_file_release_public_cleanup_kunit(struct kunit *test)
 	active = kunit_kzalloc(test, sizeof(*active), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, active);
 	active->session = session;
+	rk_mpp_activation_init(active);
 	active->state = RK_MPP_JOB_ACTIVE;
 	active->result = -EINPROGRESS;
 	refcount_set(&active->refs, 2);
@@ -13377,15 +13440,37 @@ static void rk_mpp_file_release_public_cleanup_kunit(struct kunit *test)
 	INIT_LIST_HEAD(&active->rkvdec_ccu_node);
 	list_add_tail(&active->session_link, &session->active_jobs);
 
+	/*
+	 * A completer has fixed this job's result and released its core, but
+	 * has not published DONE yet.  It holds the second job reference.
+	 */
+	KUNIT_ASSERT_TRUE(test,
+			  rk_mpp_activation_finalize_result(active, 0,
+							    &final_result));
+	KUNIT_EXPECT_EQ(test, final_result, 0);
+
 	KUNIT_EXPECT_EQ(test, rk_mpp_release(NULL, &file), 0);
 	KUNIT_EXPECT_PTR_EQ(test, file.private_data, NULL);
 	KUNIT_EXPECT_EQ(test, refcount_read(&import->refs), 1);
 	KUNIT_EXPECT_TRUE(test, list_empty(&active->session_link));
-	KUNIT_EXPECT_EQ(test, active->result, -ECANCELED);
-	KUNIT_EXPECT_EQ(test, active->state,
-			(enum rk_mpp_job_state)RK_MPP_JOB_DONE);
 	KUNIT_EXPECT_EQ(test, refcount_read(&active->refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&session->refs), 1);
 
+	/*
+	 * The close cancels the job but neither completes it a second time
+	 * nor overrides the result its completer already fixed; publishing
+	 * DONE stays with that completer.
+	 */
+	KUNIT_EXPECT_TRUE(test, active->canceled);
+	KUNIT_EXPECT_EQ(test, active->result, -EINPROGRESS);
+	KUNIT_EXPECT_EQ(test, active->state,
+			(enum rk_mpp_job_state)RK_MPP_JOB_ACTIVE);
+	KUNIT_EXPECT_EQ(test, active->current_activation->final_result, 0);
+	KUNIT_EXPECT_FALSE(test, active->current_activation->reason_mask &
+				 BIT(RK_MPP_TRANSITION_SESSION_CLOSE));
+
+	/* Drop the session reference the kunit-owned job stood in for. */
+	rk_mpp_session_put(session);
 	rk_mpp_import_put(import);
 }
 
@@ -16370,6 +16455,23 @@ rk_mpp_job_note_terminal_reason_locked(struct rk_mpp_job *job,
 	return noted;
 }
 
+/*
+ * True once a completer has fixed this job's result.  DONE is published only
+ * after that completer has drained the activation, so a job can be finalized
+ * and not yet DONE.  It then has nothing left to cancel and accepts no
+ * further terminal reason.
+ */
+static bool rk_mpp_job_outcome_finalized_locked(struct rk_mpp_job *job)
+{
+	struct rk_mpp_activation *activation =
+		READ_ONCE(job->current_activation);
+
+	lockdep_assert_held(&job->session->lock);
+
+	return activation && activation->job == job &&
+	       activation->outcome_finalized;
+}
+
 static bool
 rk_mpp_activation_finalize_result(struct rk_mpp_job *job, int result,
 				  int *final_result)
@@ -16887,6 +16989,12 @@ static void rk_mpp_scheduler_work(struct work_struct *work)
 		else
 			ret = ops->submit(job, image);
 
+		/*
+		 * Having unqueued the job, this worker is its only completer
+		 * until a submit succeeds and hands it to the active slot.  A
+		 * racing session abort only marks the job canceled, which
+		 * fails the submit, and leaves the completion to this call.
+		 */
 		if (ret) {
 			if (ret == -EOPNOTSUPP)
 				atomic_inc(&srv->unsupported_count);
@@ -19191,11 +19299,24 @@ rk_mpp_hw_get_active_ccu_for_job(struct rk_mpp_hw *hw,
 	return ccu;
 }
 
-/* Return true only when this dispatch can no longer start or own hardware. */
+/*
+ * Return true only when this dispatch can no longer start or own hardware.
+ * The caller has set job->canceled, so a job that is not active once
+ * run_lock is held can never be installed afterwards.
+ *
+ * Completion has exactly one owner.  A job leaves the scheduler queue once,
+ * under sched_lock, and whoever unqueued it completes it if it never reaches
+ * hardware: the scheduler worker after a failed submit, a queue sweep, or
+ * this abort when @queue_owner reports that rk_mpp_job_dequeue() removed it.
+ * A job that reached hardware is completed by the holder of its active-slot
+ * claim.  A job this abort neither unqueued nor claimed is therefore left to
+ * that other owner: completing it here too would finalize it twice and drain
+ * an activation the owner is still using.
+ */
 static bool
 rk_mpp_hw_abort_job(struct rk_mpp_job *job,
 		    enum rk_mpp_activation_transition_reason reason,
-		    int result)
+		    int result, bool queue_owner)
 {
 	struct rk_mpp_hw *hw = rk_mpp_job_get_hw(job);
 	struct rk_mpp_cluster_recovery_result ccu_recovery = {
@@ -19214,8 +19335,12 @@ rk_mpp_hw_abort_job(struct rk_mpp_job *job,
 	int ccu_stop_ret = 0;
 	int reset_ret = 0;
 
+	/*
+	 * Only a completer releases the selected core, so a job that was not
+	 * unqueued here and has none is already in its owner's terminal tail.
+	 */
 	if (!hw)
-		return rk_mpp_job_complete(job, result);
+		return queue_owner ? rk_mpp_job_complete(job, result) : true;
 
 	rk_mpp_hw_cancel_timeout_sync(hw);
 	irq_disabled = rk_mpp_hw_disable_irq(hw);
@@ -19345,7 +19470,7 @@ out_unlock_core:
 	}
 	if (ccu)
 		mutex_unlock(&ccu->ccu_recovery_lock);
-	if (dispatch_retired && !active_owned)
+	if (dispatch_retired && !active_owned && queue_owner)
 		dispatch_retired = rk_mpp_job_complete(job, result);
 	if (!dispatch_retired && READ_ONCE(job->state) == RK_MPP_JOB_DONE)
 		dispatch_retired = true;
@@ -22190,8 +22315,9 @@ err_clear_active:
 err_unlock:
 	/*
 	 * Resolve descriptor/CCU ownership before the active activation becomes
-	 * externally absent. Later job completion and abort cleanup are then
-	 * harmless idempotent calls instead of concurrent teardown owners.
+	 * externally absent. The scheduler worker that called this submit is
+	 * the job's only completer, and its completion drain then finds
+	 * nothing left to tear down.
 	 */
 	rk_mpp_rkvdec2_release_link_table(job);
 err_retain_active:
@@ -23426,7 +23552,12 @@ rk_mpp_session_abort_jobs(struct rk_mpp_session *session,
 	list_for_each_entry_safe(job, tmp, &session->active_jobs, session_link) {
 		WRITE_ONCE(job->canceled, true);
 		list_move_tail(&job->session_link, &aborted);
-		if (job->state != RK_MPP_JOB_DONE) {
+		/*
+		 * A completer fixes the result before it drains and publishes
+		 * DONE.  A job caught in between is already beyond cancelling.
+		 */
+		if (job->state != RK_MPP_JOB_DONE &&
+		    !rk_mpp_job_outcome_finalized_locked(job)) {
 			noted = rk_mpp_job_note_terminal_reason_locked(job, reason, -ECANCELED);
 			WARN_ON_ONCE(!noted);
 		}
@@ -23437,6 +23568,7 @@ rk_mpp_session_abort_jobs(struct rk_mpp_session *session,
 
 	list_for_each_entry_safe(job, tmp, &aborted, session_link) {
 		bool dispatch_retired;
+		bool queue_owner;
 
 		list_del_init(&job->session_link);
 		if (job->state == RK_MPP_JOB_DONE) {
@@ -23444,9 +23576,9 @@ rk_mpp_session_abort_jobs(struct rk_mpp_session *session,
 			continue;
 		}
 		atomic_inc(&session->srv->aborted_job_count);
-		rk_mpp_job_dequeue(job);
+		queue_owner = rk_mpp_job_dequeue(job);
 		dispatch_retired = rk_mpp_hw_abort_job(job, reason,
-						       -ECANCELED);
+						       -ECANCELED, queue_owner);
 		rk_mpp_debug_record_job(job, RK_MPP_DEBUG_ABORT, -ECANCELED,
 					0, 0);
 		WARN_ON_ONCE(!dispatch_retired);
