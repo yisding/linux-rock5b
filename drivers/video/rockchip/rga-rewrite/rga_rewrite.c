@@ -7241,15 +7241,32 @@ static int rk_rga3_soft_reset(struct rk_rga_hw *hw)
 	return i == RK_RGA_RESET_TIMEOUT_US ? -ETIMEDOUT : 0;
 }
 
-static void rk_rga_hw_refresh_iommu(struct rk_rga_hw *hw)
+/*
+ * Put the MMU serving this core back into translation after the core's reset.
+ * The MMU register bank sits inside the block that was reset, so the reset can
+ * return its directory address, fault interrupt mask and paging enable to
+ * their reset values while runtime PM keeps the MMU active.  An IOTLB flush
+ * restores none of those and cannot fail.  Probe refuses a translated core
+ * that rockchip-iommu does not serve, so there is no other provider to handle.
+ *
+ * run_lock serializes the restores of this core, the caller has released the
+ * reset, and this driver never attaches or detaches a domain.
+ */
+static int rk_rga_hw_refresh_iommu(struct rk_rga_hw *hw)
 {
+	int ret;
+
 	lockdep_assert_held(&hw->run_lock);
 
 	if (!hw->iommu_domain)
-		return;
+		return 0;
 
-	iommu_flush_iotlb_all(hw->iommu_domain);
+	ret = rockchip_iommu_restore(hw->dev);
+	if (ret)
+		return ret;
 	atomic_inc(&hw->rga->iommu_refresh_count);
+
+	return 0;
 }
 
 static void rk_rga_hw_mark_recovery_failed(struct rk_rga_hw *hw, int error)
@@ -7273,6 +7290,31 @@ static void rk_rga_hw_mark_recovery_failed(struct rk_rga_hw *hw, int error)
 		hw->match->name, hw->index, error);
 }
 
+/*
+ * Finish a recovery reset that succeeded.  The reset is what stopped the
+ * core's DMA, so a failed MMU restore does not turn it into a failed reset:
+ * the caller still retires the job and releases its resources.  The core must
+ * never be started again, though, because an MMU with paging off is bypass and
+ * the next job would do DMA to physical addresses equal to its IOVAs.
+ */
+static void rk_rga_hw_restore_iommu_after_reset(struct rk_rga_hw *hw)
+{
+	int ret = rk_rga_hw_refresh_iommu(hw);
+
+	if (!ret)
+		return;
+
+	dev_err(hw->dev, "%s IOMMU restore after recovery reset failed: %d\n",
+		hw->match->name, ret);
+	rk_rga_hw_mark_recovery_failed(hw, ret);
+}
+
+/*
+ * A nonzero return means the reset did not prove that the core's DMA stopped.
+ * Zero means it did.  The core can still have been quarantined, when its MMU
+ * could not be restored; dispatch and admission honour that through
+ * recovery_failed, so callers treat the job itself as stopped either way.
+ */
 static int rk_rga_hw_reset_for_recovery(struct rk_rga_hw *hw)
 {
 	int ret;
@@ -7289,7 +7331,7 @@ static int rk_rga_hw_reset_for_recovery(struct rk_rga_hw *hw)
 		ret = rk_rga2_soft_reset(hw);
 
 	if (!ret) {
-		rk_rga_hw_refresh_iommu(hw);
+		rk_rga_hw_restore_iommu_after_reset(hw);
 		return 0;
 	}
 
@@ -7307,7 +7349,7 @@ static int rk_rga_hw_reset_for_recovery(struct rk_rga_hw *hw)
 		goto failed;
 	}
 
-	rk_rga_hw_refresh_iommu(hw);
+	rk_rga_hw_restore_iommu_after_reset(hw);
 
 	return 0;
 
@@ -17409,30 +17451,45 @@ static void rk_rga_iommu_fault_match_kunit(struct kunit *test)
 
 static void rk_rga_iommu_refresh_kunit(struct kunit *test)
 {
+	static const struct rk_rga_hw_match match = { .name = "kunit" };
 	struct rk_rga_service *rga;
-	static const struct iommu_domain_ops iommu_ops;
-	struct iommu_domain domain = {
-		.ops = &iommu_ops,
-	};
+	struct iommu_domain domain = {};
 	struct rk_rga_hw hw = {
-		.iommu_domain = &domain,
+		.match = &match,
 	};
 
 	rga = rk_rga_kunit_alloc_service(test);
 	KUNIT_ASSERT_NOT_NULL(test, rga);
 	hw.rga = rga;
 	mutex_init(&hw.run_lock);
+	spin_lock_init(&hw.job_lock);
 	atomic_set(&rga->iommu_refresh_count, 0);
-	mutex_lock(&hw.run_lock);
-	rk_rga_hw_refresh_iommu(&hw);
-	mutex_unlock(&hw.run_lock);
-	KUNIT_EXPECT_EQ(test, atomic_read(&rga->iommu_refresh_count), 1);
+	atomic_set(&rga->recovery_failure_count, 0);
 
-	hw.iommu_domain = NULL;
+	/* A core without translation has nothing to restore after a reset. */
 	mutex_lock(&hw.run_lock);
-	rk_rga_hw_refresh_iommu(&hw);
+	KUNIT_EXPECT_EQ(test, rk_rga_hw_refresh_iommu(&hw), 0);
+	rk_rga_hw_restore_iommu_after_reset(&hw);
 	mutex_unlock(&hw.run_lock);
-	KUNIT_EXPECT_EQ(test, atomic_read(&rga->iommu_refresh_count), 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&rga->iommu_refresh_count), 0);
+	KUNIT_EXPECT_FALSE(test, hw.recovery_failed);
+
+	/*
+	 * The fixture core has no struct device, so no Rockchip MMU serves it
+	 * and the provider refuses the restore.  A restore that fails must not
+	 * be counted, and must quarantine the core instead of leaving it
+	 * startable behind an MMU that may not translate.
+	 */
+	hw.iommu_domain = &domain;
+	mutex_lock(&hw.run_lock);
+	KUNIT_EXPECT_EQ(test, rk_rga_hw_refresh_iommu(&hw), -ENODEV);
+	KUNIT_EXPECT_FALSE(test, hw.recovery_failed);
+	rk_rga_hw_restore_iommu_after_reset(&hw);
+	mutex_unlock(&hw.run_lock);
+	KUNIT_EXPECT_EQ(test, atomic_read(&rga->iommu_refresh_count), 0);
+	KUNIT_EXPECT_TRUE(test, hw.recovery_failed);
+	KUNIT_EXPECT_FALSE(test, rk_rga_hw_accepting_jobs(&hw));
+	KUNIT_EXPECT_EQ(test, atomic_read(&rga->recovery_failure_count), 1);
 }
 
 static void rk_rga_ffmpeg_rga3_profiles_kunit(struct kunit *test)
@@ -24852,13 +24909,16 @@ static void rk_rga_hw_finish_job_locked(struct rk_rga_hw *hw,
 	if (requeued) {
 		rk_rga_job_queue_ref(job, false);
 		rk_rga_session_end_job_dispatch(dispatch_session);
-		rk_rga_hw_dispatch(hw);
-		return;
+	} else {
+		rk_rga_job_complete_queued(job, result);
 	}
-
-	rk_rga_job_complete_queued(job, result);
 	rk_rga_hw_dispatch(hw);
-	if (reset_ret)
+	/*
+	 * A reset that stopped DMA can still have quarantined the core, when
+	 * its MMU could not be put back into translation.  The dispatch above
+	 * then failed the queue; work blocked in acquire needs the same.
+	 */
+	if (reset_ret || READ_ONCE(hw->recovery_failed))
 		rk_rga_abort_incompatible_pending_acquire_jobs(hw->rga, -EIO);
 }
 

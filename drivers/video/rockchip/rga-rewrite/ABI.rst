@@ -199,8 +199,12 @@ lower queued priority, and displaced work ages toward 6.  One job runs per
 core.  Multi-task requests are validated as a whole and run serially under one
 completion/fence; individual tasks may use different compatible core classes.
 
-A reset failure quarantines the core.  Its queued jobs and acquire-blocked work
-that no longer has a compatible core complete with ``-EIO``.  Removal prevents
+A reset failure quarantines the core.  So does a recovery reset after which the
+core's IOMMU cannot be put back into translation: that reset has stopped DMA,
+so the recovered job completes with its own result and its resources are
+released, but the core takes no further work.  A quarantined core's queued jobs
+and acquire-blocked work that no longer has a compatible core complete with
+``-EIO``.  Removal prevents
 new admission, aborts queued/active work after proving DMA quiescence, and
 allows reprobe to reuse the vacant public core bit.
 
