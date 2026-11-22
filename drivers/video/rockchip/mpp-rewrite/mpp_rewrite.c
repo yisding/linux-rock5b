@@ -122,6 +122,12 @@ struct rk_mpp_request {
 #define RK_MPP_RKVDEC_CCU_MODE_SOFT	1
 #define RK_MPP_RKVDEC_CCU_MODE_HARD	2
 #define RK_MPP_WORK_TIMEOUT_MS		500
+/*
+ * Bound on how long a session close or reset lets an in-flight frame retire
+ * on a core whose reset is terminal.  It exceeds the watchdog window, so a
+ * wedged frame is recovered and accounted by the watchdog, not by this wait.
+ */
+#define RK_MPP_ABORT_FRAME_WAIT_MS	(2 * RK_MPP_WORK_TIMEOUT_MS)
 #define RK_MPP_CCU_STOP_TIMEOUT_US	1000
 #define RK_MPP_RKVENC2_MIN_REG_SIZE	0x6000
 #define RK_MPP_RKVDEC2_MIN_REG_SIZE	0x05a0
@@ -2880,6 +2886,26 @@ static void rk_mpp_session_put(struct rk_mpp_session *session)
 static bool rk_mpp_hw_usable(const struct rk_mpp_hw *hw)
 {
 	return READ_ONCE(hw->online) && !READ_ONCE(hw->recovery_failed);
+}
+
+/*
+ * Session close and RESET_SESSION cancel a healthy frame for administrative
+ * reasons.  On a core whose reset pulse cannot be proven to retire DMA, the
+ * preempting reset ends in terminal isolation, which costs every user that
+ * engine until reboot.  Such an abort therefore lets the frame retire by
+ * itself first.  A core that is already offline or quarantined has nothing
+ * left to preserve.
+ */
+static bool
+rk_mpp_hw_abort_defers_to_frame(const struct rk_mpp_hw *hw,
+				enum rk_mpp_activation_transition_reason reason)
+{
+	if (reason != RK_MPP_TRANSITION_SESSION_CLOSE &&
+	    reason != RK_MPP_TRANSITION_SESSION_RESET)
+		return false;
+
+	return hw->match && hw->match->reset_requires_terminal_isolation &&
+	       rk_mpp_hw_usable(hw);
 }
 
 /*
@@ -13371,6 +13397,61 @@ static void rk_mpp_session_abort_jobs_kunit(struct kunit *test)
 			-EIO);
 }
 
+static void rk_mpp_hw_abort_defers_to_frame_kunit(struct kunit *test)
+{
+	struct rk_mpp_hw *hw;
+
+	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, hw);
+	hw->online = true;
+
+	/* Fixtures without match data must never be dereferenced. */
+	KUNIT_EXPECT_FALSE(test,
+			   rk_mpp_hw_abort_defers_to_frame(hw,
+							   RK_MPP_TRANSITION_SESSION_CLOSE));
+
+	/* A core whose reset stays reusable is preempted as before. */
+	hw->match = &rk_mpp_rkvdec2_core;
+	KUNIT_EXPECT_FALSE(test,
+			   rk_mpp_hw_abort_defers_to_frame(hw,
+							   RK_MPP_TRANSITION_SESSION_CLOSE));
+	KUNIT_EXPECT_FALSE(test,
+			   rk_mpp_hw_abort_defers_to_frame(hw,
+							   RK_MPP_TRANSITION_SESSION_RESET));
+
+	/* Only administrative cancels spare a terminal-reset core's frame. */
+	hw->match = &rk_mpp_av1_core;
+	KUNIT_EXPECT_TRUE(test,
+			  rk_mpp_hw_abort_defers_to_frame(hw,
+							  RK_MPP_TRANSITION_SESSION_CLOSE));
+	KUNIT_EXPECT_TRUE(test,
+			  rk_mpp_hw_abort_defers_to_frame(hw,
+							  RK_MPP_TRANSITION_SESSION_RESET));
+	KUNIT_EXPECT_FALSE(test,
+			   rk_mpp_hw_abort_defers_to_frame(hw,
+							   RK_MPP_TRANSITION_TIMEOUT));
+	KUNIT_EXPECT_FALSE(test,
+			   rk_mpp_hw_abort_defers_to_frame(hw,
+							   RK_MPP_TRANSITION_IOMMU_FAULT));
+	KUNIT_EXPECT_FALSE(test,
+			   rk_mpp_hw_abort_defers_to_frame(hw,
+							   RK_MPP_TRANSITION_REMOVE));
+	KUNIT_EXPECT_FALSE(test,
+			   rk_mpp_hw_abort_defers_to_frame(hw,
+							   RK_MPP_TRANSITION_SHUTDOWN));
+
+	/* A quarantined or offline core has no engine left to preserve. */
+	hw->recovery_failed = true;
+	KUNIT_EXPECT_FALSE(test,
+			   rk_mpp_hw_abort_defers_to_frame(hw,
+							   RK_MPP_TRANSITION_SESSION_CLOSE));
+	hw->recovery_failed = false;
+	hw->online = false;
+	KUNIT_EXPECT_FALSE(test,
+			   rk_mpp_hw_abort_defers_to_frame(hw,
+							   RK_MPP_TRANSITION_SESSION_CLOSE));
+}
+
 static void rk_mpp_reset_session_public_cleanup_kunit(struct kunit *test)
 {
 	struct rk_mpp_service *srv;
@@ -14617,6 +14698,7 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_session_poll_nonblock_pending_kunit),
 	KUNIT_CASE(rk_mpp_session_poll_irq_nonslice_kunit),
 	KUNIT_CASE(rk_mpp_session_abort_jobs_kunit),
+	KUNIT_CASE(rk_mpp_hw_abort_defers_to_frame_kunit),
 	KUNIT_CASE(rk_mpp_reset_session_public_cleanup_kunit),
 	KUNIT_CASE(rk_mpp_reset_session_hw_active_import_kunit),
 	KUNIT_CASE(rk_mpp_file_release_public_cleanup_kunit),
@@ -19551,6 +19633,20 @@ rk_mpp_hw_abort_job(struct rk_mpp_job *job,
 	 */
 	if (!hw)
 		return queue_owner ? rk_mpp_job_complete(job, result) : true;
+
+	/*
+	 * A job this abort did not unqueue is with the scheduler worker or on
+	 * hardware.  The caller has set job->canceled, so it cannot start
+	 * anew, and its IRQ or watchdog completes it and wakes the session;
+	 * arbitration still reports the cancellation over a clean completion.
+	 * Wait here, before the drain below takes the watchdog and the IRQ
+	 * away from the frame.  If the wait expires, the reset path below
+	 * fails closed exactly as before.
+	 */
+	if (!queue_owner && rk_mpp_hw_abort_defers_to_frame(hw, reason))
+		wait_event_timeout(job->session->wait,
+				   READ_ONCE(job->state) == RK_MPP_JOB_DONE,
+				   msecs_to_jiffies(RK_MPP_ABORT_FRAME_WAIT_MS));
 
 	rk_mpp_hw_cancel_timeout_sync(hw);
 	irq_disabled = rk_mpp_hw_disable_irq(hw);
