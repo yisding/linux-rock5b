@@ -7215,6 +7215,28 @@ static void rk_rga2_clear_irq(struct rk_rga_hw *hw)
 		     RK_RGA2_INT);
 }
 
+/*
+ * Acknowledge value for a line-count interrupt that arrived without a
+ * completion.  The engine keeps running, so a DONE or ERROR flag can latch
+ * after the handler sampled RK_RGA2_INT.  Carry over the enables, drop every
+ * status flag and every other clear strobe that was read back, and strobe
+ * only the two line clears: a flag the handler has not evaluated then stays
+ * latched and the level interrupt delivers it on the next pass.
+ */
+static u32 rk_rga2_line_irq_ack(u32 intr)
+{
+	intr &= ~(RK_RGA2_INT_DONE_MASK | RK_RGA2_INT_ERROR_MASK |
+		  RK_RGA2_INT_LINE_MASK | RK_RGA2_INT_CLEAR_MASK);
+
+	return intr | RK_RGA2_INT_LINE_RD_CLEAR | RK_RGA2_INT_LINE_WR_CLEAR;
+}
+
+static void rk_rga2_clear_line_irq(struct rk_rga_hw *hw)
+{
+	rk_rga_write(hw, rk_rga2_line_irq_ack(rk_rga_read(hw, RK_RGA2_INT)),
+		     RK_RGA2_INT);
+}
+
 static void rk_rga3_clear_irq(struct rk_rga_hw *hw)
 {
 	rk_rga_write(hw, RK_RGA3_INT_DONE_MASK | RK_RGA3_INT_ERROR_MASK,
@@ -7665,7 +7687,7 @@ static irqreturn_t rk_rga_hw_irq_status(struct rk_rga_hw *hw,
 		error = exec->intr_status & RK_RGA2_INT_ERROR_MASK;
 		if (!done && !error) {
 			if (exec->intr_status & RK_RGA2_INT_LINE_MASK) {
-				rk_rga2_clear_irq(hw);
+				rk_rga2_clear_line_irq(hw);
 				return IRQ_HANDLED;
 			}
 			return IRQ_NONE;
@@ -10380,6 +10402,35 @@ static void rk_rga2_fill_dst_offset_emit_kunit(struct kunit *test)
 			(((u32)task.dst.act_h - 1) << 16));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_SRC_FG_COLOR_OFFSET / 4],
 			task.fg_color);
+}
+
+static void rk_rga2_line_irq_ack_kunit(struct kunit *test)
+{
+	const u32 enables = RK_RGA2_INT_ENABLE_MASK | RK_RGA2_INT_LINE_RD_EN |
+			    RK_RGA2_INT_LINE_WR_EN;
+	const u32 line_clear = RK_RGA2_INT_LINE_RD_CLEAR |
+			       RK_RGA2_INT_LINE_WR_CLEAR;
+	const u32 flags = RK_RGA2_INT_DONE_MASK | RK_RGA2_INT_ERROR_MASK |
+			  RK_RGA2_INT_LINE_MASK;
+
+	/* A line-only acknowledge keeps the enables and strobes line clears. */
+	KUNIT_EXPECT_EQ(test,
+			rk_rga2_line_irq_ack(enables | RK_RGA2_INT_LINE_MASK),
+			enables | line_clear);
+	/*
+	 * A completion or error that latched after the handler's snapshot is
+	 * neither written back nor acknowledged, whatever the register reads.
+	 */
+	KUNIT_EXPECT_EQ(test, rk_rga2_line_irq_ack(enables | flags),
+			enables | line_clear);
+	KUNIT_EXPECT_EQ(test,
+			rk_rga2_line_irq_ack(enables | flags |
+					     RK_RGA2_INT_CLEAR_MASK),
+			enables | line_clear);
+	KUNIT_EXPECT_EQ(test,
+			rk_rga2_line_irq_ack(U32_MAX) &
+			(RK_RGA2_INT_CLEAR_MASK | flags), line_clear);
+	KUNIT_EXPECT_EQ(test, rk_rga2_line_irq_ack(0), line_clear);
 }
 
 static void rk_rga2_pre_intr_kunit(struct kunit *test)
@@ -21640,6 +21691,7 @@ static struct kunit_case rk_rga_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_rga_fill_hw_type_kunit),
 	KUNIT_CASE(rk_rga2_fill_dst_offset_emit_kunit),
 	KUNIT_CASE(rk_rga2_pre_intr_kunit),
+	KUNIT_CASE(rk_rga2_line_irq_ack_kunit),
 	KUNIT_CASE(rk_rga2_fill_yuv_emit_kunit),
 	KUNIT_CASE(rk_rga2_fill_packed_yuv_emit_kunit),
 	KUNIT_CASE(rk_rga2_rectangle_task_emit_kunit),
