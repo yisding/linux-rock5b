@@ -341,9 +341,12 @@ successful DMA containment, a timeout completes with ``-ETIMEDOUT`` and an
 IOMMU fault with ``-EIO``.  If the driver cannot prove that DMA stopped, it
 retains the active job and its DMA resources in fail-stop isolation rather than
 reporting false completion; encoder DCHS ownership is retained with that job.
-Reset failure quarantines the affected core or coordinator for the bound
-instance; terminal IOMMU-group isolation may require a reboot before reprobe
-can succeed.  Removal returns ``-ENODEV`` to work that can no longer execute.
+A recovery reset is followed by reprogramming the IOMMU of every core it
+pulsed, because the reset can clear that IOMMU's translation setup.  Failure
+of the reset or of that IOMMU restore quarantines the affected core or
+coordinator for the bound instance; terminal IOMMU-group isolation may require
+a reboot before reprobe can succeed.  Removal returns ``-ENODEV`` to work that
+can no longer execute.
 
 The driver does not export or import sync-file fences.  The RK3588 MPP UAPI has
 no fence command; userspace orders work through submission and poll.
