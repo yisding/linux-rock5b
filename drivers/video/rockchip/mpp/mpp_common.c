@@ -1167,10 +1167,22 @@ again:
 		atomic_inc(&task_mpp->task_count);
 		mpp_taskqueue_pending_to_run(queue, task);
 		set_bit(TASK_STATE_RUNNING, &task->state);
-		if (mpp_task_run(task_mpp, task))
+		if (mpp_task_run(task_mpp, task)) {
+			unsigned long flags;
+
 			mpp_taskqueue_fail_running(queue, task);
-		else
-			goto again;
+			/*
+			 * A backend prepare() may have claimed a core for this
+			 * task (rkvenc2 clears its core_idle bit).  Nothing will
+			 * complete on that core, so return the claim, then keep
+			 * draining: later pending tasks must not wait for an
+			 * unrelated trigger.
+			 */
+			spin_lock_irqsave(&queue->running_lock, flags);
+			set_bit(task_mpp->core_id, &queue->core_idle);
+			spin_unlock_irqrestore(&queue->running_lock, flags);
+		}
+		goto again;
 	}
 
 done:
