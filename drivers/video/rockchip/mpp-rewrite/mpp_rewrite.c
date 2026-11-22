@@ -2770,6 +2770,18 @@ static const u16 rk_mpp_av1_afbc_regs[] = {
 	32, 33, 34, 35, 48, 49, 50, 51, 96, 97, 98, 99,
 };
 
+/* VCD words, besides the output address, that size the AFBC output. */
+static const u16 rk_mpp_av1_afbc_geometry_regs[] = {
+	RK_MPP_AV1_DIMENSIONS_WORD,
+	RK_MPP_AV1_BIT_DEPTH_WORD,
+	RK_MPP_AV1_PADDING_WORD,
+};
+
+static const struct rk_mpp_trans_table rk_mpp_av1_afbc_geometry = {
+	.regs = rk_mpp_av1_afbc_geometry_regs,
+	.count = ARRAY_SIZE(rk_mpp_av1_afbc_geometry_regs),
+};
+
 static const struct rk_mpp_trans_table rk_mpp_av1_tables[] = {
 	{
 		.regs = rk_mpp_av1_vcd_regs,
@@ -7959,12 +7971,28 @@ static void rk_mpp_job_write_regs_owned_words_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_mpp_kunit_hw_word(hw, 0, 507), 0U);
 	KUNIT_EXPECT_EQ(test, rk_mpp_kunit_hw_word(hw, 0, 506), stale);
 	KUNIT_EXPECT_EQ(test, rk_mpp_kunit_hw_word(hw, 1, 13), stale);
+	/* A stale tile mode must not outlive the image's "no AFBC". */
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_kunit_hw_word(hw, 0, RK_MPP_AV1_PP_CONFIG_WORD),
+			0U);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_kunit_hw_word(hw, 0, RK_MPP_AV1_DIMENSIONS_WORD),
+			stale);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_kunit_hw_word(hw, 0, RK_MPP_AV1_PADDING_WORD),
+			stale);
 
-	/* Once the job programs the cache block, its addresses follow. */
+	/*
+	 * Once the job programs the cache block, its addresses follow.  The
+	 * image now selects AFBC too, so the words that size it follow.
+	 */
 	job->req_cnt = 2;
 	job->reqs[1].req.offset = RK_MPP_AV1_CACHE_ABI_OFFSET +
 				  RK_MPP_AV1_CACHE_STATUS0;
 	job->reqs[1].req.size = sizeof(u32);
+	regs[RK_MPP_AV1_PP_CONFIG_WORD] = RK_MPP_AV1_PP_TILE_16X16;
+	regs[RK_MPP_AV1_DIMENSIONS_WORD] = (240U << 19) | (135U << 6);
+	regs[RK_MPP_AV1_PADDING_WORD] = 8U << 20;
 
 	KUNIT_ASSERT_EQ(test,
 			rk_mpp_job_write_regs(job, image, RK_MPP_AV1_IRQ_BASE,
@@ -7973,6 +8001,18 @@ static void rk_mpp_job_write_regs_owned_words_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_mpp_kunit_hw_word(hw, 1, 13), 0U);
 	KUNIT_EXPECT_EQ(test, rk_mpp_kunit_hw_word(hw, 1, 147), 0U);
 	KUNIT_EXPECT_EQ(test, rk_mpp_kunit_hw_word(hw, 1, 14), stale);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_kunit_hw_word(hw, 0, RK_MPP_AV1_PP_CONFIG_WORD),
+			(u32)RK_MPP_AV1_PP_TILE_16X16);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_kunit_hw_word(hw, 0, RK_MPP_AV1_DIMENSIONS_WORD),
+			(240U << 19) | (135U << 6));
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_kunit_hw_word(hw, 0, RK_MPP_AV1_BIT_DEPTH_WORD),
+			0U);
+	KUNIT_EXPECT_EQ(test,
+			rk_mpp_kunit_hw_word(hw, 0, RK_MPP_AV1_PADDING_WORD),
+			8U << 20);
 }
 
 static void rk_mpp_rkvdec2_link_irq_decode_kunit(struct kunit *test)
@@ -21921,9 +21961,10 @@ static void rk_mpp_job_write_owned_table(struct rk_mpp_job *job,
  * Close that by making the words the kernel answers for a function of the
  * image alone: the format selector that chose the address table (a stale
  * selector would make the hardware consult a table that was never checked),
- * every register of that table and of the custom table, and the encoder's
- * dual-core handshake word.  Other registers a job omits keep their previous
- * value, as in the BSP; they carry no address.
+ * every register of that table and of the custom table, the encoder's
+ * dual-core handshake word, and the AV1 words the AFBC decision is taken
+ * from.  Other registers a job omits keep their previous value, as in the
+ * BSP; they carry no address.
  */
 static int rk_mpp_job_write_owned_regs(struct rk_mpp_job *job,
 				       const struct rk_mpp_reg_image *image,
@@ -21934,6 +21975,7 @@ static int rk_mpp_job_write_owned_regs(struct rk_mpp_job *job,
 		.count = min_t(u32, job->trans_count,
 			       ARRAY_SIZE(job->trans_table)),
 	};
+	u32 pp_config = 0;
 	u32 fmt = 0;
 	u32 i;
 
@@ -21952,6 +21994,24 @@ static int rk_mpp_job_write_owned_regs(struct rk_mpp_job *job,
 						     sizeof(u32),
 						     start_offset, written);
 		}
+		/*
+		 * The post-processor word decides whether the kernel programs
+		 * the AFBC block, and the geometry words size the output that
+		 * block is then given.  A stale tile mode could run the block
+		 * on an earlier job's addresses; stale geometry could outgrow
+		 * the span the output buffer was checked against.
+		 */
+		rk_mpp_job_write_owned_word(job, image,
+					    RK_MPP_AV1_PP_CONFIG_WORD,
+					    start_offset, written);
+		if (image->reg_words > RK_MPP_AV1_PP_CONFIG_WORD)
+			pp_config = image->regs[RK_MPP_AV1_PP_CONFIG_WORD];
+		if ((pp_config & RK_MPP_AV1_PP_TILE_MASK) !=
+		    RK_MPP_AV1_PP_TILE_16X16)
+			return 0;
+		rk_mpp_job_write_owned_table(job, image,
+					     &rk_mpp_av1_afbc_geometry, 0,
+					     start_offset, written);
 		return 0;
 	case RK_MPP_DEVICE_RKVDEC:
 		if (image->reg_words > RK_MPP_RKVDEC_REG_FMT)
