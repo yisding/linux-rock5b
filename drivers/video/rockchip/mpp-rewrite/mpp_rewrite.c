@@ -7083,6 +7083,8 @@ static void rk_mpp_reg_offsets_kunit(struct kunit *test)
 
 	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, job);
+	/* The overflow rejection reports through the job's activation. */
+	rk_mpp_activation_init(job);
 
 	KUNIT_EXPECT_EQ(test, rk_mpp_job_store_reg_offsets(job, &job_req), 0);
 	KUNIT_EXPECT_EQ(test, job->reg_builder.image.offset_count,
@@ -7108,6 +7110,7 @@ static void rk_mpp_reg_offsets_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, job->reg_builder.image.regs[1], U32_MAX);
 	kfree(job->reg_builder.image.regs);
 	memset(job, 0, sizeof(*job));
+	rk_mpp_activation_init(job);
 
 	job_req.req.size = 0;
 	job_req.payload = NULL;
@@ -7138,6 +7141,7 @@ static void rk_mpp_reg_offset_dma_bounds_kunit(struct kunit *test)
 
 	job = kunit_kzalloc(test, sizeof(*job), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, job);
+	rk_mpp_activation_init(job);
 	job->client_type = RK_MPP_DEVICE_RKVENC;
 	job->reg_builder.image.regs =
 		kunit_kcalloc(test, RK_MPP_RKVENC_BS_TOP_WORD + 2,
@@ -8181,9 +8185,15 @@ static void rk_mpp_rkvdec2_link_table_ownership_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, table1[info->next_word],
 			(u32)(hw->rkvdec_link_iova +
 			      2 * hw->rkvdec_link_node_size));
-	KUNIT_EXPECT_EQ(test, table2[info->next_word],
+	/*
+	 * The third job reuses node 0.  Node 2 is the spare that reservation
+	 * always keeps: every staged table prelinks to it and none owns it.
+	 */
+	KUNIT_EXPECT_EQ(test, table0[info->next_word],
 			(u32)(hw->rkvdec_link_iova +
 			      2 * hw->rkvdec_link_node_size));
+	KUNIT_EXPECT_FALSE(test, test_bit(2, used));
+	KUNIT_EXPECT_EQ(test, table2[info->next_word], 0U);
 
 	KUNIT_EXPECT_EQ(test, rk_mpp_rkvdec2_stage_link_table(job0), -ENOSPC);
 	KUNIT_EXPECT_FALSE(test, rk_mpp_job_resources(job0)->rkvdec_link_active);
@@ -8950,6 +8960,21 @@ static void rk_mpp_hw_take_active_if_kunit(struct kunit *test)
 	job0->current_activation->watchdog_deadline = 123;
 	job0->current_activation->watchdog_deadline_valid = true;
 	hw.activation_generation_seq = U64_MAX;
+	/*
+	 * Only a pristine activation installs.  One that still carries a
+	 * watchdog deadline is refused before it consumes a generation.
+	 */
+	spin_lock_irqsave(&hw.lock, flags);
+	generation = rk_mpp_hw_install_active_locked(&hw, job0);
+	spin_unlock_irqrestore(&hw.lock, flags);
+	KUNIT_EXPECT_EQ(test, generation, 0ULL);
+	KUNIT_EXPECT_EQ(test, hw.activation_generation_seq, U64_MAX);
+	KUNIT_EXPECT_TRUE(test, rk_mpp_activation_ref_empty(&hw.active_ref));
+	KUNIT_EXPECT_EQ(test, job0->current_activation->slot_state,
+			(enum rk_mpp_activation_slot_state)
+			RK_MPP_ACTIVATION_UNINSTALLED);
+	job0->current_activation->watchdog_deadline = 0;
+	job0->current_activation->watchdog_deadline_valid = false;
 	spin_lock_irqsave(&hw.lock, flags);
 	generation = rk_mpp_hw_install_active_locked(&hw, job0);
 	spin_unlock_irqrestore(&hw.lock, flags);
@@ -10121,14 +10146,13 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	unsigned long flags;
 	u64 installed;
 
-	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	srv = rk_mpp_kunit_alloc_service(test);
 	KUNIT_ASSERT_NOT_NULL(test, srv);
 	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, hw);
 	ccu = kunit_kzalloc(test, sizeof(*ccu), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, ccu);
 	session.srv = srv;
-	mutex_init(&srv->sched_lock);
 	job0 = kunit_kzalloc(test, sizeof(*job0), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, job0);
 	job1 = kunit_kzalloc(test, sizeof(*job1), GFP_KERNEL);
@@ -10157,10 +10181,20 @@ static void rk_mpp_hw_prepare_active_retry_kunit(struct kunit *test)
 	core2->reset_epoch = 43;
 	core2->quiesced = true;
 
+	/*
+	 * Give both objects the back-pointers and locks probe would, so a
+	 * path that starts using one fails an expectation instead of
+	 * dereferencing a zeroed fixture.
+	 */
+	hw->srv = srv;
+	ccu->srv = srv;
 	spin_lock_init(&hw->lock);
 	spin_lock_init(&ccu->lock);
 	raw_spin_lock_init(&hw->regs_lock);
+	raw_spin_lock_init(&ccu->regs_lock);
 	mutex_init(&hw->run_lock);
+	mutex_init(&ccu->run_lock);
+	mutex_init(&ccu->ccu_recovery_lock);
 	mutex_init(&session.lock);
 	hw->iommu_domain = &domain;
 	refcount_set(&hw->refs, 1);
@@ -11212,6 +11246,9 @@ static void rk_mpp_scheduler_session_start_order_kunit(struct kunit *test)
 	other = kunit_kzalloc(test, sizeof(*other), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, other);
 
+	/* Dropping a claim reclaims the activation under the session lock. */
+	mutex_init(&session_a->lock);
+	mutex_init(&session_b->lock);
 	session_a->srv = srv;
 	session_a->client_type = RK_MPP_DEVICE_RKVDEC;
 	session_b->srv = srv;
@@ -12711,6 +12748,7 @@ static void rk_mpp_collect_msg_limit_kunit(struct kunit *test)
 
 static void rk_mpp_batch_session_switch_split_kunit(struct kunit *test)
 {
+	struct rk_mpp_service *srv;
 	struct rk_mpp_session *session0;
 	struct rk_mpp_session *session1;
 	struct rk_mpp_batch_state *batch;
@@ -12721,6 +12759,9 @@ static void rk_mpp_batch_session_switch_split_kunit(struct kunit *test)
 	struct rk_mpp_job *iter;
 	int ret;
 
+	/* Job release proves the dispatch lease under the service lock. */
+	srv = rk_mpp_kunit_alloc_service(test);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
 	session0 = kunit_kzalloc(test, sizeof(*session0), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, session0);
 	session1 = kunit_kzalloc(test, sizeof(*session1), GFP_KERNEL);
@@ -12731,6 +12772,8 @@ static void rk_mpp_batch_session_switch_split_kunit(struct kunit *test)
 	ret = kunit_add_action_or_reset(test, rk_mpp_kunit_batch_release,
 					batch);
 	KUNIT_ASSERT_EQ(test, ret, 0);
+	session0->srv = srv;
+	session1->srv = srv;
 	mutex_init(&session0->lock);
 	mutex_init(&session1->lock);
 	refcount_set(&session0->refs, 1);
@@ -12776,16 +12819,21 @@ static void rk_mpp_batch_session_switch_split_kunit(struct kunit *test)
 
 static void rk_mpp_batch_session_snapshot_kunit(struct kunit *test)
 {
+	struct rk_mpp_service *srv;
 	struct rk_mpp_session *session;
 	struct rk_mpp_batch_state *batch;
 	struct rk_mpp_job *job0;
 	struct rk_mpp_job *job1;
 	int ret;
 
+	/* Job release proves the dispatch lease under the service lock. */
+	srv = rk_mpp_kunit_alloc_service(test);
+	KUNIT_ASSERT_NOT_NULL(test, srv);
 	session = kunit_kzalloc(test, sizeof(*session), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, session);
 	batch = kunit_kzalloc(test, sizeof(*batch), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, batch);
+	session->srv = srv;
 	session->client_type = RK_MPP_DEVICE_RKVDEC;
 	session->initialized = true;
 	session->state_seq = 7;
@@ -13417,6 +13465,8 @@ static void rk_mpp_session_poll_irq_nonslice_kunit(struct kunit *test)
 	job->session = &session;
 	job->state = RK_MPP_JOB_DONE;
 	job->result = 0;
+	/* A job that ran was sealed; the reap reads back from that image. */
+	job->reg_builder.state = RK_MPP_REG_BUILDER_SEALED;
 	refcount_set(&job->refs, 2);
 	INIT_LIST_HEAD(&job->session_link);
 	list_add_tail(&job->session_link, &session.active_jobs);
@@ -13754,7 +13804,8 @@ static void rk_mpp_reset_session_hw_active_import_kunit(struct kunit *test)
 	struct rk_mpp_job *active;
 	int ret;
 
-	srv = kunit_kzalloc(test, sizeof(*srv), GFP_KERNEL);
+	/* Aborting the active job completes it and kicks the scheduler. */
+	srv = rk_mpp_kunit_alloc_service(test);
 	KUNIT_ASSERT_NOT_NULL(test, srv);
 	session = kunit_kzalloc(test, sizeof(*session), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, session);
@@ -13776,10 +13827,6 @@ static void rk_mpp_reset_session_hw_active_import_kunit(struct kunit *test)
 	pm_runtime_set_active(dev);
 	pm_runtime_enable(dev);
 	pm_runtime_get_noresume(dev);
-
-	mutex_init(&srv->sched_lock);
-	spin_lock_init(&srv->rkvenc_dchs_lock);
-	INIT_LIST_HEAD(&srv->queued_jobs);
 
 	session->srv = srv;
 	session->initialized = true;
