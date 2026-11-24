@@ -2087,6 +2087,44 @@ static void rk_mpp_service_state_init(struct rk_mpp_service *srv)
 	INIT_WORK(&srv->sched_work, rk_mpp_scheduler_work);
 }
 
+/*
+ * Coordinator (CCU) devices are rk_mpp_hw instances whose run_lock and lock
+ * nest inside their cores' same-named locks. Distinct lockdep classes let
+ * the core -> coordinator ordering be validated instead of reported as
+ * same-class recursion, which would also disable lockdep for the boot.
+ */
+static struct lock_class_key rk_mpp_ccu_run_lock_key;
+static struct lock_class_key rk_mpp_ccu_hw_lock_key;
+
+/*
+ * Every lock, list, completion, reference and work item of a hardware object
+ * that does not depend on the device behind it.  Probe and the KUnit fixtures
+ * both come through here, so a new member initialised in this function is
+ * initialised in every fixture as well.
+ */
+static void rk_mpp_hw_state_init(struct rk_mpp_hw *hw, bool coordinator)
+{
+	refcount_set(&hw->refs, 1);
+	init_completion(&hw->released);
+	mutex_init(&hw->run_lock);
+	mutex_init(&hw->ccu_recovery_lock);
+	spin_lock_init(&hw->lock);
+	raw_spin_lock_init(&hw->aux_lock);
+	raw_spin_lock_init(&hw->regs_lock);
+	if (coordinator) {
+		lockdep_set_class(&hw->run_lock, &rk_mpp_ccu_run_lock_key);
+		lockdep_set_class(&hw->lock, &rk_mpp_ccu_hw_lock_key);
+	}
+	atomic_set(&hw->irq_disable_depth, 0);
+	atomic_set(&hw->power_count, 0);
+	INIT_LIST_HEAD(&hw->fault_link);
+	INIT_LIST_HEAD(&hw->reset_domain_link);
+	INIT_LIST_HEAD(&hw->cluster_link);
+	INIT_LIST_HEAD(&hw->rkvdec_ccu_jobs);
+	INIT_DELAYED_WORK(&hw->timeout_work, rk_mpp_hw_timeout_work);
+	INIT_WORK(&hw->iommu_fault_work, rk_mpp_hw_iommu_fault_work);
+}
+
 static const char *rk_mpp_debug_event_name(enum rk_mpp_debug_event_type type)
 {
 	switch (type) {
@@ -25816,15 +25854,6 @@ static int rk_mpp_hw_read_id(struct rk_mpp_hw *hw)
 	return 0;
 }
 
-/*
- * Coordinator (CCU) devices are rk_mpp_hw instances whose run_lock and lock
- * nest inside their cores' same-named locks. Distinct lockdep classes let
- * the core -> coordinator ordering be validated instead of reported as
- * same-class recursion, which would also disable lockdep for the boot.
- */
-static struct lock_class_key rk_mpp_ccu_run_lock_key;
-static struct lock_class_key rk_mpp_ccu_hw_lock_key;
-
 static int rk_mpp_hw_probe(struct platform_device *pdev)
 {
 	const struct rk_mpp_hw_match *match;
@@ -25854,25 +25883,7 @@ static int rk_mpp_hw_probe(struct platform_device *pdev)
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
 	if (ret)
 		return ret;
-	refcount_set(&hw->refs, 1);
-	init_completion(&hw->released);
-	mutex_init(&hw->run_lock);
-	mutex_init(&hw->ccu_recovery_lock);
-	spin_lock_init(&hw->lock);
-	raw_spin_lock_init(&hw->aux_lock);
-	raw_spin_lock_init(&hw->regs_lock);
-	if (match->type == RK_MPP_DEVICE_BUTT) {
-		lockdep_set_class(&hw->run_lock, &rk_mpp_ccu_run_lock_key);
-		lockdep_set_class(&hw->lock, &rk_mpp_ccu_hw_lock_key);
-	}
-	atomic_set(&hw->irq_disable_depth, 0);
-	atomic_set(&hw->power_count, 0);
-	INIT_LIST_HEAD(&hw->fault_link);
-	INIT_LIST_HEAD(&hw->reset_domain_link);
-	INIT_LIST_HEAD(&hw->cluster_link);
-	INIT_LIST_HEAD(&hw->rkvdec_ccu_jobs);
-	INIT_DELAYED_WORK(&hw->timeout_work, rk_mpp_hw_timeout_work);
-	INIT_WORK(&hw->iommu_fault_work, rk_mpp_hw_iommu_fault_work);
+	rk_mpp_hw_state_init(hw, match->type == RK_MPP_DEVICE_BUTT);
 
 	hw->ccu_node = of_parse_phandle(dev->of_node, "rockchip,ccu", 0);
 	if (hw->ccu_node) {
