@@ -42,6 +42,7 @@
 #if IS_ENABLED(CONFIG_ROCKCHIP_RGA_REWRITE_KUNIT_TEST)
 #include <linux/mman.h>
 #include <kunit/test.h>
+#include <kunit/test-bug.h>
 #endif
 #include <linux/list.h>
 #include <linux/log2.h>
@@ -6091,6 +6092,8 @@ prepare_mmu:
 	return ret;
 }
 
+static void rk_rga_task_plan_free(struct rk_rga_task_plan *plan);
+
 static bool rk_rga_job_release_exec_storage(struct rk_rga_job *job)
 {
 	struct rk_rga_task_exec *exec, *tmp;
@@ -6110,7 +6113,7 @@ static bool rk_rga_job_release_exec_storage(struct rk_rga_job *job)
 		list_del_init(&exec->job_link);
 		if (WARN_ON_ONCE(!refcount_dec_and_test(&exec->refs)))
 			return false;
-		kfree(exec->plan);
+		rk_rga_task_plan_free(exec->plan);
 		exec->plan = NULL;
 		if (exec != &job->exec_storage)
 			kfree(exec);
@@ -7830,6 +7833,10 @@ struct rk_rga2_palette_profile {
  * owned representation and the backend profile selected during planning.
  */
 struct rk_rga_task_plan {
+#if IS_ENABLED(CONFIG_ROCKCHIP_RGA_REWRITE_KUNIT_TEST)
+	/* Set only for a direct-emitter fixture plan that KUnit will free. */
+	struct kunit *kunit_test;
+#endif
 	enum rk_rga_hw_type hw_type;
 	u8 render_mode;
 	struct rga_img_info_t src;
@@ -9689,6 +9696,8 @@ static int rk_rga2_validate_gauss(const struct rga_req *task)
 }
 
 #if IS_ENABLED(CONFIG_ROCKCHIP_RGA_REWRITE_KUNIT_TEST)
+static void rk_rga_task_plan_free(struct rk_rga_task_plan *plan);
+
 static int rk_rga_kunit_advance_task(struct rk_rga_job *job, int result)
 {
 	struct rk_rga_task_exec *exec;
@@ -9712,6 +9721,26 @@ static int rk_rga_kunit_advance_task(struct rk_rga_job *job, int result)
 	return ret;
 }
 
+/*
+ * A multi-task emitter fixture advances a stack job and never tears it down.
+ * Free the successor executions rk_rga_job_advance_task() allocated for it.
+ */
+static void rk_rga_kunit_free_execs(struct rk_rga_job *job)
+{
+	struct rk_rga_task_exec *exec, *tmp;
+
+	if (!job->current_exec)
+		return;
+	WRITE_ONCE(job->current_exec, NULL);
+	list_for_each_entry_safe(exec, tmp, &job->executions, job_link) {
+		list_del_init(&exec->job_link);
+		rk_rga_task_plan_free(exec->plan);
+		exec->plan = NULL;
+		if (exec != &job->exec_storage)
+			kfree(exec);
+	}
+}
+
 static int rk_rga2_select_dst_addresses(const struct rga_img_info_t *dst,
 					const struct rk_rga2_format_info *fmt,
 					const struct rk_rga2_transform *transform,
@@ -9724,6 +9753,8 @@ static int __maybe_unused rk_rga_job_hw_type(struct rk_rga_job *job,
 static int rk_rga_job_hw_type_mask(struct rk_rga_job *job, u32 *type_mask);
 static int rk_rga_job_sched_hw_type_mask(struct rk_rga_job *job,
 					 u32 *type_mask);
+static int rk_rga_task_plan_build(struct rk_rga_job *job,
+				  enum rk_rga_hw_type hw_type);
 static int rk_rga_job_emit_cmd(struct rk_rga_hw *hw, struct rk_rga_job *job);
 static void rk_rga2_emit_mmu(struct rk_rga_job *job);
 static int rk_rga2_emit_simple_bitblt(struct rk_rga_job *job);
@@ -10648,12 +10679,12 @@ static void rk_rga2_rectangle_task_emit_kunit(struct kunit *test)
 		u32 expected_base;
 
 		memset(cmd, 0, sizeof(cmd));
-		job.exec_storage.cmd_ready = false;
+		rk_rga_job_current_exec(&job)->cmd_ready = false;
 
 		KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 		KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 		KUNIT_EXPECT_EQ(test, rk_rga2_emit_color_fill(&job), 0);
-		KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
+		KUNIT_EXPECT_TRUE(test, rk_rga_job_current_exec(&job)->cmd_ready);
 
 		expected_base = lower_32_bits(tasks[i].dst.yrgb_addr +
 					      (u64)rects[i].y *
@@ -10676,6 +10707,8 @@ static void rk_rga2_rectangle_task_emit_kunit(struct kunit *test)
 			KUNIT_EXPECT_FALSE(test, rk_rga_kunit_advance_task(&job,
 									 0));
 	}
+
+	rk_rga_kunit_free_execs(&job);
 }
 
 static void rk_rga2_mosaic_emit_kunit(struct kunit *test)
@@ -10787,12 +10820,12 @@ static void rk_rga2_mosaic_task_array_emit_kunit(struct kunit *test)
 		u32 expected_base;
 
 		memset(cmd, 0, sizeof(cmd));
-		job.exec_storage.cmd_ready = false;
+		rk_rga_job_current_exec(&job)->cmd_ready = false;
 
 		KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 		KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA2);
 		KUNIT_EXPECT_EQ(test, rk_rga2_emit_simple_bitblt(&job), 0);
-		KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
+		KUNIT_EXPECT_TRUE(test, rk_rga_job_current_exec(&job)->cmd_ready);
 
 		expected_base = lower_32_bits(tasks[i].src.yrgb_addr +
 					      (u64)rects[i].y *
@@ -10820,6 +10853,8 @@ static void rk_rga2_mosaic_task_array_emit_kunit(struct kunit *test)
 			KUNIT_EXPECT_FALSE(test, rk_rga_kunit_advance_task(&job,
 									 0));
 	}
+
+	rk_rga_kunit_free_execs(&job);
 }
 
 static void rk_rga2_rop_emit_kunit(struct kunit *test)
@@ -12495,6 +12530,7 @@ static void rk_rga_release_configured_request_kunit(struct kunit *test)
 	struct rga_user_request user = {
 		.task_num = 1,
 		.id = 14,
+		.sync_mode = RGA_BLIT_ASYNC,
 	};
 	struct rk_rga_session *session;
 	struct rk_rga_request *request;
@@ -12590,6 +12626,20 @@ static void rk_rga_release_configured_request_kunit(struct kunit *test)
 	rk_rga_import_put(dst_import);
 	rk_rga_kunit_release_fd(test, acquire_fd);
 	kunit_release_action(test, rk_rga_kunit_fence_put, acquire_fence);
+}
+
+/* Wait for an asynchronous owner to drop its reference; false on timeout. */
+static bool rk_rga_kunit_wait_refs(refcount_t *refs, unsigned int want)
+{
+	unsigned int i;
+
+	for (i = 0; i < 1000; i++) {
+		if (refcount_read(refs) == want)
+			return true;
+		usleep_range(1000, 2000);
+	}
+
+	return refcount_read(refs) == want;
 }
 
 static void rk_rga_release_pending_acquire_job_kunit(struct kunit *test)
@@ -12693,6 +12743,9 @@ static void rk_rga_release_pending_acquire_job_kunit(struct kunit *test)
 	kunit_remove_action(test, rk_rga_kunit_release_file, &file);
 	KUNIT_EXPECT_PTR_EQ(test, file.private_data, NULL);
 	KUNIT_EXPECT_EQ(test, dma_fence_get_status(release_fence), -EFAULT);
+	/* The acquire worker drops the job, and its imports, after completion. */
+	KUNIT_EXPECT_TRUE(test, rk_rga_kunit_wait_refs(&src_import->refs, 1));
+	KUNIT_EXPECT_TRUE(test, rk_rga_kunit_wait_refs(&dst_import->refs, 1));
 	KUNIT_EXPECT_EQ(test, refcount_read(&src_import->refs), 1);
 	KUNIT_EXPECT_EQ(test, refcount_read(&dst_import->refs), 1);
 	list_del_init(&hw->node);
@@ -12814,6 +12867,9 @@ static void rk_rga_last_hw_remove_pending_acquire_kunit(struct kunit *test)
 					       msecs_to_jiffies(1000)),
 			0L);
 	KUNIT_EXPECT_EQ(test, dma_fence_get_status(release_fence), -ENODEV);
+	/* The acquire worker drops the job, and its imports, after completion. */
+	KUNIT_EXPECT_TRUE(test, rk_rga_kunit_wait_refs(&src_import->refs, 2));
+	KUNIT_EXPECT_TRUE(test, rk_rga_kunit_wait_refs(&dst_import->refs, 2));
 	KUNIT_EXPECT_EQ(test, refcount_read(&src_import->refs), 2);
 	KUNIT_EXPECT_EQ(test, refcount_read(&dst_import->refs), 2);
 
@@ -13324,8 +13380,9 @@ static void rk_rga_legacy_blit_sync_wait_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, user_task->in_fence_fd, 0);
 	KUNIT_EXPECT_EQ(test, user_task->out_fence_fd, -1);
 
+	/* Storage is released only once retirement has been proved. */
 	memset(&hw->active_ref, 0, sizeof(hw->active_ref));
-	active->current_exec->state = RK_RGA_TASK_EXEC_RETIRED;
+	active->current_exec->state = RK_RGA_TASK_EXEC_RECLAIMABLE;
 	KUNIT_EXPECT_TRUE(test, rk_rga_job_release_exec_storage(active));
 	list_del_init(&hw->node);
 	KUNIT_EXPECT_PTR_EQ(test, idr_remove(&session.imports, 11),
@@ -13990,6 +14047,7 @@ static void rk_rga2_mmu_emit_kunit(struct kunit *test)
 			.dma = 0x20000,
 		},
 	};
+	struct rk_rga_task_plan *plan;
 	struct rk_rga_job job = {
 		.tasks = &task,
 		.task_count = 1,
@@ -13997,6 +14055,13 @@ static void rk_rga2_mmu_emit_kunit(struct kunit *test)
 		.exec_storage.cmd_vaddr = cmd,
 		.exec_storage.cmd_size = sizeof(cmd),
 	};
+
+	/* The emitter reads the alpha routing from the published plan. */
+	plan = kunit_kzalloc(test, sizeof(*plan), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, plan);
+	plan->hw_type = RK_RGA_HW_RGA2;
+	plan->alpha_rop_flag = task.alpha_rop_flag;
+	job.exec_storage.plan = plan;
 
 	rk_rga2_emit_mmu(&job);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA2_MMU_CTRL1_OFFSET / 4],
@@ -14590,6 +14655,14 @@ static int rk_rga_kunit_race_thread(void *data)
 							 -ECANCELED);
 	}
 	complete(&thread->done);
+
+	/* The test always calls kthread_stop(), so stay until it does. */
+	set_current_state(TASK_INTERRUPTIBLE);
+	while (!kthread_should_stop()) {
+		schedule();
+		set_current_state(TASK_INTERRUPTIBLE);
+	}
+	__set_current_state(TASK_RUNNING);
 
 	return 0;
 }
@@ -17346,8 +17419,8 @@ static void rk_rga_iommu_fault_generation_kunit(struct kunit *test)
 	struct rk_rga_task_exec_ref fault = {};
 	struct rk_rga_task_exec *taken;
 	struct rk_rga_hw *hw;
-	struct rk_rga_job target = {};
-	struct rk_rga_job replacement = {};
+	struct rk_rga_job *target;
+	struct rk_rga_job *replacement;
 	unsigned long flags;
 	bool matches;
 
@@ -17357,45 +17430,50 @@ static void rk_rga_iommu_fault_generation_kunit(struct kunit *test)
 	init_waitqueue_head(&hw->idle);
 	mutex_init(&hw->run_lock);
 	INIT_LIST_HEAD(&hw->iommu_fault_events);
-	rk_rga_job_init(&target);
-	rk_rga_job_init(&replacement);
+	/* A job embeds work items, so it cannot live on the stack. */
+	target = kunit_kzalloc(test, sizeof(*target), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, target);
+	replacement = kunit_kzalloc(test, sizeof(*replacement), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, replacement);
+	rk_rga_job_init(target);
+	rk_rga_job_init(replacement);
 
 	hw->activation_generation_seq = U64_MAX;
 	mutex_lock(&hw->run_lock);
 	spin_lock_irqsave(&hw->job_lock, flags);
 	KUNIT_ASSERT_TRUE(test, rk_rga_hw_install_active_locked(
-					hw, target.current_exec));
+					hw, target->current_exec));
 	spin_unlock_irqrestore(&hw->job_lock, flags);
 	mutex_unlock(&hw->run_lock);
-	KUNIT_EXPECT_PTR_EQ(test, hw->active_ref.exec, target.current_exec);
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_ref.exec, target->current_exec);
 	KUNIT_EXPECT_EQ(test, hw->active_ref.generation, 1ULL);
 	KUNIT_ASSERT_TRUE(test, rk_rga_hw_mark_iommu_fault(hw));
-	KUNIT_EXPECT_TRUE(test, target.current_exec->iommu_fault_seen);
-	KUNIT_EXPECT_TRUE(test, target.current_exec->iommu_fault_work_pending);
+	KUNIT_EXPECT_TRUE(test, target->current_exec->iommu_fault_seen);
+	KUNIT_EXPECT_TRUE(test, target->current_exec->iommu_fault_work_pending);
 	KUNIT_EXPECT_EQ(test,
-			rk_rga_task_exec_terminal_result(target.current_exec, 0),
+			rk_rga_task_exec_terminal_result(target->current_exec, 0),
 			-EIO);
 	KUNIT_ASSERT_TRUE(test, rk_rga_hw_take_iommu_fault_ref(hw, &fault));
-	KUNIT_EXPECT_FALSE(test, target.current_exec->iommu_fault_work_pending);
+	KUNIT_EXPECT_FALSE(test, target->current_exec->iommu_fault_work_pending);
 	spin_lock_irqsave(&hw->job_lock, flags);
 	matches = rk_rga_hw_iommu_fault_matches_locked(hw, &fault);
 	taken = rk_rga_hw_take_active_locked(hw, &claim);
 	spin_unlock_irqrestore(&hw->job_lock, flags);
 	KUNIT_EXPECT_TRUE(test, matches);
-	KUNIT_EXPECT_PTR_EQ(test, taken, target.current_exec);
+	KUNIT_EXPECT_PTR_EQ(test, taken, target->current_exec);
 	KUNIT_EXPECT_TRUE(test, rk_rga_task_exec_retire(taken));
 	KUNIT_EXPECT_TRUE(test, rk_rga_task_exec_ref_put(&claim));
 
 	mutex_lock(&hw->run_lock);
 	spin_lock_irqsave(&hw->job_lock, flags);
 	KUNIT_ASSERT_TRUE(test, rk_rga_hw_install_active_locked(
-					hw, replacement.current_exec));
+					hw, replacement->current_exec));
 	matches = rk_rga_hw_iommu_fault_matches_locked(hw, &fault);
 	spin_unlock_irqrestore(&hw->job_lock, flags);
 	mutex_unlock(&hw->run_lock);
 	KUNIT_EXPECT_FALSE(test, matches);
 	KUNIT_EXPECT_PTR_EQ(test, hw->active_ref.exec,
-			    replacement.current_exec);
+			    replacement->current_exec);
 	KUNIT_EXPECT_TRUE(test, rk_rga_task_exec_ref_put(&fault));
 
 	spin_lock_irqsave(&hw->job_lock, flags);
@@ -17404,8 +17482,8 @@ static void rk_rga_iommu_fault_generation_kunit(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, taken);
 	KUNIT_EXPECT_TRUE(test, rk_rga_task_exec_retire(taken));
 	KUNIT_EXPECT_TRUE(test, rk_rga_task_exec_ref_put(&claim));
-	KUNIT_EXPECT_TRUE(test, rk_rga_job_release_exec_storage(&target));
-	KUNIT_EXPECT_TRUE(test, rk_rga_job_release_exec_storage(&replacement));
+	KUNIT_EXPECT_TRUE(test, rk_rga_job_release_exec_storage(target));
+	KUNIT_EXPECT_TRUE(test, rk_rga_job_release_exec_storage(replacement));
 }
 
 static void rk_rga_reset_failure_retains_active_kunit(struct kunit *test)
@@ -17415,7 +17493,7 @@ static void rk_rga_reset_failure_retains_active_kunit(struct kunit *test)
 	struct rk_rga_retirement retirement = {};
 	struct rk_rga_task_exec *taken;
 	struct rk_rga_hw *hw;
-	struct rk_rga_job target = {};
+	struct rk_rga_job *target;
 	unsigned long flags;
 	bool quarantined = false;
 
@@ -17424,32 +17502,35 @@ static void rk_rga_reset_failure_retains_active_kunit(struct kunit *test)
 	spin_lock_init(&hw->job_lock);
 	mutex_init(&hw->run_lock);
 	INIT_LIST_HEAD(&hw->iommu_fault_events);
-	rk_rga_job_init(&target);
+	/* A job embeds work items, so it cannot live on the stack. */
+	target = kunit_kzalloc(test, sizeof(*target), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, target);
+	rk_rga_job_init(target);
 	hw->activation_generation_seq = 6;
 	mutex_lock(&hw->run_lock);
 	spin_lock_irqsave(&hw->job_lock, flags);
 	KUNIT_ASSERT_TRUE(test, rk_rga_hw_install_active_locked(
-					hw, target.current_exec));
+					hw, target->current_exec));
 	spin_unlock_irqrestore(&hw->job_lock, flags);
 	mutex_unlock(&hw->run_lock);
 	KUNIT_ASSERT_TRUE(test, rk_rga_hw_mark_iommu_fault(hw));
 	KUNIT_ASSERT_TRUE(test, rk_rga_hw_take_iommu_fault_ref(hw, &fault));
-	KUNIT_EXPECT_FALSE(test, target.current_exec->iommu_fault_work_pending);
+	KUNIT_EXPECT_FALSE(test, target->current_exec->iommu_fault_work_pending);
 	mutex_lock(&hw->run_lock);
 	spin_lock_irqsave(&hw->job_lock, flags);
 	taken = rk_rga_hw_take_active_locked(hw, &claim);
 	spin_unlock_irqrestore(&hw->job_lock, flags);
-	if (taken == target.current_exec)
+	if (taken == target->current_exec)
 		quarantined = rk_rga_task_exec_retire_engine(
 			hw, &claim, -EIO, false, &retirement);
 	mutex_unlock(&hw->run_lock);
-	KUNIT_ASSERT_PTR_EQ(test, taken, target.current_exec);
+	KUNIT_ASSERT_PTR_EQ(test, taken, target->current_exec);
 	KUNIT_ASSERT_TRUE(test, quarantined);
-	KUNIT_EXPECT_PTR_EQ(test, hw->active_ref.exec, target.current_exec);
+	KUNIT_EXPECT_PTR_EQ(test, hw->active_ref.exec, target->current_exec);
 	KUNIT_EXPECT_EQ(test, hw->active_ref.generation, 7ULL);
-	KUNIT_EXPECT_EQ(test, target.current_exec->state,
+	KUNIT_EXPECT_EQ(test, target->current_exec->state,
 			RK_RGA_TASK_EXEC_QUARANTINED);
-	KUNIT_EXPECT_PTR_EQ(test, retirement.job, &target);
+	KUNIT_EXPECT_PTR_EQ(test, retirement.job, target);
 	KUNIT_EXPECT_EQ(test, retirement.result, -EIO);
 	KUNIT_EXPECT_EQ(test, retirement.disposition,
 			RK_RGA_RETIRE_QUARANTINED);
@@ -17463,7 +17544,7 @@ static void rk_rga_reset_failure_retains_active_kunit(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, rk_rga_task_exec_retire(taken));
 	KUNIT_EXPECT_TRUE(test, rk_rga_task_exec_ref_put(&claim));
 	KUNIT_EXPECT_TRUE(test, rk_rga_task_exec_ref_put(&fault));
-	KUNIT_EXPECT_TRUE(test, rk_rga_job_release_exec_storage(&target));
+	KUNIT_EXPECT_TRUE(test, rk_rga_job_release_exec_storage(target));
 }
 
 static void rk_rga_abort_reset_failure_retains_dma_kunit(struct kunit *test)
@@ -17545,8 +17626,8 @@ static void rk_rga_abort_reset_failure_retains_dma_kunit(struct kunit *test)
 static void rk_rga_timeout_target_replacement_kunit(struct kunit *test)
 {
 	struct rk_rga_hw *hw;
-	struct rk_rga_job target = {};
-	struct rk_rga_job replacement = {};
+	struct rk_rga_job *target;
+	struct rk_rga_job *replacement;
 	int ret;
 
 	/* timeout_work uses INIT_DELAYED_WORK(), so keep its owner off-stack. */
@@ -17560,12 +17641,17 @@ static void rk_rga_timeout_target_replacement_kunit(struct kunit *test)
 					rk_rga_kunit_cancel_delayed_work,
 					&hw->timeout_work);
 	KUNIT_ASSERT_EQ(test, ret, 0);
-	rk_rga_job_init(&target);
-	rk_rga_job_init(&replacement);
+	/* A job embeds work items, so it cannot live on the stack. */
+	target = kunit_kzalloc(test, sizeof(*target), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, target);
+	replacement = kunit_kzalloc(test, sizeof(*replacement), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, replacement);
+	rk_rga_job_init(target);
+	rk_rga_job_init(replacement);
 	mutex_lock(&hw->run_lock);
 	spin_lock_irq(&hw->job_lock);
 	KUNIT_ASSERT_TRUE(test, rk_rga_hw_install_active_locked(
-					hw, replacement.current_exec));
+					hw, replacement->current_exec));
 	spin_unlock_irq(&hw->job_lock);
 	mutex_unlock(&hw->run_lock);
 	/*
@@ -17573,42 +17659,44 @@ static void rk_rga_timeout_target_replacement_kunit(struct kunit *test)
 	 * slot.  The typed reference keeps that stale identity alive long enough
 	 * for the worker to reject it without dereferencing recycled storage.
 	 */
-	target.current_exec->generation = 1;
+	target->current_exec->generation = 1;
 	KUNIT_ASSERT_TRUE(test, rk_rga_task_exec_ref_get(
-					&hw->timeout_ref, target.current_exec));
+					&hw->timeout_ref, target->current_exec));
 
 	rk_rga_hw_timeout_work(&hw->timeout_work.work);
 
 	KUNIT_EXPECT_PTR_EQ(test, hw->active_ref.exec,
-			    replacement.current_exec);
+			    replacement->current_exec);
 	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_ref.exec, NULL);
-	KUNIT_EXPECT_EQ(test, refcount_read(&target.refs), 1);
-	KUNIT_EXPECT_EQ(test, refcount_read(&replacement.refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&target->refs), 1);
+	/* Every typed execution reference pins its job: the slot holds one. */
+	KUNIT_EXPECT_EQ(test, refcount_read(&replacement->refs), 2);
 
 	KUNIT_ASSERT_EQ(test, rk_rga_hw_schedule_timeout(
-					hw, replacement.current_exec), 0);
+					hw, replacement->current_exec), 0);
 	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_ref.exec,
-			    replacement.current_exec);
+			    replacement->current_exec);
 	KUNIT_EXPECT_EQ(test, hw->timeout_ref.generation,
-			replacement.current_exec->generation);
-	KUNIT_EXPECT_EQ(test, refcount_read(&replacement.refs), 2);
+			replacement->current_exec->generation);
+	KUNIT_EXPECT_EQ(test, refcount_read(&replacement->refs), 3);
 	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&hw->timeout_work));
 	rk_rga_hw_cancel_timeout_sync(hw);
 	KUNIT_EXPECT_PTR_EQ(test, hw->timeout_ref.exec, NULL);
-	KUNIT_EXPECT_EQ(test, refcount_read(&replacement.refs), 1);
+	KUNIT_EXPECT_EQ(test, refcount_read(&replacement->refs), 2);
 
 	spin_lock_irq(&hw->job_lock);
 	KUNIT_ASSERT_PTR_EQ(test,
 			    rk_rga_hw_take_active_locked(hw, &hw->timeout_ref),
-			    replacement.current_exec);
+			    replacement->current_exec);
 	spin_unlock_irq(&hw->job_lock);
 	KUNIT_EXPECT_TRUE(test,
-			  rk_rga_task_exec_retire(replacement.current_exec));
+			  rk_rga_task_exec_retire(replacement->current_exec));
 	KUNIT_EXPECT_TRUE(test,
 			  rk_rga_task_exec_ref_put(&hw->timeout_ref));
-	KUNIT_EXPECT_TRUE(test, rk_rga_job_release_exec_storage(&target));
+	KUNIT_EXPECT_EQ(test, refcount_read(&replacement->refs), 1);
+	KUNIT_EXPECT_TRUE(test, rk_rga_job_release_exec_storage(target));
 	KUNIT_EXPECT_TRUE(test,
-			  rk_rga_job_release_exec_storage(&replacement));
+			  rk_rga_job_release_exec_storage(replacement));
 	kunit_release_action(test, rk_rga_kunit_cancel_delayed_work,
 			     &hw->timeout_work);
 }
@@ -18445,7 +18533,7 @@ static void rk_rga3_librga_copy_splice_task_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, rk_rga_job_current_exec(&job)->cmd_ready);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_Y_BASE_OFFSET / 4],
 			lower_32_bits(0x10000000));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
@@ -18456,13 +18544,13 @@ static void rk_rga3_librga_copy_splice_task_kunit(struct kunit *test)
 			2560U);
 
 	memset(cmd, 0, sizeof(cmd));
-	job.exec_storage.cmd_ready = false;
+	rk_rga_job_current_exec(&job)->cmd_ready = false;
 	KUNIT_EXPECT_TRUE(test, rk_rga_kunit_advance_task(&job, 0));
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 	KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, rk_rga_job_current_exec(&job)->cmd_ready);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_Y_BASE_OFFSET / 4],
 			lower_32_bits(0x30000000));
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_DST_SIZE_OFFSET / 4],
@@ -18472,6 +18560,8 @@ static void rk_rga3_librga_copy_splice_task_kunit(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WR_VIR_STRIDE_OFFSET / 4],
 			2560U);
 	KUNIT_EXPECT_FALSE(test, rk_rga_kunit_advance_task(&job, 0));
+
+	rk_rga_kunit_free_execs(&job);
 }
 
 static void rk_rga3_multitask_emit_clears_stale_regs_kunit(struct kunit *test)
@@ -18512,19 +18602,23 @@ static void rk_rga3_multitask_emit_clears_stale_regs_kunit(struct kunit *test)
 	tasks[0].bg_global_alpha = 0xff;
 	tasks[0].yuv2rgb_mode = 0;
 
+	/* Dispatch publishes each task's plan before it emits. */
+	KUNIT_ASSERT_EQ(test, rk_rga_task_plan_build(&job, hw->type), 0);
 	KUNIT_EXPECT_EQ(test, rk_rga_job_emit_cmd(hw, &job), 0);
-	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, rk_rga_job_current_exec(&job)->cmd_ready);
 	KUNIT_EXPECT_NE(test, cmd[RK_RGA3_OVLP_TOP_CTRL_OFFSET / 4], 0U);
 	KUNIT_EXPECT_NE(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4], 0U);
 
 	KUNIT_EXPECT_TRUE(test, rk_rga_kunit_advance_task(&job, 0));
-	job.exec_storage.cmd_ready = true;
+	KUNIT_ASSERT_EQ(test, rk_rga_task_plan_build(&job, hw->type), 0);
 	KUNIT_EXPECT_EQ(test, rk_rga_job_emit_cmd(hw, &job), 0);
-	KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
+	KUNIT_EXPECT_TRUE(test, rk_rga_job_current_exec(&job)->cmd_ready);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_OVLP_TOP_CTRL_OFFSET / 4], 0U);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN1_RD_CTRL_OFFSET / 4], 0U);
 	KUNIT_EXPECT_EQ(test, cmd[RK_RGA3_WIN0_Y_BASE_OFFSET / 4],
 			lower_32_bits(0x40000000));
+
+	rk_rga_kunit_free_execs(&job);
 }
 
 static void rk_rga3_librga_translate_emit_kunit(struct kunit *test)
@@ -18931,13 +19025,13 @@ static void rk_rga3_librga_side_border_kunit(struct kunit *test)
 		bool reflect = tasks[i].rotate_mode == 2;
 
 		memset(rga3_cmd, 0, sizeof(rga3_cmd));
-		job.exec_storage.cmd_ready = false;
+		rk_rga_job_current_exec(&job)->cmd_ready = false;
 		type = 0;
 
 		KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 		KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 		KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-		KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
+		KUNIT_EXPECT_TRUE(test, rk_rga_job_current_exec(&job)->cmd_ready);
 		KUNIT_EXPECT_TRUE(test,
 				  rga3_cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4] &
 				  RK_RGA3_WIN0_ENABLE);
@@ -19004,6 +19098,8 @@ static void rk_rga3_librga_side_border_kunit(struct kunit *test)
 	type = 0;
 	KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(single_job, &type),
 			-EOPNOTSUPP);
+
+	rk_rga_kunit_free_execs(&job);
 }
 
 static void rk_rga3_librga_padding_kunit(struct kunit *test)
@@ -19034,12 +19130,12 @@ static void rk_rga3_librga_padding_kunit(struct kunit *test)
 		bool reflect = tasks[i].rotate_mode == 3;
 
 		memset(cmd, 0, sizeof(cmd));
-		job.exec_storage.cmd_ready = false;
+		rk_rga_job_current_exec(&job)->cmd_ready = false;
 
 		KUNIT_EXPECT_EQ(test, rk_rga_job_hw_type(&job, &type), 0);
 		KUNIT_EXPECT_EQ(test, type, RK_RGA_HW_RGA3);
 		KUNIT_EXPECT_EQ(test, rk_rga3_emit_simple_bitblt(&job), 0);
-		KUNIT_EXPECT_TRUE(test, job.exec_storage.cmd_ready);
+		KUNIT_EXPECT_TRUE(test, rk_rga_job_current_exec(&job)->cmd_ready);
 
 		ctrl = cmd[RK_RGA3_WIN0_RD_CTRL_OFFSET / 4];
 		KUNIT_EXPECT_TRUE(test, ctrl & RK_RGA3_WIN0_ENABLE);
@@ -19071,6 +19167,8 @@ static void rk_rga3_librga_padding_kunit(struct kunit *test)
 			KUNIT_EXPECT_FALSE(test, rk_rga_kunit_advance_task(&job,
 									 0));
 	}
+
+	rk_rga_kunit_free_execs(&job);
 }
 
 static void rk_rga2_compact_10bit_profile_kunit(struct kunit *test)
@@ -22591,6 +22689,37 @@ static void rk_rga_task_plan_copy_semantics(struct rk_rga_task_plan *plan,
 	plan->gauss_config = task->gauss_config;
 }
 
+#if IS_ENABLED(CONFIG_ROCKCHIP_RGA_REWRITE_KUNIT_TEST)
+static void rk_rga_kunit_plan_free(void *data)
+{
+	kfree(data);
+}
+
+/*
+ * A direct-emitter fixture builds its plan on a job that is never torn down,
+ * so nothing would free the last one.  Hand it to the running test instead.
+ */
+static void rk_rga_kunit_own_plan(struct rk_rga_task_plan *plan)
+{
+	struct kunit *test = kunit_get_current_test();
+
+	if (test && !kunit_add_action(test, rk_rga_kunit_plan_free, plan))
+		plan->kunit_test = test;
+}
+#endif
+
+static void rk_rga_task_plan_free(struct rk_rga_task_plan *plan)
+{
+#if IS_ENABLED(CONFIG_ROCKCHIP_RGA_REWRITE_KUNIT_TEST)
+	if (plan && plan->kunit_test) {
+		kunit_release_action(plan->kunit_test, rk_rga_kunit_plan_free,
+				     plan);
+		return;
+	}
+#endif
+	kfree(plan);
+}
+
 static int rk_rga_task_plan_build(struct rk_rga_job *job,
 				  enum rk_rga_hw_type hw_type)
 {
@@ -22693,7 +22822,7 @@ static int rk_rga_emitter_require_plan(struct rk_rga_job *job,
 		struct rk_rga_task_plan *old_plan;
 
 		old_plan = xchg(&exec->plan, NULL);
-		kfree(old_plan);
+		rk_rga_task_plan_free(old_plan);
 	}
 #endif
 	*plan = rk_rga_task_exec_plan(exec);
@@ -22701,6 +22830,10 @@ static int rk_rga_emitter_require_plan(struct rk_rga_job *job,
 		ret = rk_rga_task_plan_build(job, hw_type);
 		if (ret)
 			return ret;
+#if IS_ENABLED(CONFIG_ROCKCHIP_RGA_REWRITE_KUNIT_TEST)
+		if (!exec->hw)
+			rk_rga_kunit_own_plan(exec->plan);
+#endif
 		*plan = rk_rga_task_exec_plan(exec);
 	}
 	if (!*plan || (*plan)->hw_type != hw_type)
