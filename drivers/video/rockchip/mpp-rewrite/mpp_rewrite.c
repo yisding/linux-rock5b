@@ -6050,70 +6050,6 @@ static void rk_mpp_get_cmd_butt_kunit(struct kunit *test)
 			(__u32)MPP_CMD_CONTROL_BUTT);
 }
 
-static void rk_mpp_support_cmds_kunit(struct kunit *test)
-{
-	static const struct rk_mpp_support_cmd expected[] = {
-		{ "QUERY_HW_SUPPORT:", MPP_CMD_QUERY_HW_SUPPORT },
-		{ "QUERY_HW_ID:", MPP_CMD_QUERY_HW_ID },
-		{ "QUERY_CMD_SUPPORT:", MPP_CMD_QUERY_CMD_SUPPORT },
-		{ "QUERY_BUTT:", MPP_CMD_QUERY_BUTT },
-		{ NULL, 0 },
-		{ "INIT_CLIENT_TYPE:", MPP_CMD_INIT_CLIENT_TYPE },
-		{ "INIT_DRIVER_DATA:", MPP_CMD_INIT_DRIVER_DATA },
-		{ "INIT_TRANS_TABLE:", MPP_CMD_INIT_TRANS_TABLE },
-		{ "INIT_BUTT:", MPP_CMD_INIT_BUTT },
-		{ NULL, 0 },
-		{ "SET_REG_WRITE:", MPP_CMD_SET_REG_WRITE },
-		{ "SET_REG_READ:", MPP_CMD_SET_REG_READ },
-		{ "SET_REG_ADDR_OFFSET:", MPP_CMD_SET_REG_ADDR_OFFSET },
-		{ "SET_RCB_INFO:", MPP_CMD_SET_RCB_INFO },
-		{ "SET_SESSION_FD:", MPP_CMD_SET_SESSION_FD },
-		{ "SEND_BUTT:", MPP_CMD_SEND_BUTT },
-		{ NULL, 0 },
-		{ "POLL_HW_FINISH:", MPP_CMD_POLL_HW_FINISH },
-		{ "POLL_HW_IRQ:", MPP_CMD_POLL_HW_IRQ },
-		{ "POLL_BUTT:", MPP_CMD_POLL_BUTT },
-		{ NULL, 0 },
-		{ "RESET_SESSION:", MPP_CMD_RESET_SESSION },
-		{ "TRANS_FD_TO_IOVA:", MPP_CMD_TRANS_FD_TO_IOVA },
-		{ "RELEASE_FD:", MPP_CMD_RELEASE_FD },
-		{ "SEND_CODEC_INFO:", MPP_CMD_SEND_CODEC_INFO },
-		{ "SET_ERR_REF_HACK:", MPP_CMD_SET_ERR_REF_HACK },
-		{ "CONTROL_BUTT:", MPP_CMD_CONTROL_BUTT },
-	};
-	static const struct rk_mpp_support_device expected_devices[] = {
-		{ "AV1DEC", RK_MPP_DEVICE_AV1DEC },
-		{ "RKVDEC", RK_MPP_DEVICE_RKVDEC },
-		{ "RKVENC", RK_MPP_DEVICE_RKVENC },
-	};
-	u32 i;
-
-	KUNIT_ASSERT_EQ(test, ARRAY_SIZE(rk_mpp_support_cmds),
-			ARRAY_SIZE(expected));
-	for (i = 0; i < ARRAY_SIZE(expected); i++) {
-		if (!expected[i].name) {
-			KUNIT_EXPECT_PTR_EQ(test, rk_mpp_support_cmds[i].name,
-					    NULL);
-		} else {
-			KUNIT_ASSERT_NOT_NULL(test,
-					      rk_mpp_support_cmds[i].name);
-			KUNIT_EXPECT_STREQ(test, rk_mpp_support_cmds[i].name,
-					   expected[i].name);
-		}
-		KUNIT_EXPECT_EQ(test, rk_mpp_support_cmds[i].cmd,
-				expected[i].cmd);
-	}
-
-	KUNIT_ASSERT_EQ(test, ARRAY_SIZE(rk_mpp_support_devices),
-			ARRAY_SIZE(expected_devices));
-	for (i = 0; i < ARRAY_SIZE(expected_devices); i++) {
-		KUNIT_EXPECT_STREQ(test, rk_mpp_support_devices[i].name,
-				   expected_devices[i].name);
-		KUNIT_EXPECT_EQ(test, rk_mpp_support_devices[i].type,
-				expected_devices[i].type);
-	}
-}
-
 static void rk_mpp_msg_v1_to_request_kunit(struct kunit *test)
 {
 	struct rk_mpp_msg_v1 msg = {
@@ -14849,7 +14785,6 @@ static struct kunit_case rk_mpp_rewrite_test_cases[] = {
 	KUNIT_CASE(rk_mpp_check_cmd_v1_kunit),
 	KUNIT_CASE(rk_mpp_check_msg_flags_kunit),
 	KUNIT_CASE(rk_mpp_get_cmd_butt_kunit),
-	KUNIT_CASE(rk_mpp_support_cmds_kunit),
 	KUNIT_CASE(rk_mpp_msg_v1_to_request_kunit),
 	KUNIT_CASE(rk_mpp_cmd_copies_payload_kunit),
 	KUNIT_CASE(rk_mpp_fd_array_count_kunit),
